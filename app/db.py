@@ -3,9 +3,29 @@ import os
 from beanie import init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from app.models import Account, CardLink, Interview, Transaction, UserExtra, WeeklyPlan
+from app.models import (
+    Account,
+    AiReviewRun,
+    CardLink,
+    GlobalPrompt,
+    Interview,
+    Skill,
+    Transaction,
+    UserExtra,
+    WeeklyPlan,
+)
 
-DOCUMENT_MODELS = [UserExtra, Transaction, Account, CardLink, WeeklyPlan, Interview]
+DOCUMENT_MODELS = [
+    UserExtra,
+    Transaction,
+    Account,
+    CardLink,
+    WeeklyPlan,
+    Interview,
+    Skill,
+    AiReviewRun,
+    GlobalPrompt,
+]
 
 
 async def init_db() -> None:

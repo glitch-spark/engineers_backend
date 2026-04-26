@@ -11,10 +11,13 @@ from app.config import get_settings
 from app.db import init_db
 from app.routers import (
     accounts,
+    ai_review,
     auth as auth_router,
     cardlinks,
+    global_prompt,
     interviews,
     profile,
+    skills,
     transactions,
     users,
     weekly_plans,
@@ -67,6 +70,9 @@ def create_app() -> FastAPI:
     app.include_router(cardlinks.router)
     app.include_router(weekly_plans.router)
     app.include_router(interviews.router)
+    app.include_router(skills.router)
+    app.include_router(global_prompt.router)
+    app.include_router(ai_review.router)
 
     return app
 
