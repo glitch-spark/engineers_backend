@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
-beanie
-motor
+beanie<2
+motor<4
 pydantic-settings
 passlib[bcrypt]
 bcrypt<4.1

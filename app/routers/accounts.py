@@ -1,13 +1,77 @@
-from typing import Annotated, Any, Optional
+import re
+from typing import Annotated, Any, List, Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from app.deps import get_current_user
 from app.models import Account, UserExtra
+from app.models.account import Resume
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
+
+# Schema bounds — see Step 1 ADR.
+MAX_RESUMES_PER_ACCOUNT = 20
+MAX_RESUME_MARKDOWN_BYTES = 200_000
+MAX_FILENAME_LEN = 255
+
+# Drop control chars (incl. NUL) and path separators. Keeps the filename safe to
+# echo back in headers/UI without further escaping.
+_FILENAME_BAD = re.compile(r"[\x00-\x1f\x7f/\\]")
+
+
+class ResumeIn(BaseModel):
+    """Resume input shape. `id` is optional: present for existing resumes (preserves identity),
+    absent for newly-staged uploads (server assigns a fresh ObjectId)."""
+    id: Optional[str] = None
+    filename: str
+    markdown: str
+
+
+def _sanitize_filename(raw: str) -> str:
+    return _FILENAME_BAD.sub("_", raw or "").strip()
+
+
+def _validate_and_normalize_resumes(items: List[ResumeIn]) -> List[Resume]:
+    if len(items) > MAX_RESUMES_PER_ACCOUNT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"too many resumes (max {MAX_RESUMES_PER_ACCOUNT})",
+        )
+    out: List[Resume] = []
+    for item in items:
+        fn = _sanitize_filename(item.filename)
+        if not fn or len(fn) > MAX_FILENAME_LEN:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid filename")
+        if len(item.markdown.encode("utf-8")) > MAX_RESUME_MARKDOWN_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"resume markdown exceeds {MAX_RESUME_MARKDOWN_BYTES} bytes",
+            )
+        rid = PydanticObjectId(item.id) if item.id else PydanticObjectId()
+        out.append(Resume(id=rid, filename=fn, markdown=item.markdown))
+    return out
+
+
+def _strip_markdown_from_account(payload: dict) -> dict:
+    """Replace each resume's `markdown` with `sizeBytes` for list responses.
+    Keeps id/filename/uploadedAt so the SPA can show counts and filenames; the
+    full markdown only ships from the per-id GET endpoint when the user clicks Edit."""
+    resumes = payload.get("resumes")
+    if isinstance(resumes, list):
+        slim = []
+        for r in resumes:
+            if isinstance(r, dict):
+                slim.append({
+                    "id": r.get("id"),
+                    "filename": r.get("filename"),
+                    "uploadedAt": r.get("uploadedAt"),
+                    "sizeBytes": len((r.get("markdown") or "").encode("utf-8")),
+                })
+        payload["resumes"] = slim
+    return payload
 
 
 class AccountCreate(BaseModel):
@@ -15,6 +79,7 @@ class AccountCreate(BaseModel):
     email: str
     phone: Optional[str] = ""
     address: Optional[str] = ""
+    resumes: Optional[List[ResumeIn]] = None
 
 
 class AccountUpdate(BaseModel):
@@ -22,6 +87,21 @@ class AccountUpdate(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+    resumes: Optional[List[ResumeIn]] = None
+
+
+@router.get("/lookup")
+async def lookup_accounts(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Minimal projection of every account, for filter dropdowns. Auth required, no scoping."""
+    rows = await Account.find({}).to_list()
+    return {
+        "accounts": [
+            {"_id": str(a.id), "name": a.name, "email": a.email}
+            for a in rows
+        ]
+    }
 
 
 @router.get("")
@@ -52,6 +132,9 @@ async def list_accounts(
     total = await Account.find(query).count()
     rows = await Account.find(query).skip(skip).limit(limit).to_list()
     accounts_out = await populate_owner(rows, field="createdBy")
+    # Strip the markdown blob from list responses to prevent multi-MB payloads.
+    # Full resume content ships only from GET /accounts/{id} (used by Edit modal).
+    accounts_out = [_strip_markdown_from_account(a) for a in accounts_out]
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -67,17 +150,33 @@ async def list_accounts(
     }
 
 
+@router.get("/{account_id}")
+async def get_account(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Full account incl. resume markdown. Owner-or-admin scoped, mirroring update/delete."""
+    oid = to_object_id(account_id)
+    acc = await Account.get(oid)
+    is_admin = user.role == "admin"
+    if acc is None or (not is_admin and str(acc.createdBy) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    return doc_to_dict(acc)
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_account(
     body: AccountCreate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
+    resumes = _validate_and_normalize_resumes(body.resumes or [])
     acc = Account(
         name=body.name,
         email=body.email,
         phone=body.phone or "",
         address=body.address or "",
         createdBy=user.id,
+        resumes=resumes,
     )
     await acc.insert()
     return doc_to_dict(acc)
@@ -102,6 +201,8 @@ async def update_account(
         acc.phone = body.phone
     if body.address is not None:
         acc.address = body.address
+    if body.resumes is not None:
+        acc.resumes = _validate_and_normalize_resumes(body.resumes)
 
     await acc.save()
     return doc_to_dict(acc)

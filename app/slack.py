@@ -72,6 +72,47 @@ async def notify_new_transaction(
         log.warning("slack notify_new_transaction failed: %s", e)
 
 
+async def notify_new_interview(
+    *,
+    creator_email: str,
+    account_email: str,
+    stage: str,
+    scheduled_at: str,
+) -> None:
+    try:
+        text = f"New interview scheduled by {creator_email} ({stage} on {scheduled_at})"
+        blocks: list[dict[str, Any]] = [
+            {"type": "header", "text": {"type": "plain_text", "text": "📅 New Interview", "emoji": True}},
+            {"type": "divider"},
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*By:*\n{creator_email or '—'}"},
+                    {"type": "mrkdwn", "text": f"*Profile:*\n{account_email or '—'}"},
+                    {"type": "mrkdwn", "text": f"*Stage:*\n{stage or '—'}"},
+                    {"type": "mrkdwn", "text": f"*Scheduled:*\n{scheduled_at or '—'}"},
+                ],
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Open Interviews"},
+                        "url": f"{_app_base_url()}/interviews",
+                    }
+                ],
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
+            },
+        ]
+        await _post_to_slack({"text": text, "blocks": blocks})
+    except Exception as e:
+        log.warning("slack notify_new_interview failed: %s", e)
+
+
 async def notify_transaction_status_change(
     *,
     tx_id: str,

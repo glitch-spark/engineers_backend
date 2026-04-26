@@ -13,6 +13,7 @@ from app.routers import (
     accounts,
     auth as auth_router,
     cardlinks,
+    interviews,
     profile,
     transactions,
     users,
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
     app.include_router(transactions.router)
     app.include_router(cardlinks.router)
     app.include_router(weekly_plans.router)
+    app.include_router(interviews.router)
 
     return app
 

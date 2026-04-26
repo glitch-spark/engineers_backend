@@ -4,7 +4,7 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from app.deps import require_admin
+from app.deps import get_current_user, require_admin
 from app.models import UserExtra
 from app.routers._util import ci_regex, doc_to_dict, to_object_id
 
@@ -31,6 +31,20 @@ def _parse_dt(s: str) -> Optional[datetime]:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+@router.get("/lookup")
+async def lookup_users(
+    _: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Minimal projection of every user, for filter dropdowns. Auth required, no admin gate."""
+    rows = await UserExtra.find({}).to_list()
+    return {
+        "users": [
+            {"_id": str(u.id), "name": u.name, "email": u.email}
+            for u in rows
+        ]
+    }
 
 
 @router.get("")
