@@ -1,0 +1,103 @@
+from datetime import datetime
+from typing import Annotated, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+
+from app.deps import get_current_user
+from app.models import UserExtra
+from app.security import hash_password, verify_password
+
+router = APIRouter(prefix="/profile", tags=["profile"])
+
+
+class ProfileUpdate(BaseModel):
+    username: str
+    email: str
+    image: Optional[str] = None
+    birthday: Optional[str] = None
+
+
+class PasswordChange(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
+def _parse_dt(s: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+@router.get("")
+async def get_profile(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    return {
+        "user": {
+            "username": user.name or "",
+            "email": user.email or "",
+            "image": user.image or "",
+            "birthday": user.birthday,
+        }
+    }
+
+
+@router.put("")
+async def update_profile(
+    body: ProfileUpdate,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    if not body.username or not body.email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username and email are required")
+
+    new_email = body.email.lower().strip()
+
+    if new_email != (user.email or "").lower():
+        existing = await UserExtra.find_one(UserExtra.email == new_email)
+        if existing and str(existing.id) != str(user.id):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already taken")
+
+    user.name = body.username.strip()
+    user.email = new_email
+    user.image = body.image or ""
+    if body.birthday:
+        parsed = _parse_dt(body.birthday)
+        if parsed is not None:
+            user.birthday = parsed
+    await user.save()
+
+    return {
+        "message": "Profile updated successfully",
+        "user": {
+            "username": user.name,
+            "email": user.email,
+            "image": user.image,
+            "birthday": user.birthday,
+        },
+    }
+
+
+@router.put("/password")
+async def change_password(
+    body: PasswordChange,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    if not body.currentPassword or not body.newPassword:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password and new password are required",
+        )
+    if len(body.newPassword) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 6 characters long",
+        )
+    if not user.hashedPassword:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password verification failed")
+
+    if not verify_password(body.currentPassword, user.hashedPassword):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+
+    user.hashedPassword = hash_password(body.newPassword)
+    await user.save()
+    return {"message": "Password changed successfully"}

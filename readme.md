@@ -1,1 +1,71 @@
-this is the main backend of engineering app
+# engineers_backend
+
+FastAPI backend for the engineersapp split. Connects to the existing MongoDB Atlas
+cluster and exposes a Bearer-token API consumed by the Vite SPA in `engineersapp/`.
+
+## Requirements
+
+- Python 3.10+
+- Access to the existing MongoDB Atlas cluster (URI must include the default DB, e.g. `/EngineerDB`)
+- The same `AUTH_SECRET` the Next.js app uses today, so existing JWTs remain valid (see `docs/adr/ADR-0002`)
+
+## Quick start
+
+```bash
+cp .env.example .env
+# fill MONGODB_URI and AUTH_SECRET
+
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+uvicorn app.main:app --reload
+```
+
+- Health check: `GET http://localhost:8000/healthz` → `{"status":"ok"}`
+- Swagger UI: `http://localhost:8000/docs`
+
+## Environment variables
+
+| Name | Required | Notes |
+|---|---|---|
+| `MONGODB_URI` | yes | Same Atlas cluster the Next app uses; URI must include default DB (`/EngineerDB`) |
+| `AUTH_SECRET` | yes | **Must match** the Next app's secret so existing tokens stay valid (ADR-0002) |
+| `FRONTEND_ORIGIN` | no | CORS allowlist; default `http://localhost:5173` |
+| `APP_BASE_URL` | no | Used in Slack message links; default `http://localhost:8000` |
+| `APP_TIMEZONE` | no | IANA zone for Slack timestamps; default `America/New_York` |
+| `SLACK_WEBHOOK_URL` | no | Slack notifications are no-ops when unset |
+| `JWT_EXPIRES_MIN` | no | JWT lifetime in minutes; default 720 (12 h) |
+
+## Layout
+
+```
+app/
+├── main.py        # FastAPI app + CORS + lifespan (init_beanie)
+├── config.py      # pydantic-settings
+├── db.py          # Motor + init_beanie
+├── security.py    # bcrypt + HS256 JWT
+├── deps.py        # get_current_user, require_admin
+├── slack.py       # webhook (no-op if SLACK_WEBHOOK_URL unset)
+└── models/        # Beanie Documents (5)
+
+docs/adr/          # architecture decision records
+```
+
+Routers (`app/routers/`) land in a follow-up commit.
+
+## Auth model
+
+JWT (HS256, signed with `AUTH_SECRET`) is returned by `/auth/login` in the response body. The SPA stores it in `localStorage` and sends it as `Authorization: Bearer <token>` on every request. CORS is allowlist-only with `allow_credentials=False` — there is no cookie session. See ADR-0002 for the trade-offs vs. `HttpOnly` cookies.
+
+## Data model
+
+5 Beanie `Document` classes, one per Mongoose model. `Settings.name` is overridden on each so the existing collections (`userextras`, `transactions`, `accounts`, `cardlinks`, `weeklyplans`) are addressed verbatim — no data migration. See ADR-0001 and ADR-0003.
+
+## Deploy notes
+
+This service expects to be deployed where the SPA can reach it over HTTPS (Render, Railway, Fly, etc.). Set:
+- `FRONTEND_ORIGIN` to the deployed SPA origin (Vercel URL).
+- `APP_BASE_URL` to the public URL of this API (used in Slack action buttons).
+
+`uvicorn app.main:app --host 0.0.0.0 --port $PORT` is the typical container entrypoint.
