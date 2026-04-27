@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     APP_TIMEZONE: str = "America/New_York"
     SLACK_WEBHOOK_URL: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
 
 @lru_cache
