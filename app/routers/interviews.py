@@ -156,7 +156,7 @@ async def get_interview(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if user.role != "admin" and str(iv.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
-    rows = await populate_owner([doc_to_dict(iv)], field="createdBy")
+    rows = await populate_owner([iv], field="createdBy")
     out = await _populate_account(rows)
     return out[0]
 

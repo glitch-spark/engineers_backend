@@ -164,7 +164,28 @@ async def _openai_html(prompt: str) -> str:
     return response.output_text or ""
 
 
-async def _html_to_pdf(html: str, page_format: str = "A4") -> bytes:
+_DEFAULT_MARGIN_PT = {"top": 35, "right": 30, "bottom": 30, "left": 30}
+
+
+def _resolve_margin_pt(account: Account) -> dict:
+    """Pull `styleConfig.page.margin` (set by the structured editor) so the PDF
+    matches the on-screen preview. Falls back to the legacy defaults when the
+    user is in markdown mode or hasn't authored a styleConfig yet."""
+    cfg = account.styleConfig or {}
+    page = cfg.get("page") if isinstance(cfg, dict) else None
+    margin = page.get("margin") if isinstance(page, dict) else None
+    if not isinstance(margin, dict):
+        return _DEFAULT_MARGIN_PT
+    return {
+        "top": margin.get("top", _DEFAULT_MARGIN_PT["top"]),
+        "right": margin.get("right", _DEFAULT_MARGIN_PT["right"]),
+        "bottom": margin.get("bottom", _DEFAULT_MARGIN_PT["bottom"]),
+        "left": margin.get("left", _DEFAULT_MARGIN_PT["left"]),
+    }
+
+
+async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[dict] = None) -> bytes:
+    m = margin_pt or _DEFAULT_MARGIN_PT
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             args=[
@@ -180,10 +201,10 @@ async def _html_to_pdf(html: str, page_format: str = "A4") -> bytes:
             return await page.pdf(
                 format=page_format,
                 margin={
-                    "top": "5.3mm",
-                    "right": "5.3mm",
-                    "bottom": "8.8mm",
-                    "left": "5.3mm",
+                    "top": f"{m['top']}pt",
+                    "right": f"{m['right']}pt",
+                    "bottom": f"{m['bottom']}pt",
+                    "left": f"{m['left']}pt",
                 },
                 print_background=True,
             )
@@ -226,6 +247,10 @@ async def generate_resume(
     log.info("Generating resume for account=%s (%s) company=%s", account.label or account.name, account.id, company)
     html_content = await _openai_html(prompt)
     html = _HTML_WRAPPER.format(html_content=html_content)
-    pdf_bytes = await _html_to_pdf(html, page_format=account.pageFormat or "A4")
+    pdf_bytes = await _html_to_pdf(
+        html,
+        page_format=account.pageFormat or "A4",
+        margin_pt=_resolve_margin_pt(account),
+    )
     s3_key, s3_url = _maybe_upload_to_s3(pdf_bytes, account.name, company)
     return GeneratedResume(pdf_bytes=pdf_bytes, s3_key=s3_key, s3_url=s3_url)
