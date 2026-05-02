@@ -1,10 +1,15 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from beanie import PydanticObjectId
 from pydantic import BaseModel, Field
 
 from app.models.base import TimestampedDocument
+
+
+StyleMode = Literal["markdown", "structured"]
+PageFormat = Literal["A3", "A4", "A5", "Letter"]
+ScreeningPromptMode = Literal["markdown", "plaintext"]
 
 
 class Resume(BaseModel):
@@ -20,6 +25,11 @@ class Resume(BaseModel):
     uploadedAt: datetime = Field(default_factory=datetime.utcnow)
 
 
+class CustomLink(BaseModel):
+    label: str
+    url: str
+
+
 class Account(TimestampedDocument):
     name: str
     email: str
@@ -32,6 +42,21 @@ class Account(TimestampedDocument):
     education: Optional[str] = None
     experience: Optional[str] = None
     styles: Optional[str] = None
+
+    github: Optional[str] = None
+    linkedin: Optional[str] = None
+    website: Optional[str] = None
+    twitter: Optional[str] = None
+    customLinks: List[CustomLink] = []
+
+    styleMode: StyleMode = "markdown"
+    styleMarkdown: Optional[str] = None
+    styleConfig: Optional[Dict[str, Any]] = None
+    pageFormat: PageFormat = "A4"
+    previewHtml: Optional[str] = None
+
+    screeningPromptMode: ScreeningPromptMode = "plaintext"
+    screeningPrompt: Optional[str] = None
 
     class Settings:
         name = "accounts"

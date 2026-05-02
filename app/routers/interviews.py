@@ -1,48 +1,47 @@
 from datetime import datetime
 from typing import Annotated, Any, Iterable, Optional
 
-from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from app.deps import get_current_user
 from app.models import Account, Interview, UserExtra
+from app.models.interview import InterviewStage, InterviewStatus
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack import notify_new_interview
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
-STAGES = {"intro", "tech1", "tech2", "panel", "hiring_manager", "final", "offer", "others"}
+STAGES = {s.value for s in InterviewStage}
+STATUSES = {s.value for s in InterviewStatus}
 
 
 class InterviewCreate(BaseModel):
     accountId: str
-    resumeId: str
     scheduledAt: str
     endsAt: str
-    stage: str
-    jobDescription: Optional[str] = ""
+    stage: Optional[str] = None
+    status: Optional[str] = None
+    companyName: Optional[str] = None
+    interviewerName: Optional[str] = None
+    appliedPosition: Optional[str] = None
+    mainTechStack: Optional[str] = None
     transcript: Optional[str] = ""
     note: Optional[str] = ""
 
 
 class InterviewUpdate(BaseModel):
     accountId: Optional[str] = None
-    resumeId: Optional[str] = None
     scheduledAt: Optional[str] = None
     endsAt: Optional[str] = None
     stage: Optional[str] = None
-    jobDescription: Optional[str] = None
+    status: Optional[str] = None
+    companyName: Optional[str] = None
+    interviewerName: Optional[str] = None
+    appliedPosition: Optional[str] = None
+    mainTechStack: Optional[str] = None
     transcript: Optional[str] = None
     note: Optional[str] = None
-
-
-def _assert_resume_in_account(account: Account, resume_id: PydanticObjectId) -> None:
-    if not any(r.id == resume_id for r in account.resumes):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="resumeId is not in the selected account",
-        )
 
 
 def _parse_datetime(s: str) -> Optional[datetime]:
@@ -93,11 +92,14 @@ async def list_interviews(
     to: str = Query(""),
     accountId: str = Query(""),
     stage: str = Query(""),
+    status_: str = Query("", alias="status"),
     creatorId: str = Query(""),
     sort: str = Query("desc"),
 ) -> dict:
-    # Spec: every authenticated user can see every interview.
-    query: dict[str, Any] = {}
+    # Non-admins only see their own interviews. Admins see everything and may
+    # filter by creator. The creatorId param from a non-admin is ignored.
+    is_admin = user.role == "admin"
+    query: dict[str, Any] = {} if is_admin else {"createdBy": user.id}
 
     date_filter: dict = {}
     f_dt = parse_date(from_)
@@ -115,7 +117,11 @@ async def list_interviews(
         if stage not in STAGES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
         query["stage"] = stage
-    if creatorId:
+    if status_:
+        if status_ not in STATUSES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+        query["status"] = status_
+    if creatorId and is_admin:
         query["createdBy"] = to_object_id(creatorId)
 
     direction = 1 if sort == "asc" else -1
@@ -139,13 +145,31 @@ async def list_interviews(
     }
 
 
+@router.get("/{iv_id}")
+async def get_interview(
+    iv_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    oid = to_object_id(iv_id)
+    iv = await Interview.get(oid)
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if user.role != "admin" and str(iv.createdBy) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    rows = await populate_owner([doc_to_dict(iv)], field="createdBy")
+    out = await _populate_account(rows)
+    return out[0]
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_interview(
     body: InterviewCreate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    if body.stage not in STAGES:
+    if body.stage is not None and body.stage not in STAGES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
+    if body.status is not None and body.status not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     sched = _parse_datetime(body.scheduledAt)
     if sched is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
@@ -164,17 +188,17 @@ async def create_interview(
     if not is_admin and str(account.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="cannot use an account you do not own")
 
-    resume_oid = to_object_id(body.resumeId)
-    _assert_resume_in_account(account, resume_oid)
-
     iv = Interview(
         accountId=account_oid,
-        resumeId=resume_oid,
         createdBy=user.id,
         scheduledAt=sched,
         endsAt=ends,
-        stage=body.stage,
-        jobDescription=body.jobDescription or "",
+        stage=InterviewStage(body.stage) if body.stage else None,
+        status=InterviewStatus(body.status) if body.status else None,
+        companyName=body.companyName or None,
+        interviewerName=body.interviewerName or None,
+        appliedPosition=body.appliedPosition or None,
+        mainTechStack=body.mainTechStack or None,
         transcript=body.transcript or "",
         note=body.note or "",
     )
@@ -184,7 +208,7 @@ async def create_interview(
         await notify_new_interview(
             creator_email=user.email or "",
             account_email=account.email or "",
-            stage=body.stage,
+            stage=body.stage or "",
             scheduled_at=sched.strftime("%Y-%m-%d %H:%M"),
         )
     except Exception:
@@ -209,7 +233,6 @@ async def update_interview(
     if not is_admin and not is_owner:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
-    final_account_oid = iv.accountId
     if body.accountId is not None:
         new_account_oid = to_object_id(body.accountId)
         account = await Account.get(new_account_oid)
@@ -218,27 +241,7 @@ async def update_interview(
         if not is_admin and str(account.createdBy) != str(user.id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="cannot use an account you do not own")
         iv.accountId = new_account_oid
-        final_account_oid = new_account_oid
 
-    if body.resumeId is not None:
-        new_resume_oid = to_object_id(body.resumeId)
-        # Re-load the (possibly new) account to validate; reuse `account` if we just loaded it above.
-        target_account = account if body.accountId is not None else await Account.get(final_account_oid)
-        if target_account is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid accountId")
-        _assert_resume_in_account(target_account, new_resume_oid)
-        iv.resumeId = new_resume_oid
-    elif body.accountId is not None:
-        # Account changed but resumeId not patched: existing resumeId may no longer be valid.
-        if iv.resumeId is not None:
-            target_account = account  # loaded above
-            try:
-                _assert_resume_in_account(target_account, iv.resumeId)
-            except HTTPException:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="resumeId no longer matches new account; pass a new resumeId",
-                )
     new_sched = iv.scheduledAt
     new_ends = iv.endsAt
     if body.scheduledAt is not None:
@@ -256,11 +259,27 @@ async def update_interview(
     iv.scheduledAt = new_sched
     iv.endsAt = new_ends
     if body.stage is not None:
-        if body.stage not in STAGES:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
-        iv.stage = body.stage
-    if body.jobDescription is not None:
-        iv.jobDescription = body.jobDescription
+        if body.stage == "":
+            iv.stage = None
+        else:
+            if body.stage not in STAGES:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
+            iv.stage = InterviewStage(body.stage)
+    if body.status is not None:
+        if body.status == "":
+            iv.status = None
+        else:
+            if body.status not in STATUSES:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+            iv.status = InterviewStatus(body.status)
+    if body.companyName is not None:
+        iv.companyName = body.companyName or None
+    if body.interviewerName is not None:
+        iv.interviewerName = body.interviewerName or None
+    if body.appliedPosition is not None:
+        iv.appliedPosition = body.appliedPosition or None
+    if body.mainTechStack is not None:
+        iv.mainTechStack = body.mainTechStack or None
     if body.transcript is not None:
         iv.transcript = body.transcript
     if body.note is not None:

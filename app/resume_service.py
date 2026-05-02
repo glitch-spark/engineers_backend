@@ -104,6 +104,21 @@ def _safe_segment(s: str) -> str:
     return _S3_SAFE.sub("-", (s or "user").strip())
 
 
+def _resolve_style_spec(account: Account) -> str:
+    """Returns the prose style spec to embed in the prompt.
+
+    Routes by `styleMode`: structured mode runs the serializer (Phase C);
+    markdown mode uses `styleMarkdown` (or legacy `styles` as a fallback).
+    """
+    if account.styleMode == "structured" and account.styleConfig:
+        try:
+            from app.style_serializer import to_prose
+            return to_prose(account.styleConfig)
+        except ImportError:
+            pass
+    return account.styleMarkdown or account.styles or ""
+
+
 def _build_prompt(account: Account, job_description: str) -> str:
     parts = ["Forget anything you learned before.", "You render the resume in html format(only body element).\n"]
     if account.name:
@@ -121,7 +136,7 @@ def _build_prompt(account: Account, job_description: str) -> str:
     parts.append(f"Here's the job description. {job_description}\n")
     parts.append(_PROMPT_BODY.format(name=account.name))
     parts.append("2. Resume Formatting Styles: Exactly follow the styles below.")
-    parts.append(account.styles or "")
+    parts.append(_resolve_style_spec(account))
     return "\n".join(parts)
 
 
@@ -149,7 +164,7 @@ async def _openai_html(prompt: str) -> str:
     return response.output_text or ""
 
 
-async def _html_to_pdf(html: str) -> bytes:
+async def _html_to_pdf(html: str, page_format: str = "A4") -> bytes:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             args=[
@@ -163,7 +178,7 @@ async def _html_to_pdf(html: str) -> bytes:
             page = await browser.new_page()
             await page.set_content(html, wait_until="networkidle")
             return await page.pdf(
-                format="A4",
+                format=page_format,
                 margin={
                     "top": "5.3mm",
                     "right": "5.3mm",
@@ -211,6 +226,6 @@ async def generate_resume(
     log.info("Generating resume for account=%s (%s) company=%s", account.label or account.name, account.id, company)
     html_content = await _openai_html(prompt)
     html = _HTML_WRAPPER.format(html_content=html_content)
-    pdf_bytes = await _html_to_pdf(html)
+    pdf_bytes = await _html_to_pdf(html, page_format=account.pageFormat or "A4")
     s3_key, s3_url = _maybe_upload_to_s3(pdf_bytes, account.name, company)
     return GeneratedResume(pdf_bytes=pdf_bytes, s3_key=s3_key, s3_url=s3_url)

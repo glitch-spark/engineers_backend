@@ -1,10 +1,11 @@
 import json
-from typing import Annotated, AsyncGenerator, Optional
+from typing import Annotated, AsyncGenerator, Literal, Optional
 
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from jose import JWTError
+from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.deps import get_current_user
@@ -69,11 +70,15 @@ async def _build_interview_contexts(interview_ids: list[PydanticObjectId]) -> li
             "candidate_name": acc.name if acc else None,
             "candidate_email": acc.email if acc else None,
             "address": getattr(acc, "address", None) if acc else None,
-            "stage": iv.stage,
+            "company_name": iv.companyName,
+            "interviewer_name": iv.interviewerName,
+            "applied_position": iv.appliedPosition,
+            "main_tech_stack": iv.mainTechStack,
+            "stage": iv.stage.value if iv.stage else None,
+            "status": iv.status.value if iv.status else None,
             "scheduled_at": iv.scheduledAt.isoformat() if iv.scheduledAt else None,
             "resume_filename": resume_filename,
             "resume_markdown": resume_markdown,
-            "job_description": iv.jobDescription or "",
             "transcript": iv.transcript or "",
             "note": iv.note or "",
         })
@@ -217,6 +222,97 @@ async def list_runs(
     query: dict = {} if is_admin else {"ranBy": user.id}
     docs = await AiReviewRun.find(query).sort([("createdAt", -1)]).limit(limit).to_list()
     return {"runs": [doc_to_dict(d) for d in docs]}
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class InterviewChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(default_factory=list, max_length=40)
+    rubric: bool = False  # if true, ask the model to also score a rubric
+
+
+_BRIEF_REVIEW_PROMPT = (
+    "You are an interview reviewer. Read the candidate's interview transcript, "
+    "resume, and job context below. Produce a concise review that includes:\n"
+    "- TL;DR verdict (Strong Hire / Hire / Lean Hire / No Hire / Strong No Hire) + 1-line reasoning.\n"
+    "- 3-5 strengths (bullet points, each with a brief evidence quote).\n"
+    "- 3-5 gaps or concerns (each with a brief evidence quote).\n"
+    "- Suggested follow-up questions for the next round.\n"
+    "Be specific. Cite the transcript when you make claims. If information is missing, say so."
+)
+
+_RUBRIC_PROMPT = (
+    "\n\nAlso include a rubric scored 1-5 for: Communication, Technical Depth, "
+    "Problem Solving, Culture Fit, Coding (if applicable), System Design (if applicable). "
+    "Format as a markdown table with one short justification per row."
+)
+
+
+@router.post("/interview/{iv_id}/chat")
+async def interview_chat(
+    iv_id: str,
+    body: InterviewChatRequest,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    oid = to_object_id(iv_id)
+    iv = await Interview.get(oid)
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="interview not found")
+    if user.role != "admin" and iv.createdBy != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+
+    contexts = await _build_interview_contexts([oid])
+    global_doc = await GlobalPrompt.find_one(GlobalPrompt.key == "default")
+    global_prefix = (global_doc.systemPrompt or "").strip() if global_doc else ""
+
+    system_prompt = _BRIEF_REVIEW_PROMPT
+    if body.rubric:
+        system_prompt += _RUBRIC_PROMPT
+    if global_prefix:
+        system_prompt = f"{global_prefix}\n\n{system_prompt}"
+
+    context_blob = "Interview context (JSON):\n" + json.dumps(contexts[0], indent=2, ensure_ascii=False)
+
+    settings = get_settings()
+    openai_key = getattr(settings, "OPENAI_API_KEY", None)
+    if not openai_key:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OPENAI_API_KEY is not configured")
+    model_name = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=openai_key)
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": context_blob},
+    ]
+    if not body.messages:
+        # First call — kick off the brief review.
+        messages.append({"role": "user", "content": "Please produce the brief review now."})
+    else:
+        for m in body.messages:
+            messages.append({"role": m.role, "content": m.content})
+
+    try:
+        completion = await client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    choice = completion.choices[0] if completion.choices else None
+    reply = (choice.message.content if choice and choice.message else "") or ""
+    usage = completion.usage
+    return {
+        "reply": reply,
+        "model": model_name,
+        "promptTokens": usage.prompt_tokens if usage else 0,
+        "completionTokens": usage.completion_tokens if usage else 0,
+    }
 
 
 @router.get("/runs/{run_id}")

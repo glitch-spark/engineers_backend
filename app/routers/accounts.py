@@ -74,6 +74,11 @@ def _strip_markdown_from_account(payload: dict) -> dict:
     return payload
 
 
+class CustomLinkIn(BaseModel):
+    label: str
+    url: str
+
+
 class AccountCreate(BaseModel):
     name: str
     email: str
@@ -84,6 +89,18 @@ class AccountCreate(BaseModel):
     education: Optional[str] = None
     experience: Optional[str] = None
     styles: Optional[str] = None
+    github: Optional[str] = None
+    linkedin: Optional[str] = None
+    website: Optional[str] = None
+    twitter: Optional[str] = None
+    customLinks: Optional[List[CustomLinkIn]] = None
+    styleMode: Optional[str] = None
+    styleMarkdown: Optional[str] = None
+    styleConfig: Optional[dict] = None
+    pageFormat: Optional[str] = None
+    previewHtml: Optional[str] = None
+    screeningPromptMode: Optional[str] = None
+    screeningPrompt: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
@@ -96,6 +113,18 @@ class AccountUpdate(BaseModel):
     education: Optional[str] = None
     experience: Optional[str] = None
     styles: Optional[str] = None
+    github: Optional[str] = None
+    linkedin: Optional[str] = None
+    website: Optional[str] = None
+    twitter: Optional[str] = None
+    customLinks: Optional[List[CustomLinkIn]] = None
+    styleMode: Optional[str] = None
+    styleMarkdown: Optional[str] = None
+    styleConfig: Optional[dict] = None
+    pageFormat: Optional[str] = None
+    previewHtml: Optional[str] = None
+    screeningPromptMode: Optional[str] = None
+    screeningPrompt: Optional[str] = None
 
 
 @router.get("/lookup")
@@ -187,7 +216,7 @@ async def create_account(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     resumes = _validate_and_normalize_resumes(body.resumes or [])
-    acc = Account(
+    kwargs: dict = dict(
         name=body.name,
         email=body.email,
         phone=body.phone or "",
@@ -198,7 +227,23 @@ async def create_account(
         education=body.education,
         experience=body.experience,
         styles=body.styles,
+        github=body.github,
+        linkedin=body.linkedin,
+        website=body.website,
+        twitter=body.twitter,
+        customLinks=[link.model_dump() for link in (body.customLinks or [])],
+        styleMarkdown=body.styleMarkdown,
+        styleConfig=body.styleConfig,
+        previewHtml=body.previewHtml,
+        screeningPrompt=body.screeningPrompt,
     )
+    if body.styleMode is not None:
+        kwargs["styleMode"] = body.styleMode
+    if body.pageFormat is not None:
+        kwargs["pageFormat"] = body.pageFormat
+    if body.screeningPromptMode is not None:
+        kwargs["screeningPromptMode"] = body.screeningPromptMode
+    acc = Account(**kwargs)
     await acc.insert()
     return doc_to_dict(acc)
 
@@ -232,6 +277,31 @@ async def update_account(
         acc.experience = body.experience
     if body.styles is not None:
         acc.styles = body.styles
+    if body.github is not None:
+        acc.github = body.github
+    if body.linkedin is not None:
+        acc.linkedin = body.linkedin
+    if body.website is not None:
+        acc.website = body.website
+    if body.twitter is not None:
+        acc.twitter = body.twitter
+    if body.customLinks is not None:
+        from app.models.account import CustomLink
+        acc.customLinks = [CustomLink(label=link.label, url=link.url) for link in body.customLinks]
+    if body.styleMode is not None:
+        acc.styleMode = body.styleMode  # type: ignore[assignment]
+    if body.styleMarkdown is not None:
+        acc.styleMarkdown = body.styleMarkdown
+    if body.styleConfig is not None:
+        acc.styleConfig = body.styleConfig
+    if body.pageFormat is not None:
+        acc.pageFormat = body.pageFormat  # type: ignore[assignment]
+    if body.previewHtml is not None:
+        acc.previewHtml = body.previewHtml
+    if body.screeningPromptMode is not None:
+        acc.screeningPromptMode = body.screeningPromptMode  # type: ignore[assignment]
+    if body.screeningPrompt is not None:
+        acc.screeningPrompt = body.screeningPrompt
 
     await acc.save()
     return doc_to_dict(acc)
