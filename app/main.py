@@ -17,6 +17,7 @@ from app.routers import (
     global_prompt,
     interviews,
     profile,
+    resume,
     skills,
     transactions,
     users,
@@ -73,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(skills.router)
     app.include_router(global_prompt.router)
     app.include_router(ai_review.router)
+    app.include_router(resume.router)
 
     return app
 

@@ -9,6 +9,7 @@ from app.models import (
     CardLink,
     GlobalPrompt,
     Interview,
+    ResumeApplication,
     Skill,
     Transaction,
     UserExtra,
@@ -25,6 +26,7 @@ DOCUMENT_MODELS = [
     Skill,
     AiReviewRun,
     GlobalPrompt,
+    ResumeApplication,
 ]
 
 

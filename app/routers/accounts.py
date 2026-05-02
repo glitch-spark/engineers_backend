@@ -80,6 +80,10 @@ class AccountCreate(BaseModel):
     phone: Optional[str] = ""
     address: Optional[str] = ""
     resumes: Optional[List[ResumeIn]] = None
+    label: Optional[str] = None
+    education: Optional[str] = None
+    experience: Optional[str] = None
+    styles: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
@@ -88,17 +92,30 @@ class AccountUpdate(BaseModel):
     phone: Optional[str] = None
     address: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
+    label: Optional[str] = None
+    education: Optional[str] = None
+    experience: Optional[str] = None
+    styles: Optional[str] = None
 
 
 @router.get("/lookup")
 async def lookup_accounts(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Minimal projection of every account, for filter dropdowns. Auth required, no scoping."""
+    """Minimal projection of every account, for filter dropdowns. Auth required, no scoping.
+    `label` and `hasExperience` are surfaced so the Resume Generator dropdown can label
+    and gate accounts without a second round-trip."""
     rows = await Account.find({}).to_list()
     return {
         "accounts": [
-            {"_id": str(a.id), "name": a.name, "email": a.email}
+            {
+                "_id": str(a.id),
+                "name": a.name,
+                "email": a.email,
+                "label": a.label,
+                "hasExperience": bool((a.experience or "").strip()),
+                "createdBy": str(a.createdBy),
+            }
             for a in rows
         ]
     }
@@ -177,6 +194,10 @@ async def create_account(
         address=body.address or "",
         createdBy=user.id,
         resumes=resumes,
+        label=body.label,
+        education=body.education,
+        experience=body.experience,
+        styles=body.styles,
     )
     await acc.insert()
     return doc_to_dict(acc)
@@ -203,6 +224,14 @@ async def update_account(
         acc.address = body.address
     if body.resumes is not None:
         acc.resumes = _validate_and_normalize_resumes(body.resumes)
+    if body.label is not None:
+        acc.label = body.label
+    if body.education is not None:
+        acc.education = body.education
+    if body.experience is not None:
+        acc.experience = body.experience
+    if body.styles is not None:
+        acc.styles = body.styles
 
     await acc.save()
     return doc_to_dict(acc)

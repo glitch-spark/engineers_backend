@@ -28,5 +28,10 @@ class Account(TimestampedDocument):
     createdBy: PydanticObjectId
     resumes: List[Resume] = []
 
+    label: Optional[str] = None
+    education: Optional[str] = None
+    experience: Optional[str] = None
+    styles: Optional[str] = None
+
     class Settings:
         name = "accounts"

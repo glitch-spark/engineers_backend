@@ -36,6 +36,10 @@ uvicorn app.main:app --reload
 | `APP_TIMEZONE` | no | IANA zone for Slack timestamps; default `America/New_York` |
 | `SLACK_WEBHOOK_URL` | no | Slack notifications are no-ops when unset |
 | `JWT_EXPIRES_MIN` | no | JWT lifetime in minutes; default 720 (12 h) |
+| `OPENAI_API_KEY` | no* | Required for `/ai-review/*` and `/resume/generate`; those routes 503 without it |
+| `RESUME_OPENAI_MODEL` | no | Model for resume generation; default `gpt-5-mini` |
+| `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
+| `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |
 
 ## Layout
 
@@ -69,3 +73,11 @@ This service expects to be deployed where the SPA can reach it over HTTPS (Rende
 - `APP_BASE_URL` to the public URL of this API (used in Slack action buttons).
 
 `uvicorn app.main:app --host 0.0.0.0 --port $PORT` is the typical container entrypoint.
+
+### Railway (resume generator)
+
+The repo ships a `Dockerfile` based on `mcr.microsoft.com/playwright/python` so Chromium and its system dependencies are pre-installed — required for `/resume/generate`'s PDF rendering. On Railway:
+
+1. Connect the repo; Railway auto-detects the Dockerfile.
+2. Bump the service to **1 GB RAM minimum** — Chromium peaks around 400 MB per request.
+3. Set the envs above (`OPENAI_API_KEY`, optional `AWS_REGION`/`AWS_S3_BUCKET`/AWS credentials).

@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     JWT_EXPIRES_MIN: int = 720
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
+    RESUME_OPENAI_MODEL: str = "gpt-5-mini"
+    AWS_REGION: Optional[str] = None
+    AWS_S3_BUCKET: Optional[str] = None
 
 
 @lru_cache
