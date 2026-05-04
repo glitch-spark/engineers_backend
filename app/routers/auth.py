@@ -60,16 +60,18 @@ async def register(body: RegisterIn) -> dict:
         )
 
     count = await UserExtra.count()
-    role = "admin" if count == 0 else "staff"
+    is_first = count == 0
+    role = "admin" if is_first else "staff"
 
     user = UserExtra(
         name=body.username,
         email=email_lower,
         hashedPassword=hash_password(body.password),
         role=role,
+        isActive=is_first,  # bootstrap admin auto-active; everyone else awaits approval
     )
     await user.insert()
-    return {"ok": True}
+    return {"ok": True, "pendingApproval": not is_first}
 
 
 @router.post("/login", response_model=TokenOut)
@@ -86,6 +88,12 @@ async def login(body: LoginIn) -> TokenOut:
 
     if not verify_password(body.password, user.hashedPassword):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
+
+    if not user.isActive:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account pending admin approval",
+        )
 
     token = create_access_token(sub=str(user.id), role=user.role)
     return TokenOut(access_token=token, token_type="bearer", user=_user_to_out(user))

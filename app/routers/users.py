@@ -24,6 +24,7 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
     phone: Optional[str] = None
     birthday: Optional[str] = None
+    isActive: Optional[bool] = None
 
 
 def _parse_dt(s: str) -> Optional[datetime]:
@@ -67,10 +68,9 @@ async def list_users(
     if role:
         query["role"] = role
     if status_ == "inactive":
-        query["$or"] = [
-            {"deletedAt": {"$exists": True}},
-            {"isActive": False},
-        ]
+        query["isActive"] = False
+    elif status_ == "active":
+        query["isActive"] = {"$ne": False}
 
     skip = (page - 1) * limit
     total = await UserExtra.find(query).count()
@@ -142,7 +142,23 @@ async def update_user(
         parsed = _parse_dt(body.birthday)
         if parsed is not None:
             user.birthday = parsed
+    if body.isActive is not None:
+        user.isActive = body.isActive
 
+    await user.save()
+    return doc_to_dict(user)
+
+
+@router.post("/{user_id}/approve")
+async def approve_user(
+    user_id: str,
+    _: Annotated[UserExtra, Depends(require_admin)],
+) -> dict:
+    oid = to_object_id(user_id)
+    user = await UserExtra.get(oid)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    user.isActive = True
     await user.save()
     return doc_to_dict(user)
 
