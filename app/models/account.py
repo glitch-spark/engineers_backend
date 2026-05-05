@@ -48,6 +48,10 @@ class Account(TimestampedDocument):
     website: Optional[str] = None
     twitter: Optional[str] = None
     customLinks: List[CustomLink] = []
+    # per-type display name override for the resume contact line.
+    # Keys: 'email', 'phone', 'address', 'github', 'linkedin', 'website', 'twitter'.
+    # Empty value falls back to the underlying field (URL or raw value).
+    contactLabels: Dict[str, str] = Field(default_factory=dict)
 
     styleMode: StyleMode = "markdown"
     styleMarkdown: Optional[str] = None

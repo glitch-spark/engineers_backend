@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     RESUME_OPENAI_MODEL: str = "gpt-5-mini"
     AWS_REGION: Optional[str] = None
     AWS_S3_BUCKET: Optional[str] = None
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
 
 
 @lru_cache

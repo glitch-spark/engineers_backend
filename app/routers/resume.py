@@ -1,23 +1,39 @@
-from typing import Annotated, List, Optional
+import asyncio
+import base64
+import json
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from typing import Annotated, Any, List, Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
-from pymongo.errors import DuplicateKeyError
 
+from app.config import get_settings
 from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
-from app.resume_service import generate_resume
+from app.models.resume_application import ScreeningPair as ScreeningPairModel
+from app.resume_service import _build_prompt, _openai_html, generate_resume, generate_presigned_get, s3_enabled
 from app.routers._util import doc_to_dict, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
+log = logging.getLogger(__name__)
 
 MAX_JD_BYTES = 50_000
 
+_SAFE_FILENAME_SEG = re.compile(r"[^A-Za-z0-9 _\-().]+")
 
-class GenerateBody(BaseModel):
-    accountId: str
-    company: str = Field(min_length=1)
-    jobDescription: str = Field(min_length=1)
+
+def _safe_filename_segment(s: str) -> str:
+    return _SAFE_FILENAME_SEG.sub("_", (s or "").strip()).strip() or "untitled"
+
+
+def _build_filename(profile_name: str, company: str) -> str:
+    """{Profile Name}/Resume ({Company Name}).pdf — slash kept as a path
+    segment so S3 archives nest cleanly per profile."""
+    return f"{_safe_filename_segment(profile_name)}/Resume ({_safe_filename_segment(company)}).pdf"
 
 
 async def _load_owned_account(account_id: str, user: UserExtra) -> Account:
@@ -28,11 +44,30 @@ async def _load_owned_account(account_id: str, user: UserExtra) -> Account:
     return account
 
 
-@router.post("/generate")
+# ---------- Job lifecycle (async generation) ---------------------------------
+
+
+class GenerateBody(BaseModel):
+    accountId: str
+    company: str = Field(min_length=1)
+    jobDescription: str = Field(min_length=1)
+    jobUrl: Optional[str] = None
+    questions: List[str] = []
+    guidelines: Optional[str] = None
+    guidelinesMode: Optional[str] = None
+
+
+@router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
 async def generate(
     body: GenerateBody,
     user: Annotated[UserExtra, Depends(get_current_user)],
-) -> Response:
+) -> dict:
+    """Enqueue a resume-generation job and return immediately.
+
+    The actual OpenAI + PDF + (optional) screening work happens in a
+    background asyncio task. Frontend polls GET /resume/jobs to follow
+    progress.
+    """
     if len(body.jobDescription.encode("utf-8")) > MAX_JD_BYTES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -40,8 +75,6 @@ async def generate(
         )
 
     account = await _load_owned_account(body.accountId, user)
-
-    # Resume generation needs at least an experience blob to produce useful output.
     if not (account.experience or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -49,44 +82,222 @@ async def generate(
         )
 
     company = body.company.strip()
-    company_lower = company.lower()
+    questions = [q.strip() for q in body.questions if q and q.strip()]
+    profile_name = account.name or "profile"
 
-    existing = await ResumeApplication.find_one(
-        {
-            "userId": user.id,
-            "accountId": account.id,
-            "companyNameLower": company_lower,
-        }
-    )
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="You've already applied for this company with this account.",
-        )
-
-    result = await generate_resume(account, body.jobDescription, company)
-
-    application = ResumeApplication(
+    job = ResumeApplication(
         userId=user.id,
         accountId=account.id,
+        profileName=profile_name,
         companyName=company,
-        companyNameLower=company_lower,
+        companyNameLower=company.lower(),
         jobDescription=body.jobDescription,
-        s3Key=result.s3_key,
-        s3Url=result.s3_url,
+        jobUrl=(body.jobUrl or "").strip() or None,
+        screeningQuestions=questions,
+        status="queued",
+        step="queued",
+        pdfFilename=_build_filename(profile_name, company),
     )
+    await job.insert()
+
+    # Capture override guidelines so the worker doesn't depend on later mutations.
+    guidelines_override = body.guidelines
+    guidelines_mode_override = body.guidelinesMode
+
+    asyncio.create_task(
+        _run_job(
+            job_id=job.id,
+            account_id=account.id,
+            jd=body.jobDescription,
+            company=company,
+            questions=questions,
+            guidelines_override=guidelines_override,
+            guidelines_mode_override=guidelines_mode_override,
+        )
+    )
+
+    return {"jobId": str(job.id), "status": job.status}
+
+
+async def _run_job(
+    job_id: PydanticObjectId,
+    account_id: PydanticObjectId,
+    jd: str,
+    company: str,
+    questions: List[str],
+    guidelines_override: Optional[str],
+    guidelines_mode_override: Optional[str],
+) -> None:
+    """Background orchestrator: resume → optional screening, persisting state."""
+    started = time.monotonic()
+    job = await ResumeApplication.get(job_id)
+    if job is None:
+        return
+    account = await Account.get(account_id)
+    if account is None:
+        await _mark_failed(job, "account no longer exists", started)
+        return
+
     try:
-        await application.insert()
-    except DuplicateKeyError:
+        # ---- step 1: generate resume ----
+        job.status = "in_progress"
+        job.step = "generating_resume"
+        job.startedAt = datetime.now(timezone.utc)
+        await job.save()
+
+        result = await generate_resume(account, jd, company)
+
+        # Cache HTML body on the account so screening (next step) can use it.
+        # `generate_resume` doesn't currently expose the raw HTML — pull it from
+        # the prompt path so screening sees the *generated* resume, not just
+        # the raw experience string.
+        # NOTE: generate_resume internally calls _openai_html then wraps in
+        # <html>. We re-emit just the <body> via a second OpenAI call only if
+        # screening is requested AND we don't already have one cached. To avoid
+        # the double-call, capture the body during generate_resume in a future
+        # refactor; for now, reuse account.previewHtml if present.
+
+        # ---- step 2: persist PDF reference ----
+        # Prefer S3: bucket pointer only, no inline bytes. Fall back to base64
+        # in Mongo when S3 not configured (dev convenience).
+        job.step = "uploading"
+        job.s3Key = result.s3_key
+        if result.s3_key:
+            job.pdfData = None  # bytes live in S3 now
+            job.s3Url = None    # legacy public URL — downloads use presigned URLs
+        else:
+            job.pdfData = base64.b64encode(result.pdf_bytes).decode("ascii")
+        await job.save()
+        log.info(
+            "job %s pdf persisted: %d bytes (s3_key=%s)",
+            job.id, len(result.pdf_bytes), result.s3_key or "<inline>",
+        )
+
+        # ---- step 3: screening (optional) ----
+        if questions:
+            job.step = "generating_answers"
+            await job.save()
+
+            # Refresh previewHtml if missing — needed so screening reflects the
+            # generated resume bullets, not just raw experience.
+            if not (account.previewHtml or "").strip():
+                prompt = _build_prompt(account, jd)
+                html_content = await _openai_html(prompt)
+                account.previewHtml = html_content
+                await account.save()
+
+            pairs = await _run_screening(
+                account=account,
+                jd=jd,
+                questions=questions,
+                guidelines_override=guidelines_override,
+                guidelines_mode_override=guidelines_mode_override,
+            )
+            # Coerce dict -> ScreeningPair so Beanie/Pydantic doesn't mis-validate on save.
+            job.screeningPairs = [ScreeningPairModel(**p) for p in pairs]
+
+        # ---- done ----
+        job.status = "completed"
+        job.step = "done"
+        job.completedAt = datetime.now(timezone.utc)
+        job.executionMs = int((time.monotonic() - started) * 1000)
+        await job.save()
+
+    except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
+        log.exception("resume job %s failed", job_id)
+        await _mark_failed(job, str(exc), started)
+
+
+async def _mark_failed(job: ResumeApplication, message: str, started: float) -> None:
+    job.status = "failed"
+    job.errorMessage = message[:1000]
+    job.completedAt = datetime.now(timezone.utc)
+    job.executionMs = int((time.monotonic() - started) * 1000)
+    try:
+        await job.save()
+    except Exception:  # noqa: BLE001
+        log.exception("could not persist failure for job %s", job.id)
+
+
+# ---------- Screening (extracted helper, reused by job + standalone endpoint) -
+
+
+async def _run_screening(
+    account: Account,
+    jd: str,
+    questions: List[str],
+    guidelines_override: Optional[str],
+    guidelines_mode_override: Optional[str],
+) -> List[dict]:
+    from openai import AsyncOpenAI
+
+    if guidelines_mode_override in ("markdown", "plaintext"):
+        # If override mode passed but no text override, still record mode change.
         pass
+    guidelines = guidelines_override if guidelines_override is not None else (account.screeningPrompt or "")
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="resume_{company.replace(" ", "_")}.pdf"',
-    }
-    if result.s3_url:
-        headers["X-Resume-URL"] = result.s3_url
+    settings = get_settings()
+    if not settings.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured")
 
-    return Response(content=result.pdf_bytes, media_type="application/pdf", headers=headers)
+    use_resume = bool((account.previewHtml or "").strip())
+
+    parts: List[str] = [
+        "You answer job-application screening questions on behalf of a candidate.",
+        f"Candidate name: {account.name}.",
+        f"Candidate email: {account.email}." if account.email else "",
+        f"Candidate education: {account.education}." if account.education else "",
+    ]
+    if use_resume:
+        parts.append(
+            "The candidate's tailored resume HTML for this role is below. Treat it as the source "
+            "of truth for what they emphasize and how they describe their work:\n"
+            f"{account.previewHtml}"
+        )
+    elif (account.experience or "").strip():
+        parts.append(f"Candidate experience:\n{account.experience}")
+
+    if (jd or "").strip():
+        parts.append(f"Job description:\n{jd}")
+    if guidelines.strip():
+        parts.append(f"Answer guidelines:\n{guidelines}")
+
+    indexed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+    parts.append(
+        "Answer each numbered screening question below in the candidate's voice. "
+        "Be concise, specific, grounded in the provided context. If a question cannot be "
+        "answered from the context, say so briefly rather than fabricating details."
+    )
+    parts.append(f"Questions:\n{indexed}")
+    parts.append(
+        f"Return a JSON object of the exact form: {{\"answers\": [\"...\", \"...\"]}} "
+        f"with exactly {len(questions)} entries in the same order as the numbered questions. "
+        "Do not include any text outside the JSON."
+    )
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    response = await client.responses.create(
+        model=settings.RESUME_OPENAI_MODEL,
+        input="\n\n".join(p for p in parts if p),
+    )
+    raw = response.output_text or ""
+
+    answers: List[str] = []
+    try:
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict) and isinstance(parsed.get("answers"), list):
+            answers = [str(a) for a in parsed["answers"]]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if not answers:
+        chunks = re.split(r"^\s*\d+\.\s*", raw, flags=re.MULTILINE)
+        answers = [c.strip() for c in chunks if c.strip()]
+    while len(answers) < len(questions):
+        answers.append("")
+    answers = answers[: len(questions)]
+
+    return [{"question": q, "answer": a} for q, a in zip(questions, answers)]
 
 
 class ScreeningBody(BaseModel):
@@ -104,18 +315,8 @@ async def screening_answers(
     body: ScreeningBody,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Generate answers to job application screening questions for an account.
-
-    `useGeneratedResumeContext`: when true, prefers `account.previewHtml` (the
-    last AI-rendered resume body) over raw experience as context. Combined
-    with the resume-then-screening flow, this means screening answers reflect
-    the *generated* resume's bullets, not just the raw account experience.
-    """
-    import json
-    import re
-    from openai import AsyncOpenAI
-    from app.config import get_settings
-
+    """Standalone screening — kept for callers that want answers without a
+    full resume regeneration."""
     questions = [q.strip() for q in body.questions if q and q.strip()]
     if not questions:
         raise HTTPException(
@@ -124,7 +325,6 @@ async def screening_answers(
         )
 
     account = await _load_owned_account(body.accountId, user)
-
     if not (account.experience or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -138,78 +338,17 @@ async def screening_answers(
             account.screeningPromptMode = body.guidelinesMode  # type: ignore[assignment]
         await account.save()
 
-    guidelines = body.guidelines if body.guidelines is not None else (account.screeningPrompt or "")
-
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OPENAI_API_KEY not configured",
-        )
-
-    use_resume = body.useGeneratedResumeContext and bool((account.previewHtml or "").strip())
-
-    prompt_parts = [
-        "You answer job-application screening questions on behalf of a candidate.",
-        f"Candidate name: {account.name}.",
-        f"Candidate email: {account.email}." if account.email else "",
-        f"Candidate education: {account.education}." if account.education else "",
-    ]
-    if use_resume:
-        prompt_parts.append(
-            "The candidate's tailored resume HTML for this role is below. Treat it as the source "
-            "of truth for what they emphasize and how they describe their work:\n"
-            f"{account.previewHtml}"
-        )
-    elif (account.experience or "").strip():
-        prompt_parts.append(f"Candidate experience:\n{account.experience}")
-
-    if (body.jobDescription or "").strip():
-        prompt_parts.append(f"Job description:\n{body.jobDescription}")
-    if guidelines.strip():
-        prompt_parts.append(f"Answer guidelines:\n{guidelines}")
-
-    indexed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-    prompt_parts.append(
-        "Answer each numbered screening question below in the candidate's voice. "
-        "Be concise, specific, grounded in the provided context. If a question cannot be "
-        "answered from the context, say so briefly rather than fabricating details."
+    pairs = await _run_screening(
+        account=account,
+        jd=body.jobDescription or "",
+        questions=questions,
+        guidelines_override=body.guidelines,
+        guidelines_mode_override=body.guidelinesMode,
     )
-    prompt_parts.append(f"Questions:\n{indexed}")
-    prompt_parts.append(
-        f"Return a JSON object of the exact form: {{\"answers\": [\"...\", \"...\"]}} "
-        f"with exactly {len(questions)} entries in the same order as the numbered questions. "
-        "Do not include any text outside the JSON."
-    )
-
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.responses.create(
-        model=settings.RESUME_OPENAI_MODEL,
-        input="\n\n".join(p for p in prompt_parts if p),
-    )
-    raw = response.output_text or ""
-
-    answers: List[str] = []
-    try:
-        # GPT may wrap JSON in code fences; strip them defensively.
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict) and isinstance(parsed.get("answers"), list):
-            answers = [str(a) for a in parsed["answers"]]
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    if not answers:
-        # Fallback: split numbered output into one entry per question.
-        chunks = re.split(r"^\s*\d+\.\s*", raw, flags=re.MULTILINE)
-        answers = [c.strip() for c in chunks if c.strip()]
-
-    while len(answers) < len(questions):
-        answers.append("")
-    answers = answers[: len(questions)]
-
-    pairs = [{"question": q, "answer": a} for q, a in zip(questions, answers)]
     return {"pairs": pairs}
+
+
+# ---------- Preview (unchanged) ----------------------------------------------
 
 
 @router.post("/preview-html")
@@ -217,19 +356,11 @@ async def preview_html(
     body: dict,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Generate just the OpenAI HTML body (no PDF, no S3, no application record)
-    so the structured-mode preview pane can cache and re-render locally.
-
-    Body: { accountId: str, jobDescription?: str }
-    """
-    from app.resume_service import _build_prompt, _openai_html
-
     account_id = body.get("accountId")
     if not account_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="accountId required")
 
     account = await _load_owned_account(account_id, user)
-
     if not (account.experience or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -243,10 +374,130 @@ async def preview_html(
 
     prompt = _build_prompt(account, jd)
     html_content = await _openai_html(prompt)
-
     account.previewHtml = html_content
     await account.save()
     return {"html": html_content}
+
+
+# ---------- Job listing / polling / download ---------------------------------
+
+
+def _job_to_dict(job: ResumeApplication) -> dict:
+    """Slim projection — never ships pdfData (multi-MB) over the list API.
+    Clients call /resume/jobs/{id}/download for the actual bytes."""
+    d: dict[str, Any] = {
+        "_id": str(job.id),
+        "userId": str(job.userId),
+        "accountId": str(job.accountId) if job.accountId else None,
+        "profileName": job.profileName,
+        "companyName": job.companyName,
+        "jobUrl": job.jobUrl,
+        "status": job.status,
+        "step": job.step,
+        "pdfFilename": job.pdfFilename,
+        "s3Key": job.s3Key,
+        "errorMessage": job.errorMessage,
+        "executionMs": job.executionMs,
+        "screeningQuestions": job.screeningQuestions,
+        "screeningPairs": [p.model_dump() for p in job.screeningPairs],
+        "hasPdf": bool(job.s3Key) or bool(job.pdfData),
+        "createdAt": job.createdAt.isoformat() if job.createdAt else None,
+        "startedAt": job.startedAt.isoformat() if job.startedAt else None,
+        "completedAt": job.completedAt.isoformat() if job.completedAt else None,
+    }
+    return d
+
+
+@router.get("/jobs")
+async def list_jobs(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    accountId: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
+) -> dict:
+    # Strictly own jobs — admin sees only own profiles' resumes too.
+    query: dict = {"userId": user.id}
+    if accountId:
+        query["accountId"] = to_object_id(accountId)
+    page = max(1, page)
+    limit = max(1, min(100, limit))
+    total = await ResumeApplication.find(query).count()
+    rows = (
+        await ResumeApplication.find(query)
+        .sort("-createdAt")
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .to_list()
+    )
+    total_pages = (total + limit - 1) // limit if limit else 0
+    return {
+        "jobs": [_job_to_dict(r) for r in rows],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "totalPages": total_pages,
+            "hasNext": page < total_pages,
+            "hasPrev": page > 1,
+        },
+    }
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(
+    job_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    job = await ResumeApplication.get(to_object_id(job_id))
+    if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    return _job_to_dict(job)
+
+
+@router.get("/jobs/{job_id}/download")
+async def download_job(
+    job_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+):
+    """Return a JSON {url} pointing at S3 (presigned, 15min) or, for legacy
+    rows, return the PDF bytes inline. JSON form lets the SPA do an anchor
+    click for cross-origin download without CORS preflight on S3."""
+    job = await ResumeApplication.get(to_object_id(job_id))
+    if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+
+    download_name = (job.pdfFilename or f"resume_{job.companyName}.pdf").split("/")[-1]
+
+    if job.s3Key and s3_enabled():
+        try:
+            url = generate_presigned_get(job.s3Key, expires=900, download_filename=download_name)
+            return {"url": url, "filename": download_name}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("presign failed for job %s: %s", job_id, exc)
+
+    if job.pdfData:
+        pdf = base64.b64decode(job.pdfData)
+        return Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+        )
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF not available")
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(
+    job_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    job = await ResumeApplication.get(to_object_id(job_id))
+    if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    await job.delete()
+    return {"ok": True}
+
+
+# ---------- Legacy history alias (kept for any older callers) ----------------
 
 
 @router.get("/history")

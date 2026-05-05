@@ -27,8 +27,7 @@ _PROMPT_BODY = (
     "Generate an ATS-optimized, job-tailored resume for {name} aligned to the job description being applied for. "
     "Do not modify company names, job titles, locations, or employment dates. "
     "For work experience, the most recent company must have exactly 8 bullet points and all other companies must have exactly 6 points each. "
-    "For the most recent company, structure bullets as follows: 1 bullet describing a realistic core product or platform developed at the company "
-    "(use these mappings when applicable: SurgeAI = LLM prompt and response evaluation platform; ESL = tournament management platform and AI match summary generation; Snorkel AI = Platform Engineering capabilities for Snorkel Flow and Snorkel Evaluate), "
+    "For the most recent company, structure bullets as follows: 1 bullet describing a realistic core product or platform developed at the company, "
     "6 bullets describing core engineering work, and 1 bullet describing cross-functional collaboration and leadership. "
     "Distribute the 6 core engineering bullets based on job type: AI or GenAI role uses a balanced mix of frontend, backend, and AI or GenAI work driven by the job description; "
     "frontend role uses 4 frontend, 1 backend, and 1 DevOps bullet; backend role uses 1 frontend, 4 backend, and 1 DevOps bullet; "
@@ -144,7 +143,6 @@ def _build_prompt(account: Account, job_description: str) -> str:
 class GeneratedResume:
     pdf_bytes: bytes
     s3_key: Optional[str]
-    s3_url: Optional[str]
 
 
 async def _openai_html(prompt: str) -> str:
@@ -184,6 +182,13 @@ def _resolve_margin_pt(account: Account) -> dict:
     }
 
 
+_PT_TO_MM = 25.4 / 72  # 1pt = 0.3528mm
+
+
+def _pt_to_mm(v: float) -> str:
+    return f"{v * _PT_TO_MM:.3f}mm"
+
+
 async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[dict] = None) -> bytes:
     m = margin_pt or _DEFAULT_MARGIN_PT
     async with async_playwright() as p:
@@ -198,13 +203,14 @@ async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[d
         try:
             page = await browser.new_page()
             await page.set_content(html, wait_until="networkidle")
+            # Playwright accepts px, in, cm, mm — not pt. Convert pt → mm.
             return await page.pdf(
                 format=page_format,
                 margin={
-                    "top": f"{m['top']}pt",
-                    "right": f"{m['right']}pt",
-                    "bottom": f"{m['bottom']}pt",
-                    "left": f"{m['left']}pt",
+                    "top": _pt_to_mm(m["top"]),
+                    "right": _pt_to_mm(m["right"]),
+                    "bottom": _pt_to_mm(m["bottom"]),
+                    "left": _pt_to_mm(m["left"]),
                 },
                 print_background=True,
             )
@@ -212,30 +218,66 @@ async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[d
             await browser.close()
 
 
-def _maybe_upload_to_s3(pdf_bytes: bytes, profile_name: str, company: str) -> tuple[Optional[str], Optional[str]]:
-    """Best-effort upload. Returns (key, url) or (None, None) if disabled/fails.
+def _s3_client():
+    import boto3
+    from botocore.config import Config
 
-    Mirrors the Node service: failure is logged, not raised — the user still
-    gets their PDF.
-    """
+    s = get_settings()
+    # Force SigV4 + virtual-host addressing so presigned URLs match the host
+    # boto3 actually signs against. Mixing global vs regional endpoints
+    # produces SignatureDoesNotMatch on non-us-east-1 buckets.
+    cfg = Config(signature_version="s3v4", s3={"addressing_style": "virtual"})
+    kwargs = {"region_name": s.AWS_REGION, "config": cfg}
+    if s.AWS_ACCESS_KEY_ID and s.AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = s.AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = s.AWS_SECRET_ACCESS_KEY
+    return boto3.client("s3", **kwargs)
+
+
+def s3_enabled() -> bool:
+    settings = get_settings()
+    return bool(settings.AWS_S3_BUCKET and settings.AWS_REGION)
+
+
+def generate_presigned_get(s3_key: str, expires: int = 900, download_filename: Optional[str] = None) -> str:
+    """Short-lived URL for client download. Bucket stays private.
+    `download_filename` injects ResponseContentDisposition so the browser
+    saves with the right name when the URL is opened directly (anchor click)."""
+    settings = get_settings()
+    params: dict = {"Bucket": settings.AWS_S3_BUCKET, "Key": s3_key}
+    if download_filename:
+        params["ResponseContentDisposition"] = f'attachment; filename="{download_filename}"'
+    return _s3_client().generate_presigned_url(
+        "get_object",
+        Params=params,
+        ExpiresIn=expires,
+    )
+
+
+def _maybe_upload_to_s3(pdf_bytes: bytes, profile_name: str, company: str) -> tuple[Optional[str], Optional[str]]:
+    """Upload to S3 when configured. Returns (key, region) or (None, None).
+    Raises on failure when S3 IS configured — caller treats as job failure
+    rather than silently dropping the PDF."""
     settings = get_settings()
     bucket = settings.AWS_S3_BUCKET
     region = settings.AWS_REGION
     if not bucket or not region:
         return None, None
 
-    try:
-        import boto3  # imported lazily so AWS SDK is optional at import time
-
-        s3 = boto3.client("s3", region_name=region)
-        date_segment = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        key = f"{_safe_segment(profile_name)}/{date_segment}/{_safe_segment(company)}.pdf"
-        s3.put_object(Bucket=bucket, Key=key, Body=pdf_bytes, ContentType="application/pdf")
-        url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-        return key, url
-    except Exception as exc:  # noqa: BLE001 — non-fatal upload path
-        log.warning("S3 upload skipped: %s", exc)
-        return None, None
+    s3 = _s3_client()
+    # {YYYY_MM_DD}/{Profile}/{Company}/Resume.pdf — date first so daily
+    # listings group naturally; profile/company subfolders for browsing.
+    date_segment = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+    key = f"{date_segment}/{_safe_segment(profile_name)}/{_safe_segment(company)}/Resume.pdf"
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=pdf_bytes,
+        ContentType="application/pdf",
+        ServerSideEncryption="AES256",
+    )
+    log.info("uploaded resume to s3: bucket=%s key=%s", bucket, key)
+    return key, region
 
 
 async def generate_resume(
@@ -252,5 +294,5 @@ async def generate_resume(
         page_format=account.pageFormat or "A4",
         margin_pt=_resolve_margin_pt(account),
     )
-    s3_key, s3_url = _maybe_upload_to_s3(pdf_bytes, account.name, company)
-    return GeneratedResume(pdf_bytes=pdf_bytes, s3_key=s3_key, s3_url=s3_url)
+    s3_key, _region = _maybe_upload_to_s3(pdf_bytes, account.name, company)
+    return GeneratedResume(pdf_bytes=pdf_bytes, s3_key=s3_key)

@@ -94,6 +94,7 @@ class AccountCreate(BaseModel):
     website: Optional[str] = None
     twitter: Optional[str] = None
     customLinks: Optional[List[CustomLinkIn]] = None
+    contactLabels: Optional[dict] = None
     styleMode: Optional[str] = None
     styleMarkdown: Optional[str] = None
     styleConfig: Optional[dict] = None
@@ -118,6 +119,7 @@ class AccountUpdate(BaseModel):
     website: Optional[str] = None
     twitter: Optional[str] = None
     customLinks: Optional[List[CustomLinkIn]] = None
+    contactLabels: Optional[dict] = None
     styleMode: Optional[str] = None
     styleMarkdown: Optional[str] = None
     styleConfig: Optional[dict] = None
@@ -232,6 +234,7 @@ async def create_account(
         website=body.website,
         twitter=body.twitter,
         customLinks=[link.model_dump() for link in (body.customLinks or [])],
+        contactLabels=body.contactLabels or {},
         styleMarkdown=body.styleMarkdown,
         styleConfig=body.styleConfig,
         previewHtml=body.previewHtml,
@@ -288,6 +291,8 @@ async def update_account(
     if body.customLinks is not None:
         from app.models.account import CustomLink
         acc.customLinks = [CustomLink(label=link.label, url=link.url) for link in body.customLinks]
+    if body.contactLabels is not None:
+        acc.contactLabels = body.contactLabels
     if body.styleMode is not None:
         acc.styleMode = body.styleMode  # type: ignore[assignment]
     if body.styleMarkdown is not None:
