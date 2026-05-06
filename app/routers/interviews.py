@@ -1,14 +1,22 @@
+import asyncio
+import json
+import logging
+import re
 from datetime import datetime
-from typing import Annotated, Any, Iterable, Optional
+from typing import Annotated, Any, Iterable, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
+from app.config import get_settings
 from app.deps import get_current_user
-from app.models import Account, Interview, UserExtra
+from app.interview_analyze import extract_and_score
+from app.models import Account, Interview, InterviewQuestion, UserExtra
 from app.models.interview import InterviewStage, InterviewStatus
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack import notify_new_interview
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
@@ -204,6 +212,9 @@ async def create_interview(
     )
     await iv.insert()
 
+    if (iv.transcript or "").strip():
+        asyncio.create_task(extract_and_score(iv))
+
     try:
         await notify_new_interview(
             creator_email=user.email or "",
@@ -280,12 +291,17 @@ async def update_interview(
         iv.appliedPosition = body.appliedPosition or None
     if body.mainTechStack is not None:
         iv.mainTechStack = body.mainTechStack or None
+    transcript_changed = body.transcript is not None and body.transcript != (iv.transcript or "")
     if body.transcript is not None:
         iv.transcript = body.transcript
     if body.note is not None:
         iv.note = body.note
 
     await iv.save()
+
+    if transcript_changed and (iv.transcript or "").strip():
+        asyncio.create_task(extract_and_score(iv))
+
     return doc_to_dict(iv)
 
 
@@ -305,4 +321,230 @@ async def delete_interview(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     await iv.delete()
+    await InterviewQuestion.find({"interviewId": iv.id}).delete()
     return {"ok": True}
+
+
+# ---------- Extracted questions ---------------------------------------------
+
+
+@router.get("/{iv_id}/questions")
+async def list_interview_questions(
+    iv_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    oid = to_object_id(iv_id)
+    iv = await Interview.get(oid)
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if user.role != "admin" and str(iv.createdBy) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    rows = (
+        await InterviewQuestion.find({"interviewId": oid})
+        .sort([("createdAt", 1)])
+        .to_list()
+    )
+    return {"questions": [doc_to_dict(q) for q in rows]}
+
+
+@router.post("/{iv_id}/extract")
+async def reextract_interview(
+    iv_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Force re-extraction. Useful after fixing transcript or for legacy rows
+    that never went through the auto-trigger."""
+    oid = to_object_id(iv_id)
+    iv = await Interview.get(oid)
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if user.role != "admin" and str(iv.createdBy) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    if not (iv.transcript or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No transcript to extract")
+    asyncio.create_task(extract_and_score(iv))
+    return {"ok": True, "message": "extraction queued"}
+
+
+# ---------- Analyze (cross-interview LLM rollup) ----------------------------
+
+
+class AnalyzeBody(BaseModel):
+    accountId: Optional[str] = None
+    stages: Optional[List[str]] = None
+    fromDate: Optional[str] = None
+    toDate: Optional[str] = None
+
+
+_MAX_TRANSCRIPT_CHARS = 15_000  # per interview, capped to keep prompt size bounded
+_MAX_INTERVIEWS = 30
+
+
+_STAGE_LABELS = {
+    "intro": "Intro",
+    "tech": "Tech",
+    "panel": "Panel",
+    "live_coding": "Live Coding",
+    "system_design": "System Design",
+    "cultural": "Cultural",
+    "final": "Final",
+    "ai_interview": "AI Interview",
+}
+
+
+@router.post("/analyze")
+async def analyze_interviews(
+    body: AnalyzeBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Aggregate over pre-extracted InterviewQuestion docs. Mongo does the
+    heavy lifting; one small LLM call generates per-stage prep tips."""
+    from openai import AsyncOpenAI
+
+    iv_query: dict = {"createdBy": user.id} if user.role != "admin" else {}
+    if body.accountId:
+        iv_query["accountId"] = to_object_id(body.accountId)
+    if body.stages:
+        iv_query["stage"] = {"$in": [s for s in body.stages if s in STAGES]}
+    sched: dict = {}
+    if body.fromDate:
+        d = parse_date(body.fromDate)
+        if d: sched["$gte"] = d
+    if body.toDate:
+        d = parse_date(body.toDate)
+        if d: sched["$lte"] = d
+    if sched:
+        iv_query["scheduledAt"] = sched
+
+    interviews = await Interview.find(iv_query).sort([("scheduledAt", -1)]).to_list()
+    if not interviews:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No interviews match the filter.",
+        )
+    iv_ids = [iv.id for iv in interviews]
+
+    questions = (
+        await InterviewQuestion.find({"interviewId": {"$in": iv_ids}})
+        .to_list()
+    )
+    transcript_count = len({q.interviewId for q in questions})
+
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No extracted questions yet for the selected interviews. "
+                "Add transcripts and let extraction finish, or use the re-extract action."
+            ),
+        )
+
+    # ---- Aggregate per stage ----
+    by_stage: dict[str, list[InterviewQuestion]] = {}
+    for q in questions:
+        key = q.stage or "unknown"
+        by_stage.setdefault(key, []).append(q)
+
+    stages_out: List[dict] = []
+    weak_spots: List[dict] = []
+
+    for stage_key, qs in by_stage.items():
+        scored = [q for q in qs if q.score is not None]
+        avg = (sum(q.score for q in scored) / len(scored)) if scored else 0.0  # type: ignore[misc]
+        # frequency by lowercased question prefix (string-match v2; semantic in v3)
+        freq: dict[str, list[InterviewQuestion]] = {}
+        for q in qs:
+            key = q.question.strip().lower()[:120]
+            freq.setdefault(key, []).append(q)
+        top = sorted(freq.values(), key=lambda lst: -len(lst))[:5]
+        top_questions = [
+            {
+                "question": grp[0].question,
+                "frequency": len(grp),
+                "exampleScore": grp[0].score if grp[0].score is not None else 0,
+            }
+            for grp in top
+        ]
+        # weak: bottom 3 by score
+        bottom = sorted(scored, key=lambda q: q.score)[:3]  # type: ignore[arg-type]
+        for q in bottom:
+            if q.score is None or q.score >= 6:
+                continue
+            weak_spots.append({
+                "topic": q.question[:80],
+                "stage": stage_key,
+                "explanation": q.scoreRationale or "Low score on this question.",
+                "tip": q.improvementTip or "Practice this topic.",
+            })
+
+        stages_out.append({
+            "stage": stage_key,
+            "stageLabel": _STAGE_LABELS.get(stage_key, stage_key.title()),
+            "interviewCount": len({q.interviewId for q in qs}),
+            "overallScore": round(avg, 1),
+            "topQuestions": top_questions,
+            "_qsForTips": qs,  # private, removed before return
+        })
+
+    # ---- Generate per-stage tips with one small LLM call ----
+    settings = get_settings()
+    if settings.OPENAI_API_KEY:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        digest = []
+        for s in stages_out:
+            qs = s["_qsForTips"]
+            sample = [
+                {
+                    "q": q.question[:200],
+                    "score": q.score,
+                    "rationale": (q.scoreRationale or "")[:200],
+                    "tip": (q.improvementTip or "")[:200],
+                }
+                for q in qs[:8]
+            ]
+            digest.append({
+                "stage": s["stage"],
+                "avg": s["overallScore"],
+                "samples": sample,
+            })
+        tips_prompt = (
+            "Given a candidate's per-stage interview question samples, return JSON with "
+            "strengths, weaknesses, and prep tips per stage, plus 3 overall tips.\n\n"
+            'Schema: {"stages": [{"stage": "<key>", "strengths": ["..."], "weaknesses": ["..."], "tips": ["..."]}], "overallTips": ["..."]}\n\n'
+            "Tips must be specific and actionable, ground in the samples. Output ONLY the JSON.\n\n"
+            f"Data:\n{json.dumps(digest, ensure_ascii=False)}"
+        )
+        try:
+            # Tips digest is small + low-stakes; cheaper model is fine.
+            tips_res = await client.responses.create(
+                model=settings.EXTRACTION_MODEL,
+                input=tips_prompt,
+            )
+            tips_raw = tips_res.output_text or ""
+            tips_parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", tips_raw.strip(), flags=re.MULTILINE))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tips generation failed: %s", exc)
+            tips_parsed = {"stages": [], "overallTips": []}
+    else:
+        tips_parsed = {"stages": [], "overallTips": []}
+
+    tips_by_stage = {s.get("stage"): s for s in (tips_parsed.get("stages") or []) if isinstance(s, dict)}
+
+    # ---- Final shape ----
+    for s in stages_out:
+        del s["_qsForTips"]
+        t = tips_by_stage.get(s["stage"], {})
+        s["strengths"] = list(t.get("strengths") or [])
+        s["weaknesses"] = list(t.get("weaknesses") or [])
+        s["tips"] = list(t.get("tips") or [])
+
+    return {
+        "interviewCount": len(interviews),
+        "transcriptCount": transcript_count,
+        "questionCount": len(questions),
+        "result": {
+            "stages": sorted(stages_out, key=lambda x: -x["interviewCount"]),
+            "weakSpots": weak_spots[:8],
+            "overallTips": list(tips_parsed.get("overallTips") or []),
+        },
+    }

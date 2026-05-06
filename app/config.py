@@ -15,8 +15,14 @@ class Settings(BaseSettings):
     SLACK_WEBHOOK_URL: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720
     OPENAI_API_KEY: Optional[str] = None
+    # Streamed AI Review (interview): chat-completions, long-form. Mini is enough.
     OPENAI_MODEL: str = "gpt-4o-mini"
+    # High-quality structured generation: resume HTML, screening answers, scoring.
+    # Use a smarter model — output ships to users and judgment matters.
     RESUME_OPENAI_MODEL: str = "gpt-5-mini"
+    # Cheap structured-extraction tasks: parsing Q&A from transcripts, rollup tips.
+    # No real reasoning, just JSON shape. Mini saves ~50% per call.
+    EXTRACTION_MODEL: str = "gpt-4o-mini"
     AWS_REGION: Optional[str] = None
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
