@@ -11,7 +11,15 @@ from pydantic import BaseModel
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
-from app.models import Account, Interview, InterviewQuestion, UserExtra
+from app.models import (
+    Account,
+    AnalyzeChatLog,
+    Interview,
+    InterviewChatLog,
+    InterviewQuestion,
+    UserExtra,
+)
+from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewStage, InterviewStatus
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack import notify_new_interview
@@ -380,16 +388,7 @@ _MAX_TRANSCRIPT_CHARS = 15_000  # per interview, capped to keep prompt size boun
 _MAX_INTERVIEWS = 30
 
 
-_STAGE_LABELS = {
-    "intro": "Intro",
-    "tech": "Tech",
-    "panel": "Panel",
-    "live_coding": "Live Coding",
-    "system_design": "System Design",
-    "cultural": "Cultural",
-    "final": "Final",
-    "ai_interview": "AI Interview",
-}
+from app.prompts import STAGE_LABELS as _STAGE_LABELS
 
 
 @router.post("/analyze")
@@ -486,65 +485,274 @@ async def analyze_interviews(
             "_qsForTips": qs,  # private, removed before return
         })
 
-    # ---- Generate per-stage tips with one small LLM call ----
+    # ---- Pull recent follow-up questions for style/uncertainty signal ----
+    chat_logs = (
+        await InterviewChatLog.find({"interviewId": {"$in": iv_ids}})
+        .sort([("createdAt", -1)])
+        .limit(60)
+        .to_list()
+    )
+    follow_up_digest = [(log_.question or "")[:200] for log_ in chat_logs if (log_.question or "").strip()][:30]
+
+    # ---- Filter context block surfaces "what view is the user looking at" ----
+    company_set = sorted({iv.companyName for iv in interviews if iv.companyName})
+    position_set = sorted({iv.appliedPosition for iv in interviews if iv.appliedPosition})
+    filter_context = {
+        "stages": list(by_stage.keys()),
+        "companies": company_set[:8],
+        "positions": position_set[:8],
+        "fromDate": body.fromDate,
+        "toDate": body.toDate,
+        "interviewCount": len(interviews),
+        "questionCount": len(questions),
+    }
+
+    # ---- Generate per-stage rollup with one LLM call ----
     settings = get_settings()
     if settings.OPENAI_API_KEY:
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         digest = []
         for s in stages_out:
             qs = s["_qsForTips"]
-            sample = [
+            scored = [q for q in qs if q.score is not None]
+            buckets = {"weak": 0, "mixed": 0, "solid": 0, "strong": 0}
+            for q in scored:
+                if q.score <= 3:
+                    buckets["weak"] += 1
+                elif q.score <= 6:
+                    buckets["mixed"] += 1
+                elif q.score <= 8:
+                    buckets["solid"] += 1
+                else:
+                    buckets["strong"] += 1
+            samples = [
                 {
                     "q": q.question[:200],
+                    "a": (q.candidateAnswer or "")[:300],  # answer text required for style read
                     "score": q.score,
                     "rationale": (q.scoreRationale or "")[:200],
                     "tip": (q.improvementTip or "")[:200],
                 }
-                for q in qs[:8]
+                for q in qs[:10]
             ]
             digest.append({
                 "stage": s["stage"],
+                "stageLabel": s["stageLabel"],
                 "avg": s["overallScore"],
-                "samples": sample,
+                "questionCount": len(qs),
+                "scoreBuckets": buckets,
+                "topQuestions": s["topQuestions"],
+                "samples": samples,
+                "drillBank": STAGE_DRILL_BANK.get(s["stage"], ""),
             })
-        tips_prompt = (
-            "Given a candidate's per-stage interview question samples, return JSON with "
-            "strengths, weaknesses, and prep tips per stage, plus 3 overall tips.\n\n"
-            'Schema: {"stages": [{"stage": "<key>", "strengths": ["..."], "weaknesses": ["..."], "tips": ["..."]}], "overallTips": ["..."]}\n\n'
-            "Tips must be specific and actionable, ground in the samples. Output ONLY the JSON.\n\n"
-            f"Data:\n{json.dumps(digest, ensure_ascii=False)}"
-        )
-        try:
-            # Tips digest is small + low-stakes; cheaper model is fine.
-            tips_res = await client.responses.create(
-                model=settings.EXTRACTION_MODEL,
-                input=tips_prompt,
-            )
-            tips_raw = tips_res.output_text or ""
-            tips_parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", tips_raw.strip(), flags=re.MULTILINE))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("tips generation failed: %s", exc)
-            tips_parsed = {"stages": [], "overallTips": []}
-    else:
-        tips_parsed = {"stages": [], "overallTips": []}
 
-    tips_by_stage = {s.get("stage"): s for s in (tips_parsed.get("stages") or []) if isinstance(s, dict)}
+        rollup_prompt = (
+            "You are an interview coach analyzing a candidate's history across MULTIPLE interviews.\n"
+            "Goal: surface STATISTICAL patterns (what topics keep coming up, where they shine vs stumble),\n"
+            "read their COMMUNICATION STYLE from answer excerpts, and tell them HOW TO SHINE next time.\n\n"
+            "Audience IS the candidate. Write as 'you'. Direct, specific, no hedging. No emojis.\n\n"
+            "Use the named failure modes when calling out problems. Pick from this fixed list:\n"
+            f"{FAILURE_MODES}\n"
+            "When picking prep drills, lean on each stage's drillBank but adapt to the candidate's actual gaps.\n\n"
+            "Return STRICT JSON only. Schema:\n"
+            "{\n"
+            '  "stages": [{\n'
+            '    "stage": "<stage key from input>",\n'
+            '    "askedAlways": ["topics that recur across this stage — keep to 3-5"],\n'
+            '    "youShineOn": [{"topic": "...", "evidence": "ref to a sample question/answer"}],\n'
+            '    "youStumbleOn": [{"topic": "...", "failureMode": "<one named mode>", "evidence": "..."}],\n'
+            '    "communicationStyle": {\n'
+            '      "pacing": "<one line>", "structure": "<one line>",\n'
+            '      "verbosity": "<one line>", "confidence": "<one line>"\n'
+            "    },\n"
+            '    "styleImprovements": ["3-5 specific style fixes for this stage"],\n'
+            '    "drills": ["1-3 picked from drillBank, adapted to gaps"]\n'
+            "  }],\n"
+            '  "styleProfile": "1-paragraph signature interview voice (3-4 sentences)",\n'
+            '  "signatureStrengths": ["3 patterns to lean into"],\n'
+            '  "blindSpots": ["3 patterns hurting signal"],\n'
+            '  "howToShine": [{"move": "concrete tactic", "why": "what signal it sends"}],\n'
+            '  "interviewTactics": ["3-5 direction-leading tricks: how to steer the interview toward strengths"],\n'
+            '  "redFlags": ["recurring patterns the candidate may not realize hurt them"],\n'
+            '  "uncertaintyTopics": ["topics the candidate keeps asking AI follow-ups about — likely real gaps"],\n'
+            '  "overallTips": ["3 cross-cutting prep tips not tied to one stage"]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- Ground EVERY callout in the digest. No generic advice ('study more', 'be confident').\n"
+            "- Quote 5-10 word snippets from samples when citing evidence.\n"
+            "- If a section has nothing to say, return an empty array — do NOT fabricate.\n"
+            "- Output ONLY the JSON object. No markdown fences, no commentary.\n\n"
+            f"Filter context:\n{json.dumps(filter_context, ensure_ascii=False)}\n\n"
+            f"Per-stage digest:\n{json.dumps(digest, ensure_ascii=False)}\n\n"
+            f"Recent AI follow-up questions the candidate asked (uncertainty signal):\n"
+            f"{json.dumps(follow_up_digest, ensure_ascii=False)}"
+        )
+
+        try:
+            # Style + judgment work — bump to higher-quality model.
+            rollup_res = await client.responses.create(
+                model=settings.RESUME_OPENAI_MODEL,
+                input=rollup_prompt,
+            )
+            rollup_raw = rollup_res.output_text or ""
+            rollup_parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", rollup_raw.strip(), flags=re.MULTILINE))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("analyze rollup failed: %s", exc)
+            rollup_parsed = {}
+    else:
+        rollup_parsed = {}
+
+    by_stage_out = {s.get("stage"): s for s in (rollup_parsed.get("stages") or []) if isinstance(s, dict)}
 
     # ---- Final shape ----
     for s in stages_out:
         del s["_qsForTips"]
-        t = tips_by_stage.get(s["stage"], {})
-        s["strengths"] = list(t.get("strengths") or [])
-        s["weaknesses"] = list(t.get("weaknesses") or [])
-        s["tips"] = list(t.get("tips") or [])
+        t = by_stage_out.get(s["stage"], {})
+        s["askedAlways"] = list(t.get("askedAlways") or [])
+        s["youShineOn"] = list(t.get("youShineOn") or [])
+        s["youStumbleOn"] = list(t.get("youStumbleOn") or [])
+        s["communicationStyle"] = dict(t.get("communicationStyle") or {})
+        s["styleImprovements"] = list(t.get("styleImprovements") or [])
+        s["drills"] = list(t.get("drills") or [])
 
     return {
         "interviewCount": len(interviews),
         "transcriptCount": transcript_count,
         "questionCount": len(questions),
+        "filterContext": filter_context,
         "result": {
             "stages": sorted(stages_out, key=lambda x: -x["interviewCount"]),
             "weakSpots": weak_spots[:8],
-            "overallTips": list(tips_parsed.get("overallTips") or []),
+            "styleProfile": rollup_parsed.get("styleProfile") or "",
+            "signatureStrengths": list(rollup_parsed.get("signatureStrengths") or []),
+            "blindSpots": list(rollup_parsed.get("blindSpots") or []),
+            "howToShine": list(rollup_parsed.get("howToShine") or []),
+            "interviewTactics": list(rollup_parsed.get("interviewTactics") or []),
+            "redFlags": list(rollup_parsed.get("redFlags") or []),
+            "uncertaintyTopics": list(rollup_parsed.get("uncertaintyTopics") or []),
+            "overallTips": list(rollup_parsed.get("overallTips") or []),
         },
+    }
+
+
+# ---------- Analyze chat (follow-up Q&A grounded in a result) ---------------
+
+
+class AnalyzeChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class AnalyzeChatBody(BaseModel):
+    accountId: Optional[str] = None
+    stages: Optional[List[str]] = None
+    fromDate: Optional[str] = None
+    toDate: Optional[str] = None
+    filterContext: dict = {}
+    result: dict  # the AnalyzeResult JSON the user is looking at
+    messages: List[AnalyzeChatMessage] = []
+
+
+_ANALYZE_CHAT_PROMPT = """\
+You are an interview coach in a follow-up chat. The user is looking at a
+cross-interview ANALYSIS of their own interviews and wants to drill into it.
+Audience IS the candidate. Write directly as "you". Direct, specific, no
+hedging. No emojis.
+
+You have:
+- the filter the user applied (stages / companies / dates),
+- the analysis result (stage stats, style profile, blind spots, drills, etc.),
+- the conversation so far.
+
+Rules:
+- Ground every claim in the analysis. If the user asks about something not in
+  the data, say so — don't fabricate.
+- Reuse the named failure modes when the user asks about weaknesses:
+{failure_modes}
+- When asked for prep plans, lean on the per-stage drills already in the result;
+  expand them with concrete time-boxed tasks.
+- When asked about style, expand on the styleProfile / communicationStyle
+  fields. Quote 5-10 word evidence snippets when they help.
+- When asked "how do I shine on X", combine howToShine + interviewTactics
+  with the specific signal in the result.
+- Markdown allowed (headings, bullets, tables).
+- Keep responses tight unless the user asks for depth.
+"""
+
+
+@router.post("/analyze/chat")
+async def analyze_chat(
+    body: AnalyzeChatBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    from openai import AsyncOpenAI
+
+    settings = get_settings()
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing")
+    if not body.messages:
+        raise HTTPException(status_code=400, detail="messages required")
+
+    last_user = next((m for m in reversed(body.messages) if m.role == "user"), None)
+    if last_user is None:
+        raise HTTPException(status_code=400, detail="no user message in body")
+
+    system_prompt = _ANALYZE_CHAT_PROMPT.format(failure_modes=FAILURE_MODES)
+    grounding = (
+        "Filter the user is viewing:\n"
+        f"{json.dumps(body.filterContext or {}, ensure_ascii=False)}\n\n"
+        "Analysis result the user is viewing:\n"
+        f"{json.dumps(body.result or {}, ensure_ascii=False)}"
+    )
+
+    chat_messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": grounding},
+    ]
+    for m in body.messages:
+        if m.role not in ("user", "assistant"):
+            continue
+        chat_messages.append({"role": m.role, "content": m.content})
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    try:
+        completion = await client.chat.completions.create(
+            model=settings.RESUME_OPENAI_MODEL,
+            messages=chat_messages,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    choice = completion.choices[0] if completion.choices else None
+    reply = (choice.message.content if choice and choice.message else "") or ""
+    usage = completion.usage
+
+    # Persist user question for prompt tuning + future suggestion mining.
+    try:
+        acct_oid = None
+        if body.accountId:
+            try:
+                acct_oid = to_object_id(body.accountId)
+            except HTTPException:
+                acct_oid = None
+        await AnalyzeChatLog(
+            userId=user.id,
+            accountId=acct_oid,
+            filterStages=list(body.stages or []),
+            filterFromDate=body.fromDate,
+            filterToDate=body.toDate,
+            question=last_user.content,
+            answer=reply,
+            model=settings.RESUME_OPENAI_MODEL,
+            promptTokens=usage.prompt_tokens if usage else 0,
+            completionTokens=usage.completion_tokens if usage else 0,
+        ).insert()
+    except Exception:
+        pass  # logging never breaks the chat
+
+    return {
+        "reply": reply,
+        "model": settings.RESUME_OPENAI_MODEL,
+        "promptTokens": usage.prompt_tokens if usage else 0,
+        "completionTokens": usage.completion_tokens if usage else 0,
     }

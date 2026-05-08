@@ -7,6 +7,7 @@ and changing them changes the output.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -25,7 +26,10 @@ log = logging.getLogger(__name__)
 
 _PROMPT_BODY = (
     "Generate an ATS-optimized, job-tailored resume for {name} aligned to the job description being applied for. "
-    "Do not modify company names, job titles, locations, or employment dates. "
+    "Contact header must contain ONLY these candidate fields when non-empty: name, email, phone, address. "
+    "Do NOT derive a city, country, region, or location from education, work experience, university name, or company name. "
+    "If address is empty, omit address entirely from the header — never infer one. "
+    "Do not modify company names, job titles, work-experience locations, or employment dates. "
     "For work experience, the most recent company must have exactly 8 bullet points and all other companies must have exactly 6 points each. "
     "For the most recent company, structure bullets as follows: 1 bullet describing a realistic core product or platform developed at the company, "
     "6 bullets describing core engineering work, and 1 bullet describing cross-functional collaboration and leadership. "
@@ -126,23 +130,33 @@ def _resolve_style_spec(account: Account) -> str:
 
 
 def _build_prompt(account: Account, job_description: str) -> str:
-    parts = ["Forget anything you learned before.", "You render the resume in html format(only body element).\n"]
-    if account.name:
-        parts.append(f"name is {account.name}, ")
-    if account.email:
-        parts.append(f"email is {account.email}, ")
-    if account.phone:
-        parts.append(f"phone is {account.phone}, ")
-    if account.address:
-        parts.append(f"address is {account.address}.")
-    if account.education:
-        parts.append(f"education is {account.education}.")
-    if account.experience:
-        parts.append(f"work experience is {account.experience},")
-    parts.append(f"Here's the job description. {job_description}\n")
-    parts.append(_PROMPT_BODY.format(name=account.name))
-    parts.append("2. Resume Formatting Styles: Exactly follow the styles below.")
-    parts.append(_resolve_style_spec(account))
+    # Ship candidate fields as discrete labeled slots, not free-form sentences.
+    # Prevents the model from bleeding education location (e.g. "Singapore
+    # University") into the contact-header address slot.
+    candidate_fields = {
+        "name": account.name or "",
+        "email": account.email or "",
+        "phone": account.phone or "",
+        "address": account.address or "",
+        "education": account.education or "",
+        "experience": account.experience or "",
+    }
+    candidate_block = (
+        "Candidate fields (treat each key as an isolated slot — do NOT copy "
+        "values across keys, especially do not pull location text from "
+        "education/experience into address):\n"
+        + json.dumps(candidate_fields, ensure_ascii=False, indent=2)
+    )
+
+    parts = [
+        "Forget anything you learned before.",
+        "You render the resume in html format(only body element).\n",
+        candidate_block,
+        f"Here's the job description. {job_description}\n",
+        _PROMPT_BODY.format(name=account.name),
+        "2. Resume Formatting Styles: Exactly follow the styles below.",
+        _resolve_style_spec(account),
+    ]
     return "\n".join(parts)
 
 

@@ -8,8 +8,9 @@ from jose import JWTError
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK, STAGE_LABELS
 from app.deps import get_current_user
-from app.models import Account, AiReviewRun, GlobalPrompt, Interview, Skill, UserExtra
+from app.models import Account, AiReviewRun, GlobalPrompt, Interview, InterviewChatLog, Skill, UserExtra
 from app.routers._util import doc_to_dict, to_object_id
 from app.security import decode_token
 
@@ -234,21 +235,83 @@ class InterviewChatRequest(BaseModel):
     rubric: bool = False  # if true, ask the model to also score a rubric
 
 
-_BRIEF_REVIEW_PROMPT = (
-    "You are an interview reviewer. Read the candidate's interview transcript, "
-    "resume, and job context below. Produce a concise review that includes:\n"
-    "- TL;DR verdict (Strong Hire / Hire / Lean Hire / No Hire / Strong No Hire) + 1-line reasoning.\n"
-    "- 3-5 strengths (bullet points, each with a brief evidence quote).\n"
-    "- 3-5 gaps or concerns (each with a brief evidence quote).\n"
-    "- Suggested follow-up questions for the next round.\n"
-    "Be specific. Cite the transcript when you make claims. If information is missing, say so."
-)
+_BRIEF_REVIEW_PROMPT = """\
+You are an interview coach reviewing a transcript on behalf of the candidate.
+The audience IS the candidate. Write to them directly as "you" — not about them
+in third person. Goal: help them understand exactly what went well, what didn't,
+and what to fix before their next interview at the SAME stage.
 
-_RUBRIC_PROMPT = (
-    "\n\nAlso include a rubric scored 1-5 for: Communication, Technical Depth, "
-    "Problem Solving, Culture Fit, Coding (if applicable), System Design (if applicable). "
-    "Format as a markdown table with one short justification per row."
-)
+Be direct. Reassurance is less useful than truth. If they bombed, say so.
+
+Output (markdown), in this order:
+
+## Verdict
+3-4 sentences. Honest read of overall performance against what this stage tests.
+End with explicit signal: "on track for offer" / "borderline" / "below the bar".
+
+## What you did well
+2-4 bullets. Each cites a specific moment + one-line reason it landed (clear
+structure, right depth, good clarifying question, real-world example, etc.).
+
+## What hurt you
+Do NOT review every question. Only call out answers with a notable failure mode.
+Use these triggers — name the mode explicitly:
+
+{failure_modes}
+For each call-out:
+1. Name the moment (paraphrase or quote ~10 words).
+2. Name the failure mode (from the list).
+3. Give one concrete fix in candidate's voice ("next time, lead with the
+   constraint check before designing").
+
+Cap: 2-5 call-outs. Pick the highest-leverage, not all of them.
+
+## How to prep for the next {stage_label} interview
+Stage-aware. Specific, time-boxed, drillable. NO generic advice
+("study system design", "practice more"). Replace with:
+
+- name the topic + drill volume / time budget
+- name the language idiom or building block they tripped on
+- name 1-2 concrete exercises (e.g. "design URL shortener focusing on
+  shard rebalancing in 45 min, write down the 3 hardest tradeoffs you hit")
+- if behavioral: name the STAR-component skipped (Situation/Task/Action/
+  Result/Reflection) and the story to pre-write
+
+Pick suggestions from the **stage drill bank** below where applicable. Adapt
+to the candidate's specific gaps from the transcript — never copy verbatim.
+
+If they crushed it, still give ONE stretch goal — what pushes from
+"Hire" to "Strong Hire" at this stage.
+
+## Keep doing
+1-2 bullets on patterns to retain. Prevents over-correction.
+
+Voice + format rules:
+- Second person ("you"). Coach tone, direct.
+- Cite concrete moments with short verbatim quotes when they help.
+- Skip "perhaps consider" hedging. Use "do this" / "skip this" / "rewrite as".
+- If transcript is partial or unclear, say so. Don't fabricate.
+- Skip a section entirely if there's nothing meaningful to put in it.
+- No emojis, no exclamation marks, no closing reassurance ("you've got this!").
+"""
+
+_RUBRIC_PROMPT = """\
+
+## Rubric
+Score 1-5 with one-line justification per row. Format as markdown table.
+Include rows that apply to this stage; skip rows that don't (e.g. no Coding
+row for a behavioral panel).
+
+| Dimension | Score | Why |
+|---|---|---|
+| Communication | x/5 | ... |
+| Technical Depth | x/5 | ... |
+| Problem Solving | x/5 | ... |
+| Culture Fit | x/5 | ... |
+| Coding | x/5 | ... |
+| System Design | x/5 | ... |
+"""
+
 
 
 @router.post("/interview/{iv_id}/chat")
@@ -268,7 +331,26 @@ async def interview_chat(
     global_doc = await GlobalPrompt.find_one(GlobalPrompt.key == "default")
     global_prefix = (global_doc.systemPrompt or "").strip() if global_doc else ""
 
-    system_prompt = _BRIEF_REVIEW_PROMPT
+    stage_key = iv.stage.value if iv.stage else None
+    stage_label = STAGE_LABELS.get(stage_key, "next-stage")
+    position = iv.appliedPosition or "(unspecified position)"
+    company = iv.companyName or "(unspecified company)"
+
+    header = (
+        f"Interview meta — stage: {stage_label} · position: {position} · company: {company}.\n"
+        "Tailor every section to this stage. Skip sections that don't apply.\n\n"
+    )
+
+    system_prompt = header + _BRIEF_REVIEW_PROMPT.format(
+        stage_label=stage_label,
+        failure_modes=FAILURE_MODES,
+    )
+    drill = STAGE_DRILL_BANK.get(stage_key)
+    if drill:
+        system_prompt += (
+            f"\n\nStage drill bank for {stage_label} (adapt to candidate gaps; do not copy verbatim):\n"
+            f"{drill}\n"
+        )
     if body.rubric:
         system_prompt += _RUBRIC_PROMPT
     if global_prefix:
@@ -307,12 +389,72 @@ async def interview_chat(
     choice = completion.choices[0] if completion.choices else None
     reply = (choice.message.content if choice and choice.message else "") or ""
     usage = completion.usage
+
+    # Persist user follow-up question (skip the initial auto-brief which has no
+    # user question). Each turn = its own doc so we can mine question patterns
+    # later for system-prompt tuning + follow-up suggestion generation.
+    last_user = next((m for m in reversed(body.messages) if m.role == "user"), None)
+    if last_user:
+        try:
+            await InterviewChatLog(
+                interviewId=oid,
+                userId=user.id,
+                question=last_user.content,
+                answer=reply,
+                model=model_name,
+                promptTokens=usage.prompt_tokens if usage else 0,
+                completionTokens=usage.completion_tokens if usage else 0,
+                rubric=body.rubric,
+            ).insert()
+        except Exception:
+            pass  # logging failures must not break the chat response
+
     return {
         "reply": reply,
         "model": model_name,
         "promptTokens": usage.prompt_tokens if usage else 0,
         "completionTokens": usage.completion_tokens if usage else 0,
     }
+
+
+@router.get("/interview/{iv_id}/chat/history")
+async def interview_chat_history(
+    iv_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    oid = to_object_id(iv_id)
+    iv = await Interview.get(oid)
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="interview not found")
+    if user.role != "admin" and iv.createdBy != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+
+    query: dict = {"interviewId": oid}
+    if user.role != "admin":
+        query["userId"] = user.id
+    docs = await InterviewChatLog.find(query).sort([("createdAt", 1)]).limit(limit).to_list()
+    return {"logs": [doc_to_dict(d) for d in docs]}
+
+
+@router.delete("/interview/{iv_id}/chat/history")
+async def clear_interview_chat_history(
+    iv_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    oid = to_object_id(iv_id)
+    iv = await Interview.get(oid)
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="interview not found")
+    if user.role != "admin" and iv.createdBy != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+
+    query: dict = {"interviewId": oid}
+    if user.role != "admin":
+        query["userId"] = user.id
+    res = await InterviewChatLog.find(query).delete()
+    deleted = getattr(res, "deleted_count", 0) or 0
+    return {"deleted": deleted}
 
 
 @router.get("/runs/{run_id}")
