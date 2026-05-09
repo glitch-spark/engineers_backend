@@ -102,6 +102,8 @@ class AccountCreate(BaseModel):
     previewHtml: Optional[str] = None
     screeningPromptMode: Optional[str] = None
     screeningPrompt: Optional[str] = None
+    targetPages: Optional[int] = None
+    promptOverrides: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
@@ -127,6 +129,8 @@ class AccountUpdate(BaseModel):
     previewHtml: Optional[str] = None
     screeningPromptMode: Optional[str] = None
     screeningPrompt: Optional[str] = None
+    targetPages: Optional[int] = None
+    promptOverrides: Optional[str] = None
 
 
 @router.get("/lookup")
@@ -239,6 +243,8 @@ async def create_account(
         styleConfig=body.styleConfig,
         previewHtml=body.previewHtml,
         screeningPrompt=body.screeningPrompt,
+        targetPages=body.targetPages,
+        promptOverrides=body.promptOverrides,
     )
     if body.styleMode is not None:
         kwargs["styleMode"] = body.styleMode
@@ -247,6 +253,7 @@ async def create_account(
     if body.screeningPromptMode is not None:
         kwargs["screeningPromptMode"] = body.screeningPromptMode
     acc = Account(**kwargs)
+    _sync_style_fields(acc)
     await acc.insert()
     return doc_to_dict(acc)
 
@@ -307,9 +314,29 @@ async def update_account(
         acc.screeningPromptMode = body.screeningPromptMode  # type: ignore[assignment]
     if body.screeningPrompt is not None:
         acc.screeningPrompt = body.screeningPrompt
+    if body.targetPages is not None:
+        acc.targetPages = body.targetPages
+    if body.promptOverrides is not None:
+        acc.promptOverrides = body.promptOverrides
+
+    _sync_style_fields(acc)
 
     await acc.save()
     return doc_to_dict(acc)
+
+
+def _sync_style_fields(acc: Account) -> None:
+    """Markdown is the canonical style source. Frontend regenerates markdown
+    from structured edits before saving, so we only need to mirror tokens
+    back into styleConfig — never the reverse.
+    """
+    from app.style_tokens import deep_merge, parse_tagged_markdown
+
+    md = acc.styleMarkdown or ""
+    cfg = acc.styleConfig if isinstance(acc.styleConfig, dict) else {}
+    parsed_cfg, _notes, token_count = parse_tagged_markdown(md)
+    if token_count:
+        acc.styleConfig = deep_merge(cfg, parsed_cfg)
 
 
 @router.delete("/{account_id}")

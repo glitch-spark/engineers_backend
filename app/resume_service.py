@@ -33,7 +33,9 @@ _PROMPT_BODY = (
     "For work experience, the most recent company must have exactly 8 bullet points and all other companies must have exactly 6 points each. "
     "For the most recent company, structure bullets as follows: 1 bullet describing a realistic core product or platform developed at the company, "
     "6 bullets describing core engineering work, and 1 bullet describing cross-functional collaboration and leadership. "
-    "Distribute the 6 core engineering bullets based on job type: AI or GenAI role uses a balanced mix of frontend, backend, and AI or GenAI work driven by the job description; "
+    "Distribute the 6 core engineering bullets based on job type: "
+    "pure AI/GenAI engineer role uses 1 frontend, 1 backend, and 4 AI/GenAI bullets; "
+    "AI-leaning full-stack role uses 2 frontend, 2 backend, and 2 AI/GenAI bullets; "
     "frontend role uses 4 frontend, 1 backend, and 1 DevOps bullet; backend role uses 1 frontend, 4 backend, and 1 DevOps bullet; "
     "frontend-leaning full-stack role uses 3 frontend, 2 backend, and 1 DevOps bullet; backend-leaning full-stack role uses 2 frontend, 3 backend, and 1 DevOps bullet; "
     "DevOps-leaning full-stack role uses 1 frontend, 2 backend, and 3 DevOps bullets, choosing AWS or Azure only if realistically used by the company rather than merely listed in the job description. "
@@ -115,18 +117,39 @@ def _safe_segment(s: str) -> str:
 
 
 def _resolve_style_spec(account: Account) -> str:
-    """Returns the prose style spec to embed in the prompt.
+    """Build the prose style spec for the LLM prompt.
 
-    Routes by `styleMode`: structured mode runs the serializer (Phase C);
-    markdown mode uses `styleMarkdown` (or legacy `styles` as a fallback).
+    Markdown is canonical. Flow:
+      1. Read styleMarkdown (fallback: legacy `styles`, then styleConfig).
+      2. Parse @style tokens → structured config dict; deep-merge over the
+         account's stored styleConfig so token coverage gaps don't blow away
+         the editor's last-saved values.
+      3. Run to_prose() on merged config → strict LLM-contract prose.
+      4. Append any free-form user prose (notes / inline guidance) verbatim.
     """
-    if account.styleMode == "structured" and account.styleConfig:
-        try:
-            from app.style_serializer import to_prose
-            return to_prose(account.styleConfig)
-        except ImportError:
-            pass
-    return account.styleMarkdown or account.styles or ""
+    from app.style_serializer import to_prose
+    from app.style_tokens import deep_merge, free_prose, parse_tagged_markdown
+
+    md = account.styleMarkdown or account.styles or ""
+    parsed_cfg, _notes, token_count = parse_tagged_markdown(md)
+
+    base_cfg = account.styleConfig if isinstance(account.styleConfig, dict) else {}
+    merged_cfg = deep_merge(base_cfg, parsed_cfg) if token_count else base_cfg
+
+    # If user has pure-prose markdown (no tokens, no styleConfig), ship the
+    # prose raw — same as the legacy markdown-only path.
+    if not merged_cfg and md.strip():
+        return free_prose(md)
+
+    prose = to_prose(merged_cfg or {})
+    user_prose = free_prose(md)
+    if user_prose:
+        prose = (
+            f"{prose}\n\n"
+            f"ADDITIONAL USER STYLE NOTES (apply alongside the rules above):\n"
+            f"{user_prose}"
+        )
+    return prose
 
 
 def _build_prompt(account: Account, job_description: str) -> str:
@@ -148,16 +171,44 @@ def _build_prompt(account: Account, job_description: str) -> str:
         + json.dumps(candidate_fields, ensure_ascii=False, indent=2)
     )
 
+    # Length cap — soft hint to LLM. Bullet-count rules above are still
+    # authoritative; this nudges layout density and skills depth.
+    target_pages = getattr(account, "targetPages", None)
+    length_block = ""
+    if isinstance(target_pages, int) and target_pages > 0:
+        if target_pages == 1:
+            length_block = (
+                "TARGET LENGTH: Output must comfortably fit a SINGLE A4 page at 11pt body. "
+                "If candidate has 4+ companies, drop the oldest companies' bullets to "
+                "exactly 4 and tighten skills depth. Do not violate the bullet-count rules "
+                "for the most recent company."
+            )
+        else:
+            length_block = (
+                f"TARGET LENGTH: Output should target {target_pages} A4 pages at 11pt body. "
+                "Use the full bullet count and skills depth as specified."
+            )
+
+    # Per-account override block — appended last, treated as highest priority.
+    overrides = (account.promptOverrides or "").strip()
+    overrides_block = (
+        f"OVERRIDES (highest priority — supersede any earlier rule that conflicts):\n{overrides}"
+        if overrides
+        else ""
+    )
+
     parts = [
         "Forget anything you learned before.",
         "You render the resume in html format(only body element).\n",
         candidate_block,
         f"Here's the job description. {job_description}\n",
         _PROMPT_BODY.format(name=account.name),
+        length_block,
         "2. Resume Formatting Styles: Exactly follow the styles below.",
         _resolve_style_spec(account),
+        overrides_block,
     ]
-    return "\n".join(parts)
+    return "\n".join(p for p in parts if p)
 
 
 @dataclass

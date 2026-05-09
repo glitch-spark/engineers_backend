@@ -62,5 +62,13 @@ class Account(TimestampedDocument):
     screeningPromptMode: ScreeningPromptMode = "plaintext"
     screeningPrompt: Optional[str] = None
 
+    # Resume content prompt tuning knobs (see resume_service._build_prompt):
+    # - targetPages: 1 or 2 — soft length cap; LLM trims/expands to fit.
+    # - promptOverrides: free-form rules appended at the end of the prompt
+    #   with highest priority. Useful for one-off tone, banlist, or seniority
+    #   tweaks without redeploying.
+    targetPages: Optional[int] = None
+    promptOverrides: Optional[str] = None
+
     class Settings:
         name = "accounts"
