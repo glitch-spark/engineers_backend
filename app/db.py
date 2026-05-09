@@ -127,6 +127,32 @@ async def _migrate_style_markdown_tokens(database) -> None:
         log.warning("style-markdown token migration failed: %s", exc)
 
 
+async def _migrate_default_leaderboard_optin(database) -> None:
+    """Flip leaderboardOptIn=True for existing non-admin users that haven't
+    explicitly opted out. Idempotent — only touches docs where the field is
+    missing or False AND role != 'admin'. Admins keep their current value
+    (default False) so workspace owners don't suddenly appear on rankings."""
+    coll = database["userextras"]
+    try:
+        result = await coll.update_many(
+            {
+                "role": {"$ne": "admin"},
+                "$or": [
+                    {"leaderboardOptIn": {"$exists": False}},
+                    {"leaderboardOptIn": False},
+                ],
+            },
+            {"$set": {"leaderboardOptIn": True}},
+        )
+        if result.modified_count:
+            log.info(
+                "leaderboard opt-in default-on: flipped %d staff users",
+                result.modified_count,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("leaderboard opt-in migration failed: %s", exc)
+
+
 async def init_db() -> None:
     uri = os.environ["MONGODB_URI"]
     client = AsyncIOMotorClient(uri)
@@ -135,4 +161,5 @@ async def init_db() -> None:
     await _migrate_legacy_resume_apps(database)
     # Style-markdown backfill intentionally not invoked — defer until needed.
     # Existing accounts get tokens lazily on next save via _sync_style_fields.
+    await _migrate_default_leaderboard_optin(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)

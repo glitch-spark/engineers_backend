@@ -22,6 +22,14 @@ class UserExtra(TimestampedDocument):
     # bootstraps as admin).
     isActive: bool = True
 
+    # Opt-in to public leaderboard (Phase 1 — name + value visible to all
+    # opted-in users). leaderboardName overrides display name on the
+    # leaderboard only; leaderboardAnon hides identity behind a stable
+    # pseudonym derived from userId.
+    leaderboardOptIn: bool = False
+    leaderboardName: Optional[str] = None
+    leaderboardAnon: bool = False
+
     class Settings:
         name = "userextras"
         indexes = [

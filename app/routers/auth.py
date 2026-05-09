@@ -69,6 +69,9 @@ async def register(body: RegisterIn) -> dict:
         hashedPassword=hash_password(body.password),
         role=role,
         isActive=is_first,  # bootstrap admin auto-active; everyone else awaits approval
+        # Default-on for staff so the leaderboard is populated. Admins
+        # default-off (workspace owners shouldn't auto-display on rankings).
+        leaderboardOptIn=not is_first,
     )
     await user.insert()
     return {"ok": True, "pendingApproval": not is_first}
