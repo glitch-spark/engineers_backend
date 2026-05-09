@@ -278,7 +278,9 @@ async def leaderboard(
     always returned in `yourRank` even if outside the top N (or if not
     opted in — useful so they can see what they'd rank at)."""
     start, end = _window_for_range(range)
-    opt_in_users = await UserExtra.find({"leaderboardOptIn": True}).to_list()
+    # Opt-in is enforced by role: every non-admin staff user is in, admins
+    # are out. Stored leaderboardOptIn flag is ignored.
+    opt_in_users = await UserExtra.find({"role": {"$ne": "admin"}}).to_list()
     user_ids = [u.id for u in opt_in_users]
 
     earnings = await _earnings_by_user(user_ids, start, end)
@@ -338,6 +340,6 @@ async def leaderboard(
             "value": your_rank["value"] if your_rank else None,
             "secondary": your_rank["secondary"] if your_rank else None,
             "outOf": out_of,
-            "optedIn": user.leaderboardOptIn,
+            "optedIn": user.role != "admin",
         },
     }

@@ -70,8 +70,10 @@ async def update_profile(
         parsed = _parse_dt(body.birthday)
         if parsed is not None:
             user.birthday = parsed
-    if body.leaderboardOptIn is not None:
-        user.leaderboardOptIn = body.leaderboardOptIn
+    # Leaderboard opt-in is enforced server-side: non-admin users are always
+    # included; admins are always excluded. The fields are accepted on the
+    # API surface for backwards compat but ignored for opt-in toggling.
+    # (leaderboardName / leaderboardAnon kept editable in case we re-enable.)
     if body.leaderboardName is not None:
         user.leaderboardName = body.leaderboardName.strip() or None
     if body.leaderboardAnon is not None:
