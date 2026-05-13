@@ -26,9 +26,9 @@ log = logging.getLogger(__name__)
 
 _PROMPT_BODY = (
     "Generate an ATS-optimized, job-tailored resume for {name} aligned to the job description being applied for. "
-    "Contact header must contain ONLY these candidate fields when non-empty: name, email, phone, address. "
+    "Contact header fields are governed by the HEADER OVERRIDE block below. "
     "Do NOT derive a city, country, region, or location from education, work experience, university name, or company name. "
-    "If address is empty, omit address entirely from the header — never infer one. "
+    "If any contact field is empty, omit it from the header — never invent or infer a value. "
     "Do not modify company names, job titles, work-experience locations, or employment dates. "
     "For work experience, the most recent company must have exactly 8 bullet points and all other companies must have exactly 6 points each. "
     "For the most recent company, structure bullets as follows: 1 bullet describing a realistic core product or platform developed at the company, "
@@ -153,22 +153,72 @@ def _resolve_style_spec(account: Account) -> str:
 
 
 def _build_prompt(account: Account, job_description: str) -> str:
-    # Ship candidate fields as discrete labeled slots, not free-form sentences.
-    # Prevents the model from bleeding education location (e.g. "Singapore
-    # University") into the contact-header address slot.
+    # Mirror frontend `contactDisplay` — if contactLabels has an override for
+    # a type, that's the text the user wants rendered; the raw field is the
+    # underlying href. Ship both so LLM emits the display text and keeps the
+    # link target accurate.
+    labels = dict(account.contactLabels or {})
+    def _slot(type_key: str, raw: Optional[str]) -> dict:
+        return {
+            "display": (labels.get(type_key) or raw or ""),
+            "url": (raw or ""),
+        }
+
     candidate_fields = {
         "name": account.name or "",
-        "email": account.email or "",
-        "phone": account.phone or "",
-        "address": account.address or "",
+        "email": _slot("email", account.email),
+        "phone": _slot("phone", account.phone),
+        "address": {
+            "display": (labels.get("address") or account.address or ""),
+            "url": "",  # address has no link target
+        },
+        "github": _slot("github", account.github),
+        "linkedin": _slot("linkedin", account.linkedin),
+        "website": _slot("website", account.website),
+        "twitter": _slot("twitter", account.twitter),
+        "customLinks": [
+            {"display": link.label, "url": link.url}
+            for link in (account.customLinks or [])
+        ],
         "education": account.education or "",
         "experience": account.experience or "",
     }
     candidate_block = (
-        "Candidate fields (treat each key as an isolated slot — do NOT copy "
-        "values across keys, especially do not pull location text from "
-        "education/experience into address):\n"
+        "Candidate fields. Contact items have shape {display, url}. RENDER the "
+        "`display` value as visible text in the contact header; use `url` as "
+        "the href when the contact line wraps items in <a> tags. Treat each "
+        "key as an isolated slot — do NOT copy values across keys (e.g. do "
+        "not pull location text from education/experience into address):\n"
         + json.dumps(candidate_fields, ensure_ascii=False, indent=2)
+    )
+
+    # Build header allowlist from the user's enabled contact items so the
+    # rigid "name/email/phone/address" rule in _PROMPT_BODY is overridden by
+    # the user's actual configuration. Falls back to defaults when no items.
+    cfg = account.styleConfig if isinstance(account.styleConfig, dict) else {}
+    items = (
+        ((cfg.get("basicInfo") or {}).get("contact") or {}).get("items") or []
+    )
+    enabled_types: list[str] = []
+    for it in items:
+        if not it.get("enabled"):
+            continue
+        if it.get("type") == "custom":
+            label = it.get("customLabel") or it.get("customUrl") or "custom link"
+            enabled_types.append(label)
+        else:
+            t = it.get("type")
+            if t:
+                enabled_types.append(t)
+    if not enabled_types:
+        enabled_types = ["email", "phone", "address"]
+    header_override = (
+        "HEADER OVERRIDE (supersedes any earlier 'header allowlist' rule): "
+        f"The contact header must include exactly these fields in this order: "
+        f"name, then the following contact items separated by the configured "
+        f"separator — {', '.join(enabled_types)}. Use the values from the "
+        f"`Candidate fields` JSON. Skip any item whose value is empty. Do not "
+        f"add fields that aren't listed here."
     )
 
     # Length cap — soft hint to LLM. Bullet-count rules above are still
@@ -203,6 +253,7 @@ def _build_prompt(account: Account, job_description: str) -> str:
         candidate_block,
         f"Here's the job description. {job_description}\n",
         _PROMPT_BODY.format(name=account.name),
+        header_override,
         length_block,
         "2. Resume Formatting Styles: Exactly follow the styles below.",
         _resolve_style_spec(account),

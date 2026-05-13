@@ -78,13 +78,30 @@ def to_prose(cfg: Dict[str, Any]) -> str:
         name = bi.get("name", {})
         title = bi.get("title", {})
         contact = bi.get("contact", {})
+        # Render the enabled contact items live so the LLM emits the exact
+        # row the user configured (github/linkedin/website/etc.) — not the
+        # hardcoded "Email | Phone | Address" template.
+        items = contact.get("items") or []
+        sep = contact.get("separator", "|")
+        enabled = [
+            (it.get("customLabel") or it.get("type", ""))
+            if it.get("type") == "custom"
+            else it.get("type", "")
+            for it in items
+            if it.get("enabled")
+        ]
+        if not enabled:
+            enabled = ["email", "phone", "address"]
+        contact_template = f" {sep} ".join(enabled)
         lines.append(
             f"HEADER: Name must use {_typo(name, name.get('align', 'center'))}, margin 0. "
             f"Title ({title.get('text', 'Senior Software Engineer')}) must use "
             f"{_typo(title, title.get('align', 'center'))}, margin 0. "
-            f"Contact line (Email | Phone | Address) must use "
+            f"Contact line ({contact_template}) must use "
             f"{_typo(contact, contact.get('align', 'center'))}, "
-            f"margin-bottom {spacing.get('containerMb', 8)}px."
+            f"margin-bottom {spacing.get('containerMb', 8)}px. "
+            f"Render each item in the order shown above, separated by ' {sep} '. "
+            f"Use ONLY the items listed; do not add or reorder fields."
         )
 
     # SECTION HEADINGS
