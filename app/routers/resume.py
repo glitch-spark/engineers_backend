@@ -242,10 +242,17 @@ async def _run_screening(
 
     use_resume = bool((account.previewHtml or "").strip())
 
+    # Pull the first show-true contact item with a display value as a rough
+    # "email" proxy for the screening prompt — generic contact items have no
+    # type, so the LLM gets whichever the user prioritized first.
+    primary_contact = next(
+        (ci.display for ci in (account.contactItems or []) if ci.show and (ci.display or "").strip()),
+        "",
+    )
     parts: List[str] = [
         "You answer job-application screening questions on behalf of a candidate.",
         f"Candidate name: {account.name}.",
-        f"Candidate email: {account.email}." if account.email else "",
+        f"Candidate primary contact: {primary_contact}." if primary_contact else "",
         f"Candidate education: {account.education}." if account.education else "",
     ]
     if use_resume:

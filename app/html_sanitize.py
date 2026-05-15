@@ -1,0 +1,60 @@
+"""HTML sanitization for user-uploaded resume templates.
+
+Strips XSS vectors while keeping the visual layout. Allows everything needed
+for a static resume: inline styles, classes, semantic tags, external images,
+Google Fonts <link>. Blocks: <script>, <iframe>, <object>, <embed>, <form>,
+event handlers (onclick=…), and javascript: URLs.
+"""
+
+from __future__ import annotations
+
+import re
+
+# Block these tags entirely (content + tag). re.DOTALL matches multi-line bodies.
+_BLOCK_TAGS = ("script", "iframe", "object", "embed", "form", "noscript", "applet")
+
+_BLOCK_TAG_RE = re.compile(
+    r"<(?P<tag>" + "|".join(_BLOCK_TAGS) + r")\b[^>]*>.*?</(?P=tag)\s*>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+# Self-closing variants
+_BLOCK_TAG_SELF_RE = re.compile(
+    r"<(" + "|".join(_BLOCK_TAGS) + r")\b[^>]*/?>",
+    flags=re.IGNORECASE,
+)
+
+# Inline event handlers: onclick=, onerror=, etc.
+_EVENT_HANDLER_RE = re.compile(r"\s+on[a-z]+\s*=\s*\"[^\"]*\"", flags=re.IGNORECASE)
+_EVENT_HANDLER_RE_SQ = re.compile(r"\s+on[a-z]+\s*=\s*'[^']*'", flags=re.IGNORECASE)
+_EVENT_HANDLER_RE_UQ = re.compile(r"\s+on[a-z]+\s*=\s*[^\s>]+", flags=re.IGNORECASE)
+
+# javascript: / data:text/html URIs — match the whole attribute value so the
+# payload after the colon doesn't leak out.
+_BAD_URI_DQ = re.compile(
+    r"(href|src)\s*=\s*\"\s*(?:javascript:|data:text/html)[^\"]*\"",
+    flags=re.IGNORECASE,
+)
+_BAD_URI_SQ = re.compile(
+    r"(href|src)\s*=\s*'\s*(?:javascript:|data:text/html)[^']*'",
+    flags=re.IGNORECASE,
+)
+_BAD_URI_UQ = re.compile(
+    r"(href|src)\s*=\s*(?:javascript:|data:text/html)[^\s>]*",
+    flags=re.IGNORECASE,
+)
+
+
+def sanitize_template_html(html: str) -> str:
+    if not html:
+        return ""
+    out = html
+    out = _BLOCK_TAG_RE.sub("", out)
+    out = _BLOCK_TAG_SELF_RE.sub("", out)
+    out = _EVENT_HANDLER_RE.sub("", out)
+    out = _EVENT_HANDLER_RE_SQ.sub("", out)
+    out = _EVENT_HANDLER_RE_UQ.sub("", out)
+    # Neutralize javascript: + data:text/html URIs by rewriting to "#".
+    out = _BAD_URI_DQ.sub(r'\1="#"', out)
+    out = _BAD_URI_SQ.sub(r"\1='#'", out)
+    out = _BAD_URI_UQ.sub(r'\1=#', out)
+    return out.strip()

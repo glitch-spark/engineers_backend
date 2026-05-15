@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.models.account import Resume
+from app.models.account import ContactItem, Resume
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -74,63 +74,45 @@ def _strip_markdown_from_account(payload: dict) -> dict:
     return payload
 
 
-class CustomLinkIn(BaseModel):
-    label: str
-    url: str
+class ContactItemIn(BaseModel):
+    label: str = ""
+    display: str = ""
+    url: str = ""
+    show: bool = True
 
 
 class AccountCreate(BaseModel):
     name: str
-    email: str
-    phone: Optional[str] = ""
-    address: Optional[str] = ""
     resumes: Optional[List[ResumeIn]] = None
-    label: Optional[str] = None
     education: Optional[str] = None
     experience: Optional[str] = None
-    styles: Optional[str] = None
-    github: Optional[str] = None
-    linkedin: Optional[str] = None
-    website: Optional[str] = None
-    twitter: Optional[str] = None
-    customLinks: Optional[List[CustomLinkIn]] = None
-    contactLabels: Optional[dict] = None
-    styleMode: Optional[str] = None
-    styleMarkdown: Optional[str] = None
-    styleConfig: Optional[dict] = None
+    projects: Optional[str] = None
+    contactItems: Optional[List[ContactItemIn]] = None
+    title: Optional[str] = None
+    titleAutoFromJD: Optional[bool] = None
+    styleTemplate: Optional[str] = None
+    styleTemplateName: Optional[str] = None
     pageFormat: Optional[str] = None
     previewHtml: Optional[str] = None
     screeningPromptMode: Optional[str] = None
     screeningPrompt: Optional[str] = None
-    targetPages: Optional[int] = None
-    promptOverrides: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    address: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
-    label: Optional[str] = None
     education: Optional[str] = None
     experience: Optional[str] = None
-    styles: Optional[str] = None
-    github: Optional[str] = None
-    linkedin: Optional[str] = None
-    website: Optional[str] = None
-    twitter: Optional[str] = None
-    customLinks: Optional[List[CustomLinkIn]] = None
-    contactLabels: Optional[dict] = None
-    styleMode: Optional[str] = None
-    styleMarkdown: Optional[str] = None
-    styleConfig: Optional[dict] = None
+    projects: Optional[str] = None
+    contactItems: Optional[List[ContactItemIn]] = None
+    title: Optional[str] = None
+    titleAutoFromJD: Optional[bool] = None
+    styleTemplate: Optional[str] = None
+    styleTemplateName: Optional[str] = None
     pageFormat: Optional[str] = None
     previewHtml: Optional[str] = None
     screeningPromptMode: Optional[str] = None
     screeningPrompt: Optional[str] = None
-    targetPages: Optional[int] = None
-    promptOverrides: Optional[str] = None
 
 
 @router.get("/lookup")
@@ -146,9 +128,9 @@ async def lookup_accounts(
             {
                 "_id": str(a.id),
                 "name": a.name,
-                "email": a.email,
-                "label": a.label,
+                "title": a.title,
                 "hasExperience": bool((a.experience or "").strip()),
+                "hasTemplate": bool((a.styleTemplate or "").strip()),
                 "createdBy": str(a.createdBy),
             }
             for a in rows
@@ -175,9 +157,8 @@ async def list_accounts(
     if search.strip():
         query["$or"] = [
             {"name": ci_regex(search)},
-            {"email": ci_regex(search)},
-            {"phone": ci_regex(search)},
-            {"address": ci_regex(search)},
+            {"title": ci_regex(search)},
+            {"contactItems.display": ci_regex(search)},
         ]
 
     skip = (page - 1) * limit
@@ -224,36 +205,25 @@ async def create_account(
     resumes = _validate_and_normalize_resumes(body.resumes or [])
     kwargs: dict = dict(
         name=body.name,
-        email=body.email,
-        phone=body.phone or "",
-        address=body.address or "",
         createdBy=user.id,
         resumes=resumes,
-        label=body.label,
         education=body.education,
         experience=body.experience,
-        styles=body.styles,
-        github=body.github,
-        linkedin=body.linkedin,
-        website=body.website,
-        twitter=body.twitter,
-        customLinks=[link.model_dump() for link in (body.customLinks or [])],
-        contactLabels=body.contactLabels or {},
-        styleMarkdown=body.styleMarkdown,
-        styleConfig=body.styleConfig,
+        projects=body.projects,
+        contactItems=[ContactItem(**ci.model_dump()) for ci in (body.contactItems or [])],
+        title=body.title,
+        styleTemplate=body.styleTemplate,
+        styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
         screeningPrompt=body.screeningPrompt,
-        targetPages=body.targetPages,
-        promptOverrides=body.promptOverrides,
     )
-    if body.styleMode is not None:
-        kwargs["styleMode"] = body.styleMode
+    if body.titleAutoFromJD is not None:
+        kwargs["titleAutoFromJD"] = body.titleAutoFromJD
     if body.pageFormat is not None:
         kwargs["pageFormat"] = body.pageFormat
     if body.screeningPromptMode is not None:
         kwargs["screeningPromptMode"] = body.screeningPromptMode
     acc = Account(**kwargs)
-    _sync_style_fields(acc)
     await acc.insert()
     return doc_to_dict(acc)
 
@@ -271,41 +241,25 @@ async def update_account(
 
     if body.name is not None:
         acc.name = body.name
-    if body.email is not None:
-        acc.email = body.email
-    if body.phone is not None:
-        acc.phone = body.phone
-    if body.address is not None:
-        acc.address = body.address
     if body.resumes is not None:
         acc.resumes = _validate_and_normalize_resumes(body.resumes)
-    if body.label is not None:
-        acc.label = body.label
     if body.education is not None:
         acc.education = body.education
     if body.experience is not None:
         acc.experience = body.experience
-    if body.styles is not None:
-        acc.styles = body.styles
-    if body.github is not None:
-        acc.github = body.github
-    if body.linkedin is not None:
-        acc.linkedin = body.linkedin
-    if body.website is not None:
-        acc.website = body.website
-    if body.twitter is not None:
-        acc.twitter = body.twitter
-    if body.customLinks is not None:
-        from app.models.account import CustomLink
-        acc.customLinks = [CustomLink(label=link.label, url=link.url) for link in body.customLinks]
-    if body.contactLabels is not None:
-        acc.contactLabels = body.contactLabels
-    if body.styleMode is not None:
-        acc.styleMode = body.styleMode  # type: ignore[assignment]
-    if body.styleMarkdown is not None:
-        acc.styleMarkdown = body.styleMarkdown
-    if body.styleConfig is not None:
-        acc.styleConfig = body.styleConfig
+    if body.projects is not None:
+        acc.projects = body.projects
+    if body.contactItems is not None:
+        acc.contactItems = [ContactItem(**ci.model_dump()) for ci in body.contactItems]
+    if body.title is not None:
+        acc.title = body.title
+    if body.titleAutoFromJD is not None:
+        acc.titleAutoFromJD = body.titleAutoFromJD
+    if body.styleTemplate is not None:
+        from app.html_sanitize import sanitize_template_html
+        acc.styleTemplate = sanitize_template_html(body.styleTemplate)
+    if body.styleTemplateName is not None:
+        acc.styleTemplateName = body.styleTemplateName
     if body.pageFormat is not None:
         acc.pageFormat = body.pageFormat  # type: ignore[assignment]
     if body.previewHtml is not None:
@@ -314,29 +268,10 @@ async def update_account(
         acc.screeningPromptMode = body.screeningPromptMode  # type: ignore[assignment]
     if body.screeningPrompt is not None:
         acc.screeningPrompt = body.screeningPrompt
-    if body.targetPages is not None:
-        acc.targetPages = body.targetPages
-    if body.promptOverrides is not None:
-        acc.promptOverrides = body.promptOverrides
 
-    _sync_style_fields(acc)
 
     await acc.save()
     return doc_to_dict(acc)
-
-
-def _sync_style_fields(acc: Account) -> None:
-    """Markdown is the canonical style source. Frontend regenerates markdown
-    from structured edits before saving, so we only need to mirror tokens
-    back into styleConfig — never the reverse.
-    """
-    from app.style_tokens import deep_merge, parse_tagged_markdown
-
-    md = acc.styleMarkdown or ""
-    cfg = acc.styleConfig if isinstance(acc.styleConfig, dict) else {}
-    parsed_cfg, _notes, token_count = parse_tagged_markdown(md)
-    if token_count:
-        acc.styleConfig = deep_merge(cfg, parsed_cfg)
 
 
 @router.delete("/{account_id}")

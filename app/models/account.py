@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
 from beanie import PydanticObjectId
 from pydantic import BaseModel, Field
@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 from app.models.base import TimestampedDocument
 
 
-StyleMode = Literal["markdown", "structured"]
 PageFormat = Literal["A3", "A4", "A5", "Letter"]
 ScreeningPromptMode = Literal["markdown", "plaintext"]
 
@@ -25,50 +24,51 @@ class Resume(BaseModel):
     uploadedAt: datetime = Field(default_factory=datetime.utcnow)
 
 
-class CustomLink(BaseModel):
-    label: str
-    url: str
+class ContactItem(BaseModel):
+    """Generic contact-line entry. User authors a label (e.g. 'Email'),
+    display text (the visible value on the resume), an optional URL for
+    the href, and a visibility toggle. Label is free-form and editable;
+    profiles default-seed a standard 7-row list (Email/Phone/Address/
+    GitHub/LinkedIn/Website/Twitter) but users may rename/add/remove."""
+    label: str = ""
+    display: str = ""
+    url: str = ""
+    show: bool = True
 
 
 class Account(TimestampedDocument):
     name: str
-    email: str
-    phone: Optional[str] = None
-    address: Optional[str] = None
     createdBy: PydanticObjectId
     resumes: List[Resume] = []
 
-    label: Optional[str] = None
     education: Optional[str] = None
     experience: Optional[str] = None
-    styles: Optional[str] = None
+    # Free-form notes about projects the candidate has worked on across all
+    # companies. LLM attributes each project to a company by reading dates +
+    # context. Used to generate the Projects subsection under each company in
+    # the resume.
+    projects: Optional[str] = None
 
-    github: Optional[str] = None
-    linkedin: Optional[str] = None
-    website: Optional[str] = None
-    twitter: Optional[str] = None
-    customLinks: List[CustomLink] = []
-    # per-type display name override for the resume contact line.
-    # Keys: 'email', 'phone', 'address', 'github', 'linkedin', 'website', 'twitter'.
-    # Empty value falls back to the underlying field (URL or raw value).
-    contactLabels: Dict[str, str] = Field(default_factory=dict)
+    # Generic contact items rendered on the resume header. Each entry has
+    # display text + url + a visibility toggle. No semantic types — the user
+    # writes "mailto:..." / "tel:..." as needed.
+    contactItems: List[ContactItem] = []
 
-    styleMode: StyleMode = "markdown"
-    styleMarkdown: Optional[str] = None
-    styleConfig: Optional[Dict[str, Any]] = None
+    # Header title (e.g. "Senior Software Engineer"). When titleAutoFromJD
+    # is true, the LLM derives the title from the job description instead;
+    # the static text becomes a seniority hint only.
+    title: Optional[str] = None
+    titleAutoFromJD: bool = False
+
+    # Raw HTML template uploaded by the user. The LLM mimics its
+    # structure/CSS/classes and replaces placeholder text with candidate data.
+    styleTemplate: Optional[str] = None
+    styleTemplateName: Optional[str] = None
     pageFormat: PageFormat = "A4"
     previewHtml: Optional[str] = None
 
     screeningPromptMode: ScreeningPromptMode = "plaintext"
     screeningPrompt: Optional[str] = None
-
-    # Resume content prompt tuning knobs (see resume_service._build_prompt):
-    # - targetPages: 1 or 2 — soft length cap; LLM trims/expands to fit.
-    # - promptOverrides: free-form rules appended at the end of the prompt
-    #   with highest priority. Useful for one-off tone, banlist, or seniority
-    #   tweaks without redeploying.
-    targetPages: Optional[int] = None
-    promptOverrides: Optional[str] = None
 
     class Settings:
         name = "accounts"

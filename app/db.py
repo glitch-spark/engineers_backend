@@ -89,44 +89,6 @@ async def _drop_stale_indexes(database) -> None:
                     log.warning("failed to drop %s on %s: %s", name, collection_name, exc)
 
 
-async def _migrate_style_markdown_tokens(database) -> None:
-    """Existing accounts predate the tagged-markdown bridge: their
-    `styleConfig` was authoritative but `styleMarkdown` either empty or
-    pure prose with no @style tokens. Regenerate `styleMarkdown` so the
-    Markdown-mode editor and the backend prompt builder see the same data.
-    Idempotent — accounts that already have tokens are skipped."""
-    from app.style_tokens import (
-        extract_notes,
-        parse_tagged_markdown,
-        serialize_to_tagged_markdown,
-    )
-
-    coll = database["accounts"]
-    try:
-        cursor = coll.find({"styleConfig": {"$exists": True, "$ne": None}})
-        migrated = 0
-        async for doc in cursor:
-            cfg = doc.get("styleConfig")
-            if not isinstance(cfg, dict) or not cfg:
-                continue
-            md = (doc.get("styleMarkdown") or doc.get("styles") or "").strip()
-            _, _, token_count = parse_tagged_markdown(md)
-            if token_count > 0:
-                continue
-            # Preserve hand-written prose: if user has markdown but no notes
-            # heading, wrap the whole thing as user notes so it survives.
-            seed = md
-            if md and not extract_notes(md):
-                seed = f"## User notes\n\n{md}"
-            new_md = serialize_to_tagged_markdown(cfg, seed)
-            await coll.update_one({"_id": doc["_id"]}, {"$set": {"styleMarkdown": new_md}})
-            migrated += 1
-        if migrated:
-            log.info("backfilled @style tokens on %d account(s)", migrated)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("style-markdown token migration failed: %s", exc)
-
-
 async def _migrate_default_leaderboard_optin(database) -> None:
     """Flip leaderboardOptIn=True for existing non-admin users that haven't
     explicitly opted out. Idempotent — only touches docs where the field is
@@ -159,7 +121,5 @@ async def init_db() -> None:
     database = client.get_default_database()
     await _drop_stale_indexes(database)
     await _migrate_legacy_resume_apps(database)
-    # Style-markdown backfill intentionally not invoked — defer until needed.
-    # Existing accounts get tokens lazily on next save via _sync_style_fields.
     await _migrate_default_leaderboard_optin(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)

@@ -52,57 +52,35 @@ _PROMPT_BODY = (
     "Testing & CI/CD (include at least 8 unit or integration testing tools across frontend and backend); Other Tools & Technologies. "
     "Adjust skill depth per category based on role emphasis, with deeper frontend skills for frontend-heavy roles, deeper backend skills for backend-heavy roles, "
     "deeper AI or GenAI skills for AI roles, and deeper cloud and CI/CD skills for DevOps roles. "
-    "For resume styling, ensure work experience bullet points are rendered with a consistent visual indent equivalent to a 10px left offset relative to the company header, "
-    "using list indentation rather than margin-left declarations, and apply this consistently across all companies."
+    # ─── Per-company structure ────────────────────────────────────────────
+    "PER-COMPANY STRUCTURE (strict): under each company's header line, render the following blocks in this order: "
+    "(1) achievement bullet list (the 8/6 bullets above; counts apply to ACHIEVEMENT bullets only); "
+    "(2) a 'Projects' subsection — a <strong>Projects</strong> label on its own line, then ONE project block per project listed in the candidate `projects` field for that company. "
+    "PROJECT INPUT FORMAT: the candidate `projects` field is STRUCTURED BY COMPANY. Numbered company headings ('1. Apple', '2. Google', etc.) "
+    "with project lines under each ('- Project Title: brief description.'). "
+    "PROJECT COUNT (strict): render EXACTLY the same number of projects per company as listed in `projects`. If a company has 1 project listed, render 1. If 2, render 2. Never add, never drop, never infer extras. "
+    "PROJECT ATTRIBUTION (strict): attribute each project block to the company named in the heading directly above it in `projects`. Do not re-attribute across companies. "
+    "PROJECT BLOCK FORMAT: for each project, emit a sub-block with two parts: "
+    "(a) the project title as a <strong>Project Title</strong> on its own line — use the title from the input VERBATIM (e.g. 'Apple Developer Program App'). The title line has NO dash prefix and is NOT inside a <ul>; render it as a standalone heading-style element (e.g. <div><strong>...</strong></div>). "
+    "(b) a <ul> with exactly 2-3 <li> bullets describing what the candidate built and the impact on this specific project. Derive bullet content from the brief description in the input + the JD + work-experience context. Match the template's bullet convention exactly. Do NOT also include a separate one-sentence summary — the 2-3 bullets ARE the project description. "
+    "If a company has no projects listed in `projects`, omit the Projects subsection entirely for that company (do not infer). "
+    "Do not put project tech in the project line itself — tech belongs in the Tech stack subsection. "
+    "(3) a 'Tech stack' subsection — a <strong>Tech stack</strong> label on its own line, then a single line of comma-separated technologies actually used at that company (no <ul>, no bullets, no categories). "
+    "Limit Tech stack to 8-14 items per company; pick technologies that align with the JD and the projects + bullets you just wrote. "
+    "PER-COMPANY ORDER: Header → Bullets → Projects → Tech stack. Match the template's spacing/style conventions for subsections. "
+    "The top-level Skills section still applies and aggregates technologies across all companies — per-company Tech stack and top-level Skills coexist."
 )
 
 
-_HTML_WRAPPER = """<html>
+_TEMPLATE_HTML_WRAPPER = """<html>
   <head>
-    <!-- Web fonts users may pick in the structured editor. Chromium fetches
-         these at render time (page.set_content waits for networkidle).
-         System fonts (Arial / Tahoma / Verdana / Times New Roman / Courier)
-         come from the Docker image's msttcorefonts + Liberation install. -->
+    <meta charset="utf-8" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto:wght@400;500;700&family=Open+Sans:wght@400;600;700&family=Lato:wght@400;700&family=Montserrat:wght@400;500;700&family=Source+Sans+3:wght@400;600;700&family=Source+Serif+4:wght@400;600;700&family=Merriweather:wght@400;700&family=PT+Sans:wght@400;700&family=PT+Serif:wght@400;700&family=Nunito:wght@400;600;700&family=Raleway:wght@400;500;700&family=Poppins:wght@400;500;600;700&family=Work+Sans:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
-      * {{
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-      }}
-      ul, li {{
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-      }}
-      body {{
-        background: white;
-        line-height: 1.3 !important;
-        margin: 0;
-        padding: 0;
-      }}
-      ul {{
-        list-style-type: disc !important;
-        list-style-position: outside !important;
-        padding-left: 1em !important;
-        margin: 0 !important;
-      }}
-      li {{
-        display: list-item !important;
-        list-style-type: disc !important;
-        list-style-position: outside !important;
-        margin: 0 !important;
-        padding: 0 !important;
-      }}
-      * ul {{ list-style-type: disc !important; }}
-      * li {{ list-style-type: disc !important; display: list-item !important; }}
-      .page-break {{ page-break-before: always; break-before: page; }}
-      @media print {{
-        @page {{ margin: 35pt 30pt 30pt 30pt; size: A4; }}
-        html, body {{ margin: 0; padding: 0; }}
-      }}
+      html, body {{ margin: 0; padding: 0; background: white; }}
+      @media print {{ @page {{ size: A4; }} }}
     </style>
   </head>
   <body>{html_content}</body>
@@ -116,148 +94,114 @@ def _safe_segment(s: str) -> str:
     return _S3_SAFE.sub("-", (s or "user").strip())
 
 
-def _resolve_style_spec(account: Account) -> str:
-    """Build the prose style spec for the LLM prompt.
-
-    Markdown is canonical. Flow:
-      1. Read styleMarkdown (fallback: legacy `styles`, then styleConfig).
-      2. Parse @style tokens → structured config dict; deep-merge over the
-         account's stored styleConfig so token coverage gaps don't blow away
-         the editor's last-saved values.
-      3. Run to_prose() on merged config → strict LLM-contract prose.
-      4. Append any free-form user prose (notes / inline guidance) verbatim.
-    """
-    from app.style_serializer import to_prose
-    from app.style_tokens import deep_merge, free_prose, parse_tagged_markdown
-
-    md = account.styleMarkdown or account.styles or ""
-    parsed_cfg, _notes, token_count = parse_tagged_markdown(md)
-
-    base_cfg = account.styleConfig if isinstance(account.styleConfig, dict) else {}
-    merged_cfg = deep_merge(base_cfg, parsed_cfg) if token_count else base_cfg
-
-    # If user has pure-prose markdown (no tokens, no styleConfig), ship the
-    # prose raw — same as the legacy markdown-only path.
-    if not merged_cfg and md.strip():
-        return free_prose(md)
-
-    prose = to_prose(merged_cfg or {})
-    user_prose = free_prose(md)
-    if user_prose:
-        prose = (
-            f"{prose}\n\n"
-            f"ADDITIONAL USER STYLE NOTES (apply alongside the rules above):\n"
-            f"{user_prose}"
-        )
-    return prose
+_TEMPLATE_INSTRUCTION = (
+    "STYLE MODE: HTML TEMPLATE.\n\n"
+    "OUTPUT FORMAT (strict):\n"
+    "1. First, emit the template's <style>...</style> block VERBATIM (no edits, no reformatting). "
+    "If the template has no <style> block, skip step 1.\n"
+    "2. Then emit the contents of the template's <body> element (NOT the <body> tag itself). "
+    "Preserve every element, every class name, every inline style attribute, every nesting level, "
+    "and every attribute value EXACTLY as in the template. Change ONLY text nodes (visible text) "
+    "and href/src attribute VALUES (to point at the candidate's email/phone/links). "
+    "Do not include <html>, <head>, or <body> tags — they are added by the wrapper.\n\n"
+    "CONTENT RULES:\n"
+    "- Replace placeholder text inside elements with the candidate's data from the `Candidate fields` JSON. "
+    "Do not invent new sections or drop sections the template defines. If the candidate lacks data for a "
+    "section the template has, render the section heading + empty placeholder text.\n"
+    "- Match the template's bullet convention exactly (if it uses '- ' text prefix, keep that; if native "
+    "<li> markers, keep that). This OVERRIDES the BULLET FORMAT rule earlier.\n"
+    "- Preserve the exact number of company entries the template demonstrates as the structural pattern; "
+    "extend by repeating the same DOM shape per actual company in candidate.experience. Use the most "
+    "recent company entry as the structural prototype for newly-added companies.\n"
+    "- Do NOT add a global <h1> if the template uses a different element for the candidate name; mimic "
+    "what the template uses.\n"
+    "- Do NOT introduce new class names. Do NOT change attribute names.\n\n"
+    "HTML TEMPLATE:\n"
+)
 
 
 def _build_prompt(account: Account, job_description: str) -> str:
-    # Mirror frontend `contactDisplay` — if contactLabels has an override for
-    # a type, that's the text the user wants rendered; the raw field is the
-    # underlying href. Ship both so LLM emits the display text and keeps the
-    # link target accurate.
-    labels = dict(account.contactLabels or {})
-    def _slot(type_key: str, raw: Optional[str]) -> dict:
-        return {
-            "display": (labels.get(type_key) or raw or ""),
-            "url": (raw or ""),
-        }
+    # Contact items now live as a flat, generic list on the Account itself:
+    # each entry is {display, url, show}. No semantic types — the LLM treats
+    # `display` as the visible text and `url` as the href.
+    contact_items = [
+        {"label": ci.label, "display": ci.display, "url": ci.url}
+        for ci in (account.contactItems or [])
+        if ci.show and (ci.display or "").strip()
+    ]
 
     candidate_fields = {
         "name": account.name or "",
-        "email": _slot("email", account.email),
-        "phone": _slot("phone", account.phone),
-        "address": {
-            "display": (labels.get("address") or account.address or ""),
-            "url": "",  # address has no link target
-        },
-        "github": _slot("github", account.github),
-        "linkedin": _slot("linkedin", account.linkedin),
-        "website": _slot("website", account.website),
-        "twitter": _slot("twitter", account.twitter),
-        "customLinks": [
-            {"display": link.label, "url": link.url}
-            for link in (account.customLinks or [])
-        ],
+        "contactItems": contact_items,
         "education": account.education or "",
         "experience": account.experience or "",
+        "projects": account.projects or "",
     }
     candidate_block = (
-        "Candidate fields. Contact items have shape {display, url}. RENDER the "
-        "`display` value as visible text in the contact header; use `url` as "
-        "the href when the contact line wraps items in <a> tags. Treat each "
-        "key as an isolated slot — do NOT copy values across keys (e.g. do "
-        "not pull location text from education/experience into address):\n"
+        "Candidate fields. `contactItems` is a flat list of {label, display, url}. "
+        "`label` is a short type hint (e.g. 'Email', 'GitHub', 'Phone') — useful "
+        "for picking the right icon or fallback semantics when the template "
+        "expects them. RENDER each item's `display` value as visible text in the "
+        "contact header; use `url` as the href when wrapping in <a> tags. Skip "
+        "items with empty `display`. Do NOT pull location text from "
+        "education/experience into anything else:\n"
         + json.dumps(candidate_fields, ensure_ascii=False, indent=2)
     )
 
-    # Build header allowlist from the user's enabled contact items so the
-    # rigid "name/email/phone/address" rule in _PROMPT_BODY is overridden by
-    # the user's actual configuration. Falls back to defaults when no items.
-    cfg = account.styleConfig if isinstance(account.styleConfig, dict) else {}
-    items = (
-        ((cfg.get("basicInfo") or {}).get("contact") or {}).get("items") or []
-    )
-    enabled_types: list[str] = []
-    for it in items:
-        if not it.get("enabled"):
-            continue
-        if it.get("type") == "custom":
-            label = it.get("customLabel") or it.get("customUrl") or "custom link"
-            enabled_types.append(label)
-        else:
-            t = it.get("type")
-            if t:
-                enabled_types.append(t)
-    if not enabled_types:
-        enabled_types = ["email", "phone", "address"]
+    # Header allowlist is the contactItems order itself (only show=True entries
+    # are passed in). Tell the LLM the order is authoritative.
     header_override = (
         "HEADER OVERRIDE (supersedes any earlier 'header allowlist' rule): "
-        f"The contact header must include exactly these fields in this order: "
-        f"name, then the following contact items separated by the configured "
-        f"separator — {', '.join(enabled_types)}. Use the values from the "
-        f"`Candidate fields` JSON. Skip any item whose value is empty. Do not "
-        f"add fields that aren't listed here."
+        "The contact header must include exactly the items from `contactItems` "
+        "in the order given. Use each item's `display` as text and `url` as href. "
+        "Do not add fields that aren't in the list."
     )
 
-    # Length cap — soft hint to LLM. Bullet-count rules above are still
-    # authoritative; this nudges layout density and skills depth.
-    target_pages = getattr(account, "targetPages", None)
-    length_block = ""
-    if isinstance(target_pages, int) and target_pages > 0:
-        if target_pages == 1:
-            length_block = (
-                "TARGET LENGTH: Output must comfortably fit a SINGLE A4 page at 11pt body. "
-                "If candidate has 4+ companies, drop the oldest companies' bullets to "
-                "exactly 4 and tighten skills depth. Do not violate the bullet-count rules "
-                "for the most recent company."
-            )
-        else:
-            length_block = (
-                f"TARGET LENGTH: Output should target {target_pages} A4 pages at 11pt body. "
-                "Use the full bullet count and skills depth as specified."
-            )
+    # Auto-title — when account.titleAutoFromJD is true, LLM derives the
+    # header title from the JD. Static account.title becomes a seniority hint.
+    title_block = ""
+    if getattr(account, "titleAutoFromJD", False):
+        preferred_title = (account.title or "").strip()
+        title_block = (
+            "TITLE OVERRIDE (highest priority for the header title): "
+            "Derive the title shown under the candidate's name FROM THE JOB DESCRIPTION. "
+            "Pick the most-aligned seniority + role label (e.g. 'Senior Software Engineer', "
+            "'Staff Backend Engineer', 'Engineering Manager', 'Principal AI Engineer'). "
+            "3-6 words max. No company names. No buzzwords ('rockstar', 'ninja', '10x'). "
+            f"Candidate's preferred title is '{preferred_title or 'unspecified'}' — use it ONLY "
+            "as a seniority hint; the JD-aligned label wins. If the resume uses an HTML "
+            "template, replace the title element's text with the JD-derived label while "
+            "preserving its structure/classes/styles."
+        )
+    elif (account.title or "").strip():
+        # Static title — tell LLM to use it verbatim in the header.
+        title_block = (
+            "TITLE OVERRIDE (highest priority for the header title): "
+            f"Use the title text \"{(account.title or '').strip()}\" exactly as-is under "
+            "the candidate's name. Do not infer or modify it from the JD."
+        )
 
-    # Per-account override block — appended last, treated as highest priority.
-    overrides = (account.promptOverrides or "").strip()
-    overrides_block = (
-        f"OVERRIDES (highest priority — supersede any earlier rule that conflicts):\n{overrides}"
-        if overrides
-        else ""
+    # Template mode is now the only style path. Inject the template inline as
+    # the structural source-of-truth; everything visual (bullet glyph, indent,
+    # spacing, section headings) is owned by the template.
+    from app.html_sanitize import sanitize_template_html
+    template_block = _TEMPLATE_INSTRUCTION + sanitize_template_html(account.styleTemplate or "")
+
+    preamble = (
+        "You render the resume's body inner-HTML. You MAY also emit a leading "
+        "<style>...</style> tag (copied from the template). Do NOT emit "
+        "<html>, <head>, or <body> tags — the wrapper adds them.\n"
     )
 
     parts = [
         "Forget anything you learned before.",
-        "You render the resume in html format(only body element).\n",
+        preamble,
         candidate_block,
         f"Here's the job description. {job_description}\n",
         _PROMPT_BODY.format(name=account.name),
         header_override,
-        length_block,
-        "2. Resume Formatting Styles: Exactly follow the styles below.",
-        _resolve_style_spec(account),
-        overrides_block,
+        title_block,
+        template_block,
     ]
     return "\n".join(p for p in parts if p)
 
@@ -289,19 +233,15 @@ _DEFAULT_MARGIN_PT = {"top": 35, "right": 30, "bottom": 30, "left": 30}
 
 
 def _resolve_margin_pt(account: Account) -> dict:
-    """Pull `styleConfig.page.margin` (set by the structured editor) so the PDF
-    matches the on-screen preview. Falls back to the legacy defaults when the
-    user is in markdown mode or hasn't authored a styleConfig yet."""
-    cfg = account.styleConfig or {}
-    page = cfg.get("page") if isinstance(cfg, dict) else None
-    margin = page.get("margin") if isinstance(page, dict) else None
-    if not isinstance(margin, dict):
-        return _DEFAULT_MARGIN_PT
+    """Template now owns visual layout including its own @page margins (set
+    via CSS inside the template). Playwright still needs a margin dict for
+    the PDF call, so use defaults — the template's CSS @page rules will
+    override these visually."""
     return {
-        "top": margin.get("top", _DEFAULT_MARGIN_PT["top"]),
-        "right": margin.get("right", _DEFAULT_MARGIN_PT["right"]),
-        "bottom": margin.get("bottom", _DEFAULT_MARGIN_PT["bottom"]),
-        "left": margin.get("left", _DEFAULT_MARGIN_PT["left"]),
+        "top": _DEFAULT_MARGIN_PT["top"],
+        "right": _DEFAULT_MARGIN_PT["right"],
+        "bottom": _DEFAULT_MARGIN_PT["bottom"],
+        "left": _DEFAULT_MARGIN_PT["left"],
     }
 
 
@@ -409,9 +349,10 @@ async def generate_resume(
     company: str,
 ) -> GeneratedResume:
     prompt = _build_prompt(account, job_description)
-    log.info("Generating resume for account=%s (%s) company=%s", account.label or account.name, account.id, company)
+    log.info("Generating resume for account=%s (%s) company=%s", account.title or account.name, account.id, company)
     html_content = await _openai_html(prompt)
-    html = _HTML_WRAPPER.format(html_content=html_content)
+    # Template mode is the only path: minimal wrapper, template owns visuals.
+    html = _TEMPLATE_HTML_WRAPPER.format(html_content=html_content)
     pdf_bytes = await _html_to_pdf(
         html,
         page_format=account.pageFormat or "A4",
