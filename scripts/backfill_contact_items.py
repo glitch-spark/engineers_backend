@@ -23,7 +23,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 LEGACY_FLAT_FIELDS = [
     "email", "phone", "address", "github", "linkedin", "website", "twitter",
     "customLinks", "contactLabels", "label", "targetPages", "promptOverrides",
-    "styleMode", "styleMarkdown", "styleConfig", "styles",
+    "styleMode", "styleMarkdown", "styleConfig", "styles", "screeningPromptMode",
 ]
 
 

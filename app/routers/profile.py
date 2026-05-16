@@ -19,6 +19,8 @@ class ProfileUpdate(BaseModel):
     leaderboardOptIn: Optional[bool] = None
     leaderboardName: Optional[str] = None
     leaderboardAnon: Optional[bool] = None
+    resumePromptBody: Optional[str] = None
+    screeningPromptBody: Optional[str] = None
 
 
 class PasswordChange(BaseModel):
@@ -44,6 +46,8 @@ async def get_profile(user: Annotated[UserExtra, Depends(get_current_user)]) -> 
             "leaderboardOptIn": user.leaderboardOptIn,
             "leaderboardName": user.leaderboardName or "",
             "leaderboardAnon": user.leaderboardAnon,
+            "resumePromptBody": user.resumePromptBody or "",
+            "screeningPromptBody": user.screeningPromptBody or "",
         }
     }
 
@@ -78,6 +82,10 @@ async def update_profile(
         user.leaderboardName = body.leaderboardName.strip() or None
     if body.leaderboardAnon is not None:
         user.leaderboardAnon = body.leaderboardAnon
+    if body.resumePromptBody is not None:
+        user.resumePromptBody = body.resumePromptBody[:8000] or None
+    if body.screeningPromptBody is not None:
+        user.screeningPromptBody = body.screeningPromptBody[:8000] or None
     await user.save()
 
     return {
@@ -90,6 +98,8 @@ async def update_profile(
             "leaderboardOptIn": user.leaderboardOptIn,
             "leaderboardName": user.leaderboardName or "",
             "leaderboardAnon": user.leaderboardAnon,
+            "resumePromptBody": user.resumePromptBody or "",
+            "screeningPromptBody": user.screeningPromptBody or "",
         },
     }
 

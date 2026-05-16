@@ -8,7 +8,6 @@ from app.models.base import TimestampedDocument
 
 
 PageFormat = Literal["A3", "A4", "A5", "Letter"]
-ScreeningPromptMode = Literal["markdown", "plaintext"]
 
 
 class Resume(BaseModel):
@@ -60,14 +59,22 @@ class Account(TimestampedDocument):
     title: Optional[str] = None
     titleAutoFromJD: bool = False
 
-    # Raw HTML template uploaded by the user. The LLM mimics its
-    # structure/CSS/classes and replaces placeholder text with candidate data.
+    # Account-level custom resume content-contract prompt. Empty → fall back
+    # to the user-level prompt, then the built-in default.
+    resumePromptBody: Optional[str] = None
+
+    # Plain HTML template uploaded by the user (the conversion source).
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
+    # Marker-annotated template: styleTemplate with data-slot/data-repeat/
+    # data-field attributes added by the LLM conversion step. Resume
+    # generation deterministically fills THIS — no LLM touches HTML at
+    # generation time.
+    styleTemplateAnnotated: Optional[str] = None
     pageFormat: PageFormat = "A4"
     previewHtml: Optional[str] = None
 
-    screeningPromptMode: ScreeningPromptMode = "plaintext"
+    # Account-level screening-answer prompt. Empty → user-level → built-in.
     screeningPrompt: Optional[str] = None
 
     class Settings:

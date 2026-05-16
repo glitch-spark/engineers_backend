@@ -90,11 +90,11 @@ class AccountCreate(BaseModel):
     contactItems: Optional[List[ContactItemIn]] = None
     title: Optional[str] = None
     titleAutoFromJD: Optional[bool] = None
+    resumePromptBody: Optional[str] = None
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
     pageFormat: Optional[str] = None
     previewHtml: Optional[str] = None
-    screeningPromptMode: Optional[str] = None
     screeningPrompt: Optional[str] = None
 
 
@@ -107,11 +107,11 @@ class AccountUpdate(BaseModel):
     contactItems: Optional[List[ContactItemIn]] = None
     title: Optional[str] = None
     titleAutoFromJD: Optional[bool] = None
+    resumePromptBody: Optional[str] = None
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
     pageFormat: Optional[str] = None
     previewHtml: Optional[str] = None
-    screeningPromptMode: Optional[str] = None
     screeningPrompt: Optional[str] = None
 
 
@@ -212,6 +212,7 @@ async def create_account(
         projects=body.projects,
         contactItems=[ContactItem(**ci.model_dump()) for ci in (body.contactItems or [])],
         title=body.title,
+        resumePromptBody=body.resumePromptBody,
         styleTemplate=body.styleTemplate,
         styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
@@ -221,8 +222,6 @@ async def create_account(
         kwargs["titleAutoFromJD"] = body.titleAutoFromJD
     if body.pageFormat is not None:
         kwargs["pageFormat"] = body.pageFormat
-    if body.screeningPromptMode is not None:
-        kwargs["screeningPromptMode"] = body.screeningPromptMode
     acc = Account(**kwargs)
     await acc.insert()
     return doc_to_dict(acc)
@@ -255,17 +254,21 @@ async def update_account(
         acc.title = body.title
     if body.titleAutoFromJD is not None:
         acc.titleAutoFromJD = body.titleAutoFromJD
+    if body.resumePromptBody is not None:
+        acc.resumePromptBody = body.resumePromptBody
     if body.styleTemplate is not None:
         from app.html_sanitize import sanitize_template_html
-        acc.styleTemplate = sanitize_template_html(body.styleTemplate)
+        new_tpl = sanitize_template_html(body.styleTemplate)
+        if new_tpl != (acc.styleTemplate or ""):
+            # Plain template changed → the annotated version is now stale.
+            acc.styleTemplateAnnotated = None
+        acc.styleTemplate = new_tpl
     if body.styleTemplateName is not None:
         acc.styleTemplateName = body.styleTemplateName
     if body.pageFormat is not None:
         acc.pageFormat = body.pageFormat  # type: ignore[assignment]
     if body.previewHtml is not None:
         acc.previewHtml = body.previewHtml
-    if body.screeningPromptMode is not None:
-        acc.screeningPromptMode = body.screeningPromptMode  # type: ignore[assignment]
     if body.screeningPrompt is not None:
         acc.screeningPrompt = body.screeningPrompt
 

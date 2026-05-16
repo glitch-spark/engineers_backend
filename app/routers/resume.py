@@ -15,7 +15,13 @@ from app.config import get_settings
 from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import ScreeningPair as ScreeningPairModel
-from app.resume_service import _build_prompt, _openai_html, generate_resume, generate_presigned_get, s3_enabled
+from app.resume_service import (
+    default_prompt_body,
+    default_screening_prompt_body,
+    generate_resume,
+    generate_presigned_get,
+    s3_enabled,
+)
 from app.routers._util import doc_to_dict, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -53,8 +59,60 @@ class GenerateBody(BaseModel):
     jobDescription: str = Field(min_length=1)
     jobUrl: Optional[str] = None
     questions: List[str] = []
-    guidelines: Optional[str] = None
-    guidelinesMode: Optional[str] = None
+    # One-off resume content-prompt override for this generation only. Wins
+    # over account-level and user-level saved prompts. Empty → fall through.
+    promptBody: Optional[str] = None
+
+
+@router.post("/templates/{account_id}/annotate")
+async def annotate_account_template(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Run the one-time LLM conversion: plain styleTemplate → marker-annotated
+    template. Persists styleTemplateAnnotated and returns it + validation."""
+    from app.html_sanitize import sanitize_template_html
+    from app.template_annotate import annotate_template
+    from app.template_fill import validate_annotated
+
+    account = await _load_owned_account(account_id, user)
+    plain = (account.styleTemplate or "").strip()
+    if not plain:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upload an HTML template first.",
+        )
+
+    annotated = await annotate_template(sanitize_template_html(plain))
+    annotated = sanitize_template_html(annotated)
+    missing_req, missing_rec = validate_annotated(annotated)
+
+    account.styleTemplateAnnotated = annotated
+    await account.save()
+
+    return {
+        "annotated": annotated,
+        "missingRequired": missing_req,
+        "missingRecommended": missing_rec,
+        "valid": not missing_req,
+    }
+
+
+@router.get("/default-prompt")
+async def get_default_prompt(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Built-in resume content-contract prompt. Frontend 'Load default' button
+    seeds the custom-prompt textareas from this."""
+    return {"promptBody": default_prompt_body()}
+
+
+@router.get("/default-screening-prompt")
+async def get_default_screening_prompt(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Built-in screening-answer prompt for the 'Load default' button."""
+    return {"promptBody": default_screening_prompt_body()}
 
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -80,6 +138,20 @@ async def generate(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Account is missing the 'experience' field — fill it on the Accounts page first.",
         )
+    from app.template_fill import validate_annotated
+    annotated = (account.styleTemplateAnnotated or "").strip()
+    if not annotated:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No annotated template. On Resume Styles, upload a template and run 'Convert to template'.",
+        )
+    missing_req, _ = validate_annotated(annotated)
+    if missing_req:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Annotated template missing required markers: " + ", ".join(missing_req)
+            + ". Re-run 'Convert to template' on Resume Styles.",
+        )
 
     company = body.company.strip()
     questions = [q.strip() for q in body.questions if q and q.strip()]
@@ -100,19 +172,17 @@ async def generate(
     )
     await job.insert()
 
-    # Capture override guidelines so the worker doesn't depend on later mutations.
-    guidelines_override = body.guidelines
-    guidelines_mode_override = body.guidelinesMode
+    prompt_body_override = (body.promptBody or "").strip()[:8000] or None
 
     asyncio.create_task(
         _run_job(
             job_id=job.id,
             account_id=account.id,
+            user_id=user.id,
             jd=body.jobDescription,
             company=company,
             questions=questions,
-            guidelines_override=guidelines_override,
-            guidelines_mode_override=guidelines_mode_override,
+            prompt_body_override=prompt_body_override,
         )
     )
 
@@ -122,11 +192,11 @@ async def generate(
 async def _run_job(
     job_id: PydanticObjectId,
     account_id: PydanticObjectId,
+    user_id: PydanticObjectId,
     jd: str,
     company: str,
     questions: List[str],
-    guidelines_override: Optional[str],
-    guidelines_mode_override: Optional[str],
+    prompt_body_override: Optional[str] = None,
 ) -> None:
     """Background orchestrator: resume → optional screening, persisting state."""
     started = time.monotonic()
@@ -137,6 +207,22 @@ async def _run_job(
     if account is None:
         await _mark_failed(job, "account no longer exists", started)
         return
+    owner = await UserExtra.get(user_id)
+
+    # Resolve resume content-prompt: per-generation > account > user > default.
+    resolved_prompt_body = (prompt_body_override or "").strip()
+    if not resolved_prompt_body:
+        resolved_prompt_body = (account.resumePromptBody or "").strip()
+    if not resolved_prompt_body:
+        resolved_prompt_body = (owner.resumePromptBody or "").strip() if owner else ""
+    # Empty → generate_resume falls back to the built-in default.
+
+    # Resolve screening prompt: account > user > built-in default.
+    resolved_screening = (account.screeningPrompt or "").strip()
+    if not resolved_screening:
+        resolved_screening = (owner.screeningPromptBody or "").strip() if owner else ""
+    if not resolved_screening:
+        resolved_screening = default_screening_prompt_body()
 
     try:
         # ---- step 1: generate resume ----
@@ -145,17 +231,9 @@ async def _run_job(
         job.startedAt = datetime.now(timezone.utc)
         await job.save()
 
-        result = await generate_resume(account, jd, company)
-
-        # Cache HTML body on the account so screening (next step) can use it.
-        # `generate_resume` doesn't currently expose the raw HTML — pull it from
-        # the prompt path so screening sees the *generated* resume, not just
-        # the raw experience string.
-        # NOTE: generate_resume internally calls _openai_html then wraps in
-        # <html>. We re-emit just the <body> via a second OpenAI call only if
-        # screening is requested AND we don't already have one cached. To avoid
-        # the double-call, capture the body during generate_resume in a future
-        # refactor; for now, reuse account.previewHtml if present.
+        result = await generate_resume(
+            account, jd, company, prompt_body=resolved_prompt_body or None
+        )
 
         # ---- step 2: persist PDF reference ----
         # Prefer S3: bucket pointer only, no inline bytes. Fall back to base64
@@ -178,20 +256,11 @@ async def _run_job(
             job.step = "generating_answers"
             await job.save()
 
-            # Refresh previewHtml if missing — needed so screening reflects the
-            # generated resume bullets, not just raw experience.
-            if not (account.previewHtml or "").strip():
-                prompt = _build_prompt(account, jd)
-                html_content = await _openai_html(prompt)
-                account.previewHtml = html_content
-                await account.save()
-
             pairs = await _run_screening(
                 account=account,
                 jd=jd,
                 questions=questions,
-                guidelines_override=guidelines_override,
-                guidelines_mode_override=guidelines_mode_override,
+                screening_prompt=resolved_screening,
             )
             # Coerce dict -> ScreeningPair so Beanie/Pydantic doesn't mis-validate on save.
             job.screeningPairs = [ScreeningPairModel(**p) for p in pairs]
@@ -226,21 +295,15 @@ async def _run_screening(
     account: Account,
     jd: str,
     questions: List[str],
-    guidelines_override: Optional[str],
-    guidelines_mode_override: Optional[str],
+    screening_prompt: str,
 ) -> List[dict]:
+    """`screening_prompt` is the resolved answer-prompt (account > user >
+    built-in default), resolved by the caller."""
     from openai import AsyncOpenAI
-
-    if guidelines_mode_override in ("markdown", "plaintext"):
-        # If override mode passed but no text override, still record mode change.
-        pass
-    guidelines = guidelines_override if guidelines_override is not None else (account.screeningPrompt or "")
 
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
-
-    use_resume = bool((account.previewHtml or "").strip())
 
     # Pull the first show-true contact item with a display value as a rough
     # "email" proxy for the screening prompt — generic contact items have no
@@ -255,26 +318,14 @@ async def _run_screening(
         f"Candidate primary contact: {primary_contact}." if primary_contact else "",
         f"Candidate education: {account.education}." if account.education else "",
     ]
-    if use_resume:
-        parts.append(
-            "The candidate's tailored resume HTML for this role is below. Treat it as the source "
-            "of truth for what they emphasize and how they describe their work:\n"
-            f"{account.previewHtml}"
-        )
-    elif (account.experience or "").strip():
+    if (account.experience or "").strip():
         parts.append(f"Candidate experience:\n{account.experience}")
 
     if (jd or "").strip():
         parts.append(f"Job description:\n{jd}")
-    if guidelines.strip():
-        parts.append(f"Answer guidelines:\n{guidelines}")
 
     indexed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-    parts.append(
-        "Answer each numbered screening question below in the candidate's voice. "
-        "Be concise, specific, grounded in the provided context. If a question cannot be "
-        "answered from the context, say so briefly rather than fabricating details."
-    )
+    parts.append((screening_prompt or default_screening_prompt_body()).strip())
     parts.append(f"Questions:\n{indexed}")
     parts.append(
         f"Return a JSON object of the exact form: {{\"answers\": [\"...\", \"...\"]}} "
@@ -311,10 +362,6 @@ class ScreeningBody(BaseModel):
     accountId: str
     jobDescription: Optional[str] = ""
     questions: List[str]
-    guidelines: Optional[str] = None
-    guidelinesMode: Optional[str] = None
-    saveGuidelines: bool = False
-    useGeneratedResumeContext: bool = False
 
 
 @router.post("/screening-answers")
@@ -322,8 +369,8 @@ async def screening_answers(
     body: ScreeningBody,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Standalone screening — kept for callers that want answers without a
-    full resume regeneration."""
+    """Standalone screening — answers without a full resume regeneration.
+    Screening prompt resolves account > user > built-in default."""
     questions = [q.strip() for q in body.questions if q and q.strip()]
     if not questions:
         raise HTTPException(
@@ -338,52 +385,19 @@ async def screening_answers(
             detail="Account is missing the 'experience' field — fill it on the Accounts page first.",
         )
 
-    if body.saveGuidelines:
-        if body.guidelines is not None:
-            account.screeningPrompt = body.guidelines
-        if body.guidelinesMode in ("markdown", "plaintext"):
-            account.screeningPromptMode = body.guidelinesMode  # type: ignore[assignment]
-        await account.save()
+    screening = (account.screeningPrompt or "").strip()
+    if not screening:
+        screening = (user.screeningPromptBody or "").strip()
+    if not screening:
+        screening = default_screening_prompt_body()
 
     pairs = await _run_screening(
         account=account,
         jd=body.jobDescription or "",
         questions=questions,
-        guidelines_override=body.guidelines,
-        guidelines_mode_override=body.guidelinesMode,
+        screening_prompt=screening,
     )
     return {"pairs": pairs}
-
-
-# ---------- Preview (unchanged) ----------------------------------------------
-
-
-@router.post("/preview-html")
-async def preview_html(
-    body: dict,
-    user: Annotated[UserExtra, Depends(get_current_user)],
-) -> dict:
-    account_id = body.get("accountId")
-    if not account_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="accountId required")
-
-    account = await _load_owned_account(account_id, user)
-    if not (account.experience or "").strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Account is missing the 'experience' field — fill it on the Accounts page first.",
-        )
-
-    jd = body.get("jobDescription") or (
-        "Senior Software Engineer role focused on full-stack product engineering "
-        "with strong React, TypeScript, FastAPI, and PostgreSQL experience."
-    )
-
-    prompt = _build_prompt(account, jd)
-    html_content = await _openai_html(prompt)
-    account.previewHtml = html_content
-    await account.save()
-    return {"html": html_content}
 
 
 # ---------- Job listing / polling / download ---------------------------------
@@ -419,6 +433,7 @@ def _job_to_dict(job: ResumeApplication) -> dict:
 async def list_jobs(
     user: Annotated[UserExtra, Depends(get_current_user)],
     accountId: Optional[str] = None,
+    company: Optional[str] = None,
     page: int = 1,
     limit: int = 20,
 ) -> dict:
@@ -426,6 +441,9 @@ async def list_jobs(
     query: dict = {"userId": user.id}
     if accountId:
         query["accountId"] = to_object_id(accountId)
+    if company and company.strip():
+        # Case-insensitive substring match on company name.
+        query["companyNameLower"] = {"$regex": re.escape(company.strip().lower())}
     page = max(1, page)
     limit = max(1, min(100, limit))
     total = await ResumeApplication.find(query).count()

@@ -44,6 +44,28 @@ _BAD_URI_UQ = re.compile(
 )
 
 
+_STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>(.*?)</style\s*>", flags=re.IGNORECASE | re.DOTALL)
+_BODY_INNER_RE = re.compile(r"<body\b[^>]*>(.*?)</body\s*>", flags=re.IGNORECASE | re.DOTALL)
+
+
+def split_template(html: str) -> tuple[str, str]:
+    """Split a sanitized HTML template into (css_text, body_inner_html).
+
+    - css_text concatenates the content of every <style> block (head or body),
+      preserving order. Used to inject byte-for-byte into the final document.
+    - body_inner_html is the inside of the first <body>; if no <body>, falls
+      back to the whole document (minus the extracted <style> blocks).
+    The LLM only sees body_inner_html as the structural reference; css_text
+    bypasses the LLM entirely so it can't paraphrase the CSS."""
+    if not html:
+        return "", ""
+    css = "\n".join(m.group(1).strip() for m in _STYLE_BLOCK_RE.finditer(html))
+    without_styles = _STYLE_BLOCK_RE.sub("", html)
+    m = _BODY_INNER_RE.search(without_styles)
+    body = m.group(1) if m else without_styles
+    return css.strip(), body.strip()
+
+
 def sanitize_template_html(html: str) -> str:
     if not html:
         return ""

@@ -25,69 +25,39 @@ log = logging.getLogger(__name__)
 
 
 _PROMPT_BODY = (
-    "Generate an ATS-optimized, job-tailored resume for {name} aligned to the job description being applied for. "
-    "Contact header fields are governed by the HEADER OVERRIDE block below. "
-    "Do NOT derive a city, country, region, or location from education, work experience, university name, or company name. "
-    "If any contact field is empty, omit it from the header — never invent or infer a value. "
-    "Do not modify company names, job titles, work-experience locations, or employment dates. "
-    "For work experience, the most recent company must have exactly 8 bullet points and all other companies must have exactly 6 points each. "
-    "For the most recent company, structure bullets as follows: 1 bullet describing a realistic core product or platform developed at the company, "
-    "6 bullets describing core engineering work, and 1 bullet describing cross-functional collaboration and leadership. "
-    "Distribute the 6 core engineering bullets based on job type: "
-    "pure AI/GenAI engineer role uses 1 frontend, 1 backend, and 4 AI/GenAI bullets; "
-    "AI-leaning full-stack role uses 2 frontend, 2 backend, and 2 AI/GenAI bullets; "
-    "frontend role uses 4 frontend, 1 backend, and 1 DevOps bullet; backend role uses 1 frontend, 4 backend, and 1 DevOps bullet; "
-    "frontend-leaning full-stack role uses 3 frontend, 2 backend, and 1 DevOps bullet; backend-leaning full-stack role uses 2 frontend, 3 backend, and 1 DevOps bullet; "
-    "DevOps-leaning full-stack role uses 1 frontend, 2 backend, and 3 DevOps bullets, choosing AWS or Azure only if realistically used by the company rather than merely listed in the job description. "
-    "Each bullet must contain only work details, must not be labeled by category, must avoid repetition, and may include quantitative metrics only when meaningful. "
-    "Use ATS-friendly language with a professional, concise, non-repetitive tone, focusing on realistic tech stacks, architectures, workflows, and concrete product features without buzzwords. "
-    "Generate a summary of 3–4 sentences with no bullets or headings, starting with “X years of experience in [relevant field or domain]” where X is a plain number with no brackets or symbols, "
-    "calculated by subtracting the university graduation year from the current year, written in a narrative human tone, including relevant skills only when they strengthen alignment, and never copying text directly from the job description. "
-    "Generate a skills section derived from work experience and JD-aligned pairings only, with no duplicated skills across categories, one line per category, and no qualifiers such as “familiar with.” "
-    "For AI or GenAI-related jobs, organize skills in this strict order: Languages; AI (must be second, right after Languages); Frontend (ordered as frameworks, languages, state management, UI frameworks, HTML/CSS); "
-    "Backend (ordered as frameworks, languages, API development, authentication, caching, microservices, event-driven systems, monitoring); Cloud & DevOps; Databases; "
-    "Testing & CI/CD (include at least 8 unit or integration testing tools across frontend and backend); Other Tools & Technologies. "
-    "For non-AI jobs, organize skills in this strict order: Languages; Frontend (ordered as frameworks, languages, state management, UI frameworks, HTML/CSS); "
-    "Backend (ordered as frameworks, languages, API development, authentication, caching, microservices, event-driven systems, monitoring); Cloud & DevOps; Databases; "
-    "Testing & CI/CD (include at least 8 unit or integration testing tools across frontend and backend); Other Tools & Technologies. "
-    "Adjust skill depth per category based on role emphasis, with deeper frontend skills for frontend-heavy roles, deeper backend skills for backend-heavy roles, "
-    "deeper AI or GenAI skills for AI roles, and deeper cloud and CI/CD skills for DevOps roles. "
-    # ─── Per-company structure ────────────────────────────────────────────
-    "PER-COMPANY STRUCTURE (strict): under each company's header line, render the following blocks in this order: "
-    "(1) achievement bullet list (the 8/6 bullets above; counts apply to ACHIEVEMENT bullets only); "
-    "(2) a 'Projects' subsection — a <strong>Projects</strong> label on its own line, then ONE project block per project listed in the candidate `projects` field for that company. "
-    "PROJECT INPUT FORMAT: the candidate `projects` field is STRUCTURED BY COMPANY. Numbered company headings ('1. Apple', '2. Google', etc.) "
+    "Generate ATS-optimized, job-tailored resume CONTENT for the candidate, aligned to the job description. "
+    "Do NOT modify company names, job titles, work-experience locations, or employment dates — copy them verbatim "
+    "from the candidate `experience` field into `companyName` / `role` / `period`. "
+    # ─── Achievement bullets ──────────────────────────────────────────────
+    "ACHIEVEMENT BULLETS: the most recent company's `bullets` array has exactly 8 entries; every other company has exactly 6. "
+    "For the most recent company, structure the 8 bullets as: 1 bullet on a realistic core product/platform developed there, "
+    "6 bullets on core engineering work, 1 bullet on cross-functional collaboration + leadership. "
+    "Distribute the 6 core engineering bullets by job type: "
+    "pure AI/GenAI role = 1 frontend / 1 backend / 4 AI; AI-leaning full-stack = 2/2/2; "
+    "frontend role = 4 frontend / 1 backend / 1 DevOps; backend role = 1/4/1; "
+    "frontend-leaning full-stack = 3/2/1; backend-leaning full-stack = 2/3/1; "
+    "DevOps-leaning full-stack = 1 frontend / 2 backend / 3 DevOps (AWS or Azure only if realistic for the company). "
+    "Each bullet is plain text, work details only, no category labels, no repetition, metrics only when meaningful, no buzzwords. "
+    # ─── Summary ──────────────────────────────────────────────────────────
+    "SUMMARY: 3-4 sentences, narrative tone, opens with \"X years of experience in [field]\" where X is a plain number "
+    "(current year minus university graduation year). Never copy text from the job description. "
+    # ─── Skills ───────────────────────────────────────────────────────────
+    "SKILLS: derive from work experience + JD-aligned pairings. No skill duplicated across categories. No qualifiers like 'familiar with'. "
+    "Each `skills` entry = one category {category, items}. "
+    "For AI/GenAI jobs, category order: Languages; AI (2nd); Frontend; Backend; Cloud & DevOps; Databases; Testing & CI/CD (8+ tools); Other Tools & Technologies. "
+    "For non-AI jobs: Languages; Frontend; Backend; Cloud & DevOps; Databases; Testing & CI/CD (8+ tools); Other Tools & Technologies. "
+    "Deeper skills in the category the role emphasizes. "
+    # ─── Projects ─────────────────────────────────────────────────────────
+    "PROJECTS: the candidate `projects` field is structured by company — numbered company headings ('1. Apple', '2. Google') "
     "with project lines under each ('- Project Title: brief description.'). "
-    "PROJECT COUNT (strict): render EXACTLY the same number of projects per company as listed in `projects`. If a company has 1 project listed, render 1. If 2, render 2. Never add, never drop, never infer extras. "
-    "PROJECT ATTRIBUTION (strict): attribute each project block to the company named in the heading directly above it in `projects`. Do not re-attribute across companies. "
-    "PROJECT BLOCK FORMAT (NON-NEGOTIABLE — overrides any single-line project convention the template shows): "
-    "For each project, ALWAYS emit a sub-block with two parts: "
-    "(a) the project title as a <strong>Project Title</strong> on its own line — use the title from the input VERBATIM (e.g. 'Apple Developer Program App'). The title line has NO dash prefix and is NOT inside a <ul>; render it as a standalone element (e.g. <div><strong>...</strong></div>). "
-    "(b) directly below the title line, a <ul> with EXACTLY 2-3 separate <li> elements describing what the candidate built and the impact. Derive content from the input brief + JD + work-experience context. "
-    "If the template renders projects as a single one-line <li> with the title and a brief inline (e.g. '- <strong>Title</strong> — description.'), IGNORE that pattern — split it into the two-part block above with 2-3 standalone bullets. "
-    "Do NOT inline the description on the title line. Do NOT use an em-dash to glue title + description. Do NOT emit a single-sentence summary instead of bullets. "
-    "If a company has no projects listed in `projects`, omit the Projects subsection entirely for that company (do not infer). "
-    "Do not put project tech in the project line itself — tech belongs in the Tech stack subsection. "
-    "(3) a 'Tech stack' subsection — a <strong>Tech stack</strong> label on its own line, then a single line of comma-separated technologies actually used at that company (no <ul>, no bullets, no categories). "
-    "Limit Tech stack to 8-14 items per company; pick technologies that align with the JD and the projects + bullets you just wrote. "
-    "PER-COMPANY ORDER: Header → Bullets → Projects → Tech stack. Match the template's spacing/style conventions for subsections. "
-    "The top-level Skills section still applies and aggregates technologies across all companies — per-company Tech stack and top-level Skills coexist."
+    "For each company's `projects` array, emit EXACTLY the projects listed under that company heading — never add, drop, or infer extras. "
+    "Attribute each project to the company named in the heading directly above it. If a company has no projects listed, its `projects` array is empty. "
+    "Each project = {title, bullets}: `title` is the project title VERBATIM from the input; `bullets` is exactly 2-3 plain-text bullets "
+    "describing what was built and the impact (from the input brief + JD + experience context). Project tech goes in the company `techStack`, not in project bullets. "
+    # ─── Tech stack ───────────────────────────────────────────────────────
+    "TECH STACK: each company's `techStack` is a comma-separated line of 8-14 technologies actually used there, JD-aligned, "
+    "consistent with that company's bullets + projects."
 )
-
-
-_TEMPLATE_HTML_WRAPPER = """<html>
-  <head>
-    <meta charset="utf-8" />
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto:wght@400;500;700&family=Open+Sans:wght@400;600;700&family=Lato:wght@400;700&family=Montserrat:wght@400;500;700&family=Source+Sans+3:wght@400;600;700&family=Source+Serif+4:wght@400;600;700&family=Merriweather:wght@400;700&family=PT+Sans:wght@400;700&family=PT+Serif:wght@400;700&family=Nunito:wght@400;600;700&family=Raleway:wght@400;500;700&family=Poppins:wght@400;500;600;700&family=Work+Sans:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
-      html, body {{ margin: 0; padding: 0; background: white; }}
-      @media print {{ @page {{ size: A4; }} }}
-    </style>
-  </head>
-  <body>{html_content}</body>
-</html>"""
 
 
 _S3_SAFE = re.compile(r"[^a-zA-Z0-9\-_]")
@@ -97,123 +67,81 @@ def _safe_segment(s: str) -> str:
     return _S3_SAFE.sub("-", (s or "user").strip())
 
 
-_TEMPLATE_INSTRUCTION = (
-    "STYLE MODE: HTML TEMPLATE.\n\n"
-    "OUTPUT FORMAT (strict):\n"
-    "1. First, emit the template's <style>...</style> block VERBATIM (no edits, no reformatting). "
-    "If the template has no <style> block, skip step 1.\n"
-    "2. Then emit the contents of the template's <body> element (NOT the <body> tag itself). "
-    "Preserve every element, every class name, every inline style attribute, every nesting level, "
-    "and every attribute value EXACTLY as in the template. Change ONLY text nodes (visible text) "
-    "and href/src attribute VALUES (to point at the candidate's email/phone/links). "
-    "Do not include <html>, <head>, or <body> tags — they are added by the wrapper.\n\n"
-    "CONTENT RULES:\n"
-    "- Replace placeholder text inside elements with the candidate's data from the `Candidate fields` JSON. "
-    "Do not invent new sections or drop sections the template defines. If the candidate lacks data for a "
-    "section the template has, render the section heading + empty placeholder text.\n"
-    "- Match the template's bullet convention exactly (if it uses '- ' text prefix, keep that; if native "
-    "<li> markers, keep that). This OVERRIDES the BULLET FORMAT rule earlier.\n"
-    "- EXCEPTION: the Projects subsection's per-project layout is governed by the PROJECT BLOCK FORMAT "
-    "rule earlier — always emit each project as a title line + a separate <ul> with 2-3 bullet <li>s. "
-    "If the template demonstrates projects as a single-line summary, do NOT mimic that; split each "
-    "project into the two-part block.\n"
-    "- Preserve the exact number of company entries the template demonstrates as the structural pattern; "
-    "extend by repeating the same DOM shape per actual company in candidate.experience. Use the most "
-    "recent company entry as the structural prototype for newly-added companies.\n"
-    "- Do NOT add a global <h1> if the template uses a different element for the candidate name; mimic "
-    "what the template uses.\n"
-    "- Do NOT introduce new class names. Do NOT change attribute names.\n\n"
-    "HTML TEMPLATE:\n"
+_CONTENT_OUTPUT_SCHEMA = (
+    "OUTPUT FORMAT (strict): Return ONLY a JSON object — no prose, no markdown, "
+    "no code fences. The server fills an HTML template deterministically from "
+    "this JSON, so the shape must be exact. Schema:\n"
+    "{\n"
+    '  "title": "<header title — see TITLE rule below>",\n'
+    '  "summary": "<the summary paragraph, plain text, no bullets>",\n'
+    '  "experience": [\n'
+    "    {\n"
+    '      "companyName": "<verbatim from candidate experience>",\n'
+    '      "role": "<verbatim>",\n'
+    '      "period": "<verbatim>",\n'
+    '      "bullets": ["<achievement bullet>", ...],\n'
+    '      "projects": [{"title": "<verbatim project title>", "bullets": ["<2-3 bullets>"]}],\n'
+    '      "techStack": "<comma-separated technologies for this company>"\n'
+    "    }\n"
+    "  ],\n"
+    '  "skills": [{"category": "<label>", "items": "<comma-separated skills>"}],\n'
+    '  "education": [{"school": "<name>", "degree": "<degree>", "eduPeriod": "<dates>"}]\n'
+    "}\n"
+    "Bullet text is PLAIN TEXT — no leading dash, no bullet glyph, no HTML. The "
+    "template supplies the bullet marker. Company order: most recent first. "
+    "Project count per company must match exactly what the candidate `projects` "
+    "field lists for that company; omit `projects` (empty list) when none listed."
 )
 
 
-def _build_prompt(account: Account, job_description: str) -> str:
-    # Contact items now live as a flat, generic list on the Account itself:
-    # each entry is {display, url, show}. No semantic types — the LLM treats
-    # `display` as the visible text and `url` as the href.
-    contact_items = [
-        {"label": ci.label, "display": ci.display, "url": ci.url}
-        for ci in (account.contactItems or [])
-        if ci.show and (ci.display or "").strip()
-    ]
+def _build_content_prompt(
+    account: Account,
+    job_description: str,
+    prompt_body: Optional[str] = None,
+) -> str:
+    """Build the prompt that asks the LLM for resume CONTENT as JSON.
+    The LLM never sees or emits HTML — `template_fill.fill_template` renders
+    the JSON into the annotated template deterministically.
 
+    `prompt_body` = resolved content-contract text. None → built-in default.
+    """
     candidate_fields = {
         "name": account.name or "",
-        "contactItems": contact_items,
         "education": account.education or "",
         "experience": account.experience or "",
         "projects": account.projects or "",
     }
     candidate_block = (
-        "Candidate fields. `contactItems` is a flat list of {label, display, url}. "
-        "`label` is a short type hint (e.g. 'Email', 'GitHub', 'Phone') — useful "
-        "for picking the right icon or fallback semantics when the template "
-        "expects them. RENDER each item's `display` value as visible text in the "
-        "contact header; use `url` as the href when wrapping in <a> tags. Skip "
-        "items with empty `display`. Do NOT pull location text from "
-        "education/experience into anything else:\n"
+        "Candidate fields (source material — structure + tailor these into the "
+        "output JSON; do NOT pull location text across fields):\n"
         + json.dumps(candidate_fields, ensure_ascii=False, indent=2)
     )
 
-    # Header allowlist is the contactItems order itself (only show=True entries
-    # are passed in). Tell the LLM the order is authoritative.
-    header_override = (
-        "HEADER OVERRIDE (supersedes any earlier 'header allowlist' rule): "
-        "The contact header must include exactly the items from `contactItems` "
-        "in the order given. Use each item's `display` as text and `url` as href. "
-        "Do not add fields that aren't in the list. "
-        "CONTACT LINK COLOR: when wrapping a contact item in an <a> tag, the link "
-        "MUST inherit the surrounding text color — do not let the browser's default "
-        "blue/purple link color leak through. Always add inline style "
-        '`style="color: inherit; text-decoration: none;"` to every <a> in the '
-        "contact header, regardless of what the template's own CSS says."
-    )
-
-    # Auto-title — when account.titleAutoFromJD is true, LLM derives the
-    # header title from the JD. Static account.title becomes a seniority hint.
-    title_block = ""
+    # Title rule — into the JSON `title` field.
     if getattr(account, "titleAutoFromJD", False):
-        preferred_title = (account.title or "").strip()
-        title_block = (
-            "TITLE OVERRIDE (highest priority for the header title): "
-            "Derive the title shown under the candidate's name FROM THE JOB DESCRIPTION. "
-            "Pick the most-aligned seniority + role label (e.g. 'Senior Software Engineer', "
-            "'Staff Backend Engineer', 'Engineering Manager', 'Principal AI Engineer'). "
-            "3-6 words max. No company names. No buzzwords ('rockstar', 'ninja', '10x'). "
-            f"Candidate's preferred title is '{preferred_title or 'unspecified'}' — use it ONLY "
-            "as a seniority hint; the JD-aligned label wins. If the resume uses an HTML "
-            "template, replace the title element's text with the JD-derived label while "
-            "preserving its structure/classes/styles."
+        preferred = (account.title or "").strip()
+        title_rule = (
+            "TITLE: derive the `title` field FROM THE JOB DESCRIPTION — the most "
+            "aligned seniority + role label (3-6 words, e.g. 'Senior Software "
+            f"Engineer'). Candidate's preferred title '{preferred or 'unspecified'}' "
+            "is a seniority hint only; the JD-aligned label wins. No buzzwords."
         )
-    elif (account.title or "").strip():
-        # Static title — tell LLM to use it verbatim in the header.
-        title_block = (
-            "TITLE OVERRIDE (highest priority for the header title): "
-            f"Use the title text \"{(account.title or '').strip()}\" exactly as-is under "
-            "the candidate's name. Do not infer or modify it from the JD."
+    else:
+        title_rule = (
+            f"TITLE: set the `title` field to exactly \"{(account.title or '').strip()}\" "
+            "(verbatim — do not infer or modify)."
         )
 
-    # Template mode is now the only style path. Inject the template inline as
-    # the structural source-of-truth; everything visual (bullet glyph, indent,
-    # spacing, section headings) is owned by the template.
-    from app.html_sanitize import sanitize_template_html
-    template_block = _TEMPLATE_INSTRUCTION + sanitize_template_html(account.styleTemplate or "")
-
-    preamble = (
-        "You render the resume's body inner-HTML. You MAY also emit a leading "
-        "<style>...</style> tag (copied from the template). Do NOT emit "
-        "<html>, <head>, or <body> tags — the wrapper adds them.\n"
-    )
+    body = (prompt_body or "").strip() or _PROMPT_BODY
 
     parts = [
         "Forget anything you learned before.",
-        preamble,
+        "You produce resume CONTENT as a JSON object. You do NOT write HTML.",
         candidate_block,
         f"Here's the job description. {job_description}\n",
-        _PROMPT_BODY.format(name=account.name),
-        header_override,
-        title_block,
-        template_block,
+        body,
+        title_rule,
+        _CONTENT_OUTPUT_SCHEMA,
     ]
     return "\n".join(p for p in parts if p)
 
@@ -278,6 +206,13 @@ async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[d
         try:
             page = await browser.new_page()
             await page.set_content(html, wait_until="networkidle")
+            # Wait for web fonts (Google Fonts <link>) to finish loading before
+            # we snapshot to PDF; otherwise Chromium can rasterize with the
+            # system fallback (Arial), altering letter-spacing + metrics.
+            try:
+                await page.evaluate("document.fonts.ready")
+            except Exception:
+                pass
             # Playwright accepts px, in, cm, mm — not pt. Convert pt → mm.
             return await page.pdf(
                 format=page_format,
@@ -355,16 +290,125 @@ def _maybe_upload_to_s3(pdf_bytes: bytes, profile_name: str, company: str) -> tu
     return key, region
 
 
+def default_prompt_body() -> str:
+    """The built-in resume content-contract prompt. Exported to users so they
+    can start from it and customize."""
+    return _PROMPT_BODY
+
+
+_SCREENING_PROMPT_BODY = (
+    "Answer each numbered screening question in the candidate's voice. "
+    "Be concise, specific, and grounded in the provided context (resume / "
+    "experience / job description). Lead with concrete examples. Keep answers "
+    "tight — no filler, no restating the question. If a question cannot be "
+    "answered from the context, say so briefly rather than fabricating details."
+)
+
+
+def default_screening_prompt_body() -> str:
+    """The built-in screening-answer prompt. Exported so users can start from
+    it and customize. Account/user-level overrides replace it verbatim."""
+    return _SCREENING_PROMPT_BODY
+
+
+def _strip_fences(s: str) -> str:
+    """Drop ```json … ``` fences if the model wrapped its JSON."""
+    s = (s or "").strip()
+    if s.startswith("```"):
+        nl = s.find("\n")
+        if nl != -1:
+            s = s[nl + 1:]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
+
+
+_GOOGLE_FONTS_LINK = (
+    '<link href="https://fonts.googleapis.com/css2?'
+    'family=Inter:wght@400;500;600;700&family=Roboto:wght@400;500;700'
+    '&family=Open+Sans:wght@400;600;700&family=Lato:wght@400;700'
+    '&family=Montserrat:wght@400;500;700&family=Source+Sans+3:wght@400;600;700'
+    '&family=Source+Serif+4:wght@400;600;700&family=Merriweather:wght@400;700'
+    '&family=PT+Sans:wght@400;700&family=PT+Serif:wght@400;700'
+    '&family=Nunito:wght@400;600;700&family=Raleway:wght@400;500;700'
+    '&family=Poppins:wght@400;500;600;700&family=Work+Sans:wght@400;500;700'
+    '&display=swap" rel="stylesheet">'
+)
+
+
+def _ensure_fonts_link(html: str) -> str:
+    """Inject the Google Fonts <link> into <head> if absent, so the template's
+    web fonts resolve during the Playwright render."""
+    if "fonts.googleapis.com" in html:
+        return html
+    if "<head>" in html:
+        return html.replace("<head>", "<head>" + _GOOGLE_FONTS_LINK, 1)
+    if "<html>" in html:
+        return html.replace("<html>", "<html><head>" + _GOOGLE_FONTS_LINK + "</head>", 1)
+    return _GOOGLE_FONTS_LINK + html
+
+
+def _build_content(account: Account, llm_json: dict) -> dict:
+    """Merge LLM-generated content with account-owned fields (name + contact
+    items) into the shape `template_fill.fill_template` expects."""
+    contact_items = [
+        {"display": ci.display, "url": ci.url}
+        for ci in (account.contactItems or [])
+        if ci.show and (ci.display or "").strip()
+    ]
+    return {
+        "name": account.name or "",
+        "title": (llm_json.get("title") or account.title or "").strip(),
+        "summary": llm_json.get("summary") or "",
+        "contactItems": contact_items,
+        "experience": llm_json.get("experience") or [],
+        "skills": llm_json.get("skills") or [],
+        "education": llm_json.get("education") or [],
+    }
+
+
 async def generate_resume(
     account: Account,
     job_description: str,
     company: str,
+    prompt_body: Optional[str] = None,
 ) -> GeneratedResume:
-    prompt = _build_prompt(account, job_description)
-    log.info("Generating resume for account=%s (%s) company=%s", account.title or account.name, account.id, company)
-    html_content = await _openai_html(prompt)
-    # Template mode is the only path: minimal wrapper, template owns visuals.
-    html = _TEMPLATE_HTML_WRAPPER.format(html_content=html_content)
+    from app.template_fill import fill_template, validate_annotated
+
+    annotated = (account.styleTemplateAnnotated or "").strip()
+    if not annotated:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No annotated template. Upload a template and run 'Convert to template' first.",
+        )
+    missing_req, _ = validate_annotated(annotated)
+    if missing_req:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Annotated template is missing required markers: " + ", ".join(missing_req),
+        )
+
+    log.info("Generating resume for account=%s (%s) company=%s",
+             account.title or account.name, account.id, company)
+
+    # ---- step 1: LLM → JSON content (no HTML) ----
+    prompt = _build_content_prompt(account, job_description, prompt_body=prompt_body)
+    raw = await _openai_html(prompt)
+    try:
+        llm_json = json.loads(_strip_fences(raw))
+    except json.JSONDecodeError as exc:
+        log.error("resume content JSON parse failed: %s\nraw=%s", exc, raw[:500])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Resume content generation returned malformed JSON.",
+        )
+
+    # ---- step 2: deterministic fill into the annotated template ----
+    content = _build_content(account, llm_json)
+    filled = fill_template(annotated, content)
+    html = _ensure_fonts_link(filled)
+
+    # ---- step 3: HTML → PDF ----
     pdf_bytes = await _html_to_pdf(
         html,
         page_format=account.pageFormat or "A4",

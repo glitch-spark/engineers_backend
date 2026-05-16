@@ -30,6 +30,11 @@ class UserExtra(TimestampedDocument):
     leaderboardName: Optional[str] = None
     leaderboardAnon: bool = False
 
+    # User-level custom prompts. Empty → built-in default. Account-level
+    # overrides take precedence per profile.
+    resumePromptBody: Optional[str] = None
+    screeningPromptBody: Optional[str] = None
+
     class Settings:
         name = "userextras"
         indexes = [
