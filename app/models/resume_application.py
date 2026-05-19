@@ -50,6 +50,8 @@ class ResumeApplication(TimestampedDocument):
     pdfData: Optional[str] = None    # base64-encoded; survives without S3
     s3Key: Optional[str] = None
     s3Url: Optional[str] = None
+    # Logical reading-order text — use instead of copy-pasting from the PDF.
+    plainText: Optional[str] = None
 
     screeningQuestions: List[str] = []
     screeningPairs: List[ScreeningPair] = []
