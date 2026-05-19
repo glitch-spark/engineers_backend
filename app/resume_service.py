@@ -231,20 +231,16 @@ async def _openai_html(prompt: str) -> str:
     return response.output_text or ""
 
 
-_DEFAULT_MARGIN_PT = {"top": 35, "right": 30, "bottom": 30, "left": 30}
+# Playwright page.pdf margin — keep at zero; inset is body padding (see below).
+_DEFAULT_MARGIN_PT = {"top": 0, "right": 0, "bottom": 0, "left": 0}
+# Small uniform padding applied to <body> at PDF render time (~5 mm).
+_PDF_BODY_PADDING_PT = {"top": 14, "right": 14, "bottom": 14, "left": 14}
+_PRINT_INSET_STYLE_ID = "resume-pdf-inset"
 
 
 def _resolve_margin_pt(account: Account) -> dict:
-    """Template now owns visual layout including its own @page margins (set
-    via CSS inside the template). Playwright still needs a margin dict for
-    the PDF call, so use defaults — the template's CSS @page rules will
-    override these visually."""
-    return {
-        "top": _DEFAULT_MARGIN_PT["top"],
-        "right": _DEFAULT_MARGIN_PT["right"],
-        "bottom": _DEFAULT_MARGIN_PT["bottom"],
-        "left": _DEFAULT_MARGIN_PT["left"],
-    }
+    """Playwright PDF margins are zero; `_ensure_pdf_inset` adds body padding."""
+    return dict(_DEFAULT_MARGIN_PT)
 
 
 _PT_TO_MM = 25.4 / 72  # 1pt = 0.3528mm
@@ -252,6 +248,30 @@ _PT_TO_MM = 25.4 / 72  # 1pt = 0.3528mm
 
 def _pt_to_mm(v: float) -> str:
     return f"{v * _PT_TO_MM:.3f}mm"
+
+
+def _print_inset_css(padding_pt: Optional[dict] = None) -> str:
+    p = padding_pt or _PDF_BODY_PADDING_PT
+    t, r, b, l = (_pt_to_mm(p[k]) for k in ("top", "right", "bottom", "left"))
+    return (
+        f'<style id="{_PRINT_INSET_STYLE_ID}">'
+        "@page { margin: 0; }\n"
+        "html, body { margin: 0 !important; box-sizing: border-box; }\n"
+        f"body {{ padding: {t} {r} {b} {l} !important; min-height: 100%; width: 100%; }}\n"
+        "</style>"
+    )
+
+
+def _ensure_pdf_inset(html: str) -> str:
+    """Zero @page margin + small body padding so the PDF uses padding, not margin."""
+    if _PRINT_INSET_STYLE_ID in html:
+        return html
+    snippet = _print_inset_css()
+    if "<head>" in html:
+        return html.replace("<head>", "<head>" + snippet, 1)
+    if "<html>" in html:
+        return html.replace("<html>", "<html><head>" + snippet + "</head>", 1)
+    return snippet + html
 
 
 async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[dict] = None) -> bytes:
@@ -475,6 +495,7 @@ async def generate_resume(
     content = _build_content(account, llm_json)
     filled = fill_template(annotated, content)
     html = _ensure_fonts_link(filled)
+    html = _ensure_pdf_inset(html)
 
     # ---- step 3: HTML → PDF ----
     pdf_bytes = await _html_to_pdf(
