@@ -26,8 +26,9 @@ log = logging.getLogger(__name__)
 
 _PROMPT_BODY = (
     "Generate ATS-optimized, job-tailored resume CONTENT for the candidate, aligned to the job description. "
-    "Do NOT modify company names, job titles, work-experience locations, or employment dates — copy them verbatim "
-    "from the candidate `experience` field into `companyName` / `role` / `period`. "
+    "Do NOT modify company names, work-experience locations, or employment dates — copy them verbatim "
+    "from the candidate `experience` field into `companyName` / `originalRole` / `location` / `period`. "
+    "Per company, `tailoredRole` is a JD-aligned reinterpretation shown on the resume; see EXPERIENCE ROLE rules. "
     # ─── Achievement bullets ──────────────────────────────────────────────
     "ACHIEVEMENT BULLETS: the most recent company's `bullets` array has exactly 8 entries; every other company has exactly 6. "
     "For the most recent company, structure the 8 bullets as: 1 bullet on a realistic core product/platform developed there, "
@@ -67,31 +68,91 @@ def _safe_segment(s: str) -> str:
     return _S3_SAFE.sub("-", (s or "user").strip())
 
 
+_EXPERIENCE_ROLE_RULES = (
+    "EXPERIENCE ROLE (every experience entry):\n"
+    "- `originalRole`: verbatim job title from the candidate `experience` field.\n"
+    "- `tailoredRole`: JD-aligned reinterpretation for the resume header under each "
+    "company — shift seniority wording and role nouns toward the target role "
+    "(e.g. 'Senior Fullstack Developer' → 'Senior Software Quality Engineer' when "
+    "the JD is QA/SDET). Stay anchored to work the candidate actually did; never "
+    "inflate seniority more than one level or invent a domain they did not touch.\n"
+    "- When the target role classification differs from the candidate's original "
+    "domain, `originalRole` and `tailoredRole` must NOT be byte-identical — at "
+    "minimum normalize seniority ('Sr' → 'Senior') and shift the role noun toward "
+    "target vocabulary.\n"
+    "- If work at a company cannot support the target role, keep `tailoredRole` close "
+    "to `originalRole` and reflect the target in bullets/skills instead."
+)
+
 _CONTENT_OUTPUT_SCHEMA = (
     "OUTPUT FORMAT (strict): Return ONLY a JSON object — no prose, no markdown, "
     "no code fences. The server fills an HTML template deterministically from "
     "this JSON, so the shape must be exact. Schema:\n"
     "{\n"
-    '  "title": "<header title — see TITLE rule below>",\n'
+    '  "title": "<header subtitle — see TITLE rule below>",\n'
     '  "summary": "<the summary paragraph, plain text, no bullets>",\n'
     '  "experience": [\n'
     "    {\n"
     '      "companyName": "<verbatim from candidate experience>",\n'
-    '      "role": "<verbatim>",\n'
+    '      "originalRole": "<verbatim role title from candidate input>",\n'
+    '      "tailoredRole": "<JD-aligned reinterpretation; MUST NOT equal originalRole when target classification differs from original domain>",\n'
+    '      "location": "<verbatim from candidate experience; empty string if not provided>",\n'
     '      "period": "<verbatim>",\n'
-    '      "bullets": ["<achievement bullet>", ...],\n'
+    '      "bullets": ["<achievement bullet>", "..."],\n'
     '      "projects": [{"title": "<verbatim project title>", "bullets": ["<2-3 bullets>"]}],\n'
-    '      "techStack": "<comma-separated technologies for this company>"\n'
+    '      "techStack": "<comma-separated technologies for this company, 8-14 items>"\n'
     "    }\n"
     "  ],\n"
-    '  "skills": [{"category": "<label>", "items": "<comma-separated skills>"}],\n'
+    '  "skills": [{"category": "<label>", "items": ["<skill>", "<skill>", "..."]}],\n'
     '  "education": [{"school": "<name>", "degree": "<degree>", "eduPeriod": "<dates>"}]\n'
     "}\n"
-    "Bullet text is PLAIN TEXT — no leading dash, no bullet glyph, no HTML. The "
-    "template supplies the bullet marker. Company order: most recent first. "
-    "Project count per company must match exactly what the candidate `projects` "
-    "field lists for that company; omit `projects` (empty list) when none listed."
+    "FIELD NOTES:\n"
+    "- `originalRole` and `tailoredRole` are BOTH required on every experience entry. "
+    "The renderer displays tailoredRole; originalRole is kept for debug/audit. "
+    "They must NOT be byte-identical when the target role's classification differs "
+    "from the candidate's original domain — at minimum normalize seniority ('Sr' → 'Senior') "
+    "and shift the role noun toward the target vocabulary.\n"
+    "- `skills[].items` is a JSON ARRAY of strings, NOT a comma-separated string.\n"
+    "- `projects` is NESTED inside each experience entry — there is no top-level projects array. "
+    "Project count per company must match exactly what the candidate `projects` field lists "
+    "for that company; emit `\"projects\": []` when none listed.\n"
+    "- Bullet text is PLAIN TEXT — no leading dash, no bullet glyph, no HTML. The "
+    "template supplies the bullet marker.\n"
+    "- Company order: most recent first."
 )
+
+
+def _normalize_experience_entry(exp: dict) -> dict:
+    """Map LLM experience objects to the template-fill shape.
+
+    Display role prefers tailoredRole; keeps originalRole for audit. Accepts
+    legacy single-field `role` from older prompts/models.
+    """
+    original = (exp.get("originalRole") or exp.get("role") or "").strip()
+    tailored = (exp.get("tailoredRole") or "").strip()
+    if not tailored:
+        tailored = original
+    out = dict(exp)
+    out["originalRole"] = original
+    out["tailoredRole"] = tailored
+    out["role"] = tailored
+    if "location" not in out:
+        out["location"] = ""
+    return out
+
+
+def _normalize_skills(skills: list) -> list:
+    out = []
+    for sk in skills or []:
+        if not isinstance(sk, dict):
+            continue
+        items = sk.get("items", [])
+        if isinstance(items, list):
+            items_str = ", ".join(str(i).strip() for i in items if str(i).strip())
+        else:
+            items_str = str(items or "").strip()
+        out.append({**sk, "items": items_str})
+    return out
 
 
 def _build_content_prompt(
@@ -141,6 +202,7 @@ def _build_content_prompt(
         f"Here's the job description. {job_description}\n",
         body,
         title_rule,
+        _EXPERIENCE_ROLE_RULES,
         _CONTENT_OUTPUT_SCHEMA,
     ]
     return "\n".join(p for p in parts if p)
@@ -356,13 +418,19 @@ def _build_content(account: Account, llm_json: dict) -> dict:
         for ci in (account.contactItems or [])
         if ci.show and (ci.display or "").strip()
     ]
+    raw_experience = llm_json.get("experience") or []
+    experience = [
+        _normalize_experience_entry(e)
+        for e in raw_experience
+        if isinstance(e, dict)
+    ]
     return {
         "name": account.name or "",
         "title": (llm_json.get("title") or account.title or "").strip(),
         "summary": llm_json.get("summary") or "",
         "contactItems": contact_items,
-        "experience": llm_json.get("experience") or [],
-        "skills": llm_json.get("skills") or [],
+        "experience": experience,
+        "skills": _normalize_skills(llm_json.get("skills") or []),
         "education": llm_json.get("education") or [],
     }
 

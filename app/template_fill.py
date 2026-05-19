@@ -13,7 +13,8 @@ data-field="<key>"       text node filled from the current item / content
 
 Repeat kinds + their item shape (see CONTENT schema in resume_service):
   contact   -> {display, url}
-  company   -> {companyName, role, period, bullets[], projects[], techStack}
+  company   -> {companyName, role|tailoredRole, originalRole, location, period,
+               bullets[], projects[], techStack}
   bullet    -> str            (nested in company)
   project   -> {title, bullets[]}   (nested in company)
   projectBullet -> str        (nested in project)
@@ -136,10 +137,19 @@ def _bullet_prefix(el: Tag) -> str:
     return m.group(1) if m else ""
 
 
+def _display_role(company: dict) -> str:
+    """Resume shows tailoredRole; fall back for legacy LLM output."""
+    return (
+        (company.get("tailoredRole") or company.get("role") or company.get("originalRole") or "")
+        .strip()
+    )
+
+
 def _fill_company(clone: Tag, company: dict) -> None:
     _fill_fields(clone, {
         "companyName": company.get("companyName", ""),
-        "role": company.get("role", ""),
+        "role": _display_role(company),
+        "location": company.get("location", ""),
         "period": company.get("period", ""),
         "techStack": company.get("techStack", ""),
     })
@@ -195,10 +205,17 @@ def _fill_contact(clone: Tag, item: dict) -> None:
             anchor.attrs.pop("href", None)
 
 
+def _skill_items_text(skill: dict) -> str:
+    items = skill.get("items", "")
+    if isinstance(items, list):
+        return ", ".join(str(i).strip() for i in items if str(i).strip())
+    return str(items or "")
+
+
 def _fill_skill(clone: Tag, skill: dict) -> None:
     _fill_fields(clone, {
         "skillCategory": skill.get("category", ""),
-        "skillItems": skill.get("items", ""),
+        "skillItems": _skill_items_text(skill),
     })
 
 
@@ -216,7 +233,7 @@ def fill_template(annotated_html: str, content: dict) -> str:
     content shape:
       name, title, summary        -> str
       contactItems  -> [{display, url}]
-      experience    -> [{companyName, role, period, bullets[],
+      experience    -> [{companyName, role|tailoredRole, location, period, bullets[],
                          projects[{title, bullets[]}], techStack}]
       skills        -> [{category, items}]
       education     -> [{school, degree, eduPeriod}]
