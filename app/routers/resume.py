@@ -245,7 +245,6 @@ async def _run_job(
             job.s3Url = None    # legacy public URL — downloads use presigned URLs
         else:
             job.pdfData = base64.b64encode(result.pdf_bytes).decode("ascii")
-        job.plainText = result.plain_text
         await job.save()
         log.info(
             "job %s pdf persisted: %d bytes (s3_key=%s)",
@@ -423,7 +422,6 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "screeningQuestions": job.screeningQuestions,
         "screeningPairs": [p.model_dump() for p in job.screeningPairs],
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
-        "hasPlainText": bool((job.plainText or "").strip()),
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,
         "completedAt": job.completedAt.isoformat() if job.completedAt else None,
@@ -479,30 +477,6 @@ async def get_job(
     if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     return _job_to_dict(job)
-
-
-@router.get("/jobs/{job_id}/plain-text")
-async def download_plain_text(
-    job_id: str,
-    user: Annotated[UserExtra, Depends(get_current_user)],
-):
-    """Plain-text resume in logical reading order (preferred over PDF copy-paste)."""
-    job = await ResumeApplication.get(to_object_id(job_id))
-    if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    text = (job.plainText or "").strip()
-    if not text:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plain text not available for this build",
-        )
-    base = (job.pdfFilename or f"resume_{job.companyName}.txt").split("/")[-1]
-    txt_name = base.rsplit(".", 1)[0] + ".txt" if "." in base else base + ".txt"
-    return Response(
-        content=text.encode("utf-8"),
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{txt_name}"'},
-    )
 
 
 @router.get("/jobs/{job_id}/download")
