@@ -172,7 +172,7 @@ async def generate(
     )
     await job.insert()
 
-    prompt_body_override = (body.promptBody or "").strip()[:8000] or None
+    prompt_body_override = (body.promptBody or "").strip()[:30000] or None
 
     asyncio.create_task(
         _run_job(

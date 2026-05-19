@@ -83,9 +83,9 @@ async def update_profile(
     if body.leaderboardAnon is not None:
         user.leaderboardAnon = body.leaderboardAnon
     if body.resumePromptBody is not None:
-        user.resumePromptBody = body.resumePromptBody[:8000] or None
+        user.resumePromptBody = body.resumePromptBody[:30000] or None
     if body.screeningPromptBody is not None:
-        user.screeningPromptBody = body.screeningPromptBody[:8000] or None
+        user.screeningPromptBody = body.screeningPromptBody[:30000] or None
     await user.save()
 
     return {
