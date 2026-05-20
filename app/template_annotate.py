@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from fastapi import HTTPException, status
 
 from app.config import get_settings
@@ -135,22 +135,61 @@ def _apply_markers(soup: BeautifulSoup, markers: list[dict]) -> int:
 _MARKER_ATTRS = ("data-slot", "data-repeat", "data-field")
 
 
+def _is_live_tag(el: object) -> bool:
+    """True when `el` is still attached and safe for attrs / decompose."""
+    return isinstance(el, Tag) and el.parent is not None
+
+
+def _element_has_marker(el: Tag) -> bool:
+    attrs = getattr(el, "attrs", None)
+    if not isinstance(attrs, dict):
+        return False
+    return any(a in attrs for a in _MARKER_ATTRS)
+
+
+def _contains_marked_descendant(el: Tag) -> bool:
+    for child in el.find_all(True):
+        if child is el:
+            continue
+        if _element_has_marker(child):
+            return True
+    return False
+
+
+def _removal_depth(el: Tag) -> int:
+    depth = 0
+    parent = el.parent
+    while parent is not None and getattr(parent, "name", None):
+        depth += 1
+        parent = parent.parent
+    return depth
+
+
 def _apply_removals(soup: BeautifulSoup, remove_ids: list) -> int:
     """Delete redundant sample elements the LLM flagged. Never deletes an
     element that carries a marker (safety against the LLM contradicting
     itself)."""
-    by_id: dict[str, object] = {}
+    by_id: dict[str, Tag] = {}
     for el in soup.find_all(attrs={_ANNO_ID: True}):
-        by_id[el[_ANNO_ID]] = el
+        if isinstance(el, Tag):
+            by_id[el[_ANNO_ID]] = el
+
+    # Remove deepest nodes first so parent decompose does not leave stale
+    # child refs that break has_attr on decomposed tags.
+    ordered_ids = sorted(
+        (str(rid) for rid in remove_ids),
+        key=lambda rid: _removal_depth(by_id[rid]) if rid in by_id and _is_live_tag(by_id[rid]) else -1,
+        reverse=True,
+    )
+
     removed = 0
-    for rid in remove_ids:
-        el = by_id.get(str(rid))
-        if el is None:
+    for rid in ordered_ids:
+        el = by_id.get(rid)
+        if not _is_live_tag(el):
             continue
-        if any(el.has_attr(a) for a in _MARKER_ATTRS):
+        if _element_has_marker(el):
             continue  # never remove a marked element
-        # Skip if it contains a marked descendant (would orphan the marker).
-        if any(el.find(attrs={a: True}) for a in _MARKER_ATTRS):
+        if _contains_marked_descendant(el):
             continue
         el.decompose()
         removed += 1
