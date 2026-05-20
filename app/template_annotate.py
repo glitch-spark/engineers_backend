@@ -13,6 +13,7 @@ The template's CSS, fonts, margins, and structure are preserved byte-for-byte
 — the LLM only decides WHERE markers go.
 
 Runtime behavior is unchanged; this module only maps markers onto existing HTML.
+Deploy-only touch: no functional change.
 """
 
 from __future__ import annotations
