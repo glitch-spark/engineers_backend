@@ -11,6 +11,8 @@ Drift-free design: the LLM NEVER re-emits the template's HTML/CSS. Instead:
 
 The template's CSS, fonts, margins, and structure are preserved byte-for-byte
 — the LLM only decides WHERE markers go.
+
+Runtime behavior is unchanged; this module only maps markers onto existing HTML.
 """
 
 from __future__ import annotations
