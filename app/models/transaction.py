@@ -6,7 +6,7 @@ from beanie import PydanticObjectId
 from app.models.base import TimestampedDocument
 
 TransactionStatus = Literal["pending", "approved", "rejected"]
-PayMethod = Literal["crypto", "card"]
+PayMethod = Literal["coin", "card"]
 
 
 class Transaction(TimestampedDocument):

@@ -17,15 +17,19 @@ _LAST4_RE = re.compile(r"^\d{4}$")
 
 
 def _validate_pay_method(pay_method: Optional[str], card_last4: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Normalize + validate (payMethod, cardLast4). When method=='card',
-    cardLast4 must be exactly 4 digits. When method=='crypto', cardLast4
-    is forced to None. Returns the cleaned pair. Raises 400 on invalid."""
+    """Normalize + validate (payMethod, cardLast4). Accepts legacy 'crypto'
+    spelling as an alias for 'coin' so older clients keep working. When
+    method=='card', cardLast4 must be exactly 4 digits. When method=='coin',
+    cardLast4 is forced to None. Returns the cleaned pair. Raises 400 on
+    invalid input."""
     if pay_method is None:
         return None, None
-    if pay_method not in ("crypto", "card"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payMethod must be 'crypto' or 'card'")
     if pay_method == "crypto":
-        return "crypto", None
+        pay_method = "coin"  # legacy alias
+    if pay_method not in ("coin", "card"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payMethod must be 'coin' or 'card'")
+    if pay_method == "coin":
+        return "coin", None
     last4 = (card_last4 or "").strip()
     if not _LAST4_RE.match(last4):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cardLast4 must be exactly 4 digits when payMethod='card'")
@@ -146,7 +150,9 @@ async def list_transactions(
     if is_admin and userId:
         query["userId"] = to_object_id(userId)
 
-    if payMethod in ("crypto", "card"):
+    if payMethod == "crypto":
+        payMethod = "coin"  # legacy alias from older clients
+    if payMethod in ("coin", "card"):
         query["payMethod"] = payMethod
 
     if search:
