@@ -6,7 +6,9 @@ from beanie import PydanticObjectId
 from app.models.base import TimestampedDocument
 
 TransactionStatus = Literal["pending", "approved", "rejected"]
-PayMethod = Literal["coin", "card"]
+# 'crypto' is the legacy spelling kept here so Beanie can deserialize old rows.
+# Drop it from the literal after running scripts/rename_paymethod_crypto_to_coin.
+PayMethod = Literal["coin", "card", "crypto"]
 
 
 class Transaction(TimestampedDocument):
