@@ -88,11 +88,7 @@ async def _populate_account(items: Iterable[dict], *, field: str = "accountId") 
         acc_id = item.get(field)
         acc = by_id.get(str(acc_id)) if acc_id else None
         if acc is not None:
-            primary = next(
-                (ci.display for ci in (acc.contactItems or []) if ci.show and (ci.display or "").strip()),
-                "",
-            )
-            item[field] = {"_id": str(acc.id), "name": acc.name, "email": primary}
+            item[field] = {"_id": str(acc.id), "name": acc.name, "email": ""}
             # Resolve the resume filename for this interview's resumeId, if present.
             resume_id = item.get("resumeId")
             if resume_id:
@@ -228,13 +224,9 @@ async def create_interview(
         asyncio.create_task(extract_and_score(iv))
 
     try:
-        primary = next(
-            (ci.display for ci in (account.contactItems or []) if ci.show and (ci.display or "").strip()),
-            "",
-        )
         await notify_new_interview(
             creator_email=user.email or "",
-            account_email=primary,
+            account_email="",
             stage=body.stage or "",
             scheduled_at=sched.strftime("%Y-%m-%d %H:%M"),
         )

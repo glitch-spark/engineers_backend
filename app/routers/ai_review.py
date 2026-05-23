@@ -67,15 +67,9 @@ async def _build_interview_contexts(interview_ids: list[PydanticObjectId]) -> li
             if r:
                 resume_filename = r.filename
                 resume_markdown = _truncate(r.markdown or "", MAX_RESUME_CHARS)
-        primary_contact = ""
-        if acc is not None:
-            primary_contact = next(
-                (ci.display for ci in (acc.contactItems or []) if ci.show and (ci.display or "").strip()),
-                "",
-            )
         contexts.append({
             "candidate_name": acc.name if acc else None,
-            "candidate_email": primary_contact or None,
+            "candidate_email": None,
             "address": None,
             "company_name": iv.companyName,
             "interviewer_name": iv.interviewerName,

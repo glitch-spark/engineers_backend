@@ -16,8 +16,6 @@ from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import ScreeningPair as ScreeningPairModel
 from app.resume_service import (
-    default_prompt_body,
-    default_screening_prompt_body,
     generate_resume,
     generate_presigned_get,
     s3_enabled,
@@ -64,57 +62,6 @@ class GenerateBody(BaseModel):
     promptBody: Optional[str] = None
 
 
-@router.post("/templates/{account_id}/annotate")
-async def annotate_account_template(
-    account_id: str,
-    user: Annotated[UserExtra, Depends(get_current_user)],
-) -> dict:
-    """Run the one-time LLM conversion: plain styleTemplate → marker-annotated
-    template. Persists styleTemplateAnnotated and returns it + validation."""
-    from app.html_sanitize import sanitize_template_html
-    from app.template_annotate import annotate_template
-    from app.template_fill import validate_annotated
-
-    account = await _load_owned_account(account_id, user)
-    plain = (account.styleTemplate or "").strip()
-    if not plain:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Upload an HTML template first.",
-        )
-
-    annotated = await annotate_template(sanitize_template_html(plain))
-    annotated = sanitize_template_html(annotated)
-    missing_req, missing_rec = validate_annotated(annotated)
-
-    account.styleTemplateAnnotated = annotated
-    await account.save()
-
-    return {
-        "annotated": annotated,
-        "missingRequired": missing_req,
-        "missingRecommended": missing_rec,
-        "valid": not missing_req,
-    }
-
-
-@router.get("/default-prompt")
-async def get_default_prompt(
-    user: Annotated[UserExtra, Depends(get_current_user)],
-) -> dict:
-    """Built-in resume content-contract prompt. Frontend 'Load default' button
-    seeds the custom-prompt textareas from this."""
-    return {"promptBody": default_prompt_body()}
-
-
-@router.get("/default-screening-prompt")
-async def get_default_screening_prompt(
-    user: Annotated[UserExtra, Depends(get_current_user)],
-) -> dict:
-    """Built-in screening-answer prompt for the 'Load default' button."""
-    return {"promptBody": default_screening_prompt_body()}
-
-
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
 async def generate(
     body: GenerateBody,
@@ -133,24 +80,10 @@ async def generate(
         )
 
     account = await _load_owned_account(body.accountId, user)
-    if not (account.experience or "").strip():
+    if not (account.styleTemplate or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Account is missing the 'experience' field — fill it on the Accounts page first.",
-        )
-    from app.template_fill import validate_annotated
-    annotated = (account.styleTemplateAnnotated or "").strip()
-    if not annotated:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No annotated template. On Resume Styles, upload a template and run 'Convert to template'.",
-        )
-    missing_req, _ = validate_annotated(annotated)
-    if missing_req:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Annotated template missing required markers: " + ", ".join(missing_req)
-            + ". Re-run 'Convert to template' on Resume Styles.",
+            detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
         )
 
     company = body.company.strip()
@@ -215,14 +148,12 @@ async def _run_job(
         resolved_prompt_body = (account.resumePromptBody or "").strip()
     if not resolved_prompt_body:
         resolved_prompt_body = (owner.resumePromptBody or "").strip() if owner else ""
-    # Empty → generate_resume falls back to the built-in default.
+    # Empty → no content guidance sent to the LLM (system rules only).
 
-    # Resolve screening prompt: account > user > built-in default.
+    # Resolve screening prompt: account > user. Empty → no guidance sent.
     resolved_screening = (account.screeningPrompt or "").strip()
     if not resolved_screening:
         resolved_screening = (owner.screeningPromptBody or "").strip() if owner else ""
-    if not resolved_screening:
-        resolved_screening = default_screening_prompt_body()
 
     try:
         # ---- step 1: generate resume ----
@@ -305,27 +236,34 @@ async def _run_screening(
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
 
-    # Pull the first show-true contact item with a display value as a rough
-    # "email" proxy for the screening prompt — generic contact items have no
-    # type, so the LLM gets whichever the user prioritized first.
-    primary_contact = next(
-        (ci.display for ci in (account.contactItems or []) if ci.show and (ci.display or "").strip()),
-        "",
-    )
+    # Candidate context comes from the profile's uploaded HTML template —
+    # name, contact, education, experience, projects all live there. Strip
+    # tags to give the LLM a clean text view.
+    candidate_text = ""
+    template_html = (account.styleTemplate or "").strip()
+    if template_html:
+        from bs4 import BeautifulSoup
+        candidate_text = re.sub(
+            r"\n{3,}", "\n\n",
+            BeautifulSoup(template_html, "html.parser").get_text("\n").strip(),
+        )
+
     parts: List[str] = [
         "You answer job-application screening questions on behalf of a candidate.",
-        f"Candidate name: {account.name}.",
-        f"Candidate primary contact: {primary_contact}." if primary_contact else "",
-        f"Candidate education: {account.education}." if account.education else "",
+        f"Profile: {account.name}.",
     ]
-    if (account.experience or "").strip():
-        parts.append(f"Candidate experience:\n{account.experience}")
+    if candidate_text:
+        parts.append(
+            "Candidate context (extracted from their resume template):\n"
+            + candidate_text
+        )
 
     if (jd or "").strip():
         parts.append(f"Job description:\n{jd}")
 
     indexed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-    parts.append((screening_prompt or default_screening_prompt_body()).strip())
+    if (screening_prompt or "").strip():
+        parts.append(screening_prompt.strip())
     parts.append(f"Questions:\n{indexed}")
     parts.append(
         f"Return a JSON object of the exact form: {{\"answers\": [\"...\", \"...\"]}} "
@@ -379,17 +317,15 @@ async def screening_answers(
         )
 
     account = await _load_owned_account(body.accountId, user)
-    if not (account.experience or "").strip():
+    if not (account.styleTemplate or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Account is missing the 'experience' field — fill it on the Accounts page first.",
+            detail="Profile has no HTML template yet — upload one on the Resume Styles tab first.",
         )
 
     screening = (account.screeningPrompt or "").strip()
     if not screening:
         screening = (user.screeningPromptBody or "").strip()
-    if not screening:
-        screening = default_screening_prompt_body()
 
     pairs = await _run_screening(
         account=account,

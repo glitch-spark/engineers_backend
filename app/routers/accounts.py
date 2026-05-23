@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.models.account import ContactItem, Resume
+from app.models.account import Resume
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -74,22 +74,9 @@ def _strip_markdown_from_account(payload: dict) -> dict:
     return payload
 
 
-class ContactItemIn(BaseModel):
-    label: str = ""
-    display: str = ""
-    url: str = ""
-    show: bool = True
-
-
 class AccountCreate(BaseModel):
     name: str
     resumes: Optional[List[ResumeIn]] = None
-    education: Optional[str] = None
-    experience: Optional[str] = None
-    projects: Optional[str] = None
-    contactItems: Optional[List[ContactItemIn]] = None
-    title: Optional[str] = None
-    titleAutoFromJD: Optional[bool] = None
     resumePromptBody: Optional[str] = None
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
@@ -101,12 +88,6 @@ class AccountCreate(BaseModel):
 class AccountUpdate(BaseModel):
     name: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
-    education: Optional[str] = None
-    experience: Optional[str] = None
-    projects: Optional[str] = None
-    contactItems: Optional[List[ContactItemIn]] = None
-    title: Optional[str] = None
-    titleAutoFromJD: Optional[bool] = None
     resumePromptBody: Optional[str] = None
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
@@ -119,17 +100,16 @@ class AccountUpdate(BaseModel):
 async def lookup_accounts(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Minimal projection of every account, for filter dropdowns. Auth required, no scoping.
-    `label` and `hasExperience` are surfaced so the Resume Generator dropdown can label
-    and gate accounts without a second round-trip."""
+    """Minimal projection of every account for filter dropdowns. Auth required,
+    no scoping. `hasTemplate` lets the Resume Generator label / gate accounts
+    without a second round-trip — a profile is generation-ready iff it has an
+    uploaded template."""
     rows = await Account.find({}).to_list()
     return {
         "accounts": [
             {
                 "_id": str(a.id),
                 "name": a.name,
-                "title": a.title,
-                "hasExperience": bool((a.experience or "").strip()),
                 "hasTemplate": bool((a.styleTemplate or "").strip()),
                 "createdBy": str(a.createdBy),
             }
@@ -155,11 +135,7 @@ async def list_accounts(
         query["createdBy"] = user.id
 
     if search.strip():
-        query["$or"] = [
-            {"name": ci_regex(search)},
-            {"title": ci_regex(search)},
-            {"contactItems.display": ci_regex(search)},
-        ]
+        query["name"] = ci_regex(search)
 
     skip = (page - 1) * limit
     total = await Account.find(query).count()
@@ -207,19 +183,12 @@ async def create_account(
         name=body.name,
         createdBy=user.id,
         resumes=resumes,
-        education=body.education,
-        experience=body.experience,
-        projects=body.projects,
-        contactItems=[ContactItem(**ci.model_dump()) for ci in (body.contactItems or [])],
-        title=body.title,
         resumePromptBody=body.resumePromptBody,
         styleTemplate=body.styleTemplate,
         styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
         screeningPrompt=body.screeningPrompt,
     )
-    if body.titleAutoFromJD is not None:
-        kwargs["titleAutoFromJD"] = body.titleAutoFromJD
     if body.pageFormat is not None:
         kwargs["pageFormat"] = body.pageFormat
     acc = Account(**kwargs)
@@ -242,27 +211,11 @@ async def update_account(
         acc.name = body.name
     if body.resumes is not None:
         acc.resumes = _validate_and_normalize_resumes(body.resumes)
-    if body.education is not None:
-        acc.education = body.education
-    if body.experience is not None:
-        acc.experience = body.experience
-    if body.projects is not None:
-        acc.projects = body.projects
-    if body.contactItems is not None:
-        acc.contactItems = [ContactItem(**ci.model_dump()) for ci in body.contactItems]
-    if body.title is not None:
-        acc.title = body.title
-    if body.titleAutoFromJD is not None:
-        acc.titleAutoFromJD = body.titleAutoFromJD
     if body.resumePromptBody is not None:
         acc.resumePromptBody = body.resumePromptBody
     if body.styleTemplate is not None:
         from app.html_sanitize import sanitize_template_html
-        new_tpl = sanitize_template_html(body.styleTemplate)
-        if new_tpl != (acc.styleTemplate or ""):
-            # Plain template changed → the annotated version is now stale.
-            acc.styleTemplateAnnotated = None
-        acc.styleTemplate = new_tpl
+        acc.styleTemplate = sanitize_template_html(body.styleTemplate)
     if body.styleTemplateName is not None:
         acc.styleTemplateName = body.styleTemplateName
     if body.pageFormat is not None:

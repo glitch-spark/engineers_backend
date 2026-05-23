@@ -11,66 +11,37 @@ PageFormat = Literal["A3", "A4", "A5", "Letter"]
 
 
 class Resume(BaseModel):
-    """Embedded resume document on Account.
-
-    Parsed client-side from PDF/TXT/MD into markdown; backend just stores it.
-    Per-resume `id` lets the frontend reference resumes during edits without
-    relying on array index (which would break under concurrent edits).
-    """
+    """Embedded generated-resume record on Account. Parsed client-side from
+    PDF/TXT/MD to markdown; backend just stores it. Per-resume `id` lets the
+    frontend reference resumes during edits without relying on array index."""
     id: PydanticObjectId = Field(default_factory=PydanticObjectId)
     filename: str
     markdown: str
     uploadedAt: datetime = Field(default_factory=datetime.utcnow)
 
 
-class ContactItem(BaseModel):
-    """Generic contact-line entry. User authors a label (e.g. 'Email'),
-    display text (the visible value on the resume), an optional URL for
-    the href, and a visibility toggle. Label is free-form and editable;
-    profiles default-seed a standard 7-row list (Email/Phone/Address/
-    GitHub/LinkedIn/Website/Twitter) but users may rename/add/remove."""
-    label: str = ""
-    display: str = ""
-    url: str = ""
-    show: bool = True
-
-
 class Account(TimestampedDocument):
+    """A generation profile = (label, HTML template, prompts).
+
+    All candidate data — name, contact line, education, companies, dates,
+    projects — lives INSIDE the uploaded HTML template. The resume LLM
+    rewrites only the parts the prompt asks for (typically headline, role
+    labels, bullets, summary) and preserves the rest byte-for-byte.
+    """
+    # Profile label, e.g. "AI Full-stack" / "Backend". Identifies the profile
+    # in lists, dropdowns, S3 paths, and generated-resume filenames.
     name: str
     createdBy: PydanticObjectId
     resumes: List[Resume] = []
-
-    education: Optional[str] = None
-    experience: Optional[str] = None
-    # Free-form notes about projects the candidate has worked on across all
-    # companies. LLM attributes each project to a company by reading dates +
-    # context. Used to generate the Projects subsection under each company in
-    # the resume.
-    projects: Optional[str] = None
-
-    # Generic contact items rendered on the resume header. Each entry has
-    # display text + url + a visibility toggle. No semantic types — the user
-    # writes "mailto:..." / "tel:..." as needed.
-    contactItems: List[ContactItem] = []
-
-    # Header title (e.g. "Senior Software Engineer"). When titleAutoFromJD
-    # is true, the LLM derives the title from the job description instead;
-    # the static text becomes a seniority hint only.
-    title: Optional[str] = None
-    titleAutoFromJD: bool = False
 
     # Account-level custom resume content-contract prompt. Empty → fall back
     # to the user-level prompt, then the built-in default.
     resumePromptBody: Optional[str] = None
 
-    # Plain HTML template uploaded by the user (the conversion source).
+    # HTML template uploaded by the user. The resume LLM edits this in
+    # place per generation — structure/CSS preserved, sample text replaced.
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
-    # Marker-annotated template: styleTemplate with data-slot/data-repeat/
-    # data-field attributes added by the LLM conversion step. Resume
-    # generation deterministically fills THIS — no LLM touches HTML at
-    # generation time.
-    styleTemplateAnnotated: Optional[str] = None
     pageFormat: PageFormat = "A4"
     previewHtml: Optional[str] = None
 
