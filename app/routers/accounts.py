@@ -111,6 +111,7 @@ async def lookup_accounts(
                 "_id": str(a.id),
                 "name": a.name,
                 "hasTemplate": bool((a.styleTemplate or "").strip()),
+                "hasPrompt": bool((a.resumePromptBody or "").strip()),
                 "createdBy": str(a.createdBy),
             }
             for a in rows

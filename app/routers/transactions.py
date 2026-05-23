@@ -13,11 +13,32 @@ from app.slack import notify_new_transaction, notify_transaction_status_change
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
 
+_LAST4_RE = re.compile(r"^\d{4}$")
+
+
+def _validate_pay_method(pay_method: Optional[str], card_last4: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Normalize + validate (payMethod, cardLast4). When method=='card',
+    cardLast4 must be exactly 4 digits. When method=='crypto', cardLast4
+    is forced to None. Returns the cleaned pair. Raises 400 on invalid."""
+    if pay_method is None:
+        return None, None
+    if pay_method not in ("crypto", "card"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payMethod must be 'crypto' or 'card'")
+    if pay_method == "crypto":
+        return "crypto", None
+    last4 = (card_last4 or "").strip()
+    if not _LAST4_RE.match(last4):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cardLast4 must be exactly 4 digits when payMethod='card'")
+    return "card", last4
+
+
 class TransactionCreate(BaseModel):
     date: str
     amount: float
     description: Optional[str] = ""
     notes: Optional[str] = ""
+    payMethod: Optional[str] = None
+    cardLast4: Optional[str] = None
 
 
 class TransactionUpdate(BaseModel):
@@ -26,6 +47,8 @@ class TransactionUpdate(BaseModel):
     description: Optional[str] = None
     notes: Optional[str] = None
     status: Optional[str] = None
+    payMethod: Optional[str] = None
+    cardLast4: Optional[str] = None
 
 
 @router.get("/summary")
@@ -105,6 +128,7 @@ async def list_transactions(
     fromSearch: str = Query(""),
     toSearch: str = Query(""),
     userSearch: str = Query(""),
+    payMethod: str = Query(""),
 ) -> dict:
     is_admin = user.role == "admin"
     query: dict[str, Any] = {} if is_admin else {"userId": user.id}
@@ -121,6 +145,9 @@ async def list_transactions(
 
     if is_admin and userId:
         query["userId"] = to_object_id(userId)
+
+    if payMethod in ("crypto", "card"):
+        query["payMethod"] = payMethod
 
     if search:
         query["$or"] = [
@@ -182,6 +209,10 @@ async def create_transaction(
     if date_dt is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid date")
 
+    if not body.payMethod:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payMethod is required")
+    pay_method, card_last4 = _validate_pay_method(body.payMethod, body.cardLast4)
+
     tx = Transaction(
         userId=user.id,
         date=date_dt,
@@ -189,6 +220,8 @@ async def create_transaction(
         description=body.description or "",
         notes=body.notes or "",
         status="pending",
+        payMethod=pay_method,
+        cardLast4=card_last4,
     )
     await tx.insert()
 
@@ -251,6 +284,19 @@ async def update_transaction(
             tx.description = body.description
         if body.notes is not None:
             tx.notes = body.notes
+        if body.payMethod is not None:
+            # Allow caller to send only payMethod; validate uses the
+            # incoming cardLast4 when present, else the row's current one.
+            pm, l4 = _validate_pay_method(
+                body.payMethod,
+                body.cardLast4 if body.cardLast4 is not None else tx.cardLast4,
+            )
+            tx.payMethod = pm
+            tx.cardLast4 = l4
+        elif body.cardLast4 is not None and tx.payMethod == "card":
+            # Updating only last4 on an existing card payment.
+            pm, l4 = _validate_pay_method("card", body.cardLast4)
+            tx.cardLast4 = l4
 
     await tx.save()
     return doc_to_dict(tx)
