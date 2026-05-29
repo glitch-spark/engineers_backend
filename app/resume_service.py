@@ -150,6 +150,14 @@ def _build_resume_prompt(
         "the absolute rules above):\n" + body
         if body else ""
     )
+    # Soft-trim the JD before sending. Core role requirements live in the
+    # first few KB; the tail is usually benefits / EEO / legal boilerplate
+    # with little tailoring signal. Capping cuts input tokens with no
+    # quality loss. Tunable via RESUME_JD_MAX_CHARS.
+    jd = (job_description or "").strip()
+    cap = getattr(get_settings(), "RESUME_JD_MAX_CHARS", 8000) or 8000
+    if len(jd) > cap:
+        jd = jd[:cap].rstrip() + "\n[... job description truncated ...]"
     return (
         _SYSTEM_RULES
         + custom_block
@@ -157,7 +165,7 @@ def _build_resume_prompt(
           "return the full document) ===\n"
         + template_html
         + "\n\n=== JOB DESCRIPTION ===\n"
-        + (job_description or "").strip()
+        + jd
     )
 
 
@@ -167,7 +175,13 @@ def _build_resume_prompt(
 
 
 async def _openai_call(prompt: str) -> str:
-    """Single OpenAI Responses call. Returns the raw output_text."""
+    """Single OpenAI Responses call. Returns the raw output_text.
+
+    gpt-5-mini is a reasoning model — without an explicit effort it defaults
+    to medium and bills heavy hidden reasoning tokens (at output rate). The
+    resume task is a mechanical text-replace inside a fixed template, so it
+    needs little reasoning. Pin effort low to cut hidden-token cost ~5-10x.
+    Override via RESUME_REASONING_EFFORT env if a profile needs more depth."""
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         raise HTTPException(
@@ -175,10 +189,25 @@ async def _openai_call(prompt: str) -> str:
             detail="OPENAI_API_KEY not configured",
         )
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.responses.create(
-        model=settings.RESUME_OPENAI_MODEL,
-        input=prompt,
-    )
+    effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
+    kwargs: dict = {"model": settings.RESUME_OPENAI_MODEL, "input": prompt}
+    # Reasoning param only applies to gpt-5* reasoning models; harmless to
+    # send, but guard so a non-reasoning override model doesn't 400.
+    if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+        kwargs["reasoning"] = {"effort": effort}
+    response = await client.responses.create(**kwargs)
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        out_details = getattr(usage, "output_tokens_details", None)
+        reasoning_toks = getattr(out_details, "reasoning_tokens", None) if out_details else None
+        log.info(
+            "resume LLM usage: in=%s out=%s reasoning=%s effort=%s",
+            getattr(usage, "input_tokens", "?"),
+            getattr(usage, "output_tokens", "?"),
+            reasoning_toks if reasoning_toks is not None else "?",
+            effort,
+        )
     return response.output_text or ""
 
 

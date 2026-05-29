@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     # High-quality structured generation: resume HTML, screening answers, scoring.
     # Use a smarter model — output ships to users and judgment matters.
     RESUME_OPENAI_MODEL: str = "gpt-5-mini"
+    # Reasoning effort for the resume rewrite (gpt-5* only). Mechanical
+    # text-replace needs little reasoning — "low" cuts hidden reasoning
+    # tokens (billed at output rate) ~5-10x vs the medium default.
+    # Values: minimal | low | medium | high.
+    RESUME_REASONING_EFFORT: str = "low"
+    # Soft cap on JD chars fed to the resume LLM. Core requirements sit at
+    # the top; the tail is benefits/EEO/legal boilerplate. Trimming cuts
+    # input tokens with negligible quality loss. ~8000 chars ≈ 2K tokens.
+    RESUME_JD_MAX_CHARS: int = 8000
     # Cheap structured-extraction tasks: parsing Q&A from transcripts, rollup tips.
     # No real reasoning, just JSON shape. Mini saves ~50% per call.
     EXTRACTION_MODEL: str = "gpt-4o-mini"
