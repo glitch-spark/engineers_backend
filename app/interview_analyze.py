@@ -120,10 +120,11 @@ async def extract_and_score(interview: Interview) -> int:
     )
 
     try:
-        sc_res = await client.responses.create(
-            model=settings.RESUME_OPENAI_MODEL,
-            input=score_prompt,
-        )
+        # Scoring is mechanical (0-10 + one-liners) — minimal reasoning.
+        sc_kwargs: dict = {"model": settings.RESUME_OPENAI_MODEL, "input": score_prompt}
+        if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+            sc_kwargs["reasoning"] = {"effort": "minimal"}
+        sc_res = await client.responses.create(**sc_kwargs)
         sc_raw = sc_res.output_text or ""
         sc_parsed = json.loads(_strip_fences(sc_raw))
         scores_by_i = {

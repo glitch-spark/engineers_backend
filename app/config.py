@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     # the top; the tail is benefits/EEO/legal boilerplate. Trimming cuts
     # input tokens with negligible quality loss. ~8000 chars ≈ 2K tokens.
     RESUME_JD_MAX_CHARS: int = 8000
+    # Reasoning effort for non-resume gpt-5* calls (interview rollup,
+    # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
+    # medium default bills heavy hidden reasoning tokens. low is plenty for
+    # these synthesis/chat tasks. minimal | low | medium | high.
+    AI_REASONING_EFFORT: str = "low"
+    # Output-token ceilings to stop runaway generations (billed at output
+    # rate). Tunable per deployment.
+    AI_CHAT_MAX_TOKENS: int = 800
+    AI_REVIEW_MAX_TOKENS: int = 1500
     # Cheap structured-extraction tasks: parsing Q&A from transcripts, rollup tips.
     # No real reasoning, just JSON shape. Mini saves ~50% per call.
     EXTRACTION_MODEL: str = "gpt-4o-mini"

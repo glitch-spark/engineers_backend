@@ -590,10 +590,10 @@ async def analyze_interviews(
 
         try:
             # Style + judgment work — bump to higher-quality model.
-            rollup_res = await client.responses.create(
-                model=settings.RESUME_OPENAI_MODEL,
-                input=rollup_prompt,
-            )
+            rollup_kwargs: dict = {"model": settings.RESUME_OPENAI_MODEL, "input": rollup_prompt}
+            if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+                rollup_kwargs["reasoning"] = {"effort": settings.AI_REASONING_EFFORT}
+            rollup_res = await client.responses.create(**rollup_kwargs)
             rollup_raw = rollup_res.output_text or ""
             rollup_parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", rollup_raw.strip(), flags=re.MULTILINE))
         except Exception as exc:  # noqa: BLE001
@@ -715,11 +715,15 @@ async def analyze_chat(
         chat_messages.append({"role": m.role, "content": m.content})
 
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    chat_kwargs: dict = {
+        "model": settings.RESUME_OPENAI_MODEL,
+        "messages": chat_messages,
+        "max_completion_tokens": settings.AI_CHAT_MAX_TOKENS,
+    }
+    if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+        chat_kwargs["reasoning_effort"] = settings.AI_REASONING_EFFORT
     try:
-        completion = await client.chat.completions.create(
-            model=settings.RESUME_OPENAI_MODEL,
-            messages=chat_messages,
-        )
+        completion = await client.chat.completions.create(**chat_kwargs)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc))
 

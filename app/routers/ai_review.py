@@ -171,6 +171,7 @@ async def stream_ai_review(
                 model=model_name,
                 stream=True,
                 stream_options={"include_usage": True},
+                max_tokens=settings.AI_REVIEW_MAX_TOKENS,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
@@ -382,6 +383,7 @@ async def interview_chat(
         completion = await client.chat.completions.create(
             model=model_name,
             messages=messages,
+            max_tokens=settings.AI_CHAT_MAX_TOKENS,
         )
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
