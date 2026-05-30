@@ -56,6 +56,11 @@ class ResumeApplication(TimestampedDocument):
     screeningQuestions: List[str] = []
     screeningPairs: List[ScreeningPair] = []
 
+    # LLM token usage from the resume rewrite (gpt-5* reasoning model).
+    inputTokens: Optional[int] = None
+    outputTokens: Optional[int] = None
+    reasoningTokens: Optional[int] = None
+
     class Settings:
         name = "resumeapplications"
         indexes = [

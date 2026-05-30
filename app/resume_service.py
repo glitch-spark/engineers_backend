@@ -155,7 +155,7 @@ def _build_resume_prompt(
     # with little tailoring signal. Capping cuts input tokens with no
     # quality loss. Tunable via RESUME_JD_MAX_CHARS.
     jd = (job_description or "").strip()
-    cap = getattr(get_settings(), "RESUME_JD_MAX_CHARS", 8000) or 8000
+    cap = getattr(get_settings(), "RESUME_JD_MAX_CHARS", 12000) or 12000
     if len(jd) > cap:
         jd = jd[:cap].rstrip() + "\n[... job description truncated ...]"
     return (
@@ -174,8 +174,11 @@ def _build_resume_prompt(
 # ---------------------------------------------------------------------------
 
 
-async def _openai_call(prompt: str) -> str:
-    """Single OpenAI Responses call. Returns the raw output_text.
+async def _openai_call(prompt: str) -> tuple[str, dict]:
+    """Single OpenAI Responses call. Returns (output_text, usage_dict).
+
+    usage_dict shape: {input, output, reasoning}. Empty dict on failure or
+    when the SDK doesn't surface usage.
 
     gpt-5-mini is a reasoning model — without an explicit effort it defaults
     to medium and bills heavy hidden reasoning tokens (at output rate). The
@@ -197,18 +200,27 @@ async def _openai_call(prompt: str) -> str:
         kwargs["reasoning"] = {"effort": effort}
     response = await client.responses.create(**kwargs)
 
+    usage_out: dict = {}
     usage = getattr(response, "usage", None)
     if usage is not None:
         out_details = getattr(usage, "output_tokens_details", None)
         reasoning_toks = getattr(out_details, "reasoning_tokens", None) if out_details else None
+        input_toks = getattr(usage, "input_tokens", None)
+        output_toks = getattr(usage, "output_tokens", None)
         log.info(
             "resume LLM usage: in=%s out=%s reasoning=%s effort=%s",
-            getattr(usage, "input_tokens", "?"),
-            getattr(usage, "output_tokens", "?"),
+            input_toks if input_toks is not None else "?",
+            output_toks if output_toks is not None else "?",
             reasoning_toks if reasoning_toks is not None else "?",
             effort,
         )
-    return response.output_text or ""
+        if input_toks is not None:
+            usage_out["input"] = int(input_toks)
+        if output_toks is not None:
+            usage_out["output"] = int(output_toks)
+        if reasoning_toks is not None:
+            usage_out["reasoning"] = int(reasoning_toks)
+    return (response.output_text or ""), usage_out
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +344,13 @@ def _maybe_upload_to_s3(pdf_bytes: bytes, profile_name: str, company: str) -> tu
 class GeneratedResume:
     pdf_bytes: bytes
     s3_key: Optional[str]
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    # Plain reading-order text extracted from the rewritten HTML. Used as
+    # candidate context for follow-up screening Q&A so the answers reflect
+    # the tailored resume, not the raw template.
+    plain_text: Optional[str] = None
 
 
 async def generate_resume(
@@ -356,7 +375,7 @@ async def generate_resume(
     )
 
     prompt = _build_resume_prompt(account, job_description, template, prompt_body=prompt_body)
-    raw = await _openai_call(prompt)
+    raw, usage = await _openai_call(prompt)
     out_html = _strip_fences(raw)
     _validate_llm_html(template, out_html)
 
@@ -366,4 +385,15 @@ async def generate_resume(
         margin_pt=_resolve_margin_pt(account),
     )
     s3_key, _region = _maybe_upload_to_s3(pdf_bytes, account.name, company)
-    return GeneratedResume(pdf_bytes=pdf_bytes, s3_key=s3_key)
+    plain_text = re.sub(
+        r"\n{3,}", "\n\n",
+        BeautifulSoup(out_html, "html.parser").get_text("\n").strip(),
+    )
+    return GeneratedResume(
+        pdf_bytes=pdf_bytes,
+        s3_key=s3_key,
+        input_tokens=usage.get("input"),
+        output_tokens=usage.get("output"),
+        reasoning_tokens=usage.get("reasoning"),
+        plain_text=plain_text,
+    )

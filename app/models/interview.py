@@ -52,6 +52,7 @@ class Interview(TimestampedDocument):
     companyName: Optional[str] = None
     interviewerName: Optional[str] = None
     appliedPosition: Optional[str] = None
+    jobUrl: Optional[str] = None
     mainTechStack: Optional[str] = None
     transcript: str = ""
     note: str = ""

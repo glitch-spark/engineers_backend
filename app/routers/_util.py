@@ -57,13 +57,15 @@ async def populate_owner(
         if owner is not None:
             owner_dict = doc_to_dict(owner)
             if only is not None:
-                keep = set(only) | {"_id"}
+                keep = set(only) | {"_id", "image"}
                 owner_dict = {k: v for k, v in owner_dict.items() if k in keep}
             item[field] = owner_dict
             item["ownerEmail"] = owner.email
             item["ownerName"] = owner.name
+            item["ownerImage"] = getattr(owner, "image", None) or None
         else:
             item["ownerEmail"] = None
             item["ownerName"] = None
+            item["ownerImage"] = None
         out.append(item)
     return out

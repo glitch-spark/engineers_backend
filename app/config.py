@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     RESUME_REASONING_EFFORT: str = "low"
     # Soft cap on JD chars fed to the resume LLM. Core requirements sit at
     # the top; the tail is benefits/EEO/legal boilerplate. Trimming cuts
-    # input tokens with negligible quality loss. ~8000 chars ≈ 2K tokens.
-    RESUME_JD_MAX_CHARS: int = 8000
+    # input tokens with negligible quality loss. ~12000 chars ≈ 3K tokens.
+    RESUME_JD_MAX_CHARS: int = 12000
     # Reasoning effort for non-resume gpt-5* calls (interview rollup,
     # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for

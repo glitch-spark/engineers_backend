@@ -41,6 +41,7 @@ class InterviewCreate(BaseModel):
     companyName: Optional[str] = None
     interviewerName: Optional[str] = None
     appliedPosition: Optional[str] = None
+    jobUrl: Optional[str] = None
     mainTechStack: Optional[str] = None
     transcript: Optional[str] = ""
     note: Optional[str] = ""
@@ -55,6 +56,7 @@ class InterviewUpdate(BaseModel):
     companyName: Optional[str] = None
     interviewerName: Optional[str] = None
     appliedPosition: Optional[str] = None
+    jobUrl: Optional[str] = None
     mainTechStack: Optional[str] = None
     transcript: Optional[str] = None
     note: Optional[str] = None
@@ -214,6 +216,7 @@ async def create_interview(
         companyName=body.companyName or None,
         interviewerName=body.interviewerName or None,
         appliedPosition=body.appliedPosition or None,
+        jobUrl=body.jobUrl or None,
         mainTechStack=body.mainTechStack or None,
         transcript=body.transcript or "",
         note=body.note or "",
@@ -297,6 +300,8 @@ async def update_interview(
         iv.interviewerName = body.interviewerName or None
     if body.appliedPosition is not None:
         iv.appliedPosition = body.appliedPosition or None
+    if body.jobUrl is not None:
+        iv.jobUrl = body.jobUrl or None
     if body.mainTechStack is not None:
         iv.mainTechStack = body.mainTechStack or None
     transcript_changed = body.transcript is not None and body.transcript != (iv.transcript or "")

@@ -165,6 +165,10 @@ async def _run_job(
         result = await generate_resume(
             account, jd, company, prompt_body=resolved_prompt_body or None
         )
+        job.inputTokens = result.input_tokens
+        job.outputTokens = result.output_tokens
+        job.reasoningTokens = result.reasoning_tokens
+        job.plainText = result.plain_text
 
         # ---- step 2: persist PDF reference ----
         # Prefer S3: bucket pointer only, no inline bytes. Fall back to base64
@@ -227,26 +231,33 @@ async def _run_screening(
     jd: str,
     questions: List[str],
     screening_prompt: str,
+    resume_text: Optional[str] = None,
 ) -> List[dict]:
     """`screening_prompt` is the resolved answer-prompt (account > user >
-    built-in default), resolved by the caller."""
+    built-in default), resolved by the caller. When `resume_text` is set
+    (post-generation Q&A), the LLM uses the tailored resume's plain text
+    as the candidate context; otherwise it falls back to the account's
+    raw template text."""
     from openai import AsyncOpenAI
 
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
 
-    # Candidate context comes from the profile's uploaded HTML template —
-    # name, contact, education, experience, projects all live there. Strip
-    # tags to give the LLM a clean text view.
-    candidate_text = ""
-    template_html = (account.styleTemplate or "").strip()
-    if template_html:
-        from bs4 import BeautifulSoup
-        candidate_text = re.sub(
-            r"\n{3,}", "\n\n",
-            BeautifulSoup(template_html, "html.parser").get_text("\n").strip(),
-        )
+    # Candidate context — prefer the tailored generated-resume text when
+    # supplied (post-gen ask endpoint); else fall back to the profile's
+    # raw template text. Either way, strip tags before sending.
+    candidate_text = (resume_text or "").strip()
+    candidate_source = "tailored resume"
+    if not candidate_text:
+        template_html = (account.styleTemplate or "").strip()
+        if template_html:
+            from bs4 import BeautifulSoup
+            candidate_text = re.sub(
+                r"\n{3,}", "\n\n",
+                BeautifulSoup(template_html, "html.parser").get_text("\n").strip(),
+            )
+            candidate_source = "resume template"
 
     parts: List[str] = [
         "You answer job-application screening questions on behalf of a candidate.",
@@ -254,7 +265,7 @@ async def _run_screening(
     ]
     if candidate_text:
         parts.append(
-            "Candidate context (extracted from their resume template):\n"
+            f"Candidate context (extracted from their {candidate_source}):\n"
             + candidate_text
         )
 
@@ -336,6 +347,56 @@ async def screening_answers(
     return {"pairs": pairs}
 
 
+class JobAskBody(BaseModel):
+    questions: List[str] = Field(min_length=1, max_length=10)
+
+
+@router.post("/jobs/{job_id}/ask")
+async def ask_job_screening(
+    job_id: str,
+    body: JobAskBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Ad-hoc screening Q&A against an existing generated resume — uses the
+    job's stored JD + the profile's screening prompt. Appends the new pairs
+    to the job so future opens show them. Owner-only (admin too)."""
+    oid = to_object_id(job_id)
+    job = await ResumeApplication.get(oid)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    is_admin = user.role == "admin"
+    if not is_admin and str(job.userId) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    if job.accountId is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="job has no profile")
+    account = await Account.get(job.accountId)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="profile no longer exists")
+    owner = await UserExtra.get(job.userId)
+
+    questions = [q.strip() for q in body.questions if q and q.strip()]
+    if not questions:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one non-empty question is required")
+
+    # Same precedence as initial generation: account > user > empty.
+    screening_prompt = (account.screeningPrompt or "").strip()
+    if not screening_prompt and owner:
+        screening_prompt = (owner.screeningPromptBody or "").strip()
+
+    pairs = await _run_screening(
+        account=account,
+        jd=job.jobDescription or "",
+        questions=questions,
+        screening_prompt=screening_prompt,
+        resume_text=job.plainText or "",
+    )
+
+    # Append to the job so the panel persists history across refreshes.
+    job.screeningPairs = [*(job.screeningPairs or []), *[ScreeningPairModel(**p) for p in pairs]]
+    await job.save()
+    return {"pairs": pairs}
+
+
 # ---------- Job listing / polling / download ---------------------------------
 
 
@@ -357,6 +418,10 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "executionMs": job.executionMs,
         "screeningQuestions": job.screeningQuestions,
         "screeningPairs": [p.model_dump() for p in job.screeningPairs],
+        "jobDescription": job.jobDescription or "",
+        "inputTokens": job.inputTokens,
+        "outputTokens": job.outputTokens,
+        "reasoningTokens": job.reasoningTokens,
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,
@@ -370,6 +435,7 @@ async def list_jobs(
     user: Annotated[UserExtra, Depends(get_current_user)],
     accountId: Optional[str] = None,
     company: Optional[str] = None,
+    q: Optional[str] = None,
     page: int = 1,
     limit: int = 20,
 ) -> dict:
@@ -380,6 +446,16 @@ async def list_jobs(
     if company and company.strip():
         # Case-insensitive substring match on company name.
         query["companyNameLower"] = {"$regex": re.escape(company.strip().lower())}
+    # Free-text search across the stored JD only. Multi-word = AND (each
+    # term must appear somewhere in the JD, case-insensitive).
+    q_terms: list[str] = []
+    if q and q.strip():
+        q_terms = [t for t in re.split(r"\s+", q.strip()) if t]
+        if q_terms:
+            query["$and"] = [
+                {"jobDescription": {"$regex": re.escape(t), "$options": "i"}}
+                for t in q_terms
+            ]
     page = max(1, page)
     limit = max(1, min(100, limit))
     total = await ResumeApplication.find(query).count()
@@ -390,9 +466,39 @@ async def list_jobs(
         .limit(limit)
         .to_list()
     )
+
+    def _snippet(jd: str) -> Optional[str]:
+        """Pull ~160 chars of JD around the first matched term so the row
+        can show the user *why* it matched."""
+        if not jd or not q_terms:
+            return None
+        first_match: Optional[re.Match[str]] = None
+        for t in q_terms:
+            m = re.search(re.escape(t), jd, re.IGNORECASE)
+            if m and (first_match is None or m.start() < first_match.start()):
+                first_match = m
+        if first_match is None:
+            return None
+        s = max(0, first_match.start() - 70)
+        e = min(len(jd), first_match.end() + 90)
+        out = jd[s:e].strip().replace("\n", " ")
+        if s > 0:
+            out = "…" + out
+        if e < len(jd):
+            out = out + "…"
+        return out
+
+    jobs_out = []
+    for r in rows:
+        d = _job_to_dict(r)
+        snip = _snippet(r.jobDescription or "")
+        if snip:
+            d["matchSnippet"] = snip
+        jobs_out.append(d)
+
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
-        "jobs": [_job_to_dict(r) for r in rows],
+        "jobs": jobs_out,
         "pagination": {
             "page": page,
             "limit": limit,
@@ -415,35 +521,136 @@ async def get_job(
     return _job_to_dict(job)
 
 
+_FOLDER_BAD = re.compile(r"[\\/\x00-\x1f<>:\"|?*]+")
+
+
+def _safe_folder(name: str) -> str:
+    """Filesystem-safe folder name derived from the company. Strips path
+    separators + control chars + reserved Windows chars; trims dots/spaces."""
+    s = _FOLDER_BAD.sub("_", (name or "").strip())
+    s = s.strip(". ") or "company"
+    return s[:120]
+
+
+async def _fetch_pdf_bytes(job: ResumeApplication) -> bytes:
+    """PDF bytes for a job — pulled from S3 when configured, else inline
+    pdfData. Used by both single + bulk zip downloads."""
+    if job.s3Key and s3_enabled():
+        from app.resume_service import _s3_client
+        s = get_settings()
+        try:
+            obj = _s3_client().get_object(Bucket=s.AWS_S3_BUCKET, Key=job.s3Key)
+            return obj["Body"].read()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("s3 get_object failed for job %s: %s", job.id, exc)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="PDF fetch failed")
+    if job.pdfData:
+        return base64.b64decode(job.pdfData)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF not available")
+
+
+def _build_zip(entries: list[tuple[str, bytes]]) -> bytes:
+    """Build an in-memory zip with `(path, bytes)` pairs. Dedups colliding
+    paths by appending ` (2)`, ` (3)`, ..."""
+    import io
+    import zipfile
+
+    seen: dict[str, int] = {}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, data in entries:
+            base, _, ext = path.rpartition(".")
+            if base == "":
+                base, ext = path, ""
+            final = path
+            if path in seen:
+                seen[path] += 1
+                final = f"{base} ({seen[path]}).{ext}" if ext else f"{path} ({seen[path]})"
+            else:
+                seen[path] = 1
+            zf.writestr(final, data)
+    return buf.getvalue()
+
+
+def _job_archive_path(job: ResumeApplication) -> str:
+    """Folder path inside the archive (or on disk under the user-picked
+    directory). Shape: `<ProfileName>/<CompanyName>` — both sanitized for
+    filesystem safety."""
+    profile = _safe_folder(job.profileName or "profile")
+    company = _safe_folder(job.companyName or "company")
+    return f"{profile}/{company}"
+
+
 @router.get("/jobs/{job_id}/download")
 async def download_job(
     job_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    format: str = "zip",
 ):
-    """Return a JSON {url} pointing at S3 (presigned, 15min) or, for legacy
-    rows, return the PDF bytes inline. JSON form lets the SPA do an anchor
-    click for cross-origin download without CORS preflight on S3."""
+    """Default returns a ZIP containing `<profile>/<company>/Resume.pdf`.
+    Pass `?format=pdf` for raw PDF bytes plus an `X-Folder: <profile>/<company>`
+    header — used by the File System Access API path so the SPA can write
+    nested folders directly into the user-picked directory."""
     job = await ResumeApplication.get(to_object_id(job_id))
     if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
 
-    download_name = (job.pdfFilename or f"resume_{job.companyName}.pdf").split("/")[-1]
-
-    if job.s3Key and s3_enabled():
-        try:
-            url = generate_presigned_get(job.s3Key, expires=900, download_filename=download_name)
-            return {"url": url, "filename": download_name}
-        except Exception as exc:  # noqa: BLE001
-            log.exception("presign failed for job %s: %s", job_id, exc)
-
-    if job.pdfData:
-        pdf = base64.b64decode(job.pdfData)
+    pdf = await _fetch_pdf_bytes(job)
+    folder = _job_archive_path(job)
+    if format == "pdf":
         return Response(
             content=pdf,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+            headers={"Content-Disposition": f'attachment; filename="Resume.pdf"', "X-Folder": folder},
         )
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF not available")
+    zip_bytes = _build_zip([(f"{folder}/Resume.pdf", pdf)])
+    zip_name = f"{_safe_folder(job.companyName or 'company')}.zip"
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
+class BulkDownloadBody(BaseModel):
+    jobIds: List[str] = Field(min_length=1, max_length=100)
+
+
+@router.post("/jobs/bulk-download")
+async def bulk_download_jobs(
+    body: BulkDownloadBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+):
+    """Stream a single ZIP containing one folder per selected job:
+    `<company>/Resume.pdf`. Companies that repeat get suffixed " (2)", " (3)"
+    inside the archive so nothing is overwritten."""
+    oids = [to_object_id(jid) for jid in body.jobIds]
+    is_admin = user.role == "admin"
+    query: dict = {"_id": {"$in": oids}}
+    if not is_admin:
+        query["userId"] = user.id
+    jobs = await ResumeApplication.find(query).to_list()
+    if not jobs:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no jobs in scope")
+
+    entries: list[tuple[str, bytes]] = []
+    for job in jobs:
+        try:
+            pdf = await _fetch_pdf_bytes(job)
+        except HTTPException:
+            continue  # skip rows whose PDF isn't available
+        entries.append((f"{_job_archive_path(job)}/Resume.pdf", pdf))
+    if not entries:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no downloadable PDFs in selection")
+
+    zip_bytes = _build_zip(entries)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    zip_name = f"resumes-{stamp}.zip"
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
 
 
 @router.delete("/jobs/{job_id}")

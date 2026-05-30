@@ -6,9 +6,35 @@ from pydantic import BaseModel
 
 from app.deps import get_current_user
 from app.models import UserExtra, WeeklyPlan
+from app.models.weekly_plan import CORE_METRICS, WeeklyMetric
 from app.routers._util import doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
+
+
+class MetricIn(BaseModel):
+    key: str
+    label: str
+    target: int = 0
+    actual: int = 0
+    unit: Optional[str] = None
+
+
+def _clean_metrics(items: Optional[list[MetricIn]]) -> list[WeeklyMetric]:
+    out: list[WeeklyMetric] = []
+    for m in items or []:
+        key = (m.key or "").strip()
+        label = (m.label or "").strip()
+        if not key or not label:
+            continue
+        out.append(WeeklyMetric(
+            key=key,
+            label=label,
+            target=max(0, int(m.target or 0)),
+            actual=max(0, int(m.actual or 0)),
+            unit="hours" if (m.unit or "").strip().lower() == "hours" else "count",
+        ))
+    return out
 
 
 class WeeklyPlanCreate(BaseModel):
@@ -16,8 +42,11 @@ class WeeklyPlanCreate(BaseModel):
     year: int
     startDate: str
     endDate: str
-    content: str
+    content: Optional[str] = None
     result: Optional[str] = None
+    metrics: Optional[list[MetricIn]] = None
+    status: Optional[str] = None
+    nextInterviewTarget: Optional[int] = None
 
 
 class WeeklyPlanUpdate(BaseModel):
@@ -27,10 +56,185 @@ class WeeklyPlanUpdate(BaseModel):
     endDate: Optional[str] = None
     content: Optional[str] = None
     result: Optional[str] = None
+    metrics: Optional[list[MetricIn]] = None
+    status: Optional[str] = None
+    nextInterviewTarget: Optional[int] = None
 
 
 def _parse_dt(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+@router.post("/progress-report")
+async def progress_report(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    year: Optional[int] = Query(None),
+    weekNumber: Optional[int] = Query(None),
+    userId: Optional[str] = Query(None),
+) -> dict:
+    """Admin-only. Run AI extraction over the weekly plans in scope (free-text
+    plan/follow-up -> structured metrics), persist the metrics onto each plan,
+    and return a per-user rollup. Re-running overwrites (picks up text edits)."""
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+
+    from app.weekly_report import extract_metrics
+
+    query: dict[str, Any] = {}
+    if year is not None:
+        query["year"] = year
+    if weekNumber is not None:
+        query["weekNumber"] = weekNumber
+    if userId:
+        query["userId"] = to_object_id(userId)
+
+    plans = await WeeklyPlan.find(query).sort([("year", -1), ("weekNumber", -1)]).to_list()
+    # Guardrail: cap how many plans one run will process (cost control).
+    MAX_PLANS = 200
+    capped = plans[:MAX_PLANS]
+
+    processed = 0
+    for p in capped:
+        metrics = await extract_metrics(p.content or "", p.result or "")
+        p.metrics = metrics
+        if (p.result or "").strip():
+            p.status = "reviewed"
+        await p.save()
+        processed += 1
+
+    populated = await populate_owner(capped, field="userId", only=("name", "email"))
+    return {
+        "processed": processed,
+        "skipped": max(0, len(plans) - len(capped)),
+        "plans": populated,
+    }
+
+
+@router.get("/user-rollup")
+async def user_rollup(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    year: Optional[int] = Query(None),
+    weekNumber: Optional[int] = Query(None),
+    userId: Optional[str] = Query(None),
+) -> dict:
+    """Admin-only. Aggregate stored metrics per user across the scoped weeks
+    (planned vs actual bids/interviews/etc). Pure aggregation — no AI call;
+    reads metrics populated by Run Progress Report. Scope follows the same
+    filters as the list (year + optional week + optional user)."""
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+
+    query: dict[str, Any] = {}
+    if year is not None:
+        query["year"] = year
+    if weekNumber is not None:
+        query["weekNumber"] = weekNumber
+    if userId:
+        query["userId"] = to_object_id(userId)
+
+    plans = await WeeklyPlan.find(query).to_list()
+
+    # Group by user.
+    by_user: dict[str, dict] = {}
+    for p in plans:
+        uid = str(p.userId)
+        u = by_user.setdefault(uid, {
+            "userId": uid, "planCount": 0, "reviewedCount": 0, "metrics": {},
+        })
+        u["planCount"] += 1
+        if p.status == "reviewed":
+            u["reviewedCount"] += 1
+        for m in (p.metrics or []):
+            agg = u["metrics"].setdefault(m.key, {"label": m.label, "target": 0, "actual": 0, "unit": "count"})
+            agg["target"] += m.target
+            agg["actual"] += m.actual
+            if m.label:
+                agg["label"] = m.label
+            agg["unit"] = getattr(m, "unit", "count") or "count"
+
+    # Populate owner name/email.
+    owners = await UserExtra.find({"_id": {"$in": [to_object_id(uid) for uid in by_user]}}).to_list() if by_user else []
+    name_by_id = {str(o.id): (o.name or "", o.email or "") for o in owners}
+
+    rows = []
+    for uid, u in by_user.items():
+        nm, em = name_by_id.get(uid, ("", ""))
+        rows.append({
+            **u,
+            "name": nm,
+            "email": em,
+            "metrics": [{"key": k, **v} for k, v in u["metrics"].items()],
+        })
+    rows.sort(key=lambda r: (r["name"] or r["email"] or "").lower())
+    return {"users": rows}
+
+
+@router.get("/metric-catalog")
+async def metric_catalog(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Recommended core metrics — frontend seeds new plans from this."""
+    return {"metrics": CORE_METRICS}
+
+
+@router.get("/summary")
+async def plans_summary(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    year: Optional[int] = Query(None),
+    weekNumber: Optional[int] = Query(None),
+    userId: Optional[str] = Query(None),
+) -> dict:
+    """Aggregate metrics across weeks for the stats header. Scope follows
+    the same filters as the list (year + optional weekNumber + optional
+    userId). Admin may scope to a user; non-admins scoped to themselves."""
+    is_admin = user.role == "admin"
+    query: dict[str, Any] = {}
+    if not is_admin:
+        query["userId"] = user.id
+    elif userId:
+        query["userId"] = to_object_id(userId)
+    if year is not None:
+        query["year"] = year
+    if weekNumber is not None:
+        query["weekNumber"] = weekNumber
+
+    plans = (
+        await WeeklyPlan.find(query)
+        .sort([("year", 1), ("weekNumber", 1)])
+        .to_list()
+    )
+
+    series: list[dict] = []
+    totals: dict[str, dict] = {}   # key -> {label, target, actual}
+    reviewed = 0
+    for p in plans:
+        if p.status == "reviewed":
+            reviewed += 1
+        row: dict[str, Any] = {
+            "weekNumber": p.weekNumber,
+            "year": p.year,
+            "label": f"W{p.weekNumber}",
+            "status": p.status,
+        }
+        for m in (p.metrics or []):
+            row[f"{m.key}_target"] = m.target
+            row[f"{m.key}_actual"] = m.actual
+            agg = totals.setdefault(m.key, {"label": m.label, "target": 0, "actual": 0})
+            agg["target"] += m.target
+            agg["actual"] += m.actual
+            # keep latest non-empty label
+            if m.label:
+                agg["label"] = m.label
+        series.append(row)
+
+    total_plans = len(plans)
+    return {
+        "series": series,
+        "totals": [{"key": k, **v} for k, v in totals.items()],
+        "planCount": total_plans,
+        "reviewedCount": reviewed,
+        "completionRate": round(reviewed / total_plans, 3) if total_plans else 0.0,
+    }
 
 
 @router.get("")
@@ -85,7 +289,7 @@ async def create_plan(
     body: WeeklyPlanCreate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    if not body.weekNumber or not body.year or not body.startDate or not body.endDate or not body.content:
+    if not body.weekNumber or not body.year or not body.startDate or not body.endDate:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required fields")
 
     existing = await WeeklyPlan.find_one({
@@ -105,8 +309,11 @@ async def create_plan(
         year=body.year,
         startDate=_parse_dt(body.startDate),
         endDate=_parse_dt(body.endDate),
-        content=body.content,
+        content=body.content or "",
         result=body.result or "",
+        metrics=_clean_metrics(body.metrics),
+        status=body.status if body.status in ("planned", "reviewed") else "planned",
+        nextInterviewTarget=body.nextInterviewTarget,
     )
     await plan.insert()
     populated = await populate_owner([plan], field="userId", only=("name", "email"))
@@ -158,6 +365,12 @@ async def update_plan(
         plan.content = body.content
     if body.result is not None:
         plan.result = body.result
+    if body.metrics is not None:
+        plan.metrics = _clean_metrics(body.metrics)
+    if body.status in ("planned", "reviewed"):
+        plan.status = body.status
+    if body.nextInterviewTarget is not None:
+        plan.nextInterviewTarget = max(0, int(body.nextInterviewTarget))
 
     await plan.save()
     populated = await populate_owner([plan], field="userId", only=("name", "email"))

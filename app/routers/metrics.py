@@ -311,6 +311,7 @@ async def leaderboard(
         rows.append({
             "userId": str(u.id),
             "name": _display_name(u),
+            "image": getattr(u, "image", None) or None,
             "value": round(value, 4) if metric == "conversion" else round(value, 2),
             "secondary": secondary,
             "_qualifies": (b >= 5) if metric == "conversion" else True,
