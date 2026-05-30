@@ -27,6 +27,7 @@ class UserOut(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None
     role: str
+    image: Optional[str] = None
 
 
 class TokenOut(BaseModel):
@@ -36,7 +37,10 @@ class TokenOut(BaseModel):
 
 
 def _user_to_out(u: UserExtra) -> UserOut:
-    return UserOut(id=str(u.id), name=u.name, email=u.email, role=u.role)
+    return UserOut(
+        id=str(u.id), name=u.name, email=u.email, role=u.role,
+        image=getattr(u, "image", None) or None,
+    )
 
 
 def _ci_eq(field: str, value: str) -> dict:

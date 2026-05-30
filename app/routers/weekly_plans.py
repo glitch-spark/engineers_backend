@@ -72,21 +72,23 @@ async def progress_report(
     weekNumber: Optional[int] = Query(None),
     userId: Optional[str] = Query(None),
 ) -> dict:
-    """Admin-only. Run AI extraction over the weekly plans in scope (free-text
-    plan/follow-up -> structured metrics), persist the metrics onto each plan,
-    and return a per-user rollup. Re-running overwrites (picks up text edits)."""
-    if user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
-
+    """Run AI extraction over the weekly plans in scope (free-text plan/
+    follow-up -> structured metrics), persist the metrics onto each plan,
+    and return a per-user rollup. Re-running overwrites (picks up text
+    edits). Non-admins are auto-scoped to their own plans regardless of
+    the `userId` param."""
     from app.weekly_report import extract_metrics
 
+    is_admin = user.role == "admin"
     query: dict[str, Any] = {}
+    if not is_admin:
+        query["userId"] = user.id
+    elif userId:
+        query["userId"] = to_object_id(userId)
     if year is not None:
         query["year"] = year
     if weekNumber is not None:
         query["weekNumber"] = weekNumber
-    if userId:
-        query["userId"] = to_object_id(userId)
 
     plans = await WeeklyPlan.find(query).sort([("year", -1), ("weekNumber", -1)]).to_list()
     # Guardrail: cap how many plans one run will process (cost control).
