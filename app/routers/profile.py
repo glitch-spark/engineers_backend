@@ -21,6 +21,7 @@ class ProfileUpdate(BaseModel):
     leaderboardAnon: Optional[bool] = None
     resumePromptBody: Optional[str] = None
     screeningPromptBody: Optional[str] = None
+    coverLetterPromptBody: Optional[str] = None
 
 
 class PasswordChange(BaseModel):
@@ -48,6 +49,7 @@ async def get_profile(user: Annotated[UserExtra, Depends(get_current_user)]) -> 
             "leaderboardAnon": user.leaderboardAnon,
             "resumePromptBody": user.resumePromptBody or "",
             "screeningPromptBody": user.screeningPromptBody or "",
+            "coverLetterPromptBody": user.coverLetterPromptBody or "",
         }
     }
 
@@ -86,6 +88,8 @@ async def update_profile(
         user.resumePromptBody = body.resumePromptBody[:30000] or None
     if body.screeningPromptBody is not None:
         user.screeningPromptBody = body.screeningPromptBody[:30000] or None
+    if body.coverLetterPromptBody is not None:
+        user.coverLetterPromptBody = body.coverLetterPromptBody[:30000] or None
     await user.save()
 
     return {

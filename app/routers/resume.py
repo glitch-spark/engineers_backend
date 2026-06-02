@@ -60,6 +60,8 @@ class GenerateBody(BaseModel):
     # One-off resume content-prompt override for this generation only. Wins
     # over account-level and user-level saved prompts. Empty → fall through.
     promptBody: Optional[str] = None
+    # Opt-in cover letter for this submission only.
+    generateCoverLetter: bool = False
 
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -116,6 +118,7 @@ async def generate(
             company=company,
             questions=questions,
             prompt_body_override=prompt_body_override,
+            generate_cover_letter=body.generateCoverLetter,
         )
     )
 
@@ -130,8 +133,10 @@ async def _run_job(
     company: str,
     questions: List[str],
     prompt_body_override: Optional[str] = None,
+    generate_cover_letter: bool = False,
 ) -> None:
-    """Background orchestrator: resume → optional screening, persisting state."""
+    """Background orchestrator: resume → optional screening + cover letter,
+    persisting state at each step."""
     started = time.monotonic()
     job = await ResumeApplication.get(job_id)
     if job is None:
@@ -199,6 +204,23 @@ async def _run_job(
             )
             # Coerce dict -> ScreeningPair so Beanie/Pydantic doesn't mis-validate on save.
             job.screeningPairs = [ScreeningPairModel(**p) for p in pairs]
+
+        # ---- step 4: cover letter (optional) ----
+        if generate_cover_letter:
+            cl_prompt = (account.coverLetterPrompt or "").strip()
+            if not cl_prompt and owner:
+                cl_prompt = (getattr(owner, "coverLetterPromptBody", None) or "").strip()
+            try:
+                from app.resume_service import generate_cover_letter as _gen_cover
+                cl_text, _cl_usage = await _gen_cover(
+                    candidate_resume_text=job.plainText or "",
+                    job_description=jd,
+                    company=company,
+                    prompt_body=cl_prompt,
+                )
+                job.coverLetterText = cl_text
+            except Exception as exc:  # noqa: BLE001 — non-fatal
+                log.warning("cover-letter generation failed for job %s: %s", job_id, exc)
 
         # ---- done ----
         job.status = "completed"
@@ -422,6 +444,7 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "inputTokens": job.inputTokens,
         "outputTokens": job.outputTokens,
         "reasoningTokens": job.reasoningTokens,
+        "coverLetterText": job.coverLetterText,
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,

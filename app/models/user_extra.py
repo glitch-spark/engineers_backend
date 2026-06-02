@@ -34,6 +34,7 @@ class UserExtra(TimestampedDocument):
     # overrides take precedence per profile.
     resumePromptBody: Optional[str] = None
     screeningPromptBody: Optional[str] = None
+    coverLetterPromptBody: Optional[str] = None
 
     class Settings:
         name = "userextras"

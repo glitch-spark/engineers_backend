@@ -83,6 +83,7 @@ class AccountCreate(BaseModel):
     pageFormat: Optional[str] = None
     previewHtml: Optional[str] = None
     screeningPrompt: Optional[str] = None
+    coverLetterPrompt: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
@@ -94,6 +95,7 @@ class AccountUpdate(BaseModel):
     pageFormat: Optional[str] = None
     previewHtml: Optional[str] = None
     screeningPrompt: Optional[str] = None
+    coverLetterPrompt: Optional[str] = None
 
 
 @router.get("/lookup")
@@ -189,6 +191,7 @@ async def create_account(
         styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
         screeningPrompt=body.screeningPrompt,
+        coverLetterPrompt=body.coverLetterPrompt,
     )
     if body.pageFormat is not None:
         kwargs["pageFormat"] = body.pageFormat
@@ -225,6 +228,8 @@ async def update_account(
         acc.previewHtml = body.previewHtml
     if body.screeningPrompt is not None:
         acc.screeningPrompt = body.screeningPrompt
+    if body.coverLetterPrompt is not None:
+        acc.coverLetterPrompt = body.coverLetterPrompt
 
 
     await acc.save()

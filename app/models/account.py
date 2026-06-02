@@ -48,5 +48,8 @@ class Account(TimestampedDocument):
     # Account-level screening-answer prompt. Empty → user-level → built-in.
     screeningPrompt: Optional[str] = None
 
+    # Account-level cover-letter prompt. Empty → fall back to user level.
+    coverLetterPrompt: Optional[str] = None
+
     class Settings:
         name = "accounts"

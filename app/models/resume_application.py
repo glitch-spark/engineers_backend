@@ -61,6 +61,10 @@ class ResumeApplication(TimestampedDocument):
     outputTokens: Optional[int] = None
     reasoningTokens: Optional[int] = None
 
+    # Plain-text cover letter generated alongside the resume (opt-in per
+    # submission). Empty when the user didn't request one.
+    coverLetterText: Optional[str] = None
+
     class Settings:
         name = "resumeapplications"
         indexes = [

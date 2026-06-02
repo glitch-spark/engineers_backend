@@ -397,3 +397,65 @@ async def generate_resume(
         reasoning_tokens=usage.get("reasoning"),
         plain_text=plain_text,
     )
+
+
+_COVER_LETTER_SYSTEM = (
+    "You write a personalized cover letter for a job application. The "
+    "letter MUST be grounded in two inputs supplied below:\n"
+    "  1. CANDIDATE RESUME — the tailored resume's plain text. Every fact "
+    "the letter cites (experience, companies, years, technologies, "
+    "achievements, metrics) MUST come from this resume. Do NOT invent "
+    "roles, companies, dates, projects, or numbers that are not present.\n"
+    "  2. JOB DESCRIPTION — the role's requirements and priorities. The "
+    "letter must tie the candidate's resume facts to what this specific "
+    "JD asks for (skills, domain, seniority, mission). Do not paste JD "
+    "phrases verbatim.\n"
+    "\n"
+    "Output rules:\n"
+    "- PLAIN TEXT only. No Markdown, no HTML, no code fences, no "
+    "surrounding commentary.\n"
+    "- 3-5 short paragraphs separated by a blank line, unless the custom "
+    "prompt below overrides.\n"
+    "- Address the hiring team naturally; do not invent a recruiter's "
+    "name.\n"
+    "- If the resume lacks evidence for a JD requirement, do not claim "
+    "it — pivot to adjacent strengths.\n"
+)
+
+
+async def generate_cover_letter(
+    *,
+    candidate_resume_text: str,
+    job_description: str,
+    company: str,
+    prompt_body: str,
+) -> tuple[str, dict]:
+    """Generate a plain-text cover letter using gpt-5-mini (low reasoning).
+    Returns (text, usage_dict). `prompt_body` is the resolved cover-letter
+    prompt (account > user). If empty, the system rules carry the call —
+    output will be generic but coherent."""
+    parts: list[str] = [_COVER_LETTER_SYSTEM]
+    body = (prompt_body or "").strip()
+    if body:
+        parts.append(
+            "CUSTOM PROMPT (candidate's style guidance — follow within the "
+            "absolute rules above):\n" + body
+        )
+    if (company or "").strip():
+        parts.append(f"Target company: {company.strip()}")
+    # Both sources are required for grounded output — log a warning when
+    # either is missing so the caller can fix the upstream pipeline.
+    if not (candidate_resume_text or "").strip():
+        log.warning("cover letter prompt missing resume text — output will be generic")
+    if not (job_description or "").strip():
+        log.warning("cover letter prompt missing job description — output will be generic")
+    parts.append(
+        "=== CANDIDATE RESUME (source of all factual claims) ===\n"
+        + (candidate_resume_text or "(no resume text supplied)").strip()
+    )
+    parts.append(
+        "=== JOB DESCRIPTION (what the letter must address) ===\n"
+        + (job_description or "(no JD supplied)").strip()
+    )
+    text, usage = await _openai_call("\n\n".join(parts))
+    return _strip_fences(text), usage
