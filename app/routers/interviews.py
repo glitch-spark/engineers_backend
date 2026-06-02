@@ -226,6 +226,13 @@ async def create_interview(
     if (iv.transcript or "").strip():
         asyncio.create_task(extract_and_score(iv))
 
+    # Auto-link to pipeline (idempotent + best-effort).
+    try:
+        from app.routers.applications import attach_interview_to_app
+        await attach_interview_to_app(user_id=user.id, interview=iv)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
+
     try:
         await notify_new_interview(
             creator_email=user.email or "",
@@ -311,6 +318,13 @@ async def update_interview(
         iv.note = body.note
 
     await iv.save()
+
+    # Re-sync pipeline (stage bump + outcome flip on status changes).
+    try:
+        from app.routers.applications import attach_interview_to_app
+        await attach_interview_to_app(user_id=user.id, interview=iv)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pipeline auto-link failed for interview %s on update: %s", iv.id, exc)
 
     if transcript_changed and (iv.transcript or "").strip():
         asyncio.create_task(extract_and_score(iv))

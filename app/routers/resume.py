@@ -229,6 +229,20 @@ async def _run_job(
         job.executionMs = int((time.monotonic() - started) * 1000)
         await job.save()
 
+        # ---- step 5: auto-link to pipeline ----
+        try:
+            from app.routers.applications import find_or_create_application
+            await find_or_create_application(
+                user_id=job.userId,
+                account_id=job.accountId,
+                company_name=job.companyName or "",
+                job_url=job.jobUrl,
+                job_description=jd,
+                bid_job_id=job.id,
+            )
+        except Exception as exc:  # noqa: BLE001 — non-fatal
+            log.warning("application auto-link failed for job %s: %s", job_id, exc)
+
     except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
         log.exception("resume job %s failed", job_id)
         await _mark_failed(job, str(exc), started)
