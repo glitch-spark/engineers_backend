@@ -17,7 +17,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.deps import get_current_user
-from app.models import Interview, ResumeApplication, Transaction, UserExtra
+from app.models import Interview, ResumeApplication, Transaction, UserExtra, WeeklyPlan
 from app.routers._util import parse_date
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
@@ -343,4 +343,297 @@ async def leaderboard(
             "outOf": out_of,
             "optedIn": user.role != "admin",
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Consolidated leaderboard — bids + interviews + conversion in one payload
+# ---------------------------------------------------------------------------
+
+_CONVERSION_MIN_BIDS = 10  # raised from 5 — needs more volume to qualify
+
+_RANGE_LABELS = {"week": "This week", "30": "Last 30 days", "90": "Last 90 days", "365": "Last year"}
+
+
+def _current_iso_week_start() -> tuple[datetime, int, int]:
+    """Monday 00:00 UTC of the current ISO week + (iso year, iso week)."""
+    now = datetime.now(timezone.utc)
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    iso_year, iso_week, _ = monday.isocalendar()
+    return monday, iso_year, iso_week
+
+
+def _resolve_lb_range(range_str: str) -> tuple[datetime, datetime, datetime, datetime, str]:
+    """Parse the range query into (start, end, prev_start, prev_end, label).
+    Accepts 'week' (current ISO Mon–now) or an int day-count."""
+    now = datetime.now(timezone.utc)
+    range_str = (range_str or "week").strip().lower()
+    if range_str == "week":
+        start, _, _ = _current_iso_week_start()
+        end = now
+        length = end - start
+        prev_end = start
+        prev_start = prev_end - length
+        return start, end, prev_start, prev_end, "This week"
+    try:
+        days = int(range_str)
+    except ValueError:
+        days = 7
+    days = max(1, min(365, days))
+    start = now - timedelta(days=days)
+    prev_start = start - timedelta(days=days)
+    prev_end = start
+    label = _RANGE_LABELS.get(str(days), f"Last {days} days")
+    return start, now, prev_start, prev_end, label
+
+
+async def _trend_by_user(user_ids: list, weeks: int = 8) -> dict:
+    """Per-user trend of last N ISO weeks: [{label, bids, interviews}]."""
+    if not user_ids:
+        return {}
+    now = datetime.now(timezone.utc)
+    monday, _, _ = _current_iso_week_start()
+    start = monday - timedelta(weeks=weeks - 1)
+
+    bid_pipe = [
+        {"$match": {"userId": {"$in": user_ids}, "createdAt": {"$gte": start}}},
+        {"$group": {
+            "_id": {"u": "$userId", "y": {"$isoWeekYear": "$createdAt"}, "w": {"$isoWeek": "$createdAt"}},
+            "n": {"$sum": 1},
+        }},
+    ]
+    iv_pipe = [
+        {"$match": {"createdBy": {"$in": user_ids}, "scheduledAt": {"$gte": start}}},
+        {"$group": {
+            "_id": {"u": "$createdBy", "y": {"$isoWeekYear": "$scheduledAt"}, "w": {"$isoWeek": "$scheduledAt"}},
+            "n": {"$sum": 1},
+        }},
+    ]
+    bid_docs = await ResumeApplication.aggregate(bid_pipe).to_list()
+    iv_docs = await Interview.aggregate(iv_pipe).to_list()
+
+    # Build week buckets in order (oldest -> newest).
+    buckets: list[tuple[int, int]] = []
+    cursor = monday - timedelta(weeks=weeks - 1)
+    for _ in range(weeks):
+        y, w, _d = cursor.isocalendar()
+        buckets.append((y, w))
+        cursor += timedelta(weeks=1)
+
+    out: dict = {}
+    for u in user_ids:
+        series = []
+        for (y, w) in buckets:
+            series.append({"label": f"W{w}", "year": y, "week": w, "bids": 0, "interviews": 0})
+        out[u] = series
+
+    for d in bid_docs:
+        u = d["_id"]["u"]; y = d["_id"]["y"]; w = d["_id"]["w"]
+        s = out.get(u)
+        if not s:
+            continue
+        for row in s:
+            if row["year"] == y and row["week"] == w:
+                row["bids"] += int(d["n"])
+                break
+    for d in iv_docs:
+        u = d["_id"]["u"]; y = d["_id"]["y"]; w = d["_id"]["w"]
+        s = out.get(u)
+        if not s:
+            continue
+        for row in s:
+            if row["year"] == y and row["week"] == w:
+                row["interviews"] += int(d["n"])
+                break
+    # Drop year/week scaffolding from output rows (frontend only needs label).
+    for u, series in out.items():
+        out[u] = [{"label": r["label"], "bids": r["bids"], "interviews": r["interviews"]} for r in series]
+    return out
+
+
+async def _weekly_targets_by_user(user_ids: list, year: int, week: int) -> dict:
+    """Read each user's WeeklyPlan for (year, week). Pull bids+interviews
+    target from the stored metrics list. Returns dict[user_id] ->
+    {bidsTarget, interviewsTarget}."""
+    if not user_ids:
+        return {}
+    plans = await WeeklyPlan.find({
+        "userId": {"$in": user_ids},
+        "year": year,
+        "weekNumber": week,
+    }).to_list()
+    out: dict = {u: {"bidsTarget": 0, "interviewsTarget": 0} for u in user_ids}
+    for p in plans:
+        for m in (p.metrics or []):
+            if m.key == "bids":
+                out[p.userId]["bidsTarget"] = int(m.target or 0)
+            elif m.key == "interviews":
+                out[p.userId]["interviewsTarget"] = int(m.target or 0)
+    return out
+
+
+@router.get("/leaderboard/consolidated")
+async def leaderboard_consolidated(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    range: str = Query("week"),
+    trendWeeks: int = Query(8, ge=4, le=26),
+) -> dict:
+    """Single-payload leaderboard focused on bids, interviews, conversion.
+    Pulls weekly targets (when scope = current week) so the table can show
+    % of plan. Includes per-user 8-week trend + previous-period deltas +
+    champion (#1) per metric + a personal stats block for the caller."""
+    start, end, prev_start, prev_end, label = _resolve_lb_range(range)
+
+    opt_in_users = await UserExtra.find({"role": {"$ne": "admin"}}).to_list()
+    user_ids = [u.id for u in opt_in_users]
+
+    cur_bids = await _bids_by_user(user_ids, start, end)
+    cur_iv = await _interviews_by_user(user_ids, start, end)
+    prev_bids = await _bids_by_user(user_ids, prev_start, prev_end)
+    prev_iv = await _interviews_by_user(user_ids, prev_start, prev_end)
+    trend = await _trend_by_user(user_ids, weeks=trendWeeks)
+
+    # Targets only meaningful for the current-week scope.
+    targets: dict = {}
+    if range == "week":
+        _monday, iso_year, iso_week = _current_iso_week_start()
+        targets = await _weekly_targets_by_user(user_ids, iso_year, iso_week)
+
+    rows: list[dict] = []
+    for u in opt_in_users:
+        b = int(cur_bids.get(u.id, 0))
+        i = int(cur_iv.get(u.id, 0))
+        pb = int(prev_bids.get(u.id, 0))
+        pi = int(prev_iv.get(u.id, 0))
+        conv = (i / b) if b >= _CONVERSION_MIN_BIDS else 0.0
+        prev_conv = (pi / pb) if pb >= _CONVERSION_MIN_BIDS else 0.0
+        t = targets.get(u.id, {"bidsTarget": 0, "interviewsTarget": 0})
+
+        rows.append({
+            "userId": str(u.id),
+            "name": _display_name(u),
+            "image": getattr(u, "image", None) or None,
+            "bids": b,
+            "interviews": i,
+            "conversion": round(conv, 4),
+            "qualifiesConversion": b >= _CONVERSION_MIN_BIDS,
+            "bidsTarget": int(t.get("bidsTarget") or 0),
+            "interviewsTarget": int(t.get("interviewsTarget") or 0),
+            "prevBids": pb,
+            "prevInterviews": pi,
+            "prevConversion": round(prev_conv, 4),
+            "trend": trend.get(u.id, []),
+        })
+
+    # Rank by each metric independently — frontend renders rank chips per cell.
+    def _attach_ranks(rows: list[dict], key: str, *, qualifier: Optional[str] = None) -> None:
+        contestants = [r for r in rows if (qualifier is None or r.get(qualifier))]
+        contestants.sort(key=lambda r: r[key], reverse=True)
+        for rank, r in enumerate(contestants, start=1):
+            r[f"rank_{key}"] = rank
+
+    _attach_ranks(rows, "bids")
+    _attach_ranks(rows, "interviews")
+    _attach_ranks(rows, "conversion", qualifier="qualifiesConversion")
+
+    def _champ(key: str) -> Optional[dict]:
+        ranked = [r for r in rows if f"rank_{key}" in r]
+        if not ranked:
+            return None
+        winner = min(ranked, key=lambda r: r[f"rank_{key}"])
+        return {"userId": winner["userId"], "name": winner["name"], "image": winner["image"], "value": winner[key]}
+
+    champions = {
+        "bids": _champ("bids"),
+        "interviews": _champ("interviews"),
+        "conversion": _champ("conversion"),
+    }
+
+    your_row = next((r for r in rows if r["userId"] == str(user.id)), None)
+    your_stats = None
+    if your_row is not None and user.role != "admin":
+        your_stats = {
+            "bids": your_row["bids"],
+            "interviews": your_row["interviews"],
+            "conversion": your_row["conversion"],
+            "rankBids": your_row.get("rank_bids"),
+            "rankInterviews": your_row.get("rank_interviews"),
+            "rankConversion": your_row.get("rank_conversion"),
+            "bidsTarget": your_row["bidsTarget"],
+            "interviewsTarget": your_row["interviewsTarget"],
+            "prevBids": your_row["prevBids"],
+            "prevInterviews": your_row["prevInterviews"],
+            "prevConversion": your_row["prevConversion"],
+        }
+
+    return {
+        "range": range,
+        "label": label,
+        "period": {"from": start.isoformat(), "to": end.isoformat()},
+        "conversionMinBids": _CONVERSION_MIN_BIDS,
+        "champions": champions,
+        "users": rows,
+        "yourStats": your_stats,
+    }
+
+
+@router.get("/dashboard-feed")
+async def dashboard_feed(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    limit: int = Query(10, ge=1, le=50),
+    upcoming: int = Query(5, ge=1, le=20),
+) -> dict:
+    """Compact dashboard feed for the logged-in user:
+      - `recent`: last N events (bid submitted, interview scheduled,
+        interview completed) merged + sorted by timestamp.
+      - `upcoming`: next M scheduled interviews from now forward.
+    Admins see global aggregates (own user's events still); UI mirrors
+    layout."""
+    uid = user.id
+
+    # Recent bids
+    bids = await ResumeApplication.find({"userId": uid}).sort("-createdAt").limit(limit).to_list()
+    bid_events = [{
+        "kind": "bid",
+        "at": (b.createdAt or datetime.now(timezone.utc)).isoformat(),
+        "company": b.companyName,
+        "profile": b.profileName,
+        "jobId": str(b.id),
+        "status": b.status,
+    } for b in bids]
+
+    # Interview events (scheduled + completed)
+    ivs = await Interview.find({"createdBy": uid}).sort("-scheduledAt").limit(limit * 2).to_list()
+    iv_events: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for iv in ivs:
+        sched = iv.scheduledAt
+        if sched and sched <= now:
+            iv_events.append({
+                "kind": "interview_done" if iv.status and str(iv.status) in ("completed", "passed", "failed") else "interview_past",
+                "at": sched.isoformat(),
+                "company": iv.companyName,
+                "stage": str(iv.stage) if iv.stage else None,
+                "status": str(iv.status) if iv.status else None,
+                "interviewId": str(iv.id),
+            })
+
+    merged = sorted([*bid_events, *iv_events], key=lambda x: x["at"], reverse=True)[:limit]
+
+    # Upcoming interviews from now forward
+    upcoming_ivs = await Interview.find({
+        "createdBy": uid,
+        "scheduledAt": {"$gte": now},
+    }).sort("+scheduledAt").limit(upcoming).to_list()
+    upcoming_out = [{
+        "interviewId": str(iv.id),
+        "company": iv.companyName,
+        "stage": str(iv.stage) if iv.stage else None,
+        "scheduledAt": iv.scheduledAt.isoformat() if iv.scheduledAt else None,
+        "endsAt": iv.endsAt.isoformat() if iv.endsAt else None,
+    } for iv in upcoming_ivs]
+
+    return {
+        "recent": merged,
+        "upcoming": upcoming_out,
     }
