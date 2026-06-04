@@ -1,10 +1,16 @@
-"""Gmail inbox sync — orchestrates: pull message IDs (initial date-bounded
-list or history delta), fetch metadata, prefilter noise, classify the
-remainder, persist EmailMessage rows, and (when confidence is high enough)
-update the matched Application.
+"""Gmail inbox sync orchestrator.
 
-Idempotent: every batch uses the (accountId, messageId) unique index, so
-re-running a sync just no-ops on already-stored messages.
+Pipeline per message:
+  1. obvious-noise blocklist (free)        -> classify_email returns
+  2. template hash → cache hit              -> reuse prior verdict
+  3. rule engine sender+phrase match        -> deterministic label
+  4. LLM extractor (single multi-output)    -> grounded label + evidence
+  5. cross-checks (sender↔label sanity)     -> downgrade impossible pairs
+  6. route by confidence                    -> auto-apply / needs-review / ignored
+
+Anything that emerges with a label gets persisted with full audit
+fields (sourceLayer + evidenceQuote + selfDoubt). The pipeline is
+idempotent — re-running a sync on already-stored messages is a no-op.
 """
 
 from __future__ import annotations
@@ -17,10 +23,24 @@ from typing import Optional
 from beanie import PydanticObjectId
 
 from app.config import get_settings
-from app.email_classifier import LABEL_TO_STAGE, classify_batch, is_obvious_noise
+from app.email_classifier import (
+    ExtractedEmail,
+    HIGH_STAKES_LABELS,
+    LABEL_TO_STAGE,
+    classify_batch,
+    is_obvious_noise,
+)
 from app.email_crypto import decrypt
+from app.email_rules import (
+    cache_lookup,
+    cache_store,
+    find_matching_rule,
+    sender_domain,
+    template_hash,
+)
 from app.gmail_api import (
     GmailApiError,
+    fetch_message_body,
     fetch_userinfo,
     get_message_metadata,
     get_profile,
@@ -35,25 +55,29 @@ from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
 log = logging.getLogger(__name__)
 
 
-# Concurrency for per-message metadata fetches. Gmail allows ~250 quota
-# units/user/second; metadata.get costs 5 units. 10 in-flight ≈ 50 units/s
-# average — well under the cap with headroom for the calling user's other
-# clients (mobile, web).
+# Concurrency: Gmail allows ~250 quota units/user/sec; metadata.get costs 5.
 _FETCH_CONCURRENCY = 10
-_CLASSIFY_BATCH_SIZE = 20
+_CLASSIFY_BATCH_SIZE = 15
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _stage_idx(stage: str) -> int:
+    try:
+        return STAGE_ORDER.index(stage)
+    except ValueError:
+        return len(STAGE_ORDER)
 
 
 async def _get_access_token(account: EmailAccount) -> str:
-    """Decrypts the stored refresh token and refreshes a short-lived
-    access token. Errors propagate so the caller can mark the account as
-    requiring re-auth."""
     refresh_token = decrypt(account.refreshTokenEncrypted)
     return await refresh_access_token(refresh_token)
 
 
 async def _fetch_metadata_batch(access_token: str, ids: list[str]) -> list[dict]:
-    """Concurrent metadata.get with a small semaphore. Skips any message
-    that 404s (deleted between list and get) — those are not errors."""
     sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
     async def _one(mid: str) -> Optional[dict]:
@@ -70,73 +94,205 @@ async def _fetch_metadata_batch(access_token: str, ids: list[str]) -> list[dict]
     return [p for p in parsed if p]
 
 
-async def _match_application(*, user_id: PydanticObjectId, company_guess: Optional[str]) -> Optional[Application]:
-    """LLM-only matching per product spec: look up an existing Application
-    by the classifier's companyName guess. No domain heuristic, no
-    auto-create — unmatched messages land in Needs Review for the user
-    to confirm."""
+async def _fetch_body_batch(access_token: str, ids: list[str]) -> dict[str, str]:
+    """Concurrent body fetch — body is required for grounded classification.
+    Missing/failed entries return empty string so the classifier still
+    runs (it'll downgrade to noise for missing evidence)."""
+    sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+    async def _one(mid: str) -> tuple[str, str]:
+        async with sem:
+            try:
+                body = await fetch_message_body(access_token, mid)
+            except GmailApiError:
+                body = ""
+            return mid, body
+
+    pairs = await asyncio.gather(*[_one(i) for i in ids])
+    return dict(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Cross-checks
+# ---------------------------------------------------------------------------
+
+
+_IMPOSSIBLE_SENDER_LABEL_PAIRS = [
+    # sender_substr, forbidden labels
+    ("noreply@", {"offer"}),
+    ("no-reply@", {"offer"}),
+    ("donotreply@", {"offer"}),
+    ("@calendly.com", {"offer", "rejection"}),
+    ("alerts@", {"applied", "offer", "rejection", "schedule_interview"}),
+    ("digest@", {"applied", "offer", "rejection", "schedule_interview"}),
+    ("newsletter@", {"applied", "offer", "rejection", "schedule_interview"}),
+]
+
+
+def _apply_cross_checks(addr: str, verdict: ExtractedEmail) -> ExtractedEmail:
+    """Catches impossible (sender, label) pairs after the LLM. Cheap
+    deterministic filter that prevents the worst class of misfires."""
+    a = (addr or "").lower()
+    for substr, forbidden in _IMPOSSIBLE_SENDER_LABEL_PAIRS:
+        if substr in a and verdict.label in forbidden:
+            return ExtractedEmail(
+                label="noise",
+                confidence=0.0,
+                evidence_quote=verdict.evidence_quote,
+                self_doubt=1.0,
+                company_name=verdict.company_name,
+                stage_round=None,
+                scheduled_at=None,
+                interviewer_name=None,
+            )
+    return verdict
+
+
+# ---------------------------------------------------------------------------
+# Per-message decision
+# ---------------------------------------------------------------------------
+
+
+async def classify_email(
+    *, from_addr: str, subject: str, body: str, gmail_labels: Optional[list[str]] = None,
+    list_unsubscribe: bool = False,
+) -> tuple[ExtractedEmail, str]:
+    """Returns (verdict, source_layer). Source layer values:
+      'noise_blocklist' | 'cache' | 'rule_engine' | 'llm' | 'cross_check'.
+
+    All layers feed the SAME ExtractedEmail shape — no callers need to
+    branch on which one fired."""
+    # 1. Obvious noise
+    if is_obvious_noise(from_addr, subject, list_unsubscribe=list_unsubscribe, gmail_labels=gmail_labels):
+        return (
+            ExtractedEmail(
+                label="noise", confidence=1.0, evidence_quote="(blocked sender)",
+                self_doubt=0.0, company_name=None, stage_round=None,
+                scheduled_at=None, interviewer_name=None,
+            ),
+            "noise_blocklist",
+        )
+
+    # 2. Cache
+    th = template_hash(from_addr=from_addr, subject=subject, body_or_snippet=body)
+    cached = await cache_lookup(th)
+    if cached is not None:
+        return (
+            ExtractedEmail(
+                label=cached.label, confidence=cached.confidence,
+                evidence_quote=cached.evidenceQuote or "",
+                self_doubt=0.0, company_name=cached.companyHint,
+                stage_round=cached.stageRound, scheduled_at=None,
+                interviewer_name=None,
+            ),
+            "cache",
+        )
+
+    # 3. Rule engine
+    rule = await find_matching_rule(from_addr=from_addr, subject=subject, body=body)
+    if rule is not None:
+        verdict = ExtractedEmail(
+            label=rule.label, confidence=rule.confidence,
+            evidence_quote=rule.phrasePattern, self_doubt=0.0,
+            company_name=None,
+            stage_round=rule.stageRound or LABEL_TO_STAGE.get(rule.label),
+            scheduled_at=None, interviewer_name=None,
+        )
+        await cache_store(
+            tpl_hash=th, label=verdict.label, confidence=verdict.confidence,
+            stage_round=verdict.stage_round, company_hint=verdict.company_name,
+            evidence_quote=verdict.evidence_quote,
+            sender_domain_str=sender_domain(from_addr),
+            subject_preview=subject[:120],
+        )
+        return verdict, "rule_engine"
+
+    # 4. LLM (caller batches; single-msg fallback path)
+    results = await classify_batch([{"id": th, "from": from_addr, "subject": subject, "body": body}])
+    verdict = results.get(th)
+    if verdict is None:
+        return (
+            ExtractedEmail(
+                label="follow_up", confidence=0.0, evidence_quote="",
+                self_doubt=1.0, company_name=None, stage_round=None,
+                scheduled_at=None, interviewer_name=None,
+            ),
+            "llm",
+        )
+
+    # 5. Cross-checks
+    verdict = _apply_cross_checks(from_addr, verdict)
+
+    # Cache the LLM verdict for future templates.
+    await cache_store(
+        tpl_hash=th, label=verdict.label, confidence=verdict.confidence,
+        stage_round=verdict.stage_round, company_hint=verdict.company_name,
+        evidence_quote=verdict.evidence_quote,
+        sender_domain_str=sender_domain(from_addr),
+        subject_preview=subject[:120],
+    )
+    return verdict, "llm"
+
+
+# ---------------------------------------------------------------------------
+# Application linkage
+# ---------------------------------------------------------------------------
+
+
+async def _match_application(
+    *, user_id: PydanticObjectId, company_guess: Optional[str]
+) -> Optional[Application]:
+    """LLM-only matching: classifier's companyName guess → existing
+    Application by companyNameLower. No domain heuristics. No
+    auto-create — unmatched goes to Needs Review."""
     if not company_guess:
         return None
     name = company_guess.strip().lower()
     if not name:
         return None
-    return await Application.find_one(Application.userId == user_id, Application.companyNameLower == name)
-
-
-def _stage_idx(stage: str) -> int:
-    try:
-        return STAGE_ORDER.index(stage)
-    except ValueError:
-        return len(STAGE_ORDER)
+    return await Application.find_one(
+        Application.userId == user_id, Application.companyNameLower == name
+    )
 
 
 async def _apply_to_application(
-    *,
-    msg: EmailMessage,
-    application: Application,
-    auto_threshold: float,
+    *, verdict: ExtractedEmail, application: Application,
 ) -> bool:
-    """Mutates `application` in place. Returns True if it was modified.
-    Forward-only stage advance for auto-events; outcome flips on offer /
-    rejection regardless of stage rank because those are terminal."""
     changed = False
-    if msg.id not in (application.emailMessageIds if hasattr(application, "emailMessageIds") else []):
-        # Application doesn't track linked emails directly — we rely on the
-        # reverse index (EmailMessage.applicationId) instead, so no field
-        # change needed here. Left in case we add forward-link later.
-        pass
+    target = verdict.stage_round or LABEL_TO_STAGE.get(verdict.label)
 
-    target = msg.targetStage
-    label = msg.label
-
-    if label == "offer" and msg.confidence >= auto_threshold:
+    if verdict.label == "offer":
         if application.outcome != "offer":
             application.outcome = "offer"
             changed = True
         target = KanbanStage.offer.value
-    elif label == "rejection" and msg.confidence >= auto_threshold:
+    elif verdict.label == "rejection":
         if application.outcome != "rejected":
             application.outcome = "rejected"
             changed = True
         target = KanbanStage.rejected.value
 
-    if target and msg.confidence >= auto_threshold:
-        if _stage_idx(target) > _stage_idx(application.stage):
-            application.stage = target
-            application.stageHistory.append(
-                StageEvent(stage=target, at=datetime.now(timezone.utc), source=f"email:{label}")
+    if target and _stage_idx(target) > _stage_idx(application.stage):
+        application.stage = target
+        application.stageHistory.append(
+            StageEvent(
+                stage=target, at=datetime.now(timezone.utc),
+                source=f"email:{verdict.label}",
             )
-            changed = True
+        )
+        changed = True
 
     if changed:
         application.lastTouchedAt = datetime.now(timezone.utc)
     return changed
 
 
+# ---------------------------------------------------------------------------
+# Sync entry point
+# ---------------------------------------------------------------------------
+
+
 async def sync_account(account: EmailAccount) -> dict[str, int]:
-    """Runs one sync pass. Picks delta if we have a historyId, otherwise
-    the date-bounded initial pull. Returns a stats dict so the API caller
-    can show counts to the user."""
     settings = get_settings()
     if account.disconnectedAt is not None:
         return {"fetched": 0, "classified": 0, "auto_applied": 0, "needs_review": 0}
@@ -148,11 +304,10 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
     try:
         access_token = await _get_access_token(account)
 
-        # --- determine which IDs to fetch ---
+        # --- pick message IDs ---
         message_ids: list[str] = []
         is_initial = not account.historyId
         if is_initial:
-            since = datetime.now(timezone.utc) - timedelta(days=settings.EMAIL_INITIAL_SYNC_DAYS)
             query = f"in:inbox newer_than:{settings.EMAIL_INITIAL_SYNC_DAYS}d"
             page_token = None
             while len(message_ids) < settings.EMAIL_SYNC_MAX_MESSAGES:
@@ -187,10 +342,8 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
                     if not page_token or len(message_ids) >= settings.EMAIL_SYNC_MAX_MESSAGES:
                         break
             except GmailApiError as exc:
-                # 404 = history cursor too old (>7 days). Fall back to a
-                # short initial-style pull so we recover gracefully.
                 if exc.status == 404:
-                    log.info("history cursor expired for %s, falling back to date pull", account.email)
+                    log.info("history cursor expired for %s, falling back to short date pull", account.email)
                     query = "in:inbox newer_than:2d"
                     page = await list_message_ids(access_token, query=query, max_results=100)
                     for m in page.get("messages") or []:
@@ -221,48 +374,131 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
         # --- fetch metadata ---
         parsed = await _fetch_metadata_batch(access_token, message_ids)
 
-        # --- split noise vs needs-classification ---
-        noise: list[dict] = []
-        for_llm: list[dict] = []
+        # --- bucket by short-circuit (blocklist / rule / cache) vs needs-LLM ---
+        # First do the cheap async-without-body checks: blocklist, then
+        # template-hash cache, then rule engine (using snippet for body).
+        verdicts: dict[str, tuple[ExtractedEmail, str]] = {}
+        needs_llm: list[dict] = []
         for p in parsed:
-            if is_obvious_noise(p["fromAddress"], p["subject"], p.get("isUnsub", False)):
-                noise.append(p)
-            else:
-                for_llm.append(p)
+            mid = p["messageId"]
+            # We may not have body yet; rule + cache use subject + snippet.
+            if is_obvious_noise(p["fromAddress"], p["subject"], list_unsubscribe=p.get("isUnsub", False)):
+                verdicts[mid] = (
+                    ExtractedEmail(
+                        label="noise", confidence=1.0,
+                        evidence_quote="(blocked sender)", self_doubt=0.0,
+                        company_name=None, stage_round=None,
+                        scheduled_at=None, interviewer_name=None,
+                    ),
+                    "noise_blocklist",
+                )
+                continue
+            th = template_hash(from_addr=p["fromAddress"], subject=p["subject"], body_or_snippet=p["snippet"])
+            cached = await cache_lookup(th)
+            if cached is not None:
+                verdicts[mid] = (
+                    ExtractedEmail(
+                        label=cached.label, confidence=cached.confidence,
+                        evidence_quote=cached.evidenceQuote or "",
+                        self_doubt=0.0, company_name=cached.companyHint,
+                        stage_round=cached.stageRound, scheduled_at=None,
+                        interviewer_name=None,
+                    ),
+                    "cache",
+                )
+                continue
+            rule = await find_matching_rule(
+                from_addr=p["fromAddress"], subject=p["subject"], body=p["snippet"]
+            )
+            if rule is not None:
+                verdict = ExtractedEmail(
+                    label=rule.label, confidence=rule.confidence,
+                    evidence_quote=rule.phrasePattern, self_doubt=0.0,
+                    company_name=None,
+                    stage_round=rule.stageRound or LABEL_TO_STAGE.get(rule.label),
+                    scheduled_at=None, interviewer_name=None,
+                )
+                verdicts[mid] = (verdict, "rule_engine")
+                await cache_store(
+                    tpl_hash=th, label=verdict.label, confidence=verdict.confidence,
+                    stage_round=verdict.stage_round, company_hint=verdict.company_name,
+                    evidence_quote=verdict.evidence_quote,
+                    sender_domain_str=sender_domain(p["fromAddress"]),
+                    subject_preview=p["subject"][:120],
+                )
+                continue
+            needs_llm.append(p)
 
-        # --- classify in batches ---
-        verdicts_by_id: dict[str, dict] = {}
-        for i in range(0, len(for_llm), _CLASSIFY_BATCH_SIZE):
-            chunk = for_llm[i : i + _CLASSIFY_BATCH_SIZE]
-            inp = [
-                {"id": m["messageId"], "from": m["fromAddress"], "subject": m["subject"], "snippet": m["snippet"]}
+        # --- fetch bodies for LLM bucket ---
+        if needs_llm:
+            bodies = await _fetch_body_batch(access_token, [p["messageId"] for p in needs_llm])
+            for p in needs_llm:
+                p["body"] = bodies.get(p["messageId"], "")
+
+        # --- classify LLM bucket in batches ---
+        for i in range(0, len(needs_llm), _CLASSIFY_BATCH_SIZE):
+            chunk = needs_llm[i : i + _CLASSIFY_BATCH_SIZE]
+            inputs = [
+                {
+                    "id": m["messageId"],
+                    "from": m["fromAddress"],
+                    "subject": m["subject"],
+                    "body": m.get("body") or m["snippet"],
+                }
                 for m in chunk
             ]
-            results = await classify_batch(inp)
-            for r in results:
-                verdicts_by_id[r["id"]] = r
+            llm_results = await classify_batch(inputs)
+            for m in chunk:
+                v = llm_results.get(m["messageId"])
+                if v is None:
+                    v = ExtractedEmail(
+                        label="follow_up", confidence=0.0, evidence_quote="",
+                        self_doubt=1.0, company_name=None, stage_round=None,
+                        scheduled_at=None, interviewer_name=None,
+                    )
+                v = _apply_cross_checks(m["fromAddress"], v)
+                verdicts[m["messageId"]] = (v, "llm")
+                # Cache the LLM verdict against the body-aware hash.
+                th = template_hash(
+                    from_addr=m["fromAddress"], subject=m["subject"],
+                    body_or_snippet=m.get("body") or m["snippet"],
+                )
+                await cache_store(
+                    tpl_hash=th, label=v.label, confidence=v.confidence,
+                    stage_round=v.stage_round, company_hint=v.company_name,
+                    evidence_quote=v.evidence_quote,
+                    sender_domain_str=sender_domain(m["fromAddress"]),
+                    subject_preview=m["subject"][:120],
+                )
 
-        # --- persist + apply ---
+        # --- persist + auto-apply ---
         auto_threshold = settings.EMAIL_AUTO_ADVANCE_CONFIDENCE
         auto_applied = 0
         needs_review = 0
         model_name = settings.EXTRACTION_MODEL
 
-        for p in noise + for_llm:
-            verdict = (
-                {"label": "noise", "confidence": 1.0, "companyName": None}
-                if p in noise
-                else verdicts_by_id.get(p["messageId"], {"label": "follow_up", "confidence": 0.0, "companyName": None})
-            )
-            label = verdict["label"]
-            confidence = float(verdict.get("confidence") or 0.0)
-            company = verdict.get("companyName")
-            target_stage = LABEL_TO_STAGE.get(label)
+        for p in parsed:
+            mid = p["messageId"]
+            verdict, source = verdicts.get(mid, (
+                ExtractedEmail(
+                    label="follow_up", confidence=0.0, evidence_quote="",
+                    self_doubt=1.0, company_name=None, stage_round=None,
+                    scheduled_at=None, interviewer_name=None,
+                ),
+                "llm",
+            ))
+
+            scheduled_at_dt: Optional[datetime] = None
+            if verdict.scheduled_at:
+                try:
+                    scheduled_at_dt = datetime.fromisoformat(verdict.scheduled_at.replace("Z", "+00:00"))
+                except ValueError:
+                    scheduled_at_dt = None
 
             msg = EmailMessage(
                 userId=account.userId,
                 accountId=account.id,
-                messageId=p["messageId"],
+                messageId=mid,
                 threadId=p["threadId"],
                 historyId=p.get("historyId"),
                 fromAddress=p["fromAddress"],
@@ -270,27 +506,31 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
                 subject=p["subject"],
                 snippet=p["snippet"],
                 receivedAt=p["receivedAt"],
-                label=label,
-                confidence=confidence,
-                companyGuess=company,
-                targetStage=target_stage,
+                label=verdict.label,
+                confidence=verdict.confidence,
+                companyGuess=verdict.company_name,
+                targetStage=verdict.stage_round,
                 classifierModel=model_name,
+                evidenceQuote=verdict.evidence_quote,
+                sourceLayer=source,
+                selfDoubt=verdict.self_doubt,
+                scheduledAt=scheduled_at_dt,
+                interviewerName=verdict.interviewer_name,
             )
 
-            application: Optional[Application] = None
-            if label in ("noise", "follow_up"):
+            if verdict.label in ("noise", "follow_up"):
                 msg.reviewStatus = "ignored"
             else:
-                application = await _match_application(user_id=account.userId, company_guess=company)
+                application = await _match_application(
+                    user_id=account.userId, company_guess=verdict.company_name
+                )
                 if application is None:
                     msg.reviewStatus = "needs_review"
                     needs_review += 1
                 else:
                     msg.applicationId = application.id
-                    if confidence >= auto_threshold:
-                        if await _apply_to_application(
-                            msg=msg, application=application, auto_threshold=auto_threshold
-                        ):
+                    if verdict.confidence >= auto_threshold:
+                        if await _apply_to_application(verdict=verdict, application=application):
                             await application.save()
                         msg.reviewStatus = "auto_applied"
                         msg.reviewedAt = datetime.now(timezone.utc)
@@ -302,18 +542,15 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
             try:
                 await msg.insert()
             except Exception as exc:  # noqa: BLE001
-                # Likely the unique (accountId, messageId) index — concurrent
-                # syncs racing. Safe to ignore.
                 log.debug("email insert skipped (dup?): %s", exc)
 
-        # --- finalize ---
         account.historyId = new_history_id or account.historyId
         account.lastSyncAt = datetime.now(timezone.utc)
         account.syncStatus = "idle"
         await account.save()
         return {
             "fetched": len(parsed),
-            "classified": len(for_llm),
+            "classified": len(needs_llm),
             "auto_applied": auto_applied,
             "needs_review": needs_review,
         }
@@ -332,15 +569,14 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
         raise
 
 
+# ---------------------------------------------------------------------------
+# OAuth bootstrap (unchanged)
+# ---------------------------------------------------------------------------
+
+
 async def bootstrap_account_from_oauth(
-    *,
-    user_id: PydanticObjectId,
-    code: str,
+    *, user_id: PydanticObjectId, code: str,
 ) -> EmailAccount:
-    """OAuth-callback helper: exchanges code → tokens, identifies the
-    account email, upserts an EmailAccount row, and stores the encrypted
-    refresh token. The first sync is left to the caller (we don't block
-    the OAuth callback on a multi-minute mailbox pull)."""
     from app.email_crypto import encrypt
     from app.gmail_api import exchange_code
 
@@ -348,9 +584,6 @@ async def bootstrap_account_from_oauth(
     refresh_token = token_response.get("refresh_token")
     access_token = token_response.get("access_token")
     if not refresh_token:
-        # Google omits refresh_token when the user previously authorized us
-        # AND we forgot prompt=consent. We always pass it, so this should
-        # not happen — fail loudly so we notice if the flow regresses.
         raise GmailApiError(400, "Google did not return a refresh_token — re-run OAuth with prompt=consent")
     if not access_token:
         raise GmailApiError(400, "Google did not return an access_token")
@@ -376,11 +609,8 @@ async def bootstrap_account_from_oauth(
         return existing
 
     account = EmailAccount(
-        userId=user_id,
-        provider="gmail",
-        email=email,
-        refreshTokenEncrypted=encrypt(refresh_token),
-        scopes=scopes,
+        userId=user_id, provider="gmail", email=email,
+        refreshTokenEncrypted=encrypt(refresh_token), scopes=scopes,
     )
     await account.insert()
     return account

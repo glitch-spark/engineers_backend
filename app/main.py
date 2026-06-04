@@ -80,6 +80,7 @@ def create_app() -> FastAPI:
     app.include_router(resume.router)
     app.include_router(applications.router)
     app.include_router(integrations.router)
+    app.include_router(integrations.oauth_router)
 
     return app
 

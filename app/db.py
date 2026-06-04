@@ -22,7 +22,9 @@ from app.models import (
     AnalyzeChatLog,
     Application,
     EmailAccount,
+    EmailClassificationCache,
     EmailMessage,
+    EmailRule,
     GlobalPrompt,
     Interview,
     InterviewChatLog,
@@ -50,6 +52,8 @@ DOCUMENT_MODELS = [
     Application,
     EmailAccount,
     EmailMessage,
+    EmailRule,
+    EmailClassificationCache,
 ]
 
 

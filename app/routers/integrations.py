@@ -39,15 +39,24 @@ from app.gmail_api import (
     build_authorization_url,
     revoke_refresh_token,
 )
-from app.models import Application, EmailAccount, EmailMessage, UserExtra
+from app.models import Application, EmailAccount, EmailMessage, EmailRule, UserExtra
+from app.email_rules import sender_domain
 from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
 from app.models.email_account import EmailAccountPublic
 from app.models.email_message import EmailMessagePublic
+from app.models.email_rule import EmailRulePublic
 from app.routers._util import to_object_id
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/integrations/email", tags=["integrations"])
+
+# Google's OAuth client config (and the matching env var) places the
+# redirect URI at /integrations/gmail/oauth-callback — without the
+# /email/ segment. Rather than force every operator to update Google
+# Cloud + .env, we expose the callback under a second router at that
+# bare path. All other email routes stay under /integrations/email.
+oauth_router = APIRouter(prefix="/integrations/gmail", tags=["integrations"])
 
 
 # ---- state token signing ---------------------------------------------------
@@ -114,7 +123,7 @@ async def gmail_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)
     return {"url": url}
 
 
-@router.get("/gmail/oauth-callback")
+@oauth_router.get("/oauth-callback")
 async def gmail_oauth_callback(
     code: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
@@ -289,7 +298,65 @@ async def apply_message(
     msg.reviewedAt = datetime.now(timezone.utc)
     msg.reviewedBy = user.id
     await msg.save()
+
+    # Learn from the correction. If the classifier label was uncertain or
+    # wrong, the user's confirmation becomes a deterministic rule for the
+    # same (sender domain, evidence phrase) combination next time.
+    await _learn_rule_from_confirmation(msg=msg, user_id=user.id)
     return {"ok": True}
+
+
+async def _learn_rule_from_confirmation(
+    *, msg: EmailMessage, user_id: PydanticObjectId,
+) -> None:
+    """Writes an EmailRule from a user's confirmation in the review tray.
+
+    Pattern strategy:
+      - senderPattern: '@' + the sender's domain. This is broader than
+        the exact address (one address per recruiter is normal), but
+        narrower than top-level domain.
+      - phrasePattern: msg.evidenceQuote if it looks reasonable
+        (15-200 chars, no obvious recipient personalization like the
+        user's name). Fallback to a stable substring of the subject.
+
+    Skipped if a rule with this exact (sender, phrase) already exists.
+    Idempotent on re-confirmation.
+    """
+    domain = sender_domain(msg.fromAddress)
+    if not domain or len(domain) < 4:
+        return
+    label = msg.label or ""
+    if label in ("", "noise", "follow_up"):
+        return
+    phrase = (msg.evidenceQuote or "").strip().lower()
+    if not (15 <= len(phrase) <= 200):
+        phrase = (msg.subject or "").strip().lower()[:120]
+    if len(phrase) < 10:
+        return
+    try:
+        existing = await EmailRule.find_one(
+            EmailRule.senderPattern == domain,
+            EmailRule.phrasePattern == phrase,
+        )
+        if existing is not None:
+            existing.hitCount += 1
+            existing.lastHitAt = datetime.now(timezone.utc)
+            existing.label = label
+            existing.stageRound = msg.targetStage
+            await existing.save()
+            return
+        await EmailRule(
+            senderPattern=domain,
+            phrasePattern=phrase,
+            label=label,
+            stageRound=msg.targetStage,
+            confidence=0.95,  # slightly below seed rules — user-derived
+            source="user_correction",
+            createdBy=user_id,
+            notes=f"learned from message {msg.id}",
+        ).insert()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("learn-rule from confirmation failed: %s", exc)
 
 
 @router.post("/messages/{message_id}/dismiss")
@@ -332,3 +399,106 @@ async def message_body(
     except GmailApiError as exc:
         raise HTTPException(status_code=502, detail=exc.message) from exc
     return {"body": body}
+
+
+# ---------------------------------------------------------------------------
+# Rule management (admin)
+# ---------------------------------------------------------------------------
+
+
+class RuleUpsertBody(BaseModel):
+    senderPattern: str
+    phrasePattern: str
+    label: str
+    stageRound: Optional[str] = None
+    confidence: float = 1.0
+    notes: str = ""
+    enabled: bool = True
+
+
+@router.get("/rules")
+async def list_rules(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    label: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    enabledOnly: bool = Query(False),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    q: dict[str, Any] = {}
+    if label:
+        q["label"] = label
+    if source:
+        q["source"] = source
+    if enabledOnly:
+        q["enabled"] = True
+    rows = await EmailRule.find(q).sort([("hitCount", -1)]).limit(limit).to_list()
+    return {"rules": [EmailRulePublic.from_doc(r).model_dump() for r in rows]}
+
+
+@router.post("/rules")
+async def create_rule(
+    body: RuleUpsertBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    sp = body.senderPattern.strip().lower()
+    pp = body.phrasePattern.strip().lower()
+    if not sp or not pp:
+        raise HTTPException(status_code=400, detail="senderPattern and phrasePattern are required")
+    existing = await EmailRule.find_one(
+        EmailRule.senderPattern == sp, EmailRule.phrasePattern == pp,
+    )
+    if existing is not None:
+        existing.label = body.label
+        existing.stageRound = body.stageRound
+        existing.confidence = body.confidence
+        existing.notes = body.notes or existing.notes
+        existing.enabled = body.enabled
+        await existing.save()
+        return EmailRulePublic.from_doc(existing).model_dump()
+    row = EmailRule(
+        senderPattern=sp, phrasePattern=pp, label=body.label,
+        stageRound=body.stageRound, confidence=body.confidence,
+        notes=body.notes, enabled=body.enabled,
+        source="admin_added", createdBy=user.id,
+    )
+    await row.insert()
+    return EmailRulePublic.from_doc(row).model_dump()
+
+
+@router.patch("/rules/{rule_id}")
+async def update_rule(
+    rule_id: str,
+    body: RuleUpsertBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    row = await EmailRule.get(to_object_id(rule_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    row.senderPattern = body.senderPattern.strip().lower()
+    row.phrasePattern = body.phrasePattern.strip().lower()
+    row.label = body.label
+    row.stageRound = body.stageRound
+    row.confidence = body.confidence
+    row.notes = body.notes
+    row.enabled = body.enabled
+    await row.save()
+    return EmailRulePublic.from_doc(row).model_dump()
+
+
+@router.delete("/rules/{rule_id}", status_code=204)
+async def delete_rule(
+    rule_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> None:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    row = await EmailRule.get(to_object_id(rule_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    await row.delete()

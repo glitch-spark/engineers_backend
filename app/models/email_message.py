@@ -78,6 +78,18 @@ class EmailMessage(TimestampedDocument):
     reviewStatus: EmailReviewStatus = "needs_review"
     reviewedAt: Optional[datetime] = None
     reviewedBy: Optional[PydanticObjectId] = None
+    # Audit trail — every classification reproducible without re-fetching
+    # the body. `evidenceQuote` is the substring the classifier grounded
+    # its label on; the sync orchestrator validates it appears in the
+    # actual body and downgrades to noise on miss. `sourceLayer` records
+    # which decision path produced the verdict so we can attribute
+    # accuracy regressions to one layer.
+    evidenceQuote: Optional[str] = None
+    sourceLayer: Optional[str] = None  # rule_engine | cache | llm | noise_blocklist
+    selfDoubt: Optional[float] = None  # model's own uncertainty self-rating (LLM only)
+    gmailCategory: Optional[str] = None
+    scheduledAt: Optional[datetime] = None
+    interviewerName: Optional[str] = None
 
     class Settings:
         name = "emailMessages"
@@ -108,6 +120,10 @@ class EmailMessagePublic(BaseModel):
     targetStage: Optional[str] = None
     applicationId: Optional[str] = None
     reviewStatus: EmailReviewStatus
+    evidenceQuote: Optional[str] = None
+    sourceLayer: Optional[str] = None
+    scheduledAt: Optional[datetime] = None
+    interviewerName: Optional[str] = None
 
     @classmethod
     def from_doc(cls, doc: "EmailMessage") -> "EmailMessagePublic":
@@ -127,4 +143,8 @@ class EmailMessagePublic(BaseModel):
             targetStage=doc.targetStage,
             applicationId=str(doc.applicationId) if doc.applicationId else None,
             reviewStatus=doc.reviewStatus,
+            evidenceQuote=doc.evidenceQuote,
+            sourceLayer=doc.sourceLayer,
+            scheduledAt=doc.scheduledAt,
+            interviewerName=doc.interviewerName,
         )

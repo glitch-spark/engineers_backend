@@ -333,59 +333,50 @@ async def delete_application(
 async def migrate_applications(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Admin-triggered one-off backfill: groups existing ResumeApplication
-    rows by (userId, companyNameLower, jobUrl) and creates/links an
-    Application for each group. Attached interviews are pulled in by
-    matching companyName + createdBy + accountId."""
+    """Admin-triggered backfill — interview-only.
+
+    The pipeline is now driven by Gmail sync; we no longer backfill
+    Application rows from completed resume generations (those produced a
+    huge bid_sent column with no real signal). Existing Interview rows
+    are still a valid pipeline source, so we sweep them and create /
+    advance the matching Application based on each interview's stage.
+    """
     if user.role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
 
-    created = 0
-    linked_bids = 0
     linked_ivs = 0
+    created = set()
 
-    bids = await ResumeApplication.find({}).to_list()
-    # Bucket bids by (userId, company, jobUrl).
-    buckets: dict[tuple, list[ResumeApplication]] = {}
-    for b in bids:
-        key = (str(b.userId), (b.companyName or "").strip().lower(), b.jobUrl or None)
-        buckets.setdefault(key, []).append(b)
-
-    for (uid_str, _company_lc, _job_url), group in buckets.items():
-        group.sort(key=lambda r: r.createdAt or datetime.min.replace(tzinfo=timezone.utc))
-        first = group[0]
-        app = await find_or_create_application(
-            user_id=first.userId,
-            account_id=first.accountId,
-            company_name=first.companyName,
-            job_url=first.jobUrl,
-            job_description=first.jobDescription,
-            bid_job_id=first.id,
-        )
-        existed_count = len(app.bidJobIds)
-        for extra in group[1:]:
-            if extra.id not in app.bidJobIds:
-                app.bidJobIds.append(extra.id)
-        if existed_count != len(app.bidJobIds):
-            await app.save()
-        linked_bids += len(group)
-
-        # Attach matching interviews.
-        ivs = await Interview.find({
-            "createdBy": first.userId,
-            "companyName": first.companyName,
-        }).to_list() if first.companyName else []
-        for iv in ivs:
-            if iv.id in app.interviewIds:
-                continue
-            await attach_interview_to_app(user_id=first.userId, interview=iv)
+    ivs = await Interview.find({}).to_list()
+    for iv in ivs:
+        if not (iv.companyName or "").strip():
+            continue
+        app = await attach_interview_to_app(user_id=iv.createdBy, interview=iv)
+        if app is not None:
+            created.add(str(app.id))
             linked_ivs += 1
-        if app.appliedAt is None:
-            app.appliedAt = first.createdAt
-            await app.save()
-        created += 1
 
-    return {"applications": created, "bidsLinked": linked_bids, "interviewsLinked": linked_ivs}
+    return {"applications": len(created), "bidsLinked": 0, "interviewsLinked": linked_ivs}
+
+
+@router.post("/wipe-bid-only")
+async def wipe_bid_only_applications(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Admin sweep: deletes Application rows that have no attached
+    interviews (i.e. were created solely from a resume-gen auto-link).
+    These were the bid_sent backfill the new email-driven pipeline no
+    longer wants. Rows with any interviewIds are preserved.
+    """
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+    # Clear the entire bid_sent column. The new email-driven pipeline
+    # repopulates it only when Gmail surfaces a confirmation or recruiter
+    # reach-out, so the historical backfill (auto-created from resume
+    # generations + interview-attach helpers) is just noise.
+    res = await Application.find({"stage": "bid_sent"}).delete()
+    deleted = getattr(res, "deleted_count", 0) if res is not None else 0
+    return {"deleted": deleted}
 
 
 @router.post("/auto-archive")
