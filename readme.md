@@ -22,8 +22,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-- Health check: `GET http://localhost:8000/healthz` → `{"status":"ok"}`
-- Swagger UI: `http://localhost:8000/docs`
+- Health check: `GET http://localhost:8080/healthz` → `{"status":"ok"}`
+- Swagger UI: `http://localhost:8080/docs`
 
 ## Environment variables
 
@@ -32,7 +32,7 @@ uvicorn app.main:app --reload
 | `MONGODB_URI` | yes | Same Atlas cluster the Next app uses; URI must include default DB (`/EngineerDB`) |
 | `AUTH_SECRET` | yes | **Must match** the Next app's secret so existing tokens stay valid (ADR-0002) |
 | `FRONTEND_ORIGIN` | no | CORS allowlist; default `http://localhost:5173` |
-| `APP_BASE_URL` | no | Used in Slack message links; default `http://localhost:8000` |
+| `APP_BASE_URL` | no | Used in Slack message links; default `http://localhost:8080` |
 | `APP_TIMEZONE` | no | IANA zone for Slack timestamps; default `America/New_York` |
 | `SLACK_WEBHOOK_URL` | no | Slack notifications are no-ops when unset |
 | `JWT_EXPIRES_MIN` | no | JWT lifetime in minutes; default 720 (12 h) |

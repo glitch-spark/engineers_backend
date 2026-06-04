@@ -1,0 +1,334 @@
+"""Email integrations router — Gmail OAuth + sync + needs-review actions.
+
+Routes:
+  GET    /integrations/email/accounts                  list user's connected accounts
+  POST   /integrations/email/gmail/oauth-start         returns Google consent URL
+  GET    /integrations/email/gmail/oauth-callback      redirect target Google sends back to
+  POST   /integrations/email/{id}/sync                 manual delta sync (or initial)
+  DELETE /integrations/email/{id}                      revoke + soft-delete the account
+  GET    /integrations/email/messages                  list classified messages (review queue)
+  POST   /integrations/email/messages/{id}/apply       confirm proposed action
+  POST   /integrations/email/messages/{id}/dismiss     drop from review queue
+
+The OAuth callback uses a short-lived signed `state` token to bind the
+flow back to the originating user. We deliberately avoid sessions/cookies
+since the frontend stores its JWT in memory only.
+"""
+
+from __future__ import annotations
+
+import logging
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any, List, Optional
+from urllib.parse import urlencode
+
+from beanie import PydanticObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
+from jose import JWTError, jwt
+from pydantic import BaseModel
+
+from app.config import get_settings
+from app.deps import get_current_user
+from app.email_classifier import LABEL_TO_STAGE
+from app.email_crypto import EmailCryptoUnavailable
+from app.email_sync import bootstrap_account_from_oauth, sync_account
+from app.gmail_api import (
+    GmailApiError,
+    build_authorization_url,
+    revoke_refresh_token,
+)
+from app.models import Application, EmailAccount, EmailMessage, UserExtra
+from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
+from app.models.email_account import EmailAccountPublic
+from app.models.email_message import EmailMessagePublic
+from app.routers._util import to_object_id
+
+log = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/integrations/email", tags=["integrations"])
+
+
+# ---- state token signing ---------------------------------------------------
+# Re-use the JWT signing key already used for auth tokens. State carries
+# {userId, nonce, exp} so the callback can attribute the OAuth code back
+# to the user that initiated the flow.
+
+_STATE_AUDIENCE = "gmail-oauth"
+_STATE_TTL_SECONDS = 600  # 10 min — generous for slow consent flows
+
+
+def _sign_state(user_id: PydanticObjectId) -> str:
+    s = get_settings()
+    payload = {
+        "sub": str(user_id),
+        "aud": _STATE_AUDIENCE,
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=_STATE_TTL_SECONDS),
+        "jti": secrets.token_urlsafe(16),
+    }
+    return jwt.encode(payload, s.AUTH_SECRET, algorithm="HS256")
+
+
+def _verify_state(token: str) -> PydanticObjectId:
+    s = get_settings()
+    try:
+        payload = jwt.decode(token, s.AUTH_SECRET, algorithms=["HS256"], audience=_STATE_AUDIENCE)
+        return PydanticObjectId(payload["sub"])
+    except (JWTError, KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid or expired state") from exc
+
+
+def _frontend_redirect(*, status_value: str, detail: Optional[str] = None) -> RedirectResponse:
+    """OAuth callback redirects the browser back to the SPA with a status
+    query param. The SPA reads it and shows toast / closes the popup."""
+    s = get_settings()
+    qs = {"status": status_value}
+    if detail:
+        qs["detail"] = detail[:200]
+    return RedirectResponse(url=f"{s.FRONTEND_ORIGIN}/integrations?{urlencode(qs)}", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Account endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/accounts")
+async def list_accounts(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    rows = await EmailAccount.find(EmailAccount.userId == user.id).sort([("createdAt", -1)]).to_list()
+    return {"accounts": [EmailAccountPublic.from_doc(r).model_dump() for r in rows]}
+
+
+@router.post("/gmail/oauth-start")
+async def gmail_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Returns the Google consent URL the SPA should open in a popup."""
+    s = get_settings()
+    if not s.GOOGLE_OAUTH_CLIENT_ID or not s.EMAIL_TOKEN_KEY:
+        raise HTTPException(status_code=503, detail="Email integration is not configured on this server")
+    state = _sign_state(user.id)
+    try:
+        url = build_authorization_url(state=state, login_hint=user.email)
+    except GmailApiError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    return {"url": url}
+
+
+@router.get("/gmail/oauth-callback")
+async def gmail_oauth_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+) -> RedirectResponse:
+    """Google redirects here after consent. We exchange the code for tokens
+    and persist the EmailAccount, then bounce the browser back to the
+    /integrations page in the SPA with a status query param."""
+    if error:
+        return _frontend_redirect(status_value="error", detail=error)
+    if not code or not state:
+        return _frontend_redirect(status_value="error", detail="missing code or state")
+    try:
+        user_id = _verify_state(state)
+    except HTTPException as exc:
+        return _frontend_redirect(status_value="error", detail=str(exc.detail))
+
+    try:
+        account = await bootstrap_account_from_oauth(user_id=user_id, code=code)
+    except (GmailApiError, EmailCryptoUnavailable) as exc:
+        log.warning("gmail oauth-callback failed for %s: %s", user_id, exc)
+        return _frontend_redirect(status_value="error", detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("gmail oauth-callback unexpected error")
+        return _frontend_redirect(status_value="error", detail="internal error")
+
+    return _frontend_redirect(status_value="connected", detail=account.email)
+
+
+@router.delete("/{account_id}", status_code=204)
+async def disconnect_account(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> None:
+    oid = to_object_id(account_id)
+    account = await EmailAccount.get(oid)
+    if account is None or account.userId != user.id:
+        raise HTTPException(status_code=404, detail="not found")
+    # Best-effort revoke upstream, then wipe the encrypted token locally so
+    # even with the file backup an attacker has no usable credential.
+    try:
+        from app.email_crypto import decrypt
+        token = decrypt(account.refreshTokenEncrypted)
+        await revoke_refresh_token(token)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("revoke during disconnect failed for %s: %s", account.email, exc)
+    account.refreshTokenEncrypted = ""  # wipe
+    account.disconnectedAt = datetime.now(timezone.utc)
+    account.syncStatus = "idle"
+    await account.save()
+
+
+# ---------------------------------------------------------------------------
+# Sync
+# ---------------------------------------------------------------------------
+
+
+# Per-user rate limit on manual sync. Cheap in-memory map — multi-instance
+# deployments will allow one sync per replica, which is fine; the worker
+# itself is idempotent.
+_LAST_SYNC: dict[str, datetime] = {}
+_SYNC_COOLDOWN_SECONDS = 30
+
+
+@router.post("/{account_id}/sync")
+async def sync(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    oid = to_object_id(account_id)
+    account = await EmailAccount.get(oid)
+    if account is None or account.userId != user.id:
+        raise HTTPException(status_code=404, detail="not found")
+    if account.disconnectedAt is not None:
+        raise HTTPException(status_code=400, detail="account is disconnected — reconnect first")
+    if account.syncStatus == "running":
+        raise HTTPException(status_code=409, detail="sync already running")
+
+    last = _LAST_SYNC.get(account_id)
+    if last and (datetime.now(timezone.utc) - last).total_seconds() < _SYNC_COOLDOWN_SECONDS:
+        raise HTTPException(status_code=429, detail=f"Please wait {_SYNC_COOLDOWN_SECONDS}s between syncs")
+    _LAST_SYNC[account_id] = datetime.now(timezone.utc)
+
+    try:
+        stats = await sync_account(account)
+    except GmailApiError as exc:
+        # 400 invalid_grant = user revoked us via Google; surface as 401.
+        if exc.status in (400, 401):
+            raise HTTPException(status_code=401, detail="Gmail authorization expired — reconnect required") from exc
+        raise HTTPException(status_code=502, detail=exc.message) from exc
+    return {"ok": True, "stats": stats}
+
+
+# ---------------------------------------------------------------------------
+# Messages / review queue
+# ---------------------------------------------------------------------------
+
+
+@router.get("/messages")
+async def list_messages(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    accountId: Optional[str] = Query(None),
+    applicationId: Optional[str] = Query(None),
+    reviewStatus: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    """Filterable list. `reviewStatus=needs_review` powers the Inbox tab on
+    the Pipeline page; `applicationId` powers the drawer email list."""
+    q: dict[str, Any] = {"userId": user.id}
+    if accountId:
+        q["accountId"] = to_object_id(accountId)
+    if applicationId:
+        q["applicationId"] = to_object_id(applicationId)
+    if reviewStatus:
+        q["reviewStatus"] = reviewStatus
+    rows = await EmailMessage.find(q).sort([("receivedAt", -1)]).limit(limit).to_list()
+    return {"messages": [EmailMessagePublic.from_doc(r).model_dump() for r in rows]}
+
+
+class ApplyMessageBody(BaseModel):
+    applicationId: Optional[str] = None
+    stage: Optional[str] = None
+
+
+@router.post("/messages/{message_id}/apply")
+async def apply_message(
+    message_id: str,
+    body: ApplyMessageBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """User-confirmed action from the review tray. Either:
+      - links to applicationId + advances stage (defaulting to targetStage),
+      - or just links to applicationId without advancing if stage omitted."""
+    oid = to_object_id(message_id)
+    msg = await EmailMessage.get(oid)
+    if msg is None or msg.userId != user.id:
+        raise HTTPException(status_code=404, detail="not found")
+
+    app_id = body.applicationId or (str(msg.applicationId) if msg.applicationId else None)
+    if not app_id:
+        raise HTTPException(status_code=400, detail="applicationId is required")
+    app = await Application.get(to_object_id(app_id))
+    if app is None or app.userId != user.id:
+        raise HTTPException(status_code=404, detail="application not found")
+
+    target_stage = body.stage or msg.targetStage
+    valid_stages = {s.value for s in KanbanStage}
+    if target_stage and target_stage in valid_stages:
+        # forward-only advance
+        try:
+            old_idx = STAGE_ORDER.index(app.stage)
+        except ValueError:
+            old_idx = len(STAGE_ORDER)
+        try:
+            new_idx = STAGE_ORDER.index(target_stage)
+        except ValueError:
+            new_idx = len(STAGE_ORDER)
+        if new_idx > old_idx:
+            app.stage = target_stage
+            app.stageHistory.append(
+                StageEvent(stage=target_stage, at=datetime.now(timezone.utc), by=user.id, source=f"email-confirm:{msg.label}")
+            )
+        if target_stage == KanbanStage.offer.value:
+            app.outcome = "offer"
+        elif target_stage == KanbanStage.rejected.value:
+            app.outcome = "rejected"
+        app.lastTouchedAt = datetime.now(timezone.utc)
+        await app.save()
+
+    msg.applicationId = app.id
+    msg.reviewStatus = "applied"
+    msg.reviewedAt = datetime.now(timezone.utc)
+    msg.reviewedBy = user.id
+    await msg.save()
+    return {"ok": True}
+
+
+@router.post("/messages/{message_id}/dismiss")
+async def dismiss_message(
+    message_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    oid = to_object_id(message_id)
+    msg = await EmailMessage.get(oid)
+    if msg is None or msg.userId != user.id:
+        raise HTTPException(status_code=404, detail="not found")
+    msg.reviewStatus = "dismissed"
+    msg.reviewedAt = datetime.now(timezone.utc)
+    msg.reviewedBy = user.id
+    await msg.save()
+    return {"ok": True}
+
+
+@router.get("/messages/{message_id}/body")
+async def message_body(
+    message_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """On-demand body fetch — body is NEVER persisted server-side. Hits
+    Gmail directly each request. The drawer calls this when opened."""
+    from app.email_crypto import decrypt
+    from app.gmail_api import fetch_message_body, refresh_access_token
+
+    oid = to_object_id(message_id)
+    msg = await EmailMessage.get(oid)
+    if msg is None or msg.userId != user.id:
+        raise HTTPException(status_code=404, detail="not found")
+    account = await EmailAccount.get(msg.accountId)
+    if account is None or account.disconnectedAt is not None:
+        raise HTTPException(status_code=400, detail="account disconnected")
+    try:
+        refresh = decrypt(account.refreshTokenEncrypted)
+        access = await refresh_access_token(refresh)
+        body = await fetch_message_body(access, msg.messageId)
+    except GmailApiError as exc:
+        raise HTTPException(status_code=502, detail=exc.message) from exc
+    return {"body": body}

@@ -2,6 +2,8 @@ from app.models.account import Account
 from app.models.ai_review import AiReviewRun, GlobalPrompt, Skill
 from app.models.analyze_chat_log import AnalyzeChatLog
 from app.models.application import Application
+from app.models.email_account import EmailAccount
+from app.models.email_message import EmailMessage
 from app.models.interview import Interview
 from app.models.interview_chat_log import InterviewChatLog
 from app.models.interview_question import InterviewQuestion
@@ -15,6 +17,8 @@ __all__ = [
     "AiReviewRun",
     "AnalyzeChatLog",
     "Application",
+    "EmailAccount",
+    "EmailMessage",
     "GlobalPrompt",
     "Interview",
     "InterviewChatLog",

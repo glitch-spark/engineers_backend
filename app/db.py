@@ -21,6 +21,8 @@ from app.models import (
     AiReviewRun,
     AnalyzeChatLog,
     Application,
+    EmailAccount,
+    EmailMessage,
     GlobalPrompt,
     Interview,
     InterviewChatLog,
@@ -46,6 +48,8 @@ DOCUMENT_MODELS = [
     GlobalPrompt,
     ResumeApplication,
     Application,
+    EmailAccount,
+    EmailMessage,
 ]
 
 

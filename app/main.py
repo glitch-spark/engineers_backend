@@ -15,6 +15,7 @@ from app.routers import (
     applications,
     auth as auth_router,
     global_prompt,
+    integrations,
     interviews,
     metrics,
     profile,
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
     app.include_router(metrics.router)
     app.include_router(resume.router)
     app.include_router(applications.router)
+    app.include_router(integrations.router)
 
     return app
 

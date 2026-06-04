@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     MONGODB_URI: str
     AUTH_SECRET: str
     FRONTEND_ORIGIN: str = "http://localhost:5173"
-    APP_BASE_URL: str = "http://localhost:8000"
+    APP_BASE_URL: str = "http://localhost:8080"
     APP_TIMEZONE: str = "America/New_York"
     SLACK_WEBHOOK_URL: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720
@@ -41,6 +41,24 @@ class Settings(BaseSettings):
     # Cheap structured-extraction tasks: parsing Q&A from transcripts, rollup tips.
     # No real reasoning, just JSON shape. Mini saves ~50% per call.
     EXTRACTION_MODEL: str = "gpt-4o-mini"
+    # Gmail integration — OAuth client + Fernet key for refresh-token storage.
+    # If GOOGLE_OAUTH_CLIENT_ID is unset, the gmail router 503s on use so the
+    # rest of the app still boots without these. EMAIL_TOKEN_KEY is a 32-byte
+    # urlsafe-base64 Fernet key — generate one with
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
+    GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/gmail/oauth-callback"
+    EMAIL_TOKEN_KEY: Optional[str] = None
+    # Days of inbox history pulled on the first connect. Subsequent syncs use
+    # Gmail's history.list delta API and only fetch new messages.
+    EMAIL_INITIAL_SYNC_DAYS: int = 7
+    # Hard cap on messages classified per sync — guards LLM cost on noisy
+    # inboxes. Anything older than the cap is skipped (not failed).
+    EMAIL_SYNC_MAX_MESSAGES: int = 500
+    # Min classifier confidence (0-1) required to auto-advance an Application
+    # stage. Below threshold the email lands in the Needs Review tray.
+    EMAIL_AUTO_ADVANCE_CONFIDENCE: float = 0.8
     AWS_REGION: Optional[str] = None
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
