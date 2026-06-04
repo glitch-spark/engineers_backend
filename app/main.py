@@ -81,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(applications.router)
     app.include_router(integrations.router)
     app.include_router(integrations.oauth_router)
+    app.include_router(integrations.outlook_oauth_router)
 
     return app
 

@@ -30,24 +30,15 @@ from app.email_classifier import (
     classify_batch,
     is_obvious_noise,
 )
+from app import email_provider
 from app.email_crypto import decrypt
+from app.email_provider import ProviderError
 from app.email_rules import (
     cache_lookup,
     cache_store,
     find_matching_rule,
     sender_domain,
     template_hash,
-)
-from app.gmail_api import (
-    GmailApiError,
-    fetch_message_body,
-    fetch_userinfo,
-    get_message_metadata,
-    get_profile,
-    list_history,
-    list_message_ids,
-    parse_message_metadata,
-    refresh_access_token,
 )
 from app.models import Application, EmailAccount, EmailMessage
 from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
@@ -74,27 +65,22 @@ def _stage_idx(stage: str) -> int:
 
 async def _get_access_token(account: EmailAccount) -> str:
     refresh_token = decrypt(account.refreshTokenEncrypted)
-    return await refresh_access_token(refresh_token)
+    return await email_provider.refresh_access_token(account.provider, refresh_token)
 
 
-async def _fetch_metadata_batch(access_token: str, ids: list[str]) -> list[dict]:
+async def _fetch_metadata_batch(account: EmailAccount, access_token: str, ids: list[str]) -> list[dict]:
     sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
     async def _one(mid: str) -> Optional[dict]:
         async with sem:
-            try:
-                raw = await get_message_metadata(access_token, mid)
-            except GmailApiError as exc:
-                if exc.status == 404:
-                    return None
-                raise
-            return parse_message_metadata(raw)
+            parsed = await email_provider.get_message_metadata(account, access_token, mid)
+            return parsed or None
 
     parsed = await asyncio.gather(*[_one(i) for i in ids])
     return [p for p in parsed if p]
 
 
-async def _fetch_body_batch(access_token: str, ids: list[str]) -> dict[str, str]:
+async def _fetch_body_batch(account: EmailAccount, access_token: str, ids: list[str]) -> dict[str, str]:
     """Concurrent body fetch — body is required for grounded classification.
     Missing/failed entries return empty string so the classifier still
     runs (it'll downgrade to noise for missing evidence)."""
@@ -103,8 +89,8 @@ async def _fetch_body_batch(access_token: str, ids: list[str]) -> dict[str, str]
     async def _one(mid: str) -> tuple[str, str]:
         async with sem:
             try:
-                body = await fetch_message_body(access_token, mid)
-            except GmailApiError:
+                body = await email_provider.fetch_message_body(account, access_token, mid)
+            except ProviderError:
                 body = ""
             return mid, body
 
@@ -304,55 +290,28 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
     try:
         access_token = await _get_access_token(account)
 
-        # --- pick message IDs ---
-        message_ids: list[str] = []
+        # --- pick message IDs (provider-agnostic) ---
         is_initial = not account.historyId
         if is_initial:
-            query = f"in:inbox newer_than:{settings.EMAIL_INITIAL_SYNC_DAYS}d"
-            page_token = None
-            while len(message_ids) < settings.EMAIL_SYNC_MAX_MESSAGES:
-                page = await list_message_ids(access_token, query=query, page_token=page_token, max_results=100)
-                for m in page.get("messages") or []:
-                    if m.get("id"):
-                        message_ids.append(m["id"])
-                page_token = page.get("nextPageToken")
-                if not page_token:
-                    break
-            profile = await get_profile(access_token)
-            new_history_id = str(profile.get("historyId") or "")
+            message_ids, new_history_id = await email_provider.list_initial_message_ids(
+                account,
+                access_token=access_token,
+                days=settings.EMAIL_INITIAL_SYNC_DAYS,
+                max_results=settings.EMAIL_SYNC_MAX_MESSAGES,
+            )
         else:
-            try:
-                page_token = None
-                seen: set[str] = set()
-                new_history_id = account.historyId
-                while True:
-                    page = await list_history(access_token, start_history_id=account.historyId, page_token=page_token)
-                    for h in page.get("history") or []:
-                        new_history_id = str(h.get("id") or new_history_id)
-                        for added in h.get("messagesAdded") or []:
-                            mid = (added.get("message") or {}).get("id")
-                            if mid and mid not in seen:
-                                seen.add(mid)
-                                message_ids.append(mid)
-                                if len(message_ids) >= settings.EMAIL_SYNC_MAX_MESSAGES:
-                                    break
-                        if len(message_ids) >= settings.EMAIL_SYNC_MAX_MESSAGES:
-                            break
-                    page_token = page.get("nextPageToken")
-                    if not page_token or len(message_ids) >= settings.EMAIL_SYNC_MAX_MESSAGES:
-                        break
-            except GmailApiError as exc:
-                if exc.status == 404:
-                    log.info("history cursor expired for %s, falling back to short date pull", account.email)
-                    query = "in:inbox newer_than:2d"
-                    page = await list_message_ids(access_token, query=query, max_results=100)
-                    for m in page.get("messages") or []:
-                        if m.get("id"):
-                            message_ids.append(m["id"])
-                    profile = await get_profile(access_token)
-                    new_history_id = str(profile.get("historyId") or "")
-                else:
-                    raise
+            message_ids, new_history_id, expired = await email_provider.list_delta_message_ids(
+                account,
+                access_token=access_token,
+                cursor=account.historyId,
+                max_results=settings.EMAIL_SYNC_MAX_MESSAGES,
+            )
+            if expired:
+                log.info("delta cursor expired for %s, falling back to short initial pull", account.email)
+                message_ids, new_history_id = await email_provider.list_initial_message_ids(
+                    account, access_token=access_token, days=2,
+                    max_results=settings.EMAIL_SYNC_MAX_MESSAGES,
+                )
 
         # --- dedupe vs already-stored ---
         if message_ids:
@@ -372,7 +331,7 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
             return {"fetched": 0, "classified": 0, "auto_applied": 0, "needs_review": 0}
 
         # --- fetch metadata ---
-        parsed = await _fetch_metadata_batch(access_token, message_ids)
+        parsed = await _fetch_metadata_batch(account, access_token, message_ids)
 
         # --- bucket by short-circuit (blocklist / rule / cache) vs needs-LLM ---
         # First do the cheap async-without-body checks: blocklist, then
@@ -431,7 +390,7 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
 
         # --- fetch bodies for LLM bucket ---
         if needs_llm:
-            bodies = await _fetch_body_batch(access_token, [p["messageId"] for p in needs_llm])
+            bodies = await _fetch_body_batch(account, access_token, [p["messageId"] for p in needs_llm])
             for p in needs_llm:
                 p["body"] = bodies.get(p["messageId"], "")
 
@@ -555,14 +514,14 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
             "needs_review": needs_review,
         }
 
-    except GmailApiError as exc:
-        log.warning("gmail sync failed for %s: %s", account.email, exc)
+    except ProviderError as exc:
+        log.warning("email sync failed for %s (%s): %s", account.email, account.provider, exc)
         account.syncStatus = "error"
         account.lastSyncError = exc.message[:500]
         await account.save()
         raise
     except Exception as exc:  # noqa: BLE001
-        log.exception("gmail sync failed for %s: %s", account.email, exc)
+        log.exception("email sync failed for %s (%s): %s", account.email, account.provider, exc)
         account.syncStatus = "error"
         account.lastSyncError = str(exc)[:500]
         await account.save()
@@ -570,28 +529,27 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# OAuth bootstrap (unchanged)
+# OAuth bootstrap — provider-agnostic
 # ---------------------------------------------------------------------------
 
 
 async def bootstrap_account_from_oauth(
-    *, user_id: PydanticObjectId, code: str,
+    *, user_id: PydanticObjectId, provider: str, code: str,
 ) -> EmailAccount:
     from app.email_crypto import encrypt
-    from app.gmail_api import exchange_code
 
-    token_response = await exchange_code(code)
+    token_response = await email_provider.exchange_code(provider, code)
     refresh_token = token_response.get("refresh_token")
     access_token = token_response.get("access_token")
     if not refresh_token:
-        raise GmailApiError(400, "Google did not return a refresh_token — re-run OAuth with prompt=consent")
+        raise ProviderError(400, f"{provider} did not return a refresh_token — re-run OAuth with prompt=consent")
     if not access_token:
-        raise GmailApiError(400, "Google did not return an access_token")
+        raise ProviderError(400, f"{provider} did not return an access_token")
 
-    userinfo = await fetch_userinfo(access_token)
+    userinfo = await email_provider.fetch_userinfo(provider, access_token)
     email = (userinfo.get("email") or "").lower().strip()
     if not email:
-        raise GmailApiError(400, "Google did not return the account email")
+        raise ProviderError(400, f"{provider} did not return the account email")
 
     scopes = (token_response.get("scope") or "").split()
 
@@ -600,6 +558,7 @@ async def bootstrap_account_from_oauth(
         EmailAccount.email == email,
     )
     if existing is not None:
+        existing.provider = provider  # type: ignore[assignment]
         existing.refreshTokenEncrypted = encrypt(refresh_token)
         existing.scopes = scopes
         existing.disconnectedAt = None
@@ -609,7 +568,7 @@ async def bootstrap_account_from_oauth(
         return existing
 
     account = EmailAccount(
-        userId=user_id, provider="gmail", email=email,
+        userId=user_id, provider=provider, email=email,  # type: ignore[arg-type]
         refreshTokenEncrypted=encrypt(refresh_token), scopes=scopes,
     )
     await account.insert()

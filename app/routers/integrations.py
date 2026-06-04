@@ -33,12 +33,9 @@ from app.config import get_settings
 from app.deps import get_current_user
 from app.email_classifier import LABEL_TO_STAGE
 from app.email_crypto import EmailCryptoUnavailable
+from app import email_provider
+from app.email_provider import ProviderError
 from app.email_sync import bootstrap_account_from_oauth, sync_account
-from app.gmail_api import (
-    GmailApiError,
-    build_authorization_url,
-    revoke_refresh_token,
-)
 from app.models import Application, EmailAccount, EmailMessage, EmailRule, UserExtra
 from app.email_rules import sender_domain
 from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
@@ -57,6 +54,12 @@ router = APIRouter(prefix="/integrations/email", tags=["integrations"])
 # Cloud + .env, we expose the callback under a second router at that
 # bare path. All other email routes stay under /integrations/email.
 oauth_router = APIRouter(prefix="/integrations/gmail", tags=["integrations"])
+
+# Microsoft Identity uses its own redirect URI (configured in the Azure
+# AD app registration). Same rationale as the gmail oauth_router — keep
+# the callback at the URI Microsoft was registered with, regardless of
+# the email-router prefix layout.
+outlook_oauth_router = APIRouter(prefix="/integrations/outlook", tags=["integrations"])
 
 
 # ---- state token signing ---------------------------------------------------
@@ -109,29 +112,34 @@ async def list_accounts(user: Annotated[UserExtra, Depends(get_current_user)]) -
     return {"accounts": [EmailAccountPublic.from_doc(r).model_dump() for r in rows]}
 
 
+def _oauth_start_for(provider: str, user_email: str, user_id) -> str:
+    s = get_settings()
+    if not s.EMAIL_TOKEN_KEY:
+        raise HTTPException(status_code=503, detail="EMAIL_TOKEN_KEY is not configured")
+    if provider == "gmail" and not s.GOOGLE_OAUTH_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Gmail OAuth is not configured on this server")
+    if provider == "outlook" and not s.MS_OAUTH_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Outlook OAuth is not configured on this server")
+    state = _sign_state(user_id)
+    try:
+        return email_provider.build_authorization_url(provider, state=state, login_hint=user_email)
+    except ProviderError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+
+
 @router.post("/gmail/oauth-start")
 async def gmail_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Returns the Google consent URL the SPA should open in a popup."""
-    s = get_settings()
-    if not s.GOOGLE_OAUTH_CLIENT_ID or not s.EMAIL_TOKEN_KEY:
-        raise HTTPException(status_code=503, detail="Email integration is not configured on this server")
-    state = _sign_state(user.id)
-    try:
-        url = build_authorization_url(state=state, login_hint=user.email)
-    except GmailApiError as exc:
-        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-    return {"url": url}
+    return {"url": _oauth_start_for("gmail", user.email, user.id)}
 
 
-@oauth_router.get("/oauth-callback")
-async def gmail_oauth_callback(
-    code: Optional[str] = Query(None),
-    state: Optional[str] = Query(None),
-    error: Optional[str] = Query(None),
+@router.post("/outlook/oauth-start")
+async def outlook_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    return {"url": _oauth_start_for("outlook", user.email, user.id)}
+
+
+async def _handle_oauth_callback(
+    provider: str, code: Optional[str], state: Optional[str], error: Optional[str],
 ) -> RedirectResponse:
-    """Google redirects here after consent. We exchange the code for tokens
-    and persist the EmailAccount, then bounce the browser back to the
-    /integrations page in the SPA with a status query param."""
     if error:
         return _frontend_redirect(status_value="error", detail=error)
     if not code or not state:
@@ -140,17 +148,33 @@ async def gmail_oauth_callback(
         user_id = _verify_state(state)
     except HTTPException as exc:
         return _frontend_redirect(status_value="error", detail=str(exc.detail))
-
     try:
-        account = await bootstrap_account_from_oauth(user_id=user_id, code=code)
-    except (GmailApiError, EmailCryptoUnavailable) as exc:
-        log.warning("gmail oauth-callback failed for %s: %s", user_id, exc)
+        account = await bootstrap_account_from_oauth(user_id=user_id, provider=provider, code=code)
+    except (ProviderError, EmailCryptoUnavailable) as exc:
+        log.warning("%s oauth-callback failed for %s: %s", provider, user_id, exc)
         return _frontend_redirect(status_value="error", detail=str(exc))
     except Exception as exc:  # noqa: BLE001
-        log.exception("gmail oauth-callback unexpected error")
+        log.exception("%s oauth-callback unexpected error", provider)
         return _frontend_redirect(status_value="error", detail="internal error")
-
     return _frontend_redirect(status_value="connected", detail=account.email)
+
+
+@oauth_router.get("/oauth-callback")
+async def gmail_oauth_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+) -> RedirectResponse:
+    return await _handle_oauth_callback("gmail", code, state, error)
+
+
+@outlook_oauth_router.get("/oauth-callback")
+async def outlook_oauth_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+) -> RedirectResponse:
+    return await _handle_oauth_callback("outlook", code, state, error)
 
 
 @router.delete("/{account_id}", status_code=204)
@@ -167,7 +191,7 @@ async def disconnect_account(
     try:
         from app.email_crypto import decrypt
         token = decrypt(account.refreshTokenEncrypted)
-        await revoke_refresh_token(token)
+        await email_provider.revoke_refresh_token(account.provider, token)
     except Exception as exc:  # noqa: BLE001
         log.warning("revoke during disconnect failed for %s: %s", account.email, exc)
     account.refreshTokenEncrypted = ""  # wipe
@@ -186,6 +210,32 @@ async def disconnect_account(
 # itself is idempotent.
 _LAST_SYNC: dict[str, datetime] = {}
 _SYNC_COOLDOWN_SECONDS = 30
+
+
+@router.post("/{account_id}/reset")
+async def reset_sync(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    fullReSync: bool = Query(False, description="also clear historyId so the next sync re-pulls the full N-day window"),
+) -> dict:
+    """Unsticks an account whose sync got stuck in `running` (interrupted
+    process) and optionally wipes the history cursor so the next click
+    runs a fresh initial pull. Clears the local cooldown record too."""
+    oid = to_object_id(account_id)
+    account = await EmailAccount.get(oid)
+    if account is None or account.userId != user.id:
+        raise HTTPException(status_code=404, detail="not found")
+    account.syncStatus = "idle"
+    account.lastSyncError = None
+    if fullReSync:
+        account.historyId = None
+    await account.save()
+    _LAST_SYNC.pop(account_id, None)
+    return {
+        "ok": True,
+        "syncStatus": account.syncStatus,
+        "historyId": account.historyId,
+    }
 
 
 @router.post("/{account_id}/sync")
@@ -209,10 +259,11 @@ async def sync(
 
     try:
         stats = await sync_account(account)
-    except GmailApiError as exc:
-        # 400 invalid_grant = user revoked us via Google; surface as 401.
+    except ProviderError as exc:
+        # 400 invalid_grant = user revoked us; surface as 401 so the SPA
+        # prompts a reconnect rather than retrying forever.
         if exc.status in (400, 401):
-            raise HTTPException(status_code=401, detail="Gmail authorization expired — reconnect required") from exc
+            raise HTTPException(status_code=401, detail="Authorization expired — reconnect required") from exc
         raise HTTPException(status_code=502, detail=exc.message) from exc
     return {"ok": True, "stats": stats}
 
@@ -383,8 +434,6 @@ async def message_body(
     """On-demand body fetch — body is NEVER persisted server-side. Hits
     Gmail directly each request. The drawer calls this when opened."""
     from app.email_crypto import decrypt
-    from app.gmail_api import fetch_message_body, refresh_access_token
-
     oid = to_object_id(message_id)
     msg = await EmailMessage.get(oid)
     if msg is None or msg.userId != user.id:
@@ -394,9 +443,9 @@ async def message_body(
         raise HTTPException(status_code=400, detail="account disconnected")
     try:
         refresh = decrypt(account.refreshTokenEncrypted)
-        access = await refresh_access_token(refresh)
-        body = await fetch_message_body(access, msg.messageId)
-    except GmailApiError as exc:
+        access = await email_provider.refresh_access_token(account.provider, refresh)
+        body = await email_provider.fetch_message_body(account, access, msg.messageId)
+    except ProviderError as exc:
         raise HTTPException(status_code=502, detail=exc.message) from exc
     return {"body": body}
 

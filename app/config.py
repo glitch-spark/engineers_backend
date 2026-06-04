@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     # Min classifier confidence (0-1) required to auto-advance an Application
     # stage. Below threshold the email lands in the Needs Review tray.
     EMAIL_AUTO_ADVANCE_CONFIDENCE: float = 0.8
+    # Microsoft Identity OAuth for the Outlook integration. Same shape as
+    # the Google block — if MS_OAUTH_CLIENT_ID is unset the outlook routes
+    # 503 on use so the rest of the app still boots.
+    # MS_OAUTH_TENANT is the Azure AD tenant id; "common" supports both
+    # personal and work accounts. Pin to your tenant id once you submit
+    # the app for org verification.
+    MS_OAUTH_CLIENT_ID: Optional[str] = None
+    MS_OAUTH_CLIENT_SECRET: Optional[str] = None
+    MS_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/outlook/oauth-callback"
+    MS_OAUTH_TENANT: str = "common"
     AWS_REGION: Optional[str] = None
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
