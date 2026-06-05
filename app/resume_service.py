@@ -2,15 +2,20 @@
 place, Playwright renders to PDF, optional upload to S3.
 
 The LLM receives the raw uploaded HTML template plus candidate data, the job
-description, and the user's custom prompt. It returns the SAME HTML with the
-template's sample text replaced by tailored content — structure, CSS, classes,
-and tag layout preserved byte-for-byte. No marker annotation, no deterministic
-fill: the model handles the replacement directly, the way ChatGPT does when a
-user uploads a template into a chat.
+description, and the user's custom prompt. It returns ONLY the rewritten
+<body> — structure, classes, and tag layout preserved byte-for-byte. The
+template's DOCTYPE/<head>/<style>/<link> shell is kept server-side and the
+rewritten body is spliced back in (see `_reassemble_body`), so the CSS can
+never drift and we don't pay output tokens to re-emit it. Playwright then
+renders the reassembled HTML to PDF, with optional upload to S3.
+
+Identical regenerations skip the OpenAI call via a content-hash cache
+(`ResumeLLMCache`); see `generate_resume`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -23,7 +28,7 @@ from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
-from app.models import Account
+from app.models import Account, ResumeLLMCache
 
 log = logging.getLogger(__name__)
 
@@ -45,13 +50,15 @@ _SYSTEM_RULES = (
     "label, achievement bullets, and the summary.\n"
     "\n"
     "ABSOLUTE RULES — these override anything in the custom prompt:\n"
-    "1. Output the FULL HTML document — same DOCTYPE, <html>, <head>, "
-    "<style>, <link>, <body>, and every element from the template — "
-    "preserved BYTE-FOR-BYTE except for the specific text nodes the custom "
-    "prompt asks you to rewrite.\n"
-    "2. Do NOT modify, reorder, rename, add, or remove: <style> block "
-    "contents, class names, ids, inline style attributes, href targets, "
-    "font links, or DOM structure.\n"
+    "1. Output ONLY the page's <body> element — everything from the opening "
+    "<body ...> tag through the closing </body>, inclusive. Do NOT output the "
+    "DOCTYPE, <html>, <head>, <style>, or <link> tags. They are fixed and are "
+    "re-attached automatically; emitting them wastes output and they are "
+    "discarded. Preserve every element inside <body> BYTE-FOR-BYTE except for "
+    "the specific text nodes the custom prompt asks you to rewrite.\n"
+    "2. Within the body, do NOT modify, reorder, rename, add, or remove: "
+    "class names, ids, inline style attributes, href targets, font links, or "
+    "DOM structure.\n"
     "3. ALLOWED to rewrite by default: the headline / title text, "
     "per-company role / job-title text, achievement bullet text, project "
     "bullet text, and the summary paragraph text. The custom prompt may "
@@ -65,8 +72,8 @@ _SYSTEM_RULES = (
     "template, the output has N bullets. Same for projects per company, "
     "skill rows, education rows, contact items. Never add or drop "
     "entries — the template's shape is the spec.\n"
-    "6. Output raw HTML only. No code fences. No prose. No comments "
-    "before or after the document.\n"
+    "6. Output raw HTML only — the <body> element and nothing else. No code "
+    "fences. No prose. No comments before or after it.\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -92,6 +99,42 @@ def _strip_fences(s: str) -> str:
         if s.rstrip().endswith("```"):
             s = s.rstrip()[:-3]
     return s.strip()
+
+
+_BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
+
+
+def _body_inner_html(html: str) -> Optional[str]:
+    """Inner HTML of the first <body> element, or None if there's no
+    recognizable <body>…</body> region."""
+    m = _BODY_OPEN_RE.search(html or "")
+    if not m:
+        return None
+    end = (html or "").lower().rfind("</body>")
+    if end == -1 or end < m.end():
+        return None
+    return html[m.end():end]
+
+
+def _reassemble_body(template_html: str, model_output: str) -> str:
+    """Splice the model's rewritten body into the template, keeping the
+    template's DOCTYPE/<head>/<style>/<link> shell byte-for-byte. The model is
+    asked to return only the <body>; we tolerate it returning a full document
+    (we take its body) or a bare fragment (we treat the whole thing as the
+    body's inner HTML). The template's own <body> open/close tags — and thus
+    its body attributes — are preserved; only the inner content is replaced.
+
+    If the template has no clean <body> region to splice into, fall back to
+    the raw model output as a full document so generation still produces
+    something renderable."""
+    inner = _body_inner_html(model_output)
+    if inner is None:
+        inner = (model_output or "").strip()
+    m = _BODY_OPEN_RE.search(template_html or "")
+    end = (template_html or "").lower().rfind("</body>")
+    if not m or end == -1 or end < m.end():
+        return model_output
+    return template_html[:m.end()] + inner + template_html[end:]
 
 
 def _extract_style_block(html: str) -> str:
@@ -138,12 +181,17 @@ def _build_resume_prompt(
     template_html: str,
     prompt_body: Optional[str] = None,
 ) -> str:
-    """Compose the LLM prompt: system rules → custom prompt body (if any) →
-    template HTML → JD. The template carries all candidate data; no separate
-    candidate-fields block. Stable prefix first (account-stable across
-    generations) so OpenAI prompt caching can warm-hit; per-generation JD
-    last. When no custom prompt is supplied, the model gets just the system
-    rules — no built-in content guidance."""
+    """Compose the LLM prompt: system rules → template HTML → custom prompt
+    body (if any) → JD. The template carries all candidate data; no separate
+    candidate-fields block.
+
+    Ordering is deliberate for OpenAI prompt caching: the account-stable
+    prefix (system rules + template) comes FIRST so it warm-hits across
+    generations, and the per-generation parts (custom prompt, JD) come LAST.
+    The custom prompt sits after the template — putting it before would
+    bust the cache for the much larger template that follows it. When no
+    custom prompt is supplied, the model gets just the system rules — no
+    built-in content guidance."""
     body = (prompt_body or "").strip()
     custom_block = (
         "\n\nCUSTOM PROMPT (the candidate's guidance — follow it within "
@@ -160,10 +208,10 @@ def _build_resume_prompt(
         jd = jd[:cap].rstrip() + "\n[... job description truncated ...]"
     return (
         _SYSTEM_RULES
-        + custom_block
-        + "\n\n=== TEMPLATE HTML (the candidate's resume — edit in place; "
-          "return the full document) ===\n"
+        + "\n\n=== TEMPLATE HTML (the candidate's resume — rewrite its body "
+          "text in place; return ONLY the <body> element) ===\n"
         + template_html
+        + custom_block
         + "\n\n=== JOB DESCRIPTION ===\n"
         + jd
     )
@@ -172,6 +220,16 @@ def _build_resume_prompt(
 # ---------------------------------------------------------------------------
 # OpenAI
 # ---------------------------------------------------------------------------
+
+
+def _resume_model_and_effort() -> tuple[str, str]:
+    """Resolve the resume model and reasoning effort from settings. Used by
+    both the live call and the cache key so a hit reflects exactly the params
+    the output was produced with."""
+    settings = get_settings()
+    model = settings.RESUME_OPENAI_MODEL
+    effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
+    return model, effort
 
 
 async def _openai_call(prompt: str) -> tuple[str, dict]:
@@ -192,11 +250,11 @@ async def _openai_call(prompt: str) -> tuple[str, dict]:
             detail="OPENAI_API_KEY not configured",
         )
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
-    kwargs: dict = {"model": settings.RESUME_OPENAI_MODEL, "input": prompt}
+    model, effort = _resume_model_and_effort()
+    kwargs: dict = {"model": model, "input": prompt}
     # Reasoning param only applies to gpt-5* reasoning models; harmless to
     # send, but guard so a non-reasoning override model doesn't 400.
-    if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+    if model.startswith("gpt-5"):
         kwargs["reasoning"] = {"effort": effort}
     response = await client.responses.create(**kwargs)
 
@@ -221,6 +279,41 @@ async def _openai_call(prompt: str) -> tuple[str, dict]:
         if reasoning_toks is not None:
             usage_out["reasoning"] = int(reasoning_toks)
     return (response.output_text or ""), usage_out
+
+
+def _resume_cache_key(prompt: str, model: str, effort: str) -> str:
+    """Content hash that fully determines the LLM output: model + reasoning
+    effort + the complete prompt (which already embeds the template, custom
+    prompt, and trimmed JD). NUL-joined so fields can't run together."""
+    return hashlib.sha256(
+        "\x00".join([model, effort, prompt]).encode("utf-8")
+    ).hexdigest()
+
+
+async def _resume_llm_output(cache_key: str, prompt: str, model: str) -> tuple[str, dict]:
+    """Return (raw_output, usage). On a content-hash cache hit, reuse the
+    stored output and skip the OpenAI call entirely (usage zeroed — no spend).
+    On a miss, call OpenAI and best-effort persist the result for next time."""
+    cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
+    if cached is not None:
+        log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
+        return cached.output, {"input": 0, "output": 0, "reasoning": 0}
+
+    raw, usage = await _openai_call(prompt)
+    try:
+        await ResumeLLMCache(
+            promptHash=cache_key,
+            output=raw,
+            model=model,
+            inputTokens=usage.get("input"),
+            outputTokens=usage.get("output"),
+            reasoningTokens=usage.get("reasoning"),
+        ).insert()
+        log.info("resume LLM cache STORE key=%s", cache_key[:12])
+    except Exception as exc:  # noqa: BLE001 — cache is best-effort; a duplicate
+        # key from a concurrent identical request races to insert and loses.
+        log.warning("resume LLM cache store skipped (key=%s): %s", cache_key[:12], exc)
+    return raw, usage
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +452,10 @@ async def generate_resume(
     company: str,
     prompt_body: Optional[str] = None,
 ) -> GeneratedResume:
-    """Run the full pipeline: LLM rewrites the template's text in place,
-    Playwright renders the resulting HTML to PDF, optional S3 upload."""
+    """Run the full pipeline: LLM rewrites the template's <body> text (or a
+    content-hash cache hit reuses a prior output, skipping the call), the body
+    is spliced back into the template shell, Playwright renders the HTML to
+    PDF, optional S3 upload."""
     template = (account.styleTemplate or "").strip()
     if not template:
         raise HTTPException(
@@ -375,8 +470,16 @@ async def generate_resume(
     )
 
     prompt = _build_resume_prompt(account, job_description, template, prompt_body=prompt_body)
-    raw, usage = await _openai_call(prompt)
-    out_html = _strip_fences(raw)
+    model, effort = _resume_model_and_effort()
+    cache_key = _resume_cache_key(prompt, model, effort)
+    raw, usage = await _resume_llm_output(cache_key, prompt, model)
+
+    # The model returns only the rewritten <body>; splice it back into the
+    # template's shell so the DOCTYPE/<head>/<style> stay byte-for-byte
+    # identical (CSS cannot drift) and we don't pay output tokens to re-emit
+    # them. Tolerates a full-document or bare-fragment response too.
+    body_fragment = _strip_fences(raw)
+    out_html = _reassemble_body(template, body_fragment)
     _validate_llm_html(template, out_html)
 
     pdf_bytes = await _html_to_pdf(

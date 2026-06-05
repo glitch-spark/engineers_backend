@@ -25,6 +25,7 @@ from app.models import (
     InterviewChatLog,
     InterviewQuestion,
     ResumeApplication,
+    ResumeLLMCache,
     Skill,
     Transaction,
     UserExtra,
@@ -44,6 +45,7 @@ DOCUMENT_MODELS = [
     AnalyzeChatLog,
     GlobalPrompt,
     ResumeApplication,
+    ResumeLLMCache,
 ]
 
 
