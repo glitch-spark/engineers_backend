@@ -83,9 +83,11 @@ def template_hash(*, from_addr: str, subject: str, body_or_snippet: str) -> str:
 def _match_rule(rule: EmailRule, *, from_addr: str, subject: str, body: str) -> bool:
     sp = (rule.senderPattern or "").lower().strip()
     pp = (rule.phrasePattern or "").lower().strip()
-    if not sp or not pp:
+    if not pp:
         return False
-    if sp not in (from_addr or "").lower():
+    # senderPattern is optional: empty = match ANY sender (generic, content-only
+    # rule). When present it must be a substring of the sender address.
+    if sp and sp not in (from_addr or "").lower():
         return False
     haystack = ((subject or "") + "\n" + (body or "")).lower()
     return pp in haystack

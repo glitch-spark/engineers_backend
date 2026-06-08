@@ -69,6 +69,14 @@ class Application(TimestampedDocument):
     stage: str = KanbanStage.bid_sent.value
     outcome: ApplicationOutcome = "active"
 
+    # Confirmation gate. Cards created by in-app résumé bids or manual entry
+    # are trusted (confirmed=True). Cards created from an inbound email are
+    # AI-proposed and start unconfirmed — they render on the board with a
+    # Yes/No control and are excluded from analytics until confirmed.
+    confirmed: bool = True
+    aiLabel: Optional[str] = None                    # classifier label that placed it
+    aiConfidence: Optional[float] = None             # classifier confidence (0-1)
+
     appliedAt: Optional[datetime] = None             # first bid timestamp
     lastTouchedAt: Optional[datetime] = None         # most recent activity
 

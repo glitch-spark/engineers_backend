@@ -82,9 +82,11 @@ def build_authorization_url(*, state: str, login_hint: Optional[str] = None) -> 
         "response_mode": "query",
         "scope": " ".join(OUTLOOK_SCOPES),
         "state": state,
-        # prompt=consent forces consent dialog so Microsoft always returns
-        # a refresh token, mirroring Google's `prompt=consent` behaviour.
-        "prompt": "consent",
+        # select_account shows Microsoft's account picker so the user can
+        # connect ANY Outlook account instead of being pinned to one. Refresh
+        # tokens still come back via the offline_access scope above
+        # (prompt=consent is not required to receive one).
+        "prompt": "select_account",
     }
     if login_hint:
         params["login_hint"] = login_hint

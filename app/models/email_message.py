@@ -44,11 +44,13 @@ EmailLabel = Literal[
 
 # Action taken on receipt of this message — drives the Needs Review tray.
 EmailReviewStatus = Literal[
-    "auto_applied",   # confidence >= threshold, Application updated automatically
-    "needs_review",   # below threshold OR no matching Application found
-    "dismissed",      # user dismissed in the review tray
-    "applied",        # user confirmed in the review tray
+    "on_board",       # actionable → created/advanced a (pending) board card
+    "dismissed",      # user rejected the card it fed (No)
     "ignored",        # classifier returned "noise" or "follow_up"
+    # legacy values kept so historical rows still validate
+    "auto_applied",
+    "needs_review",
+    "applied",
 ]
 
 

@@ -51,8 +51,9 @@ class Settings(BaseSettings):
     GOOGLE_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/gmail/oauth-callback"
     EMAIL_TOKEN_KEY: Optional[str] = None
     # Days of inbox history pulled on the first connect. Subsequent syncs use
-    # Gmail's history.list delta API and only fetch new messages.
-    EMAIL_INITIAL_SYNC_DAYS: int = 7
+    # Gmail's history.list delta API and only fetch new messages. 30d captures
+    # recent job-search activity; capped by EMAIL_SYNC_MAX_MESSAGES.
+    EMAIL_INITIAL_SYNC_DAYS: int = 30
     # Hard cap on messages classified per sync — guards LLM cost on noisy
     # inboxes. Anything older than the cap is skipped (not failed).
     EMAIL_SYNC_MAX_MESSAGES: int = 500

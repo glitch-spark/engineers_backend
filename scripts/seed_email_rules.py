@@ -53,6 +53,22 @@ SEED_RULES: list[tuple[str, str, str, str | None, str]] = [
     ("@notion.com", "thanks for applying to notion", "applied", "bid_sent", "Notion direct"),
     ("@stripe.com", "thanks for applying to stripe", "applied", "bid_sent", "Stripe direct"),
 
+    # --- generic, sender-agnostic application receipts (empty sender = ANY
+    # sender). These fire before the LLM, so every phrase must be
+    # confirmation-only — verified to NOT appear in rejection emails.
+    # "thank you for applying" is deliberately EXCLUDED: it shows up in
+    # rejection preambles, so the LLM handles that phrasing instead.
+    ("", "thanks for applying", "applied", "bid_sent", "generic ATS receipt"),
+    ("", "we received your application", "applied", "bid_sent", "generic receipt"),
+    ("", "we've received your application", "applied", "bid_sent", "generic receipt"),
+    ("", "we have received your application", "applied", "bid_sent", "generic receipt"),
+    ("", "your application has been received", "applied", "bid_sent", "generic receipt"),
+    ("", "your resume has been received", "applied", "bid_sent", "generic receipt"),
+    ("", "acknowledgement to application", "applied", "bid_sent", "generic receipt"),
+    ("", "acknowledgement of your application", "applied", "bid_sent", "generic receipt"),
+    ("", "successfully submitted your application", "applied", "bid_sent", "generic receipt"),
+    ("", "application has been submitted", "applied", "bid_sent", "generic receipt"),
+
     # --- rejections (high-precision phrases) ---
     ("@greenhouse-mail.com", "decided to move forward with other candidates", "rejection", "rejected", "Greenhouse rejection"),
     (".lever.co", "after careful consideration", "rejection", "rejected", "Lever rejection"),
@@ -69,10 +85,17 @@ SEED_RULES: list[tuple[str, str, str, str | None, str]] = [
     ("@codility.com", "complete the assessment", "take_home", "tech", "Codility alt"),
     ("@coderpad.io", "interview scheduled", "live_coding", "live_coding", "CoderPad"),
     ("@karat.com", "karat interview", "live_coding", "live_coding", "Karat"),
-    ("@hireflix.com", "video interview", "take_home", "tech", "Hireflix one-way"),
-    ("@sparkhire.com", "video interview", "take_home", "tech", "SparkHire one-way"),
-    ("@hirevue.com", "on-demand interview", "take_home", "tech", "HireVue"),
     ("@triplebyte.com", "assessment", "take_home", "tech", "Triplebyte"),
+
+    # --- one-way / recorded video interviews → ai_interview column ---
+    ("@hireflix.com", "video interview", "take_home", "ai_interview", "Hireflix one-way"),
+    ("@sparkhire.com", "video interview", "take_home", "ai_interview", "SparkHire one-way"),
+    ("@hirevue.com", "on-demand interview", "take_home", "ai_interview", "HireVue"),
+    ("@willo.video", "video interview", "take_home", "ai_interview", "Willo one-way"),
+    ("", "one-way video interview", "take_home", "ai_interview", "generic one-way video"),
+    ("", "record your responses", "take_home", "ai_interview", "recorded video"),
+    ("", "on-demand interview", "take_home", "ai_interview", "on-demand video"),
+    ("", "asynchronous video interview", "take_home", "ai_interview", "async video"),
 
     # --- scheduling ---
     ("@calendly.com", "scheduled a meeting", "schedule_interview", "intro", "Calendly confirmation"),

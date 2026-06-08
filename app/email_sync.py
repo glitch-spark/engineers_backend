@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -42,13 +43,14 @@ from app.email_rules import (
 )
 from app.models import Application, EmailAccount, EmailMessage
 from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
+from app.routers.applications import find_or_create_application
 
 log = logging.getLogger(__name__)
 
 
 # Concurrency: Gmail allows ~250 quota units/user/sec; metadata.get costs 5.
 _FETCH_CONCURRENCY = 10
-_CLASSIFY_BATCH_SIZE = 15
+_CLASSIFY_BATCH_SIZE = 10
 
 
 # ---------------------------------------------------------------------------
@@ -225,20 +227,29 @@ async def classify_email(
 # ---------------------------------------------------------------------------
 
 
-async def _match_application(
-    *, user_id: PydanticObjectId, company_guess: Optional[str]
-) -> Optional[Application]:
-    """LLM-only matching: classifier's companyName guess → existing
-    Application by companyNameLower. No domain heuristics. No
-    auto-create — unmatched goes to Needs Review."""
-    if not company_guess:
+_COMPANY_FROM_SUBJECT = [
+    re.compile(r"applying\s+(?:to|at|for)\s+(.+)", re.I),
+    re.compile(r"interview\s+(?:invitation|with|for|at).+?\bat\s+(.+)", re.I),
+    re.compile(r"\bat\s+([A-Z0-9][\w&.,'\- ]{1,60})\s*$", re.I),
+]
+
+
+def _infer_company_from_subject(subject: str) -> Optional[str]:
+    """Best-effort company extraction from a subject line when the classifier
+    didn't return one (e.g. rule-engine hits like "Thank you for applying to
+    X"). Conservative — returns None if nothing clean matches so the caller
+    can fall back to a placeholder."""
+    s = (subject or "").strip()
+    if not s:
         return None
-    name = company_guess.strip().lower()
-    if not name:
-        return None
-    return await Application.find_one(
-        Application.userId == user_id, Application.companyNameLower == name
-    )
+    for rx in _COMPANY_FROM_SUBJECT:
+        m = rx.search(s)
+        if m:
+            # keep only the head before any role/req separator
+            cand = re.split(r"\s*[\-—|(:]\s*", m.group(1).strip())[0].strip(" .,-")
+            if 2 <= len(cand) <= 60:
+                return cand
+    return None
 
 
 async def _apply_to_application(
@@ -281,7 +292,7 @@ async def _apply_to_application(
 async def sync_account(account: EmailAccount) -> dict[str, int]:
     settings = get_settings()
     if account.disconnectedAt is not None:
-        return {"fetched": 0, "classified": 0, "auto_applied": 0, "needs_review": 0}
+        return {"fetched": 0, "classified": 0, "on_board": 0, "ignored": 0}
 
     account.syncStatus = "running"
     account.lastSyncError = None
@@ -328,7 +339,7 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
             account.lastSyncAt = datetime.now(timezone.utc)
             account.syncStatus = "idle"
             await account.save()
-            return {"fetched": 0, "classified": 0, "auto_applied": 0, "needs_review": 0}
+            return {"fetched": 0, "classified": 0, "on_board": 0, "ignored": 0}
 
         # --- fetch metadata ---
         parsed = await _fetch_metadata_batch(account, access_token, message_ids)
@@ -340,18 +351,11 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
         needs_llm: list[dict] = []
         for p in parsed:
             mid = p["messageId"]
-            # We may not have body yet; rule + cache use subject + snippet.
-            if is_obvious_noise(p["fromAddress"], p["subject"], list_unsubscribe=p.get("isUnsub", False)):
-                verdicts[mid] = (
-                    ExtractedEmail(
-                        label="noise", confidence=1.0,
-                        evidence_quote="(blocked sender)", self_doubt=0.0,
-                        company_name=None, stage_round=None,
-                        scheduled_at=None, interviewer_name=None,
-                    ),
-                    "noise_blocklist",
-                )
-                continue
+            # Order matters: cache + rule engine run BEFORE the sender
+            # blocklist, so a known application-confirmation phrase from a
+            # no-reply ATS sender is classified (e.g. applied) rather than
+            # dropped as noise. The blocklist is the last cheap check before
+            # falling through to the LLM. (rule + cache use subject + snippet.)
             th = template_hash(from_addr=p["fromAddress"], subject=p["subject"], body_or_snippet=p["snippet"])
             cached = await cache_lookup(th)
             if cached is not None:
@@ -384,6 +388,19 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
                     evidence_quote=verdict.evidence_quote,
                     sender_domain_str=sender_domain(p["fromAddress"]),
                     subject_preview=p["subject"][:120],
+                )
+                continue
+            # Sender blocklist runs only after cache + rule miss, so it can
+            # never override a matched application-confirmation rule.
+            if is_obvious_noise(p["fromAddress"], p["subject"], list_unsubscribe=p.get("isUnsub", False)):
+                verdicts[mid] = (
+                    ExtractedEmail(
+                        label="noise", confidence=1.0,
+                        evidence_quote="(blocked sender)", self_doubt=0.0,
+                        company_name=None, stage_round=None,
+                        scheduled_at=None, interviewer_name=None,
+                    ),
+                    "noise_blocklist",
                 )
                 continue
             needs_llm.append(p)
@@ -431,9 +448,8 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
                 )
 
         # --- persist + auto-apply ---
-        auto_threshold = settings.EMAIL_AUTO_ADVANCE_CONFIDENCE
-        auto_applied = 0
-        needs_review = 0
+        on_board = 0
+        ignored = 0
         model_name = settings.EXTRACTION_MODEL
 
         for p in parsed:
@@ -479,24 +495,35 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
 
             if verdict.label in ("noise", "follow_up"):
                 msg.reviewStatus = "ignored"
+                ignored += 1
             else:
-                application = await _match_application(
-                    user_id=account.userId, company_guess=verdict.company_name
+                # Every actionable email becomes a card on the board. A new
+                # card created from email starts UNCONFIRMED (confirmed=False)
+                # and renders with a Yes/No control; an existing card (e.g. a
+                # real résumé bid) is reused and keeps its state. Company falls
+                # back to subject inference, then a placeholder, so nothing is
+                # dropped.
+                company = (
+                    (verdict.company_name or "").strip()
+                    or _infer_company_from_subject(p["subject"])
+                    or "Unknown Company"
                 )
-                if application is None:
-                    msg.reviewStatus = "needs_review"
-                    needs_review += 1
-                else:
-                    msg.applicationId = application.id
-                    if verdict.confidence >= auto_threshold:
-                        if await _apply_to_application(verdict=verdict, application=application):
-                            await application.save()
-                        msg.reviewStatus = "auto_applied"
-                        msg.reviewedAt = datetime.now(timezone.utc)
-                        auto_applied += 1
-                    else:
-                        msg.reviewStatus = "needs_review"
-                        needs_review += 1
+                application = await find_or_create_application(
+                    user_id=account.userId,
+                    account_id=account.id,
+                    company_name=company,
+                    job_url=None,
+                    confirmed=False,
+                    ai_label=verdict.label,
+                    ai_confidence=verdict.confidence,
+                )
+                msg.applicationId = application.id
+                # Advance forward-only to the predicted stage (also sets
+                # outcome for offer/rejection). New cards start at bid_sent.
+                if await _apply_to_application(verdict=verdict, application=application):
+                    await application.save()
+                msg.reviewStatus = "on_board"
+                on_board += 1
 
             try:
                 await msg.insert()
@@ -510,8 +537,8 @@ async def sync_account(account: EmailAccount) -> dict[str, int]:
         return {
             "fetched": len(parsed),
             "classified": len(needs_llm),
-            "auto_applied": auto_applied,
-            "needs_review": needs_review,
+            "on_board": on_board,
+            "ignored": ignored,
         }
 
     except ProviderError as exc:

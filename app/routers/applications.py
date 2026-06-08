@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from app.deps import get_current_user
-from app.models import Application, Interview, ResumeApplication, UserExtra
+from app.models import Application, EmailMessage, Interview, ResumeApplication, UserExtra
 from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
 from app.routers._util import doc_to_dict, populate_owner, to_object_id
 from app.slack import notify_new_interview  # reuse Slack infra (graceful no-op)
@@ -55,8 +55,15 @@ async def find_or_create_application(
     job_url: Optional[str],
     job_description: Optional[str] = None,
     bid_job_id: Optional[PydanticObjectId] = None,
+    confirmed: bool = True,
+    ai_label: Optional[str] = None,
+    ai_confidence: Optional[float] = None,
 ) -> Application:
-    """Idempotent: same (user, company, jobUrl) → same Application doc."""
+    """Idempotent: same (user, company, jobUrl) → same Application doc.
+
+    `confirmed`/`ai_label`/`ai_confidence` are applied ONLY when a new card is
+    created — an existing card keeps its confirmation state, so an inbound
+    email touching a real (confirmed) bid never silently un-confirms it."""
     now = datetime.now(timezone.utc)
     company_name = (company_name or "").strip() or "Unknown"
     q = {"userId": user_id, **_key(company_name, job_url)}
@@ -71,6 +78,9 @@ async def find_or_create_application(
             jobDescription=job_description,
             stage=KanbanStage.bid_sent.value,
             outcome="active",
+            confirmed=confirmed,
+            aiLabel=ai_label,
+            aiConfidence=ai_confidence,
             appliedAt=now,
             lastTouchedAt=now,
             stageHistory=[StageEvent(stage=KanbanStage.bid_sent.value, at=now, source="auto")],
@@ -325,6 +335,44 @@ async def delete_application(
     app = await Application.get(oid)
     if app is None or (user.role != "admin" and str(app.userId) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    await app.delete()
+    return {"ok": True}
+
+
+@router.post("/{app_id}/confirm")
+async def confirm_application(
+    app_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Confirm an AI-proposed card (the Yes control). The user agrees with the
+    label/placement, so the card stays and is treated as a real card."""
+    oid = to_object_id(app_id)
+    app = await Application.get(oid)
+    if app is None or (user.role != "admin" and str(app.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if not app.confirmed:
+        app.confirmed = True
+        app.lastTouchedAt = datetime.now(timezone.utc)
+        await app.save()
+    out = await populate_owner([app], field="userId", only=("name", "email"))
+    return out[0]
+
+
+@router.post("/{app_id}/reject")
+async def reject_application(
+    app_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Reject an AI-proposed card (the No control — wrong label). Removes the
+    card and marks any email(s) that fed it as dismissed so they don't
+    resurface on the next sync."""
+    oid = to_object_id(app_id)
+    app = await Application.get(oid)
+    if app is None or (user.role != "admin" and str(app.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    await EmailMessage.find(EmailMessage.applicationId == app.id).update(
+        {"$set": {"reviewStatus": "dismissed"}}
+    )
     await app.delete()
     return {"ok": True}
 

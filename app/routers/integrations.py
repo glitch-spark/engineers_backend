@@ -112,7 +112,7 @@ async def list_accounts(user: Annotated[UserExtra, Depends(get_current_user)]) -
     return {"accounts": [EmailAccountPublic.from_doc(r).model_dump() for r in rows]}
 
 
-def _oauth_start_for(provider: str, user_email: str, user_id) -> str:
+def _oauth_start_for(provider: str, user_id) -> str:
     s = get_settings()
     if not s.EMAIL_TOKEN_KEY:
         raise HTTPException(status_code=503, detail="EMAIL_TOKEN_KEY is not configured")
@@ -121,20 +121,24 @@ def _oauth_start_for(provider: str, user_email: str, user_id) -> str:
     if provider == "outlook" and not s.MS_OAUTH_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Outlook OAuth is not configured on this server")
     state = _sign_state(user_id)
+    # No login_hint for either provider: we want the account chooser so the
+    # user can connect ANY Gmail/Outlook account rather than being pinned to
+    # their app login. The chooser is forced via prompt=select_account in each
+    # provider's builder.
     try:
-        return email_provider.build_authorization_url(provider, state=state, login_hint=user_email)
+        return email_provider.build_authorization_url(provider, state=state)
     except ProviderError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.message) from exc
 
 
 @router.post("/gmail/oauth-start")
 async def gmail_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    return {"url": _oauth_start_for("gmail", user.email, user.id)}
+    return {"url": _oauth_start_for("gmail", user.id)}
 
 
 @router.post("/outlook/oauth-start")
 async def outlook_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    return {"url": _oauth_start_for("outlook", user.email, user.id)}
+    return {"url": _oauth_start_for("outlook", user.id)}
 
 
 async def _handle_oauth_callback(

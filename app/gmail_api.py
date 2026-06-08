@@ -81,7 +81,10 @@ def build_authorization_url(*, state: str, login_hint: Optional[str] = None) -> 
         # first connect. Without these Google only returns a refresh token
         # on the very first authorization per user/app, so re-connects fail.
         "access_type": "offline",
-        "prompt": "consent",
+        # select_account shows Google's account chooser so the user can
+        # connect ANY Google account, not just the one they're signed into.
+        # consent is kept so a refresh_token is always issued (see above).
+        "prompt": "select_account consent",
         "include_granted_scopes": "true",
         "state": state,
     }
