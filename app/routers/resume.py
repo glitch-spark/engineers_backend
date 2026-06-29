@@ -11,8 +11,8 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-from app.config import get_settings
-from app.deps import get_current_user
+from app.llm.client import complete_text
+from app.llm.resolver import resolve_llm_config
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import ScreeningPair as ScreeningPairModel
 from app.resume_service import (
@@ -146,8 +146,11 @@ async def _run_job(
         await _mark_failed(job, "account no longer exists", started)
         return
     owner = await UserExtra.get(user_id)
+    if owner is None:
+        await _mark_failed(job, "user no longer exists", started)
+        return
 
-    # Resolve resume content-prompt: per-generation > account > user > default.
+    # Resolve resume content-prompt:
     resolved_prompt_body = (prompt_body_override or "").strip()
     if not resolved_prompt_body:
         resolved_prompt_body = (account.resumePromptBody or "").strip()
@@ -168,11 +171,13 @@ async def _run_job(
         await job.save()
 
         result = await generate_resume(
-            account, jd, company, prompt_body=resolved_prompt_body or None
+            account, jd, company, prompt_body=resolved_prompt_body or None, user=owner
         )
         job.inputTokens = result.input_tokens
         job.outputTokens = result.output_tokens
         job.reasoningTokens = result.reasoning_tokens
+        job.llmProviderUsed = result.llm_provider_used
+        job.llmFallbackUsed = result.llm_fallback_used
         job.plainText = result.plain_text
 
         # ---- step 2: persist PDF reference ----
@@ -198,6 +203,7 @@ async def _run_job(
 
             pairs = await _run_screening(
                 account=account,
+                user=owner,
                 jd=jd,
                 questions=questions,
                 screening_prompt=resolved_screening,
@@ -212,13 +218,17 @@ async def _run_job(
                 cl_prompt = (getattr(owner, "coverLetterPromptBody", None) or "").strip()
             try:
                 from app.resume_service import generate_cover_letter as _gen_cover
-                cl_text, _cl_usage = await _gen_cover(
+                cl_text, _cl_usage, cl_fallback = await _gen_cover(
                     candidate_resume_text=job.plainText or "",
                     job_description=jd,
                     company=company,
                     prompt_body=cl_prompt,
+                    user=owner,
+                    account=account,
                 )
                 job.coverLetterText = cl_text
+                if cl_fallback:
+                    job.llmFallbackUsed = True
             except Exception as exc:  # noqa: BLE001 — non-fatal
                 log.warning("cover-letter generation failed for job %s: %s", job_id, exc)
 
@@ -250,25 +260,14 @@ async def _mark_failed(job: ResumeApplication, message: str, started: float) -> 
 
 async def _run_screening(
     account: Account,
+    user: UserExtra,
     jd: str,
     questions: List[str],
     screening_prompt: str,
     resume_text: Optional[str] = None,
 ) -> List[dict]:
     """`screening_prompt` is the resolved answer-prompt (account > user >
-    built-in default), resolved by the caller. When `resume_text` is set
-    (post-generation Q&A), the LLM uses the tailored resume's plain text
-    as the candidate context; otherwise it falls back to the account's
-    raw template text."""
-    from openai import AsyncOpenAI
-
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured")
-
-    # Candidate context — prefer the tailored generated-resume text when
-    # supplied (post-gen ask endpoint); else fall back to the profile's
-    # raw template text. Either way, strip tags before sending.
+    built-in default), resolved by the caller."""
     candidate_text = (resume_text or "").strip()
     candidate_source = "tailored resume"
     if not candidate_text:
@@ -304,12 +303,14 @@ async def _run_screening(
         "Do not include any text outside the JSON."
     )
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.responses.create(
-        model=settings.RESUME_OPENAI_MODEL,
-        input="\n\n".join(p for p in parts if p),
+    config = await resolve_llm_config(user, account)
+    result = await complete_text(
+        config,
+        "\n\n".join(p for p in parts if p),
+        user_id=str(user.id),
+        account_id=str(account.id),
     )
-    raw = response.output_text or ""
+    raw = result.text
 
     answers: List[str] = []
     try:
@@ -362,6 +363,7 @@ async def screening_answers(
 
     pairs = await _run_screening(
         account=account,
+        user=user,
         jd=body.jobDescription or "",
         questions=questions,
         screening_prompt=screening,
@@ -405,8 +407,10 @@ async def ask_job_screening(
     if not screening_prompt and owner:
         screening_prompt = (owner.screeningPromptBody or "").strip()
 
+    llm_user = owner if owner is not None else user
     pairs = await _run_screening(
         account=account,
+        user=llm_user,
         jd=job.jobDescription or "",
         questions=questions,
         screening_prompt=screening_prompt,
@@ -444,6 +448,8 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "inputTokens": job.inputTokens,
         "outputTokens": job.outputTokens,
         "reasoningTokens": job.reasoningTokens,
+        "llmProviderUsed": job.llmProviderUsed,
+        "llmFallbackUsed": job.llmFallbackUsed,
         "coverLetterText": job.coverLetterText,
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,

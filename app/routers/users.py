@@ -25,6 +25,7 @@ class UserUpdate(BaseModel):
     phone: Optional[str] = None
     birthday: Optional[str] = None
     isActive: Optional[bool] = None
+    llmProvider: Optional[str] = None
 
 
 def _parse_dt(s: str) -> Optional[datetime]:
@@ -144,6 +145,10 @@ async def update_user(
             user.birthday = parsed
     if body.isActive is not None:
         user.isActive = body.isActive
+    if body.llmProvider is not None:
+        if body.llmProvider not in ("openai", "nvidia_free"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid llmProvider")
+        user.llmProvider = body.llmProvider
 
     await user.save()
     return doc_to_dict(user)

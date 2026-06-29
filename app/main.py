@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.db import init_db
 from app.routers import (
     accounts,
+    admin_llm,
     ai_review,
     auth as auth_router,
     global_prompt,
@@ -75,6 +76,7 @@ def create_app() -> FastAPI:
     app.include_router(global_prompt.router)
     app.include_router(ai_review.router)
     app.include_router(metrics.router)
+    app.include_router(admin_llm.router)
     app.include_router(resume.router)
 
     return app

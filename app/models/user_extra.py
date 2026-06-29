@@ -35,6 +35,8 @@ class UserExtra(TimestampedDocument):
     resumePromptBody: Optional[str] = None
     screeningPromptBody: Optional[str] = None
     coverLetterPromptBody: Optional[str] = None
+    llmProvider: str = "openai"
+    llmBackupProvider: str = "openai"
 
     class Settings:
         name = "userextras"

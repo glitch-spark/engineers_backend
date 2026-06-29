@@ -51,5 +51,8 @@ class Account(TimestampedDocument):
     # Account-level cover-letter prompt. Empty → fall back to user level.
     coverLetterPrompt: Optional[str] = None
 
+    # None = inherit user-level llmProvider.
+    llmProvider: Optional[Literal["openai", "nvidia_free"]] = None
+
     class Settings:
         name = "accounts"
