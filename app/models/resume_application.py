@@ -60,6 +60,8 @@ class ResumeApplication(TimestampedDocument):
     inputTokens: Optional[int] = None
     outputTokens: Optional[int] = None
     reasoningTokens: Optional[int] = None
+    llmProviderUsed: Optional[str] = None
+    llmFallbackUsed: bool = False
 
     # Plain-text cover letter generated alongside the resume (opt-in per
     # submission). Empty when the user didn't request one.

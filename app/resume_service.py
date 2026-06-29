@@ -24,11 +24,12 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
-from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
-from app.models import Account, ResumeLLMCache
+from app.llm.client import complete_text
+from app.llm.resolver import resolve_llm_config
+from app.models import Account, ResumeLLMCache, UserExtra
 
 log = logging.getLogger(__name__)
 
@@ -218,102 +219,63 @@ def _build_resume_prompt(
 
 
 # ---------------------------------------------------------------------------
-# OpenAI
+# LLM
 # ---------------------------------------------------------------------------
 
 
-def _resume_model_and_effort() -> tuple[str, str]:
-    """Resolve the resume model and reasoning effort from settings. Used by
-    both the live call and the cache key so a hit reflects exactly the params
-    the output was produced with."""
-    settings = get_settings()
-    model = settings.RESUME_OPENAI_MODEL
-    effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
-    return model, effort
+async def _llm_call(
+    prompt: str,
+    *,
+    user: UserExtra,
+    account: Account,
+) -> tuple[str, dict, str, str, bool]:
+    """Returns (text, usage, provider, model, fallback_used)."""
+    config = await resolve_llm_config(user, account)
+    result = await complete_text(
+        config,
+        prompt,
+        user_id=str(user.id),
+        account_id=str(account.id),
+    )
+    usage = result.usage
+    return result.text, usage, result.provider_used, result.model_used, result.fallback_used
 
 
-async def _openai_call(prompt: str) -> tuple[str, dict]:
-    """Single OpenAI Responses call. Returns (output_text, usage_dict).
-
-    usage_dict shape: {input, output, reasoning}. Empty dict on failure or
-    when the SDK doesn't surface usage.
-
-    gpt-5-mini is a reasoning model — without an explicit effort it defaults
-    to medium and bills heavy hidden reasoning tokens (at output rate). The
-    resume task is a mechanical text-replace inside a fixed template, so it
-    needs little reasoning. Pin effort low to cut hidden-token cost ~5-10x.
-    Override via RESUME_REASONING_EFFORT env if a profile needs more depth."""
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OPENAI_API_KEY not configured",
-        )
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    model, effort = _resume_model_and_effort()
-    kwargs: dict = {"model": model, "input": prompt}
-    # Reasoning param only applies to gpt-5* reasoning models; harmless to
-    # send, but guard so a non-reasoning override model doesn't 400.
-    if model.startswith("gpt-5"):
-        kwargs["reasoning"] = {"effort": effort}
-    response = await client.responses.create(**kwargs)
-
-    usage_out: dict = {}
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        out_details = getattr(usage, "output_tokens_details", None)
-        reasoning_toks = getattr(out_details, "reasoning_tokens", None) if out_details else None
-        input_toks = getattr(usage, "input_tokens", None)
-        output_toks = getattr(usage, "output_tokens", None)
-        log.info(
-            "resume LLM usage: in=%s out=%s reasoning=%s effort=%s",
-            input_toks if input_toks is not None else "?",
-            output_toks if output_toks is not None else "?",
-            reasoning_toks if reasoning_toks is not None else "?",
-            effort,
-        )
-        if input_toks is not None:
-            usage_out["input"] = int(input_toks)
-        if output_toks is not None:
-            usage_out["output"] = int(output_toks)
-        if reasoning_toks is not None:
-            usage_out["reasoning"] = int(reasoning_toks)
-    return (response.output_text or ""), usage_out
-
-
-def _resume_cache_key(prompt: str, model: str, effort: str) -> str:
-    """Content hash that fully determines the LLM output: model + reasoning
-    effort + the complete prompt (which already embeds the template, custom
-    prompt, and trimmed JD). NUL-joined so fields can't run together."""
+def _resume_cache_key(prompt: str, provider: str, model: str) -> str:
     return hashlib.sha256(
-        "\x00".join([model, effort, prompt]).encode("utf-8")
+        "\x00".join([provider, model, prompt]).encode("utf-8")
     ).hexdigest()
 
 
-async def _resume_llm_output(cache_key: str, prompt: str, model: str) -> tuple[str, dict]:
-    """Return (raw_output, usage). On a content-hash cache hit, reuse the
-    stored output and skip the OpenAI call entirely (usage zeroed — no spend).
-    On a miss, call OpenAI and best-effort persist the result for next time."""
+async def _resume_llm_output(
+    cache_key: str,
+    prompt: str,
+    provider: str,
+    model: str,
+    *,
+    user: UserExtra,
+    account: Account,
+) -> tuple[str, dict, bool]:
     cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
     if cached is not None:
-        log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
-        return cached.output, {"input": 0, "output": 0, "reasoning": 0}
+        log.info("resume LLM cache HIT key=%s provider=%s", cache_key[:12], cached.provider)
+        return cached.output, {"input": 0, "output": 0, "reasoning": 0}, False
 
-    raw, usage = await _openai_call(prompt)
+    raw, usage, prov, mod, fallback = await _llm_call(prompt, user=user, account=account)
     try:
         await ResumeLLMCache(
             promptHash=cache_key,
             output=raw,
             model=model,
+            provider=prov,
             inputTokens=usage.get("input"),
             outputTokens=usage.get("output"),
             reasoningTokens=usage.get("reasoning"),
         ).insert()
-        log.info("resume LLM cache STORE key=%s", cache_key[:12])
-    except Exception as exc:  # noqa: BLE001 — cache is best-effort; a duplicate
-        # key from a concurrent identical request races to insert and loses.
+        log.info("resume LLM cache STORE key=%s provider=%s", cache_key[:12], prov)
+    except Exception as exc:  # noqa: BLE001
         log.warning("resume LLM cache store skipped (key=%s): %s", cache_key[:12], exc)
-    return raw, usage
+    return raw, usage, fallback
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +406,8 @@ class GeneratedResume:
     # candidate context for follow-up screening Q&A so the answers reflect
     # the tailored resume, not the raw template.
     plain_text: Optional[str] = None
+    llm_provider_used: Optional[str] = None
+    llm_fallback_used: bool = False
 
 
 async def generate_resume(
@@ -451,6 +415,8 @@ async def generate_resume(
     job_description: str,
     company: str,
     prompt_body: Optional[str] = None,
+    *,
+    user: UserExtra,
 ) -> GeneratedResume:
     """Run the full pipeline: LLM rewrites the template's <body> text (or a
     content-hash cache hit reuses a prior output, skipping the call), the body
@@ -470,9 +436,13 @@ async def generate_resume(
     )
 
     prompt = _build_resume_prompt(account, job_description, template, prompt_body=prompt_body)
-    model, effort = _resume_model_and_effort()
-    cache_key = _resume_cache_key(prompt, model, effort)
-    raw, usage = await _resume_llm_output(cache_key, prompt, model)
+    llm_config = await resolve_llm_config(user, account)
+    provider = llm_config.effective_provider
+    model = llm_config.primary.model
+    cache_key = _resume_cache_key(prompt, provider, model)
+    raw, usage, fallback = await _resume_llm_output(
+        cache_key, prompt, provider, model, user=user, account=account
+    )
 
     # The model returns only the rewritten <body>; splice it back into the
     # template's shell so the DOCTYPE/<head>/<style> stay byte-for-byte
@@ -499,6 +469,8 @@ async def generate_resume(
         output_tokens=usage.get("output"),
         reasoning_tokens=usage.get("reasoning"),
         plain_text=plain_text,
+        llm_provider_used=provider,
+        llm_fallback_used=fallback,
     )
 
 
@@ -532,11 +504,10 @@ async def generate_cover_letter(
     job_description: str,
     company: str,
     prompt_body: str,
-) -> tuple[str, dict]:
-    """Generate a plain-text cover letter using gpt-5-mini (low reasoning).
-    Returns (text, usage_dict). `prompt_body` is the resolved cover-letter
-    prompt (account > user). If empty, the system rules carry the call —
-    output will be generic but coherent."""
+    user: UserExtra,
+    account: Account,
+) -> tuple[str, dict, bool]:
+    """Generate a plain-text cover letter. Returns (text, usage, fallback_used)."""
     parts: list[str] = [_COVER_LETTER_SYSTEM]
     body = (prompt_body or "").strip()
     if body:
@@ -560,5 +531,7 @@ async def generate_cover_letter(
         "=== JOB DESCRIPTION (what the letter must address) ===\n"
         + (job_description or "(no JD supplied)").strip()
     )
-    text, usage = await _openai_call("\n\n".join(parts))
-    return _strip_fences(text), usage
+    text, usage, _, _, fallback = await _llm_call(
+        "\n\n".join(parts), user=user, account=account
+    )
+    return _strip_fences(text), usage, fallback
