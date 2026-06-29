@@ -26,7 +26,6 @@ from app.models import (
     InterviewQuestion,
     ResumeApplication,
     ResumeLLMCache,
-    LlmSettings,
     Skill,
     Transaction,
     UserExtra,
@@ -47,7 +46,6 @@ DOCUMENT_MODELS = [
     GlobalPrompt,
     ResumeApplication,
     ResumeLLMCache,
-    LlmSettings,
 ]
 
 

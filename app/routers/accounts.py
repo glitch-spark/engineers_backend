@@ -84,7 +84,6 @@ class AccountCreate(BaseModel):
     previewHtml: Optional[str] = None
     screeningPrompt: Optional[str] = None
     coverLetterPrompt: Optional[str] = None
-    llmProvider: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
@@ -97,7 +96,6 @@ class AccountUpdate(BaseModel):
     previewHtml: Optional[str] = None
     screeningPrompt: Optional[str] = None
     coverLetterPrompt: Optional[str] = None
-    llmProvider: Optional[str] = None
 
 
 @router.get("/lookup")
@@ -232,13 +230,6 @@ async def update_account(
         acc.screeningPrompt = body.screeningPrompt
     if body.coverLetterPrompt is not None:
         acc.coverLetterPrompt = body.coverLetterPrompt
-    if body.llmProvider is not None:
-        if body.llmProvider == "":
-            acc.llmProvider = None
-        elif body.llmProvider in ("openai", "nvidia_free"):
-            acc.llmProvider = body.llmProvider  # type: ignore[assignment]
-        else:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid llmProvider")
 
 
     await acc.save()

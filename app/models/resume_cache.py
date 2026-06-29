@@ -20,7 +20,6 @@ class ResumeLLMCache(TimestampedDocument):
     promptHash: str
     output: str
     model: str
-    provider: str = "openai"
     inputTokens: Optional[int] = None
     outputTokens: Optional[int] = None
     reasoningTokens: Optional[int] = None

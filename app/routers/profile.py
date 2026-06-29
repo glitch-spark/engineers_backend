@@ -50,7 +50,6 @@ async def get_profile(user: Annotated[UserExtra, Depends(get_current_user)]) -> 
             "resumePromptBody": user.resumePromptBody or "",
             "screeningPromptBody": user.screeningPromptBody or "",
             "coverLetterPromptBody": user.coverLetterPromptBody or "",
-            "llmProvider": user.llmProvider or "openai",
         }
     }
 
