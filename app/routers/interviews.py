@@ -105,7 +105,7 @@ async def _populate_account(items: Iterable[dict], *, field: str = "accountId") 
 async def list_interviews(
     user: Annotated[UserExtra, Depends(get_current_user)],
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=500),
     from_: str = Query("", alias="from"),
     to: str = Query(""),
     accountId: str = Query(""),
