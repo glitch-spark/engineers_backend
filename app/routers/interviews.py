@@ -114,10 +114,9 @@ async def list_interviews(
     creatorId: str = Query(""),
     sort: str = Query("desc"),
 ) -> dict:
-    # Non-admins only see their own interviews. Admins see everything and may
-    # filter by creator. The creatorId param from a non-admin is ignored.
-    is_admin = user.role == "admin"
-    query: dict[str, Any] = {} if is_admin else {"createdBy": user.id}
+    # Every authenticated user can list/filter all interviews. Pass creatorId
+    # to narrow to one owner; omit it to see everyone.
+    query: dict[str, Any] = {}
 
     date_filter: dict = {}
     f_dt = parse_date(from_)
@@ -139,7 +138,7 @@ async def list_interviews(
         if status_ not in STATUSES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
         query["status"] = status_
-    if creatorId and is_admin:
+    if creatorId:
         query["createdBy"] = to_object_id(creatorId)
 
     direction = 1 if sort == "asc" else -1
