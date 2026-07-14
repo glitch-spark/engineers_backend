@@ -75,8 +75,8 @@ async def progress_report(
     """Run AI extraction over the weekly plans in scope (free-text plan/
     follow-up -> structured metrics), persist the metrics onto each plan,
     and return a per-user rollup. Re-running overwrites (picks up text
-    edits). Non-admins are auto-scoped to their own plans regardless of
-    the `userId` param."""
+    edits). Non-admins may only re-analyze their own plans (to avoid
+    rewriting teammates' metrics); admins may scope via `userId`."""
     from app.weekly_report import extract_metrics
 
     is_admin = user.role == "admin"
@@ -114,18 +114,15 @@ async def progress_report(
 
 @router.get("/user-rollup")
 async def user_rollup(
-    user: Annotated[UserExtra, Depends(get_current_user)],
+    _: Annotated[UserExtra, Depends(get_current_user)],
     year: Optional[int] = Query(None),
     weekNumber: Optional[int] = Query(None),
     userId: Optional[str] = Query(None),
 ) -> dict:
-    """Admin-only. Aggregate stored metrics per user across the scoped weeks
+    """Aggregate stored metrics per user across the scoped weeks
     (planned vs actual bids/interviews/etc). Pure aggregation — no AI call;
-    reads metrics populated by Run Progress Report. Scope follows the same
-    filters as the list (year + optional week + optional user)."""
-    if user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
-
+    reads metrics populated by Run Progress Report. Any authenticated user
+    may view the team rollup; optional `userId` filters to one person."""
     query: dict[str, Any] = {}
     if year is not None:
         query["year"] = year
@@ -181,19 +178,16 @@ async def metric_catalog(
 
 @router.get("/summary")
 async def plans_summary(
-    user: Annotated[UserExtra, Depends(get_current_user)],
+    _: Annotated[UserExtra, Depends(get_current_user)],
     year: Optional[int] = Query(None),
     weekNumber: Optional[int] = Query(None),
     userId: Optional[str] = Query(None),
 ) -> dict:
     """Aggregate metrics across weeks for the stats header. Scope follows
     the same filters as the list (year + optional weekNumber + optional
-    userId). Admin may scope to a user; non-admins scoped to themselves."""
-    is_admin = user.role == "admin"
+    userId). Any authenticated user can view team-wide stats."""
     query: dict[str, Any] = {}
-    if not is_admin:
-        query["userId"] = user.id
-    elif userId:
+    if userId:
         query["userId"] = to_object_id(userId)
     if year is not None:
         query["year"] = year
@@ -241,19 +235,19 @@ async def plans_summary(
 
 @router.get("")
 async def list_plans(
-    user: Annotated[UserExtra, Depends(get_current_user)],
+    _: Annotated[UserExtra, Depends(get_current_user)],
     page: int = Query(1),
     limit: int = Query(10),
     year: Optional[int] = Query(None),
     weekNumber: Optional[int] = Query(None),
     userId: Optional[str] = Query(None),
 ) -> dict:
-    is_admin = user.role == "admin"
+    """List weekly plans for the team. Any authenticated user can read all
+    plans (so people can see how others are working). Optional `userId`
+    filters to one owner. Create/update/delete remain owner-or-admin."""
     query: dict[str, Any] = {}
 
-    if not is_admin:
-        query["userId"] = user.id
-    elif userId:
+    if userId:
         query["userId"] = to_object_id(userId)
 
     if year is not None:
@@ -325,17 +319,14 @@ async def create_plan(
 @router.get("/{plan_id}")
 async def get_plan(
     plan_id: str,
-    user: Annotated[UserExtra, Depends(get_current_user)],
+    _: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     oid = to_object_id(plan_id)
     plan = await WeeklyPlan.get(oid)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Weekly plan not found")
 
-    is_admin = user.role == "admin"
-    if not is_admin and str(plan.userId) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-
+    # Reads are open to any authenticated user (team visibility).
     populated = await populate_owner([plan], field="userId", only=("name", "email"))
     return populated[0]
 

@@ -64,7 +64,7 @@ async def test_duplicate_weekly_plan_returns_400(client, staff_user, auth_header
     assert r.status_code == 400
 
 
-async def test_staff_sees_own_plans_only(client, staff_user, staff_user_2, auth_header):
+async def test_staff_sees_all_plans(client, staff_user, staff_user_2, auth_header):
     await client.post(
         "/weekly-plans",
         headers=auth_header(staff_user),
@@ -75,7 +75,8 @@ async def test_staff_sees_own_plans_only(client, staff_user, staff_user_2, auth_
         },
     )
     r = await client.get("/weekly-plans", headers=auth_header(staff_user_2))
-    assert r.json()["pagination"]["total"] == 0
+    assert r.status_code == 200
+    assert r.json()["pagination"]["total"] == 1
 
 
 async def test_admin_sees_all_plans(client, staff_user, admin_user, auth_header):
@@ -92,7 +93,7 @@ async def test_admin_sees_all_plans(client, staff_user, admin_user, auth_header)
     assert r.json()["pagination"]["total"] == 1
 
 
-async def test_other_staff_cannot_get_plan(client, staff_user, staff_user_2, auth_header):
+async def test_other_staff_can_get_plan_but_not_edit(client, staff_user, staff_user_2, auth_header):
     r = await client.post(
         "/weekly-plans",
         headers=auth_header(staff_user),
@@ -104,4 +105,50 @@ async def test_other_staff_cannot_get_plan(client, staff_user, staff_user_2, aut
     )
     plan_id = r.json()["_id"]
     r = await client.get(f"/weekly-plans/{plan_id}", headers=auth_header(staff_user_2))
+    assert r.status_code == 200
+    assert r.json()["content"] == "x"
+
+    r = await client.put(
+        f"/weekly-plans/{plan_id}",
+        headers=auth_header(staff_user_2),
+        json={"content": "hijacked"},
+    )
     assert r.status_code == 403
+
+    r = await client.delete(f"/weekly-plans/{plan_id}", headers=auth_header(staff_user_2))
+    assert r.status_code == 403
+
+
+async def test_staff_can_filter_by_user(client, staff_user, staff_user_2, auth_header):
+    await client.post(
+        "/weekly-plans",
+        headers=auth_header(staff_user),
+        json={
+            "weekNumber": 1, "year": 2026,
+            "startDate": "2026-01-01", "endDate": "2026-01-07",
+            "content": "a",
+        },
+    )
+    await client.post(
+        "/weekly-plans",
+        headers=auth_header(staff_user_2),
+        json={
+            "weekNumber": 1, "year": 2026,
+            "startDate": "2026-01-01", "endDate": "2026-01-07",
+            "content": "b",
+        },
+    )
+    r = await client.get(
+        f"/weekly-plans?userId={staff_user.id}",
+        headers=auth_header(staff_user_2),
+    )
+    assert r.status_code == 200
+    assert r.json()["pagination"]["total"] == 1
+    assert r.json()["plans"][0]["content"] == "a"
+
+    r = await client.get(
+        "/weekly-plans/user-rollup?year=2026&weekNumber=1",
+        headers=auth_header(staff_user_2),
+    )
+    assert r.status_code == 200
+    assert len(r.json()["users"]) == 2
