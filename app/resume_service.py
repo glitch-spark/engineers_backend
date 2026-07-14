@@ -516,6 +516,7 @@ class GeneratedResume:
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_fallback_used: Optional[bool] = None
+    llm_fallback_reason: Optional[str] = None
 
 
 async def generate_resume(
@@ -575,6 +576,7 @@ async def generate_resume(
         llm_provider=llm_result.provider,
         llm_model=llm_result.model,
         llm_fallback_used=llm_result.fallback_used,
+        llm_fallback_reason=llm_result.fallback_reason,
     )
 
 
