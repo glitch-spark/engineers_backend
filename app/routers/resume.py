@@ -1,9 +1,9 @@
 import asyncio
 import base64
-import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 
@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import ScreeningPair as ScreeningPairModel
+from app.llm_router import complete_screening, parse_screening_answers
 from app.resume_service import (
     generate_resume,
     generate_presigned_get,
@@ -168,12 +169,15 @@ async def _run_job(
         await job.save()
 
         result = await generate_resume(
-            account, jd, company, prompt_body=resolved_prompt_body or None
+            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner
         )
         job.inputTokens = result.input_tokens
         job.outputTokens = result.output_tokens
         job.reasoningTokens = result.reasoning_tokens
         job.plainText = result.plain_text
+        job.resumeLlmProvider = result.llm_provider
+        job.resumeLlmModel = result.llm_model
+        job.resumeLlmFallbackUsed = result.llm_fallback_used
 
         # ---- step 2: persist PDF reference ----
         # Prefer S3: bucket pointer only, no inline bytes. Fall back to base64
@@ -196,12 +200,19 @@ async def _run_job(
             job.step = "generating_answers"
             await job.save()
 
-            pairs = await _run_screening(
+            screening_result = await _run_screening(
                 account=account,
                 jd=jd,
                 questions=questions,
                 screening_prompt=resolved_screening,
+                owner=owner,
+                use_free_llm=True,
             )
+            pairs = screening_result.pairs
+            job.screeningLlmProvider = screening_result.llm_provider
+            job.screeningLlmModel = screening_result.llm_model
+            job.screeningLlmFallbackUsed = screening_result.llm_fallback_used
+
             # Coerce dict -> ScreeningPair so Beanie/Pydantic doesn't mis-validate on save.
             job.screeningPairs = [ScreeningPairModel(**p) for p in pairs]
 
@@ -248,27 +259,21 @@ async def _mark_failed(job: ResumeApplication, message: str, started: float) -> 
 # ---------- Screening (extracted helper, reused by job + standalone endpoint) -
 
 
-async def _run_screening(
+@dataclass
+class ScreeningResult:
+    pairs: List[dict]
+    llm_provider: str
+    llm_model: str
+    llm_fallback_used: bool
+
+
+def _build_screening_prompt(
     account: Account,
     jd: str,
     questions: List[str],
     screening_prompt: str,
     resume_text: Optional[str] = None,
-) -> List[dict]:
-    """`screening_prompt` is the resolved answer-prompt (account > user >
-    built-in default), resolved by the caller. When `resume_text` is set
-    (post-generation Q&A), the LLM uses the tailored resume's plain text
-    as the candidate context; otherwise it falls back to the account's
-    raw template text."""
-    from openai import AsyncOpenAI
-
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured")
-
-    # Candidate context — prefer the tailored generated-resume text when
-    # supplied (post-gen ask endpoint); else fall back to the profile's
-    # raw template text. Either way, strip tags before sending.
+) -> str:
     candidate_text = (resume_text or "").strip()
     candidate_source = "tailored resume"
     if not candidate_text:
@@ -303,30 +308,38 @@ async def _run_screening(
         f"with exactly {len(questions)} entries in the same order as the numbered questions. "
         "Do not include any text outside the JSON."
     )
+    return "\n\n".join(p for p in parts if p)
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.responses.create(
-        model=settings.RESUME_OPENAI_MODEL,
-        input="\n\n".join(p for p in parts if p),
+
+async def _run_screening(
+    account: Account,
+    jd: str,
+    questions: List[str],
+    screening_prompt: str,
+    resume_text: Optional[str] = None,
+    owner: Optional[UserExtra] = None,
+    use_free_llm: bool = False,
+) -> ScreeningResult:
+    """Job-linked screening can use free LLM + OpenAI fallback; standalone uses OpenAI only."""
+    prompt = _build_screening_prompt(
+        account, jd, questions, screening_prompt, resume_text=resume_text
     )
-    raw = response.output_text or ""
 
-    answers: List[str] = []
-    try:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict) and isinstance(parsed.get("answers"), list):
-            answers = [str(a) for a in parsed["answers"]]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    if not answers:
-        chunks = re.split(r"^\s*\d+\.\s*", raw, flags=re.MULTILINE)
-        answers = [c.strip() for c in chunks if c.strip()]
-    while len(answers) < len(questions):
-        answers.append("")
-    answers = answers[: len(questions)]
+    if use_free_llm:
+        llm_result = await complete_screening(prompt, owner, questions)
+    else:
+        from app.llm_router import complete_openai_only
 
-    return [{"question": q, "answer": a} for q, a in zip(questions, answers)]
+        llm_result = await complete_openai_only(prompt, purpose="screening")
+
+    answers = parse_screening_answers(llm_result.text, questions)
+    pairs = [{"question": q, "answer": a} for q, a in zip(questions, answers)]
+    return ScreeningResult(
+        pairs=pairs,
+        llm_provider=llm_result.provider,
+        llm_model=llm_result.model,
+        llm_fallback_used=llm_result.fallback_used,
+    )
 
 
 class ScreeningBody(BaseModel):
@@ -360,13 +373,14 @@ async def screening_answers(
     if not screening:
         screening = (user.screeningPromptBody or "").strip()
 
-    pairs = await _run_screening(
+    result = await _run_screening(
         account=account,
         jd=body.jobDescription or "",
         questions=questions,
         screening_prompt=screening,
+        use_free_llm=False,
     )
-    return {"pairs": pairs}
+    return {"pairs": result.pairs}
 
 
 class JobAskBody(BaseModel):
@@ -405,18 +419,25 @@ async def ask_job_screening(
     if not screening_prompt and owner:
         screening_prompt = (owner.screeningPromptBody or "").strip()
 
-    pairs = await _run_screening(
+    screening_result = await _run_screening(
         account=account,
         jd=job.jobDescription or "",
         questions=questions,
         screening_prompt=screening_prompt,
         resume_text=job.plainText or "",
+        owner=owner,
+        use_free_llm=True,
     )
 
-    # Append to the job so the panel persists history across refreshes.
-    job.screeningPairs = [*(job.screeningPairs or []), *[ScreeningPairModel(**p) for p in pairs]]
+    job.screeningLlmProvider = screening_result.llm_provider
+    job.screeningLlmModel = screening_result.llm_model
+    job.screeningLlmFallbackUsed = screening_result.llm_fallback_used
+    job.screeningPairs = [
+        *(job.screeningPairs or []),
+        *[ScreeningPairModel(**p) for p in screening_result.pairs],
+    ]
     await job.save()
-    return {"pairs": pairs}
+    return {"pairs": screening_result.pairs}
 
 
 # ---------- Job listing / polling / download ---------------------------------
@@ -445,6 +466,12 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "outputTokens": job.outputTokens,
         "reasoningTokens": job.reasoningTokens,
         "coverLetterText": job.coverLetterText,
+        "resumeLlmProvider": job.resumeLlmProvider,
+        "resumeLlmModel": job.resumeLlmModel,
+        "resumeLlmFallbackUsed": job.resumeLlmFallbackUsed,
+        "screeningLlmProvider": job.screeningLlmProvider,
+        "screeningLlmModel": job.screeningLlmModel,
+        "screeningLlmFallbackUsed": job.screeningLlmFallbackUsed,
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,

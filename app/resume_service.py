@@ -28,7 +28,8 @@ from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
-from app.models import Account, ResumeLLMCache
+from app.llm_router import LlmResult, complete_openai_only, complete_resume
+from app.models import Account, ResumeLLMCache, UserExtra
 
 log = logging.getLogger(__name__)
 
@@ -281,39 +282,87 @@ async def _openai_call(prompt: str) -> tuple[str, dict]:
     return (response.output_text or ""), usage_out
 
 
-def _resume_cache_key(prompt: str, model: str, effort: str) -> str:
-    """Content hash that fully determines the LLM output: model + reasoning
-    effort + the complete prompt (which already embeds the template, custom
-    prompt, and trimmed JD). NUL-joined so fields can't run together."""
+def _resume_cache_key(prompt: str, lane: str) -> str:
+    """Content hash that fully determines the LLM output: lane (provider+model
+    params) + the complete prompt."""
     return hashlib.sha256(
-        "\x00".join([model, effort, prompt]).encode("utf-8")
+        "\x00".join([lane, prompt]).encode("utf-8")
     ).hexdigest()
 
 
-async def _resume_llm_output(cache_key: str, prompt: str, model: str) -> tuple[str, dict]:
-    """Return (raw_output, usage). On a content-hash cache hit, reuse the
-    stored output and skip the OpenAI call entirely (usage zeroed — no spend).
-    On a miss, call OpenAI and best-effort persist the result for next time."""
-    cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
-    if cached is not None:
-        log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
-        return cached.output, {"input": 0, "output": 0, "reasoning": 0}
+def _openai_lane() -> str:
+    model, effort = _resume_model_and_effort()
+    return f"openai:{model}:{effort}"
 
-    raw, usage = await _openai_call(prompt)
+
+def _free_lane(user: Optional[UserExtra]) -> Optional[str]:
+    from app.llm_router import free_llm_configured, resolve_free_preset
+
+    if not user or not free_llm_configured(user):
+        return None
+    preset, max_tokens, _ = resolve_free_preset(user)
+    if preset is None:
+        return None
+    return f"free:{preset.model}:{max_tokens}"
+
+
+async def _resume_llm_output(
+    prompt: str,
+    user: Optional[UserExtra],
+    template: str,
+) -> LlmResult:
+    """Return LLM output with provider metadata. Uses content-hash cache per lane."""
+    openai_lane = _openai_lane()
+    free_lane = _free_lane(user)
+
+    for lane in (free_lane, openai_lane):
+        if not lane:
+            continue
+        cache_key = _resume_cache_key(prompt, lane)
+        cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
+        if cached is not None:
+            log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
+            provider: str = "free" if lane.startswith("free:") else "openai"
+            return LlmResult(
+                text=cached.output,
+                provider=provider,  # type: ignore[arg-type]
+                model=cached.model,
+                usage={"input": 0, "output": 0, "reasoning": 0},
+                fallback_used=False,
+            )
+
+    result = await complete_resume(prompt, user)
+
+    body_fragment = _strip_fences(result.text)
+    out_html = _reassemble_body(template, body_fragment)
+    try:
+        _validate_llm_html(template, out_html)
+    except HTTPException:
+        if result.provider == "free":
+            log.warning("free resume output failed HTML validation — retrying OpenAI")
+            result = await complete_openai_only(prompt, purpose="resume")
+            body_fragment = _strip_fences(result.text)
+            out_html = _reassemble_body(template, body_fragment)
+            _validate_llm_html(template, out_html)
+        else:
+            raise
+
+    lane = _free_lane(user) if result.provider == "free" else _openai_lane()
+    cache_key = _resume_cache_key(prompt, lane)
     try:
         await ResumeLLMCache(
             promptHash=cache_key,
-            output=raw,
-            model=model,
-            inputTokens=usage.get("input"),
-            outputTokens=usage.get("output"),
-            reasoningTokens=usage.get("reasoning"),
+            output=result.text,
+            model=result.model,
+            inputTokens=result.usage.get("input"),
+            outputTokens=result.usage.get("output"),
+            reasoningTokens=result.usage.get("reasoning"),
         ).insert()
         log.info("resume LLM cache STORE key=%s", cache_key[:12])
-    except Exception as exc:  # noqa: BLE001 — cache is best-effort; a duplicate
-        # key from a concurrent identical request races to insert and loses.
+    except Exception as exc:  # noqa: BLE001
         log.warning("resume LLM cache store skipped (key=%s): %s", cache_key[:12], exc)
-    return raw, usage
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +489,10 @@ class GeneratedResume:
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
-    # Plain reading-order text extracted from the rewritten HTML. Used as
-    # candidate context for follow-up screening Q&A so the answers reflect
-    # the tailored resume, not the raw template.
     plain_text: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_fallback_used: Optional[bool] = None
 
 
 async def generate_resume(
@@ -451,6 +500,7 @@ async def generate_resume(
     job_description: str,
     company: str,
     prompt_body: Optional[str] = None,
+    owner: Optional[UserExtra] = None,
 ) -> GeneratedResume:
     """Run the full pipeline: LLM rewrites the template's <body> text (or a
     content-hash cache hit reuses a prior output, skipping the call), the body
@@ -470,9 +520,9 @@ async def generate_resume(
     )
 
     prompt = _build_resume_prompt(account, job_description, template, prompt_body=prompt_body)
-    model, effort = _resume_model_and_effort()
-    cache_key = _resume_cache_key(prompt, model, effort)
-    raw, usage = await _resume_llm_output(cache_key, prompt, model)
+    llm_result = await _resume_llm_output(prompt, owner, template)
+    raw = llm_result.text
+    usage = llm_result.usage
 
     # The model returns only the rewritten <body>; splice it back into the
     # template's shell so the DOCTYPE/<head>/<style> stay byte-for-byte
@@ -499,6 +549,9 @@ async def generate_resume(
         output_tokens=usage.get("output"),
         reasoning_tokens=usage.get("reasoning"),
         plain_text=plain_text,
+        llm_provider=llm_result.provider,
+        llm_model=llm_result.model,
+        llm_fallback_used=llm_result.fallback_used,
     )
 
 
