@@ -240,6 +240,11 @@ async def _run_job(
         job.executionMs = int((time.monotonic() - started) * 1000)
         await job.save()
 
+        # Pipeline is now driven entirely by email sync — completed resume
+        # generations no longer auto-create Application rows. Users land in
+        # the Pipeline board only when Gmail surfaces a confirmation,
+        # recruiter reach-out, or interview email tied to a real company.
+
     except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
         log.exception("resume job %s failed", job_id)
         await _mark_failed(job, str(exc), started)

@@ -20,6 +20,11 @@ from app.models import (
     Account,
     AiReviewRun,
     AnalyzeChatLog,
+    Application,
+    EmailAccount,
+    EmailClassificationCache,
+    EmailMessage,
+    EmailRule,
     GlobalPrompt,
     Interview,
     InterviewChatLog,
@@ -45,6 +50,11 @@ DOCUMENT_MODELS = [
     AnalyzeChatLog,
     GlobalPrompt,
     ResumeApplication,
+    Application,
+    EmailAccount,
+    EmailMessage,
+    EmailRule,
+    EmailClassificationCache,
     ResumeLLMCache,
 ]
 

@@ -105,7 +105,7 @@ async def _populate_account(items: Iterable[dict], *, field: str = "accountId") 
 async def list_interviews(
     user: Annotated[UserExtra, Depends(get_current_user)],
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=500),
     from_: str = Query("", alias="from"),
     to: str = Query(""),
     accountId: str = Query(""),
@@ -114,10 +114,9 @@ async def list_interviews(
     creatorId: str = Query(""),
     sort: str = Query("desc"),
 ) -> dict:
-    # Non-admins only see their own interviews. Admins see everything and may
-    # filter by creator. The creatorId param from a non-admin is ignored.
-    is_admin = user.role == "admin"
-    query: dict[str, Any] = {} if is_admin else {"createdBy": user.id}
+    # Every authenticated user can list/filter all interviews. Pass creatorId
+    # to narrow to one owner; omit it to see everyone.
+    query: dict[str, Any] = {}
 
     date_filter: dict = {}
     f_dt = parse_date(from_)
@@ -139,7 +138,7 @@ async def list_interviews(
         if status_ not in STATUSES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
         query["status"] = status_
-    if creatorId and is_admin:
+    if creatorId:
         query["createdBy"] = to_object_id(creatorId)
 
     direction = 1 if sort == "asc" else -1
@@ -226,6 +225,13 @@ async def create_interview(
     if (iv.transcript or "").strip():
         asyncio.create_task(extract_and_score(iv))
 
+    # Auto-link to pipeline (idempotent + best-effort).
+    try:
+        from app.routers.applications import attach_interview_to_app
+        await attach_interview_to_app(user_id=user.id, interview=iv)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
+
     try:
         await notify_new_interview(
             creator_email=user.email or "",
@@ -311,6 +317,13 @@ async def update_interview(
         iv.note = body.note
 
     await iv.save()
+
+    # Re-sync pipeline (stage bump + outcome flip on status changes).
+    try:
+        from app.routers.applications import attach_interview_to_app
+        await attach_interview_to_app(user_id=user.id, interview=iv)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pipeline auto-link failed for interview %s on update: %s", iv.id, exc)
 
     if transcript_changed and (iv.transcript or "").strip():
         asyncio.create_task(extract_and_score(iv))

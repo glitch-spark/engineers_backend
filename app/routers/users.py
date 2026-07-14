@@ -37,9 +37,13 @@ def _parse_dt(s: str) -> Optional[datetime]:
 @router.get("/lookup")
 async def lookup_users(
     _: Annotated[UserExtra, Depends(get_current_user)],
+    excludeRole: Optional[str] = Query(None),
 ) -> dict:
     """Minimal projection of every user, for filter dropdowns. Auth required, no admin gate."""
-    rows = await UserExtra.find({}).to_list()
+    query: dict[str, Any] = {}
+    if excludeRole:
+        query["role"] = {"$ne": excludeRole}
+    rows = await UserExtra.find(query).to_list()
     return {
         "users": [
             {"_id": str(u.id), "name": u.name, "email": u.email}

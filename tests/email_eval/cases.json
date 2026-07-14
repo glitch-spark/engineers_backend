@@ -1,0 +1,160 @@
+[
+  {
+    "id": "noise_jobot_alert",
+    "from": "jobs@alerts.jobot.com",
+    "subject": "Keep Going With More Jobs Like Lead Software Engineer",
+    "body": "Apply Now, Andrew and Madeline are hiring for Lead Software Engineer and Manager, Software Engineering (Hands-On | Cloud SaaS | AI-Driven Development) roles!",
+    "expected_label": "noise"
+  },
+  {
+    "id": "noise_linkedin_alert",
+    "from": "jobs-noreply@linkedin.com",
+    "subject": "10 new jobs match your search",
+    "body": "Here are the new jobs matching your preferences this week. Apply now to stand out.",
+    "expected_label": "noise"
+  },
+  {
+    "id": "noise_indeed_digest",
+    "from": "alerts@indeed.com",
+    "subject": "New jobs near you",
+    "body": "10 new Senior Engineer positions in San Francisco. View jobs.",
+    "expected_label": "noise"
+  },
+  {
+    "id": "noise_wellfound_newsletter",
+    "from": "newsletter@wellfound.com",
+    "subject": "Top startups hiring this week",
+    "body": "Hot startups looking to hire Senior Software Engineers.",
+    "expected_label": "noise"
+  },
+  {
+    "id": "applied_greenhouse",
+    "from": "jobs@greenhouse-mail.com",
+    "subject": "We received your application — Stripe",
+    "body": "Thanks for applying to the Senior Engineer role at Stripe. We've received your application and will review it shortly.",
+    "expected_label": "applied",
+    "expected_company": "Stripe"
+  },
+  {
+    "id": "applied_lever",
+    "from": "talent@hire.lever.co",
+    "subject": "Application Received — Notion",
+    "body": "Thanks for applying to Notion! We've received your application for Senior Frontend Engineer and will be in touch.",
+    "expected_label": "applied",
+    "expected_company": "Notion"
+  },
+  {
+    "id": "applied_ashby",
+    "from": "no-reply@ashbyhq.com",
+    "subject": "Application received",
+    "body": "Application received — thank you for applying to Linear. We will review your submission.",
+    "expected_label": "applied",
+    "expected_company": "Linear"
+  },
+  {
+    "id": "applied_workday",
+    "from": "noreply@myworkday.com",
+    "subject": "Your application has been submitted",
+    "body": "Thank you for your application to Salesforce. Your application has been submitted successfully.",
+    "expected_label": "applied",
+    "expected_company": "Salesforce"
+  },
+  {
+    "id": "recruiter_reachout_cold",
+    "from": "kiran@vercel.com",
+    "subject": "Senior Engineer @ Vercel",
+    "body": "Hi Brandon, I came across your GitHub and noticed your work on Next.js. We're hiring Senior Engineers at Vercel — would love to chat about the role.",
+    "expected_label": "recruiter_reachout",
+    "expected_company": "Vercel"
+  },
+  {
+    "id": "schedule_tech",
+    "from": "lina@stripe.com",
+    "subject": "Re: Application — next steps",
+    "body": "Hi! We'd like to schedule a 45-min technical interview with one of our staff engineers. Could you do Tuesday 2pm PT?",
+    "expected_label": "schedule_interview",
+    "expected_company": "Stripe",
+    "expected_stage_round": "tech"
+  },
+  {
+    "id": "schedule_phone_screen",
+    "from": "recruiter@notion.com",
+    "subject": "Quick chat about Notion?",
+    "body": "Hi Brandon — would you have 30 minutes for an introductory phone call next Thursday at 10am PT?",
+    "expected_label": "schedule_interview",
+    "expected_company": "Notion",
+    "expected_stage_round": "intro"
+  },
+  {
+    "id": "take_home_hackerrank",
+    "from": "no-reply@hackerrank.com",
+    "subject": "Your HackerRank assessment for Acme is ready",
+    "body": "Acme has invited you to take a HackerRank coding assessment. The link expires in 5 days.",
+    "expected_label": "take_home",
+    "expected_company": "Acme",
+    "expected_stage_round": "tech"
+  },
+  {
+    "id": "take_home_codility",
+    "from": "noreply@codility.com",
+    "subject": "Coding test invitation — Anthropic",
+    "body": "Anthropic invited you to a Codility coding test. Please complete the assessment within 7 days.",
+    "expected_label": "take_home",
+    "expected_company": "Anthropic"
+  },
+  {
+    "id": "live_coding_karat",
+    "from": "scheduling@karat.com",
+    "subject": "Karat technical interview scheduled",
+    "body": "Your Karat technical interview for OpenAI is scheduled for Friday at 11am ET.",
+    "expected_label": "live_coding",
+    "expected_company": "OpenAI"
+  },
+  {
+    "id": "offer_direct",
+    "from": "people@stripe.com",
+    "subject": "Offer — Senior Engineer @ Stripe",
+    "body": "We're thrilled to extend an offer for the Senior Engineer role at Stripe with a base of $250,000 and start date June 1.",
+    "expected_label": "offer",
+    "expected_company": "Stripe"
+  },
+  {
+    "id": "rejection_lever",
+    "from": "recruiting@hire.lever.co",
+    "subject": "Update on your application at Notion",
+    "body": "Thank you for taking the time to interview with Notion. After careful consideration we've decided to move forward with other candidates at this time.",
+    "expected_label": "rejection",
+    "expected_company": "Notion"
+  },
+  {
+    "id": "rejection_greenhouse",
+    "from": "jobs@greenhouse-mail.com",
+    "subject": "Stripe — Update on your application",
+    "body": "Thank you for your interest in Stripe. After careful consideration, we have decided to move forward with other candidates whose backgrounds more closely match what we are looking for.",
+    "expected_label": "rejection",
+    "expected_company": "Stripe"
+  },
+  {
+    "id": "system_design",
+    "from": "olivia@datadog.com",
+    "subject": "System design round scheduled",
+    "body": "Your system design interview with Datadog is scheduled for Thursday at 1pm PT.",
+    "expected_label": "system_design",
+    "expected_company": "Datadog"
+  },
+  {
+    "id": "behavioral",
+    "from": "talent@figma.com",
+    "subject": "Values interview — Figma",
+    "body": "Looking forward to your behavioral / values round with our head of engineering at Figma on Monday.",
+    "expected_label": "behavioral",
+    "expected_company": "Figma"
+  },
+  {
+    "id": "final_round",
+    "from": "ceo@startup.io",
+    "subject": "Final round chat",
+    "body": "Hey! Would love to do a final-round conversation with you next week — culture / vision focus. I'll be your last interviewer.",
+    "expected_label": "final_round"
+  }
+]

@@ -12,8 +12,10 @@ from app.db import init_db
 from app.routers import (
     accounts,
     ai_review,
+    applications,
     auth as auth_router,
     global_prompt,
+    integrations,
     interviews,
     metrics,
     profile,
@@ -76,6 +78,10 @@ def create_app() -> FastAPI:
     app.include_router(ai_review.router)
     app.include_router(metrics.router)
     app.include_router(resume.router)
+    app.include_router(applications.router)
+    app.include_router(integrations.router)
+    app.include_router(integrations.oauth_router)
+    app.include_router(integrations.outlook_oauth_router)
 
     return app
 

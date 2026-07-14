@@ -45,7 +45,7 @@ risk touching the prod db.
 - `test_cardlinks.py` — CRUD with `from`/`to` alias round-trip, owner-vs-admin,
   cross-user edit 403
 - `test_weekly_plans.py` — CRUD, `(userId, year, weekNumber)` duplicate guard,
-  per-plan ownership 403
+  team-wide read (staff can list/get others' plans), cross-user edit/delete 403
 
 ## Slack
 
