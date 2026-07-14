@@ -61,6 +61,16 @@ class ResumeApplication(TimestampedDocument):
     outputTokens: Optional[int] = None
     reasoningTokens: Optional[int] = None
 
+    # Which LLM produced the resume HTML (free NVIDIA tier vs OpenAI fallback).
+    resumeLlmProvider: Optional[str] = None  # "free" | "openai"
+    resumeLlmModel: Optional[str] = None
+    resumeLlmFallbackUsed: Optional[bool] = None
+
+    # Last job-linked screening batch (initial or Ask panel).
+    screeningLlmProvider: Optional[str] = None
+    screeningLlmModel: Optional[str] = None
+    screeningLlmFallbackUsed: Optional[bool] = None
+
     # Plain-text cover letter generated alongside the resume (opt-in per
     # submission). Empty when the user didn't request one.
     coverLetterText: Optional[str] = None

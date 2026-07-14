@@ -14,8 +14,10 @@ def _fmt_usd(n: float) -> str:
     return f"${n:,.2f}"
 
 
-def _app_base_url() -> str:
-    return get_settings().APP_BASE_URL.rstrip("/")
+def _frontend_link(path: str) -> str:
+    """User-facing SPA links for Slack messages (not the API base URL)."""
+    base = get_settings().FRONTEND_ORIGIN.rstrip("/")
+    return f"{base}{path}"
 
 
 def _now_str() -> str:
@@ -23,12 +25,34 @@ def _now_str() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
-async def _post_to_slack(payload: dict[str, Any]) -> None:
+def _link_block(label: str, path: str) -> dict[str, Any]:
+    url = _frontend_link(path)
+    return {"type": "section", "text": {"type": "mrkdwn", "text": f"<{url}|{label}>"}}
+
+
+async def _post_to_slack(payload: dict[str, Any]) -> bool:
+    """Post to Slack incoming webhook. Returns True on success, False otherwise."""
     url = get_settings().SLACK_WEBHOOK_URL
     if not url:
-        return
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(url, json=payload)
+        log.debug("slack: SLACK_WEBHOOK_URL not set, skipping notification")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+    except httpx.HTTPError as e:
+        log.warning("slack webhook request failed: %s", e)
+        return False
+
+    body = (resp.text or "").strip()
+    if resp.status_code == 200 and body == "ok":
+        return True
+
+    log.warning(
+        "slack webhook rejected payload: status=%s body=%s",
+        resp.status_code,
+        body[:500],
+    )
+    return False
 
 
 async def notify_new_transaction(
@@ -38,38 +62,27 @@ async def notify_new_transaction(
     date: str,
     description: Optional[str] = None,
 ) -> None:
-    try:
-        text = f"New transaction by {creator_email} ({_fmt_usd(amount)} on {date})"
-        blocks: list[dict[str, Any]] = [
-            {"type": "header", "text": {"type": "plain_text", "text": "💸 New Transaction", "emoji": True}},
-            {"type": "divider"},
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*By:*\n{creator_email or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Amount:*\n{_fmt_usd(amount)}"},
-                    {"type": "mrkdwn", "text": f"*Date:*\n{date or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Description:*\n{description or '—'}"},
-                ],
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Open Transactions"},
-                        "url": f"{_app_base_url()}/transactions",
-                    }
-                ],
-            },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
-            },
-        ]
-        await _post_to_slack({"text": text, "blocks": blocks})
-    except Exception as e:
-        log.warning("slack notify_new_transaction failed: %s", e)
+    text = f"New transaction by {creator_email} ({_fmt_usd(amount)} on {date})"
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": "💸 New Transaction", "emoji": True}},
+        {"type": "divider"},
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*By:*\n{creator_email or '—'}"},
+                {"type": "mrkdwn", "text": f"*Amount:*\n{_fmt_usd(amount)}"},
+                {"type": "mrkdwn", "text": f"*Date:*\n{date or '—'}"},
+                {"type": "mrkdwn", "text": f"*Description:*\n{description or '—'}"},
+            ],
+        },
+        _link_block("Open Transactions", "/transactions"),
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
+        },
+    ]
+    if not await _post_to_slack({"text": text, "blocks": blocks}):
+        log.warning("slack notify_new_transaction failed for %s", creator_email)
 
 
 async def notify_new_interview(
@@ -79,38 +92,27 @@ async def notify_new_interview(
     stage: str,
     scheduled_at: str,
 ) -> None:
-    try:
-        text = f"New interview scheduled by {creator_email} ({stage} on {scheduled_at})"
-        blocks: list[dict[str, Any]] = [
-            {"type": "header", "text": {"type": "plain_text", "text": "📅 New Interview", "emoji": True}},
-            {"type": "divider"},
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*By:*\n{creator_email or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Profile:*\n{account_email or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Stage:*\n{stage or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Scheduled:*\n{scheduled_at or '—'}"},
-                ],
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Open Interviews"},
-                        "url": f"{_app_base_url()}/interviews",
-                    }
-                ],
-            },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
-            },
-        ]
-        await _post_to_slack({"text": text, "blocks": blocks})
-    except Exception as e:
-        log.warning("slack notify_new_interview failed: %s", e)
+    text = f"New interview scheduled by {creator_email} ({stage} on {scheduled_at})"
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": "📅 New Interview", "emoji": True}},
+        {"type": "divider"},
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*By:*\n{creator_email or '—'}"},
+                {"type": "mrkdwn", "text": f"*Profile:*\n{account_email or '—'}"},
+                {"type": "mrkdwn", "text": f"*Stage:*\n{stage or '—'}"},
+                {"type": "mrkdwn", "text": f"*Scheduled:*\n{scheduled_at or '—'}"},
+            ],
+        },
+        _link_block("Open Interviews", "/interviews"),
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
+        },
+    ]
+    if not await _post_to_slack({"text": text, "blocks": blocks}):
+        log.warning("slack notify_new_interview failed for %s", creator_email)
 
 
 async def notify_transaction_status_change(
@@ -123,47 +125,34 @@ async def notify_transaction_status_change(
     date: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> None:
-    try:
-        emoji = "✅" if new_status == "approved" else "⛔"
-        text = f"Transaction {new_status.upper()} by {approver_email}"
-        blocks: list[dict[str, Any]] = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"{emoji} Transaction {new_status.upper()}", "emoji": True},
-            },
-            {"type": "divider"},
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Tx ID:*\n{tx_id}"},
-                    {"type": "mrkdwn", "text": f"*Owner:*\n{owner_email or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Amount:*\n{_fmt_usd(amount) if amount is not None else '—'}"},
-                    {"type": "mrkdwn", "text": f"*Date:*\n{date or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Approver:*\n{approver_email or '—'}"},
-                    {"type": "mrkdwn", "text": f"*Status:*\n{new_status}"},
-                ],
-            },
-        ]
-        if notes:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Notes*\n{notes}"}})
-        blocks.append(
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Open Transactions"},
-                        "url": f"{_app_base_url()}/transactions",
-                    }
-                ],
-            }
-        )
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
-            }
-        )
-        await _post_to_slack({"text": text, "blocks": blocks})
-    except Exception as e:
-        log.warning("slack notify_transaction_status_change failed: %s", e)
+    emoji = "✅" if new_status == "approved" else "⛔"
+    text = f"Transaction {new_status.upper()} by {approver_email}"
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{emoji} Transaction {new_status.upper()}", "emoji": True},
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Tx ID:*\n{tx_id}"},
+                {"type": "mrkdwn", "text": f"*Owner:*\n{owner_email or '—'}"},
+                {"type": "mrkdwn", "text": f"*Amount:*\n{_fmt_usd(amount) if amount is not None else '—'}"},
+                {"type": "mrkdwn", "text": f"*Date:*\n{date or '—'}"},
+                {"type": "mrkdwn", "text": f"*Approver:*\n{approver_email or '—'}"},
+                {"type": "mrkdwn", "text": f"*Status:*\n{new_status}"},
+            ],
+        },
+    ]
+    if notes:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Notes*\n{notes}"}})
+    blocks.append(_link_block("Open Transactions", "/transactions"))
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Posted by your app • {_now_str()}"}],
+        }
+    )
+    if not await _post_to_slack({"text": text, "blocks": blocks}):
+        log.warning("slack notify_transaction_status_change failed for tx %s", tx_id)

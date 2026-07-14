@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,7 +47,21 @@ class Settings(BaseSettings):
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
 
+    @field_validator("SLACK_WEBHOOK_URL", mode="before")
+    @classmethod
+    def _normalize_slack_webhook(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def reload_settings() -> Settings:
+    """Clear cached settings (e.g. after .env change in dev)."""
+    get_settings.cache_clear()
+    return get_settings()

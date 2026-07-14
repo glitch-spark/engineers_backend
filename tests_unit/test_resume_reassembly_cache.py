@@ -83,21 +83,20 @@ def test_reassemble_falls_back_when_template_has_no_body():
 # --- _resume_cache_key -----------------------------------------------------
 
 def test_cache_key_is_deterministic():
-    assert _resume_cache_key("prompt", "gpt-5-mini", "low") == _resume_cache_key(
-        "prompt", "gpt-5-mini", "low"
+    assert _resume_cache_key("prompt", "openai:gpt-5-mini:low") == _resume_cache_key(
+        "prompt", "openai:gpt-5-mini:low"
     )
 
 
 def test_cache_key_varies_with_every_input():
-    base = _resume_cache_key("prompt", "gpt-5-mini", "low")
-    assert _resume_cache_key("prompt2", "gpt-5-mini", "low") != base
-    assert _resume_cache_key("prompt", "gpt-4o-mini", "low") != base
-    assert _resume_cache_key("prompt", "gpt-5-mini", "medium") != base
+    base = _resume_cache_key("prompt", "openai:gpt-5-mini:low")
+    assert _resume_cache_key("prompt2", "openai:gpt-5-mini:low") != base
+    assert _resume_cache_key("prompt", "free:minimaxai/minimax-m3:8192") != base
+    assert _resume_cache_key("prompt", "openai:gpt-5-mini:medium") != base
 
 
 def test_cache_key_no_field_bleed():
-    # NUL-joining must stop ("a","b",...) from colliding with ("ab","",...).
-    assert _resume_cache_key("b", "a", "x") != _resume_cache_key("", "ab", "x")
+    assert _resume_cache_key("b", "lane:a") != _resume_cache_key("", "lane:ab")
 
 
 # --- _build_resume_prompt ordering (cache-prefix friendliness) -------------
