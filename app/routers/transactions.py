@@ -231,15 +231,12 @@ async def create_transaction(
     )
     await tx.insert()
 
-    try:
-        await notify_new_transaction(
-            creator_email=user.email or "",
-            amount=float(body.amount),
-            date=date_dt.strftime("%Y-%m-%d"),
-            description=body.description or "",
-        )
-    except Exception:
-        pass
+    await notify_new_transaction(
+        creator_email=user.email or "",
+        amount=float(body.amount),
+        date=date_dt.strftime("%Y-%m-%d"),
+        description=body.description or "",
+    )
 
     return doc_to_dict(tx)
 
@@ -265,19 +262,16 @@ async def update_transaction(
             tx.status = body.status
             tx.approvedBy = user.id
             tx.approvedAt = datetime.utcnow()
-            try:
-                owner = await UserExtra.get(tx.userId)
-                await notify_transaction_status_change(
-                    tx_id=str(tx.id),
-                    new_status=body.status,
-                    approver_email=user.email or "",
-                    owner_email=(owner.email if owner else None),
-                    amount=tx.amount,
-                    date=tx.date.strftime("%Y-%m-%d") if tx.date else None,
-                    notes=tx.notes,
-                )
-            except Exception:
-                pass
+            owner = await UserExtra.get(tx.userId)
+            await notify_transaction_status_change(
+                tx_id=str(tx.id),
+                new_status=body.status,
+                approver_email=user.email or "",
+                owner_email=(owner.email if owner else None),
+                amount=tx.amount,
+                date=tx.date.strftime("%Y-%m-%d") if tx.date else None,
+                notes=tx.notes,
+            )
 
     if tx.status == "pending" or is_admin:
         if body.date is not None:

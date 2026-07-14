@@ -36,6 +36,12 @@ class UserExtra(TimestampedDocument):
     screeningPromptBody: Optional[str] = None
     coverLetterPromptBody: Optional[str] = None
 
+    # NVIDIA Integrate free-tier LLM (resume gen + job-linked screening only).
+    freeLlmModelId: Optional[str] = None
+    freeLlmApiKey: Optional[str] = None
+    freeLlmMaxTokens: Optional[int] = None
+    freeLlmKeyVerified: bool = False
+
     class Settings:
         name = "userextras"
         indexes = [

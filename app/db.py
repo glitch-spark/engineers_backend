@@ -30,6 +30,7 @@ from app.models import (
     InterviewChatLog,
     InterviewQuestion,
     ResumeApplication,
+    ResumeLLMCache,
     Skill,
     Transaction,
     UserExtra,
@@ -54,6 +55,7 @@ DOCUMENT_MODELS = [
     EmailMessage,
     EmailRule,
     EmailClassificationCache,
+    ResumeLLMCache,
 ]
 
 
