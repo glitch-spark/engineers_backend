@@ -1,5 +1,6 @@
 """Unit tests for free LLM routing, rate limiting, and profile key masking."""
 
+import json
 import os
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
@@ -71,6 +72,66 @@ def test_parse_screening_answers_json():
 def test_parse_screening_answers_numbered_fallback():
     raw = "1. First answer\n2. Second answer"
     assert parse_screening_answers(raw, ["Q1", "Q2"]) == ["First answer", "Second answer"]
+
+
+def test_parse_screening_answers_objects_in_answers_array():
+    """Free LLMs often return objects instead of plain answer strings."""
+    raw = json.dumps({
+        "answers": [
+            {
+                "question": "What have you been up to lately?",
+                "answer": "Over the last two years I rebuilt CivicAI.",
+                "type_used": "long_text",
+                "length_chars": 447,
+            },
+            {
+                "question": "Do you want to be the best?",
+                "answer": "I focus on getting measurably better.",
+                "type_used": "behavioral",
+                "length_chars": 338,
+            },
+        ]
+    })
+    assert parse_screening_answers(raw, ["Q1", "Q2"]) == [
+        "Over the last two years I rebuilt CivicAI.",
+        "I focus on getting measurably better.",
+    ]
+
+
+def test_parse_screening_answers_python_literal_objects():
+    """Some models emit Python dict strings (single quotes) instead of JSON."""
+    raw = (
+        "{'answers': ["
+        "{'question': 'Q1?', 'answer': 'Plain answer one', 'type_used': 'long_text'}, "
+        "{'question': 'Q2?', 'answer': 'Plain answer two', 'type_used': 'behavioral'}"
+        "]}"
+    )
+    assert parse_screening_answers(raw, ["Q1", "Q2"]) == [
+        "Plain answer one",
+        "Plain answer two",
+    ]
+
+
+def test_parse_screening_answers_top_level_object_list():
+    raw = json.dumps([
+        {"question": "Q1", "answer": "First"},
+        {"question": "Q2", "answer": "Second"},
+    ])
+    assert parse_screening_answers(raw, ["Q1", "Q2"]) == ["First", "Second"]
+
+
+def test_parse_screening_answers_stringified_dict_entries():
+    """Already-stringified dicts (legacy bad stores) must still unwrap."""
+    raw = json.dumps({
+        "answers": [
+            "{'question': 'Q1?', 'answer': 'Recovered text', 'type_used': 'long_text'}",
+            "Normal plain answer",
+        ]
+    })
+    assert parse_screening_answers(raw, ["Q1", "Q2"]) == [
+        "Recovered text",
+        "Normal plain answer",
+    ]
 
 
 def test_free_llm_user_message_timeout():

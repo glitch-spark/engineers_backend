@@ -314,6 +314,8 @@ def _build_screening_prompt(
     parts.append(
         f"Return a JSON object of the exact form: {{\"answers\": [\"...\", \"...\"]}} "
         f"with exactly {len(questions)} entries in the same order as the numbered questions. "
+        "Each entry in \"answers\" MUST be a plain string (the answer text only) — "
+        "not an object, not metadata, not {{question, answer}}. "
         "Do not include any text outside the JSON."
     )
     return "\n\n".join(p for p in parts if p)
