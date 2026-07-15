@@ -65,11 +65,13 @@ class ResumeApplication(TimestampedDocument):
     resumeLlmProvider: Optional[str] = None  # "free" | "openai"
     resumeLlmModel: Optional[str] = None
     resumeLlmFallbackUsed: Optional[bool] = None
+    resumeLlmFallbackReason: Optional[str] = None
 
     # Last job-linked screening batch (initial or Ask panel).
     screeningLlmProvider: Optional[str] = None
     screeningLlmModel: Optional[str] = None
     screeningLlmFallbackUsed: Optional[bool] = None
+    screeningLlmFallbackReason: Optional[str] = None
 
     # Plain-text cover letter generated alongside the resume (opt-in per
     # submission). Empty when the user didn't request one.

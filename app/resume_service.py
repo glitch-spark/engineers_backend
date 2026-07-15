@@ -311,21 +311,42 @@ async def _resume_llm_output(
     user: Optional[UserExtra],
     template: str,
 ) -> LlmResult:
-    """Return LLM output with provider metadata. Uses content-hash cache per lane."""
+    """Return LLM output with provider metadata. Uses content-hash cache per lane.
+
+    Cache lookup order:
+    1. Free-lane cache → hit = return (best case, no API call).
+    2. OpenAI-lane cache → hit = return ONLY when free is not configured.
+       If free IS configured, skip the OpenAI cache so the free tier gets
+       retried — avoids permanently locking out free after one fallback.
+    """
     openai_lane = _openai_lane()
     free_lane = _free_lane(user)
 
-    for lane in (free_lane, openai_lane):
-        if not lane:
-            continue
-        cache_key = _resume_cache_key(prompt, lane)
+    # 1. Check free-lane cache first.
+    if free_lane:
+        cache_key = _resume_cache_key(prompt, free_lane)
         cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
         if cached is not None:
-            log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
-            provider: str = "free" if lane.startswith("free:") else "openai"
+            log.info("resume LLM cache HIT (free) key=%s model=%s", cache_key[:12], cached.model)
             return LlmResult(
                 text=cached.output,
-                provider=provider,  # type: ignore[arg-type]
+                provider="free",
+                model=cached.model,
+                usage={"input": 0, "output": 0, "reasoning": 0},
+                fallback_used=False,
+            )
+
+    # 2. Check OpenAI-lane cache — but only when the user has no free tier.
+    #    When free IS configured we skip this so the free model is retried
+    #    instead of being permanently shadowed by a prior fallback entry.
+    if not free_lane:
+        cache_key = _resume_cache_key(prompt, openai_lane)
+        cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
+        if cached is not None:
+            log.info("resume LLM cache HIT (openai) key=%s model=%s", cache_key[:12], cached.model)
+            return LlmResult(
+                text=cached.output,
+                provider="openai",
                 model=cached.model,
                 usage={"input": 0, "output": 0, "reasoning": 0},
                 fallback_used=False,
@@ -347,18 +368,20 @@ async def _resume_llm_output(
         else:
             raise
 
-    lane = _free_lane(user) if result.provider == "free" else _openai_lane()
+    is_fallback = result.fallback_used
+    lane = free_lane if result.provider == "free" else openai_lane
     cache_key = _resume_cache_key(prompt, lane)
     try:
         await ResumeLLMCache(
             promptHash=cache_key,
             output=result.text,
             model=result.model,
+            isFallback=is_fallback,
             inputTokens=result.usage.get("input"),
             outputTokens=result.usage.get("output"),
             reasoningTokens=result.usage.get("reasoning"),
         ).insert()
-        log.info("resume LLM cache STORE key=%s", cache_key[:12])
+        log.info("resume LLM cache STORE key=%s fallback=%s", cache_key[:12], is_fallback)
     except Exception as exc:  # noqa: BLE001
         log.warning("resume LLM cache store skipped (key=%s): %s", cache_key[:12], exc)
 
@@ -493,6 +516,7 @@ class GeneratedResume:
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_fallback_used: Optional[bool] = None
+    llm_fallback_reason: Optional[str] = None
 
 
 async def generate_resume(
@@ -552,6 +576,7 @@ async def generate_resume(
         llm_provider=llm_result.provider,
         llm_model=llm_result.model,
         llm_fallback_used=llm_result.fallback_used,
+        llm_fallback_reason=llm_result.fallback_reason,
     )
 
 

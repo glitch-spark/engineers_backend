@@ -43,6 +43,7 @@ class LlmResult:
     model: str
     usage: dict
     fallback_used: bool
+    fallback_reason: Optional[str] = None
 
 
 def _key_hash(api_key: str) -> str:
@@ -214,6 +215,7 @@ async def complete_with_fallback(
     settings = get_settings()
     preset, max_tokens, api_key = resolve_free_preset(user) if user else (None, 8192, "")
     attempted_free = False
+    fallback_reason: Optional[str] = None
 
     if preset and api_key:
         if rate_limit_allows(api_key):
@@ -248,6 +250,7 @@ async def complete_with_fallback(
                     fallback_used=False,
                 )
             except Exception as exc:
+                fallback_reason = _free_llm_user_message(exc, timeout_seconds=free_timeout)
                 log.warning(
                     "%s free LLM failed (model=%s): %s — falling back to OpenAI",
                     purpose,
@@ -255,11 +258,14 @@ async def complete_with_fallback(
                     exc,
                 )
                 if not _free_error_retryable(exc) and not validate:
-                    # Non-retryable without validation path — still try OpenAI
                     pass
         else:
             log.info("%s free LLM rate limit reached — falling back to OpenAI", purpose)
             attempted_free = True
+            fallback_reason = (
+                "Free-tier rate limit reached (40 requests/min). "
+                "Fell back to OpenAI for this request."
+            )
 
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured and free LLM unavailable")
@@ -282,6 +288,7 @@ async def complete_with_fallback(
         model=openai_model,
         usage=usage,
         fallback_used=attempted_free,
+        fallback_reason=fallback_reason,
     )
 
 

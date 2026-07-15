@@ -178,6 +178,7 @@ async def _run_job(
         job.resumeLlmProvider = result.llm_provider
         job.resumeLlmModel = result.llm_model
         job.resumeLlmFallbackUsed = result.llm_fallback_used
+        job.resumeLlmFallbackReason = result.llm_fallback_reason
 
         # ---- step 2: persist PDF reference ----
         # Prefer S3: bucket pointer only, no inline bytes. Fall back to base64
@@ -212,6 +213,7 @@ async def _run_job(
             job.screeningLlmProvider = screening_result.llm_provider
             job.screeningLlmModel = screening_result.llm_model
             job.screeningLlmFallbackUsed = screening_result.llm_fallback_used
+            job.screeningLlmFallbackReason = screening_result.llm_fallback_reason
 
             # Coerce dict -> ScreeningPair so Beanie/Pydantic doesn't mis-validate on save.
             job.screeningPairs = [ScreeningPairModel(**p) for p in pairs]
@@ -270,6 +272,7 @@ class ScreeningResult:
     llm_provider: str
     llm_model: str
     llm_fallback_used: bool
+    llm_fallback_reason: Optional[str] = None
 
 
 def _build_screening_prompt(
@@ -344,6 +347,7 @@ async def _run_screening(
         llm_provider=llm_result.provider,
         llm_model=llm_result.model,
         llm_fallback_used=llm_result.fallback_used,
+        llm_fallback_reason=llm_result.fallback_reason,
     )
 
 
@@ -437,6 +441,7 @@ async def ask_job_screening(
     job.screeningLlmProvider = screening_result.llm_provider
     job.screeningLlmModel = screening_result.llm_model
     job.screeningLlmFallbackUsed = screening_result.llm_fallback_used
+    job.screeningLlmFallbackReason = screening_result.llm_fallback_reason
     job.screeningPairs = [
         *(job.screeningPairs or []),
         *[ScreeningPairModel(**p) for p in screening_result.pairs],
@@ -474,9 +479,11 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "resumeLlmProvider": job.resumeLlmProvider,
         "resumeLlmModel": job.resumeLlmModel,
         "resumeLlmFallbackUsed": job.resumeLlmFallbackUsed,
+        "resumeLlmFallbackReason": job.resumeLlmFallbackReason,
         "screeningLlmProvider": job.screeningLlmProvider,
         "screeningLlmModel": job.screeningLlmModel,
         "screeningLlmFallbackUsed": job.screeningLlmFallbackUsed,
+        "screeningLlmFallbackReason": job.screeningLlmFallbackReason,
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,

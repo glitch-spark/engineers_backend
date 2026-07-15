@@ -4,7 +4,8 @@
   the template's <style>/<head> impossible to drift;
 - the content-hash cache key (`_resume_cache_key`);
 - the cache-friendly prompt ordering (`_build_resume_prompt`): stable
-  template before the per-generation custom prompt and JD.
+  template before the per-generation custom prompt and JD;
+- the cache TTL and isFallback flag on ResumeLLMCache.
 
 These are all pure functions — no Mongo, no OpenAI. `_build_resume_prompt`
 reads settings, so we ensure required env vars exist (dummy values; nothing
@@ -16,6 +17,7 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
+from app.models.resume_cache import CACHE_TTL_SECONDS, ResumeLLMCache  # noqa: E402
 from app.resume_service import (  # noqa: E402
     _body_inner_html,
     _build_resume_prompt,
@@ -124,3 +126,23 @@ def test_prompt_omits_custom_block_when_empty():
         prompt_body=None,
     )
     assert "CUSTOM PROMPT" not in prompt
+
+
+# --- ResumeLLMCache model ---------------------------------------------------
+
+def test_cache_ttl_is_seven_days():
+    assert CACHE_TTL_SECONDS == 7 * 24 * 3600
+
+
+def test_cache_model_has_is_fallback_field_with_default_false():
+    field = ResumeLLMCache.model_fields["isFallback"]
+    assert field.default is False
+
+
+def test_cache_has_ttl_index():
+    indexes = ResumeLLMCache.Settings.indexes
+    ttl_indexes = [
+        idx for idx in indexes
+        if getattr(idx, "document", {}).get("expireAfterSeconds") is not None
+    ]
+    assert len(ttl_indexes) >= 1, "Expected a TTL index on ResumeLLMCache"
