@@ -51,5 +51,8 @@ class Account(TimestampedDocument):
     # Account-level cover-letter prompt. Empty → fall back to user level.
     coverLetterPrompt: Optional[str] = None
 
+    # When false, hidden from the Resume Generator profile picker.
+    showInGenerate: bool = True
+
     class Settings:
         name = "accounts"
