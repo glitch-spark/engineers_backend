@@ -296,18 +296,103 @@ async def complete_resume(prompt: str, user: Optional[UserExtra]) -> LlmResult:
     return await complete_with_fallback(prompt, user, purpose="resume")
 
 
-def parse_screening_answers(raw: str, questions: list[str]) -> list[str]:
-    answers: list[str] = []
+def _coerce_screening_answer(item: object) -> str:
+    """Normalize one answer entry to plain text.
+
+    Free / OpenAI models sometimes return objects instead of strings, e.g.
+      {"question": "...", "answer": "Real text", "type_used": "long_text"}
+    or Python-style dicts as strings. Always extract the answer text.
+    """
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        text = item.strip()
+        if not text:
+            return ""
+        # Already a stringified object/dict from a previous bad parse or model.
+        if (text.startswith("{") and text.endswith("}")) or (
+            text.startswith("[") and text.endswith("]")
+        ):
+            nested = _try_parse_jsonish(text)
+            if nested is not None:
+                return _coerce_screening_answer(nested)
+        return text
+    if isinstance(item, dict):
+        for key in ("answer", "text", "response", "content", "value"):
+            if key in item and item[key] is not None:
+                return _coerce_screening_answer(item[key])
+        # Last resort: avoid dumping the whole object into the UI.
+        return ""
+    if isinstance(item, (list, tuple)) and item:
+        return _coerce_screening_answer(item[0])
+    return str(item).strip()
+
+
+def _try_parse_jsonish(raw: str) -> object | None:
+    """Parse JSON, or common near-JSON / Python-literal payloads from LLMs."""
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    if not cleaned:
+        return None
     try:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict) and isinstance(parsed.get("answers"), list):
-            answers = [str(a) for a in parsed["answers"]]
+        return json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
         pass
+    # Models sometimes emit Python dict/list literals (single quotes).
+    try:
+        import ast
+
+        value = ast.literal_eval(cleaned)
+        if isinstance(value, (dict, list, str)):
+            return value
+    except (SyntaxError, ValueError):
+        pass
+    # Salvage a JSON object/array embedded in prose.
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = cleaned.find(opener)
+        end = cleaned.rfind(closer)
+        if start >= 0 and end > start:
+            snippet = cleaned[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except (json.JSONDecodeError, ValueError):
+                try:
+                    import ast
+
+                    value = ast.literal_eval(snippet)
+                    if isinstance(value, (dict, list)):
+                        return value
+                except (SyntaxError, ValueError):
+                    pass
+    return None
+
+
+def _answers_from_parsed(parsed: object) -> list[str]:
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("answers"), list):
+            return [_coerce_screening_answer(a) for a in parsed["answers"]]
+        # Single Q&A object mistakenly returned as the whole payload.
+        if "answer" in parsed:
+            return [_coerce_screening_answer(parsed)]
+        return []
+    if isinstance(parsed, list):
+        return [_coerce_screening_answer(a) for a in parsed]
+    if isinstance(parsed, str):
+        coerced = _coerce_screening_answer(parsed)
+        return [coerced] if coerced else []
+    return []
+
+
+def parse_screening_answers(raw: str, questions: list[str]) -> list[str]:
+    answers: list[str] = []
+    parsed = _try_parse_jsonish(raw)
+    if parsed is not None:
+        answers = _answers_from_parsed(parsed)
+    # Drop empties only when we got a partial object dump; keep positional empties later.
+    if answers and not any(a.strip() for a in answers):
+        answers = []
     if not answers:
         chunks = re.split(r"^\s*\d+\.\s*", raw, flags=re.MULTILINE)
-        answers = [c.strip() for c in chunks if c.strip()]
+        answers = [_coerce_screening_answer(c) for c in chunks if c.strip()]
     while len(answers) < len(questions):
         answers.append("")
     return answers[: len(questions)]
