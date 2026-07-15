@@ -96,6 +96,7 @@ class AccountUpdate(BaseModel):
     previewHtml: Optional[str] = None
     screeningPrompt: Optional[str] = None
     coverLetterPrompt: Optional[str] = None
+    showInGenerate: Optional[bool] = None
 
 
 @router.get("/lookup")
@@ -115,6 +116,7 @@ async def lookup_accounts(
                 "hasTemplate": bool((a.styleTemplate or "").strip()),
                 "hasPrompt": bool((a.resumePromptBody or "").strip()),
                 "createdBy": str(a.createdBy),
+                "showInGenerate": a.showInGenerate,
             }
             for a in rows
         ]
@@ -230,7 +232,8 @@ async def update_account(
         acc.screeningPrompt = body.screeningPrompt
     if body.coverLetterPrompt is not None:
         acc.coverLetterPrompt = body.coverLetterPrompt
-
+    if body.showInGenerate is not None:
+        acc.showInGenerate = body.showInGenerate
 
     await acc.save()
     return doc_to_dict(acc)
