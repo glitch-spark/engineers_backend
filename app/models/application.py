@@ -26,8 +26,11 @@ class KanbanStage(str, Enum):
     bid_sent = "bid_sent"
     intro = "intro"
     tech = "tech"
+    tech_round_1 = "tech_round_1"
+    tech_round_2 = "tech_round_2"
     live_coding = "live_coding"
     system_design = "system_design"
+    home_assessment = "home_assessment"
     panel = "panel"
     cultural = "cultural"
     final = "final"
@@ -39,7 +42,8 @@ class KanbanStage(str, Enum):
 
 # Logical ordering used by the auto-bump logic (move-forward never moves back).
 STAGE_ORDER: list[str] = [
-    "bid_sent", "intro", "tech", "live_coding", "system_design",
+    "bid_sent", "intro", "tech", "tech_round_1", "tech_round_2",
+    "live_coding", "system_design", "home_assessment",
     "panel", "cultural", "ai_interview", "final", "offer",
 ]
 

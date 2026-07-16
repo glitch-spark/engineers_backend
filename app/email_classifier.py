@@ -57,7 +57,8 @@ _LABELS = [
 
 # Stage rounds the model may suggest. Subset of KanbanStage.
 _STAGE_ROUNDS = [
-    "bid_sent", "intro", "tech", "live_coding", "system_design",
+    "bid_sent", "intro", "tech", "tech_round_1", "tech_round_2",
+    "live_coding", "system_design", "home_assessment",
     "panel", "cultural", "ai_interview", "final", "offer", "rejected",
 ]
 
@@ -68,7 +69,7 @@ LABEL_TO_STAGE: dict[str, Optional[str]] = {
     "recruiter_reachout": "bid_sent",
     "phone_screen": "intro",
     "pre_screening": "intro",
-    "take_home": "tech",
+    "take_home": "home_assessment",
     "live_coding": "live_coding",
     "system_design": "system_design",
     "behavioral": "cultural",

@@ -613,7 +613,7 @@ async def dashboard_feed(
                 "kind": "interview_done" if iv.status and str(iv.status) in ("completed", "passed", "failed") else "interview_past",
                 "at": sched.isoformat(),
                 "company": iv.companyName,
-                "stage": str(iv.stage) if iv.stage else None,
+                "stage": iv.stage.value if iv.stage else None,
                 "status": str(iv.status) if iv.status else None,
                 "interviewId": str(iv.id),
             })
@@ -628,7 +628,7 @@ async def dashboard_feed(
     upcoming_out = [{
         "interviewId": str(iv.id),
         "company": iv.companyName,
-        "stage": str(iv.stage) if iv.stage else None,
+        "stage": iv.stage.value if iv.stage else None,
         "scheduledAt": iv.scheduledAt.isoformat() if iv.scheduledAt else None,
         "endsAt": iv.endsAt.isoformat() if iv.endsAt else None,
     } for iv in upcoming_ivs]

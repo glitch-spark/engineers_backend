@@ -2,7 +2,8 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Annotated, Any, Iterable, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -20,7 +21,7 @@ from app.models import (
     UserExtra,
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
-from app.models.interview import InterviewStage, InterviewStatus
+from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack import notify_new_interview
 
@@ -30,6 +31,90 @@ router = APIRouter(prefix="/interviews", tags=["interviews"])
 
 STAGES = {s.value for s in InterviewStage}
 STATUSES = {s.value for s in InterviewStatus}
+
+
+def _stage_value(stage: Any) -> Optional[str]:
+    """Return the canonical stage string. Never use str(enum) — on Python 3.11+
+    str(InterviewStage.tech) == 'InterviewStage.tech', which leaked into badges."""
+    if stage is None:
+        return None
+    if isinstance(stage, InterviewStage):
+        return stage.value
+    if isinstance(stage, Enum):
+        return str(getattr(stage, "value", stage))
+    s = str(stage).strip()
+    if s.startswith("InterviewStage."):
+        s = s.split(".", 1)[1]
+    return s or None
+
+
+def _normalize_stage(stage: Optional[str]) -> Optional[str]:
+    """Map legacy/generic tech keys to a concrete Tech sub-stage."""
+    stage = _stage_value(stage)
+    if not stage:
+        return stage
+    if stage in ("tech", "tech1"):
+        return InterviewStage.tech_round_1.value
+    if stage == "tech2":
+        return InterviewStage.tech_round_2.value
+    if stage == "hiring_manager":
+        return InterviewStage.cultural.value
+    return stage
+
+
+def _coerce_write_stage(stage: str) -> str:
+    """Validate + normalize a stage for create/update writes."""
+    normalized = _normalize_stage(stage) or stage
+    if normalized not in STAGES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
+    return normalized
+
+
+def _append_stage_history(
+    iv: Interview,
+    stage: Optional[str],
+    *,
+    by: Any,
+    source: str,
+    previous: Optional[str] = None,
+    previous_scheduled_at: Optional[datetime] = None,
+) -> None:
+    stage = _normalize_stage(stage)
+    previous = _normalize_stage(previous)
+    if not stage:
+        return
+    last = iv.stageHistory[-1].stage if iv.stageHistory else None
+    last = _normalize_stage(last)
+    if last == stage:
+        # Keep the tip's interview date in sync with the current scheduledAt.
+        if iv.stageHistory and iv.scheduledAt is not None:
+            tip = iv.stageHistory[-1]
+            if tip.scheduledAt != iv.scheduledAt:
+                tip.scheduledAt = iv.scheduledAt
+                iv.stageHistory[-1] = tip
+        return
+    now = datetime.now(timezone.utc)
+    sched = iv.scheduledAt
+    # Seed history with the prior stage when this is the first recorded move.
+    if not iv.stageHistory and previous and previous != stage:
+        iv.stageHistory.append(
+            InterviewStageEvent(
+                stage=previous,
+                at=now,
+                by=by,
+                source="seed",
+                scheduledAt=previous_scheduled_at,
+            )
+        )
+    iv.stageHistory.append(
+        InterviewStageEvent(
+            stage=stage,
+            at=now,
+            by=by,
+            source=source,
+            scheduledAt=sched,
+        )
+    )
 
 
 class InterviewCreate(BaseModel):
@@ -47,6 +132,11 @@ class InterviewCreate(BaseModel):
     note: Optional[str] = ""
 
 
+class StageHistoryItemIn(BaseModel):
+    stage: str
+    scheduledAt: Optional[str] = None  # ISO or YYYY-MM-DD
+
+
 class InterviewUpdate(BaseModel):
     accountId: Optional[str] = None
     scheduledAt: Optional[str] = None
@@ -60,15 +150,52 @@ class InterviewUpdate(BaseModel):
     mainTechStack: Optional[str] = None
     transcript: Optional[str] = None
     note: Optional[str] = None
+    # Ordered stage entries — replaces history so mistaken board moves can be fixed.
+    stageHistory: Optional[List[StageHistoryItemIn]] = None
 
 
 def _parse_datetime(s: str) -> Optional[datetime]:
     if not s:
         return None
     try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(f"{s}T12:00:00")
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _set_stage_history(
+    iv: Interview,
+    items: list[StageHistoryItemIn],
+    *,
+    by: Any,
+) -> None:
+    """Replace stageHistory from an ordered list (edit-form fixups)."""
+    cleaned: list[InterviewStageEvent] = []
+    now = datetime.now(timezone.utc)
+    for item in items:
+        s = _normalize_stage((item.stage or "").strip())
+        if not s:
+            continue
+        if s not in STAGES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid stage in history: {s}")
+        if cleaned and cleaned[-1].stage == s:
+            # Prefer a newer scheduledAt when consolidating duplicates.
+            sched = _parse_datetime(item.scheduledAt) if item.scheduledAt else None
+            if sched is not None:
+                cleaned[-1].scheduledAt = sched
+            continue
+        cleaned.append(
+            InterviewStageEvent(
+                stage=s,
+                at=now,
+                by=by,
+                source="edit",
+                scheduledAt=_parse_datetime(item.scheduledAt) if item.scheduledAt else None,
+            )
+        )
+    iv.stageHistory = cleaned
 
 
 async def _populate_account(items: Iterable[dict], *, field: str = "accountId") -> list:
@@ -183,8 +310,7 @@ async def create_interview(
     body: InterviewCreate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    if body.stage is not None and body.stage not in STAGES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
+    stage_val = _coerce_write_stage(body.stage) if body.stage else None
     if body.status is not None and body.status not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     sched = _parse_datetime(body.scheduledAt)
@@ -210,7 +336,7 @@ async def create_interview(
         createdBy=user.id,
         scheduledAt=sched,
         endsAt=ends,
-        stage=InterviewStage(body.stage) if body.stage else None,
+        stage=InterviewStage(stage_val) if stage_val else None,
         status=InterviewStatus(body.status) if body.status else None,
         companyName=body.companyName or None,
         interviewerName=body.interviewerName or None,
@@ -219,7 +345,10 @@ async def create_interview(
         mainTechStack=body.mainTechStack or None,
         transcript=body.transcript or "",
         note=body.note or "",
+        stageHistory=[],
     )
+    if stage_val:
+        _append_stage_history(iv, stage_val, by=user.id, source="create")
     await iv.insert()
 
     if (iv.transcript or "").strip():
@@ -236,7 +365,7 @@ async def create_interview(
         await notify_new_interview(
             creator_email=user.email or "",
             account_email="",
-            stage=body.stage or "",
+            stage=stage_val or "",
             scheduled_at=sched.strftime("%Y-%m-%d %H:%M"),
         )
     except Exception:
@@ -272,6 +401,7 @@ async def update_interview(
 
     new_sched = iv.scheduledAt
     new_ends = iv.endsAt
+    prev_sched = iv.scheduledAt
     if body.scheduledAt is not None:
         sched = _parse_datetime(body.scheduledAt)
         if sched is None:
@@ -282,17 +412,65 @@ async def update_interview(
         if ends is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
         new_ends = ends
-    if new_ends is not None and new_sched is not None and new_ends <= new_sched:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="endsAt must be after scheduledAt")
+    # Edit UI no longer edits times; if endsAt is missing/equal/before start, keep a 1h window.
+    if new_sched is not None and (new_ends is None or new_ends <= new_sched):
+        new_ends = new_sched + timedelta(hours=1)
+
+    # Before changing the interview date, stamp the current tip with the prior schedule
+    # so earlier rounds keep their date when the next round is scheduled.
+    if (
+        body.scheduledAt is not None
+        and body.stageHistory is None
+        and iv.stageHistory
+        and prev_sched is not None
+    ):
+        tip = iv.stageHistory[-1]
+        if tip.scheduledAt is None:
+            tip.scheduledAt = prev_sched
+            iv.stageHistory[-1] = tip
+
     iv.scheduledAt = new_sched
     iv.endsAt = new_ends
+    if body.stageHistory is not None:
+        _set_stage_history(iv, body.stageHistory, by=user.id)
+
     if body.stage is not None:
         if body.stage == "":
             iv.stage = None
         else:
-            if body.stage not in STAGES:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
-            iv.stage = InterviewStage(body.stage)
+            stage_val = _coerce_write_stage(body.stage)
+            prev = _stage_value(iv.stage)
+            iv.stage = InterviewStage(stage_val)
+            if body.stageHistory is None:
+                # Board drag / partial update — append movement.
+                if stage_val != _normalize_stage(prev):
+                    _append_stage_history(
+                        iv,
+                        stage_val,
+                        by=user.id,
+                        source="manual",
+                        previous=prev,
+                        previous_scheduled_at=prev_sched,
+                    )
+                elif body.scheduledAt is not None:
+                    # Same stage, date-only change (e.g. Tech → same Tech sub-stage).
+                    _append_stage_history(
+                        iv, stage_val, by=user.id, source="manual", previous=prev,
+                    )
+            else:
+                # Edit form sent an explicit history — keep current stage as the tip.
+                last = iv.stageHistory[-1].stage if iv.stageHistory else None
+                if _normalize_stage(last) != stage_val:
+                    _append_stage_history(
+                        iv, stage_val, by=user.id, source="edit", previous=last,
+                    )
+    elif body.stageHistory is not None and iv.stageHistory:
+        # History-only edit: current stage follows the last remaining entry.
+        tip = _normalize_stage(iv.stageHistory[-1].stage)
+        iv.stage = InterviewStage(tip) if tip in STAGES else None
+    elif body.stageHistory is not None and not iv.stageHistory:
+        iv.stage = None
+
     if body.status is not None:
         if body.status == "":
             iv.status = None
