@@ -77,6 +77,10 @@ class ResumeApplication(TimestampedDocument):
     # submission). Empty when the user didn't request one.
     coverLetterText: Optional[str] = None
 
+    # Whether this job was submitted with generateCoverLetter=True — retained
+    # so a failed-job retry can honor the original opt-in.
+    generateCoverLetter: bool = False
+
     class Settings:
         name = "resumeapplications"
         indexes = [

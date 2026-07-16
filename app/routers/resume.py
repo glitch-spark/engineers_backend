@@ -105,6 +105,7 @@ async def generate(
         status="queued",
         step="queued",
         pdfFilename=_build_filename(profile_name, company),
+        generateCoverLetter=bool(body.generateCoverLetter),
     )
     await job.insert()
 
@@ -261,6 +262,33 @@ async def _mark_failed(job: ResumeApplication, message: str, started: float) -> 
         await job.save()
     except Exception:  # noqa: BLE001
         log.exception("could not persist failure for job %s", job.id)
+
+
+def _reset_failed_job_fields(job: ResumeApplication) -> None:
+    """Clear outputs/errors and return a failed job to queued for re-run."""
+    job.status = "queued"
+    job.step = "queued"
+    job.errorMessage = None
+    job.startedAt = None
+    job.completedAt = None
+    job.executionMs = None
+    job.pdfData = None
+    job.s3Key = None
+    job.s3Url = None
+    job.plainText = None
+    job.coverLetterText = None
+    job.screeningPairs = []
+    job.inputTokens = None
+    job.outputTokens = None
+    job.reasoningTokens = None
+    job.resumeLlmProvider = None
+    job.resumeLlmModel = None
+    job.resumeLlmFallbackUsed = None
+    job.resumeLlmFallbackReason = None
+    job.screeningLlmProvider = None
+    job.screeningLlmModel = None
+    job.screeningLlmFallbackUsed = None
+    job.screeningLlmFallbackReason = None
 
 
 # ---------- Screening (extracted helper, reused by job + standalone endpoint) -
@@ -715,6 +743,52 @@ async def bulk_download_jobs(
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
     )
+
+
+@router.post("/jobs/{job_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+async def retry_job(
+    job_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Re-queue a failed job in place with its original JD / company / questions."""
+    job = await ResumeApplication.get(to_object_id(job_id))
+    if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if job.status != "failed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only failed jobs can be retried",
+        )
+    if not job.accountId:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job has no profile; cannot retry",
+        )
+
+    account = await _load_owned_account(str(job.accountId), user)
+    if not (account.styleTemplate or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
+        )
+
+    _reset_failed_job_fields(job)
+    await job.save()
+
+    asyncio.create_task(
+        _run_job(
+            job_id=job.id,
+            account_id=account.id,
+            user_id=job.userId,
+            jd=job.jobDescription,
+            company=job.companyName,
+            questions=list(job.screeningQuestions or []),
+            prompt_body_override=None,
+            generate_cover_letter=bool(job.generateCoverLetter),
+        )
+    )
+
+    return {"jobId": str(job.id), "status": job.status}
 
 
 @router.delete("/jobs/{job_id}")
