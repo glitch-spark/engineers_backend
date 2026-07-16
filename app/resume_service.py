@@ -102,6 +102,11 @@ def _strip_fences(s: str) -> str:
     return s.strip()
 
 
+def _normalize_dashes(html: str) -> str:
+    """Replace typographic em dashes with ASCII hyphens for PDF compatibility."""
+    return (html or "").replace("\u2014", "-")
+
+
 _BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
 
 
@@ -553,7 +558,7 @@ async def generate_resume(
     # identical (CSS cannot drift) and we don't pay output tokens to re-emit
     # them. Tolerates a full-document or bare-fragment response too.
     body_fragment = _strip_fences(raw)
-    out_html = _reassemble_body(template, body_fragment)
+    out_html = _normalize_dashes(_reassemble_body(template, body_fragment))
     _validate_llm_html(template, out_html)
 
     pdf_bytes = await _html_to_pdf(
