@@ -9,12 +9,16 @@ same language.
 STAGE_LABELS: dict[str, str] = {
     "intro": "Intro",
     "tech": "Tech",
+    "tech_round_1": "Tech round 1",
+    "tech_round_2": "Tech round 2",
     "panel": "Panel",
     "live_coding": "Live Coding",
     "system_design": "System Design",
+    "home_assessment": "Home Assessment",
     "cultural": "Cultural",
     "final": "Final",
     "ai_interview": "AI Interview",
+    "rejected": "Rejected",
 }
 
 # Named failure-mode catalog. Keep terse — the prompt embeds this verbatim.
@@ -53,6 +57,23 @@ STAGE_DRILL_BANK: dict[str, str] = {
         "- Before coding: state assumptions out loud, ask 1 clarifying question, write 2 edge cases.\n"
         "- Practice naming time/space complexity unprompted.\n"
         "- For language idioms you tripped on: re-watch a 15-min cheatsheet (Python comprehensions, Go context, JS event loop)."
+    ),
+    "tech_round_1": (
+        "- Drill the topic you fumbled: 5 LeetCode mediums in 3 days on it (e.g. graphs/BFS, dynamic programming, intervals).\n"
+        "- Before coding: state assumptions out loud, ask 1 clarifying question, write 2 edge cases.\n"
+        "- Practice naming time/space complexity unprompted.\n"
+        "- For language idioms you tripped on: re-watch a 15-min cheatsheet (Python comprehensions, Go context, JS event loop)."
+    ),
+    "tech_round_2": (
+        "- Expect deeper follow-ups than round 1 — rehearse explaining tradeoffs, not just the happy path.\n"
+        "- Drill the weak area from round 1 with timed mediums; write complexity unprompted.\n"
+        "- Practice recovering from a wrong first approach without freezing."
+    ),
+    "home_assessment": (
+        "- Clarify requirements and constraints in writing before you start coding.\n"
+        "- Ship a clean README: how to run, assumptions, tradeoffs, and known gaps.\n"
+        "- Prefer a small polished solution over a large incomplete one; add tests for the core path.\n"
+        "- Leave time for a short walkthrough video or notes if allowed."
     ),
     "panel": (
         "- Address the questioner first, then briefly include the others ('happy to expand for the rest of the panel').\n"

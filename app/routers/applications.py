@@ -141,7 +141,7 @@ async def attach_interview_to_app(
         app.interviewIds.append(interview.id)
         changed = True
     if interview.stage:
-        if _advance_stage(app, str(interview.stage), source="interview-link", by=user_id):
+        if _advance_stage(app, interview.stage.value if hasattr(interview.stage, "value") else str(interview.stage), source="interview-link", by=user_id):
             changed = True
 
     # Terminal status mapping → outcome.
@@ -319,7 +319,7 @@ async def attach_interview(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="interview not found")
     if iv.id not in app.interviewIds:
         app.interviewIds.append(iv.id)
-    if iv.stage and _advance_stage(app, str(iv.stage), source="manual", by=user.id):
+    if iv.stage and _advance_stage(app, iv.stage.value if hasattr(iv.stage, "value") else str(iv.stage), source="manual", by=user.id):
         pass
     app.lastTouchedAt = datetime.now(timezone.utc)
     await app.save()
