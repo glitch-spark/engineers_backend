@@ -1,4 +1,4 @@
-"""Unit tests for free LLM routing, rate limiting, and profile key masking."""
+"""Unit tests for free LLM routing and screening answer parsing."""
 
 import json
 import os
@@ -13,11 +13,8 @@ from app.llm_router import (
     _free_llm_user_message,
     _free_max_tokens_for_purpose,
     _free_timeout_for_purpose,
-    clear_rate_limits,
     free_llm_configured,
     parse_screening_answers,
-    rate_limit_allows,
-    rate_limit_record,
 )
 
 
@@ -45,16 +42,6 @@ def test_api_key_hint_masks():
     assert api_key_hint("nvapi-abcdefghijklmnop") == "••••mnop"
     assert api_key_hint("") == ""
     assert api_key_hint("ab") == ""
-
-
-def test_rate_limiter_allows_40_then_blocks():
-    clear_rate_limits()
-    key = "test-api-key-for-rate-limit"
-    for _ in range(40):
-        assert rate_limit_allows(key) is True
-        rate_limit_record(key)
-    assert rate_limit_allows(key) is False
-    clear_rate_limits()
 
 
 def test_free_llm_configured_requires_model_and_key():
