@@ -79,6 +79,23 @@ async def test_post_to_slack_network_error():
     assert ok is False
 
 
+def test_now_str_falls_back_on_invalid_timezone():
+    with patch.object(get_settings(), "APP_TIMEZONE", "Not/A_Real_Zone"):
+        s = slack_mod._now_str()
+    assert len(s) >= 19
+
+
+@pytest.mark.asyncio
+async def test_notify_new_transaction_swallows_unexpected_errors():
+    with patch.object(slack_mod, "_post_to_slack", side_effect=RuntimeError("boom")):
+        await slack_mod.notify_new_transaction(
+            creator_email="a@b.com",
+            amount=-7.0,
+            date="2026-07-16",
+            description="911 proxy",
+        )
+
+
 @pytest.mark.asyncio
 async def test_notify_new_transaction_uses_frontend_link():
     mock_resp = MagicMock(status_code=200, text="ok")
