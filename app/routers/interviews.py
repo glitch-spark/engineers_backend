@@ -77,6 +77,7 @@ def _append_stage_history(
     by: Any,
     source: str,
     previous: Optional[str] = None,
+    previous_scheduled_at: Optional[datetime] = None,
 ) -> None:
     stage = _normalize_stage(stage)
     previous = _normalize_stage(previous)
@@ -85,23 +86,33 @@ def _append_stage_history(
     last = iv.stageHistory[-1].stage if iv.stageHistory else None
     last = _normalize_stage(last)
     if last == stage:
+        # Keep the tip's interview date in sync with the current scheduledAt.
+        if iv.stageHistory and iv.scheduledAt is not None:
+            tip = iv.stageHistory[-1]
+            if tip.scheduledAt != iv.scheduledAt:
+                tip.scheduledAt = iv.scheduledAt
+                iv.stageHistory[-1] = tip
         return
+    now = datetime.now(timezone.utc)
+    sched = iv.scheduledAt
     # Seed history with the prior stage when this is the first recorded move.
     if not iv.stageHistory and previous and previous != stage:
         iv.stageHistory.append(
             InterviewStageEvent(
                 stage=previous,
-                at=datetime.now(timezone.utc),
+                at=now,
                 by=by,
                 source="seed",
+                scheduledAt=previous_scheduled_at,
             )
         )
     iv.stageHistory.append(
         InterviewStageEvent(
             stage=stage,
-            at=datetime.now(timezone.utc),
+            at=now,
             by=by,
             source=source,
+            scheduledAt=sched,
         )
     )
 
@@ -121,6 +132,11 @@ class InterviewCreate(BaseModel):
     note: Optional[str] = ""
 
 
+class StageHistoryItemIn(BaseModel):
+    stage: str
+    scheduledAt: Optional[str] = None  # ISO or YYYY-MM-DD
+
+
 class InterviewUpdate(BaseModel):
     accountId: Optional[str] = None
     scheduledAt: Optional[str] = None
@@ -134,14 +150,16 @@ class InterviewUpdate(BaseModel):
     mainTechStack: Optional[str] = None
     transcript: Optional[str] = None
     note: Optional[str] = None
-    # Ordered stage keys — replaces history so mistaken board moves can be fixed.
-    stageHistory: Optional[List[str]] = None
+    # Ordered stage entries — replaces history so mistaken board moves can be fixed.
+    stageHistory: Optional[List[StageHistoryItemIn]] = None
 
 
 def _parse_datetime(s: str) -> Optional[datetime]:
     if not s:
         return None
     try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(f"{s}T12:00:00")
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
@@ -149,26 +167,35 @@ def _parse_datetime(s: str) -> Optional[datetime]:
 
 def _set_stage_history(
     iv: Interview,
-    stages: list[str],
+    items: list[StageHistoryItemIn],
     *,
     by: Any,
 ) -> None:
-    """Replace stageHistory from an ordered list of stage keys (edit-form fixups)."""
-    cleaned: list[str] = []
-    for raw in stages:
-        s = _normalize_stage((raw or "").strip())
+    """Replace stageHistory from an ordered list (edit-form fixups)."""
+    cleaned: list[InterviewStageEvent] = []
+    now = datetime.now(timezone.utc)
+    for item in items:
+        s = _normalize_stage((item.stage or "").strip())
         if not s:
             continue
         if s not in STAGES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid stage in history: {s}")
-        if cleaned and cleaned[-1] == s:
+        if cleaned and cleaned[-1].stage == s:
+            # Prefer a newer scheduledAt when consolidating duplicates.
+            sched = _parse_datetime(item.scheduledAt) if item.scheduledAt else None
+            if sched is not None:
+                cleaned[-1].scheduledAt = sched
             continue
-        cleaned.append(s)
-    now = datetime.now(timezone.utc)
-    iv.stageHistory = [
-        InterviewStageEvent(stage=s, at=now, by=by, source="edit")
-        for s in cleaned
-    ]
+        cleaned.append(
+            InterviewStageEvent(
+                stage=s,
+                at=now,
+                by=by,
+                source="edit",
+                scheduledAt=_parse_datetime(item.scheduledAt) if item.scheduledAt else None,
+            )
+        )
+    iv.stageHistory = cleaned
 
 
 async def _populate_account(items: Iterable[dict], *, field: str = "accountId") -> list:
@@ -374,6 +401,7 @@ async def update_interview(
 
     new_sched = iv.scheduledAt
     new_ends = iv.endsAt
+    prev_sched = iv.scheduledAt
     if body.scheduledAt is not None:
         sched = _parse_datetime(body.scheduledAt)
         if sched is None:
@@ -387,6 +415,20 @@ async def update_interview(
     # Edit UI no longer edits times; if endsAt is missing/equal/before start, keep a 1h window.
     if new_sched is not None and (new_ends is None or new_ends <= new_sched):
         new_ends = new_sched + timedelta(hours=1)
+
+    # Before changing the interview date, stamp the current tip with the prior schedule
+    # so earlier rounds keep their date when the next round is scheduled.
+    if (
+        body.scheduledAt is not None
+        and body.stageHistory is None
+        and iv.stageHistory
+        and prev_sched is not None
+    ):
+        tip = iv.stageHistory[-1]
+        if tip.scheduledAt is None:
+            tip.scheduledAt = prev_sched
+            iv.stageHistory[-1] = tip
+
     iv.scheduledAt = new_sched
     iv.endsAt = new_ends
     if body.stageHistory is not None:
@@ -402,6 +444,16 @@ async def update_interview(
             if body.stageHistory is None:
                 # Board drag / partial update — append movement.
                 if stage_val != _normalize_stage(prev):
+                    _append_stage_history(
+                        iv,
+                        stage_val,
+                        by=user.id,
+                        source="manual",
+                        previous=prev,
+                        previous_scheduled_at=prev_sched,
+                    )
+                elif body.scheduledAt is not None:
+                    # Same stage, date-only change (e.g. Tech → same Tech sub-stage).
                     _append_stage_history(
                         iv, stage_val, by=user.id, source="manual", previous=prev,
                     )

@@ -49,7 +49,9 @@ class InterviewStageEvent(BaseModel):
     stage: str
     at: datetime
     by: Optional[PydanticObjectId] = None
-    source: Optional[str] = None  # 'create' | 'manual' | 'board'
+    source: Optional[str] = None  # 'create' | 'manual' | 'board' | 'edit' | 'seed'
+    # Interview scheduled date for this round (when they sat this stage).
+    scheduledAt: Optional[datetime] = None
 
 
 class Interview(TimestampedDocument):
