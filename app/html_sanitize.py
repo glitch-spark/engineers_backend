@@ -45,7 +45,63 @@ _BAD_URI_UQ = re.compile(
 
 
 _STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>(.*?)</style\s*>", flags=re.IGNORECASE | re.DOTALL)
+# Full tag match (group 0) for re-injection; group 1 is CSS body.
+_STYLE_TAG_RE = re.compile(r"<style\b[^>]*>.*?</style\s*>", flags=re.IGNORECASE | re.DOTALL)
+_BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", flags=re.IGNORECASE)
 _BODY_INNER_RE = re.compile(r"<body\b[^>]*>(.*?)</body\s*>", flags=re.IGNORECASE | re.DOTALL)
+
+
+def strip_style_tags(html: str) -> str:
+    """Remove every <style>…</style> block from html."""
+    if not html:
+        return ""
+    return _STYLE_TAG_RE.sub("", html)
+
+
+def iter_style_tags(html: str) -> list[str]:
+    """Return full original <style…>…</style> strings in document order."""
+    if not html:
+        return []
+    return [m.group(0) for m in _STYLE_TAG_RE.finditer(html)]
+
+
+def body_styles_vs_head(html: str) -> tuple[list[str], list[str]]:
+    """Split style tags into (body_styles, head_styles) by position vs first <body>.
+
+    Tags whose start index is at/after the first <body…> opening tag are body
+    styles; earlier tags are treated as head/shell styles.
+    """
+    if not html:
+        return [], []
+    body_m = _BODY_OPEN_RE.search(html)
+    body_start = body_m.start() if body_m else len(html)
+    head_styles: list[str] = []
+    body_styles: list[str] = []
+    for m in _STYLE_TAG_RE.finditer(html):
+        if m.start() >= body_start:
+            body_styles.append(m.group(0))
+        else:
+            head_styles.append(m.group(0))
+    return body_styles, head_styles
+
+
+def body_html_for_llm(template: str) -> str:
+    """Body inner HTML with all <style> blocks removed — safe LLM input.
+
+    Uses the first <body> region when present; otherwise the whole document
+    minus style tags. CSS never enters the model context.
+    """
+    if not template:
+        return ""
+    without_styles = strip_style_tags(template)
+    m = _BODY_INNER_RE.search(without_styles)
+    body = m.group(1) if m else without_styles
+    return body.strip()
+
+
+def wrap_body_for_llm(body_inner: str) -> str:
+    """Wrap style-stripped body inner HTML as a <body>…</body> fragment."""
+    return f"<body>{body_inner or ''}</body>"
 
 
 def split_template(html: str) -> tuple[str, str]:
@@ -60,10 +116,7 @@ def split_template(html: str) -> tuple[str, str]:
     if not html:
         return "", ""
     css = "\n".join(m.group(1).strip() for m in _STYLE_BLOCK_RE.finditer(html))
-    without_styles = _STYLE_BLOCK_RE.sub("", html)
-    m = _BODY_INNER_RE.search(without_styles)
-    body = m.group(1) if m else without_styles
-    return css.strip(), body.strip()
+    return css.strip(), body_html_for_llm(html)
 
 
 def sanitize_template_html(html: str) -> str:

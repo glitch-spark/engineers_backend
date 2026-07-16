@@ -113,9 +113,10 @@ def test_prompt_orders_template_before_custom_prompt_and_jd():
     i_template = prompt.index("TEMPLATE_MARKER")
     i_custom = prompt.index("CUSTOM_MARKER")
     i_jd = prompt.index("JD_MARKER")
-    # Stable template must precede the per-generation custom prompt and JD so
+    # Stable body markup must precede the per-generation custom prompt and JD so
     # it stays in OpenAI's cacheable prefix.
     assert i_template < i_custom < i_jd
+    assert "RESUME BODY HTML" in prompt
 
 
 def test_prompt_omits_custom_block_when_empty():

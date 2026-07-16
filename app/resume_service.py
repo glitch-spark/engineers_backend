@@ -1,15 +1,14 @@
-"""Resume generation pipeline: OpenAI rewrites the user's HTML template in
-place, Playwright renders to PDF, optional upload to S3.
+"""Resume generation pipeline: LLM rewrites the user's resume body text,
+Playwright renders to PDF, optional upload to S3.
 
-The LLM receives the raw uploaded HTML template plus candidate data, the job
-description, and the user's custom prompt. It returns ONLY the rewritten
-<body> — structure, classes, and tag layout preserved byte-for-byte. The
-template's DOCTYPE/<head>/<style>/<link> shell is kept server-side and the
-rewritten body is spliced back in (see `_reassemble_body`), so the CSS can
-never drift and we don't pay output tokens to re-emit it. Playwright then
-renders the reassembled HTML to PDF, with optional upload to S3.
+The LLM receives style-stripped body HTML only (CSS never enters the model
+context). The template's DOCTYPE/<head>/<style>/<link> shell — and any
+<body>-origin <style> tags — are kept server-side and reattached after the
+rewrite (see `_finalize_resume_html`), so uploaded styles cannot drift.
+Playwright then renders the reassembled HTML to PDF, with optional upload
+to S3.
 
-Identical regenerations skip the OpenAI call via a content-hash cache
+Identical regenerations skip the LLM call via a content-hash cache
 (`ResumeLLMCache`); see `generate_resume`.
 """
 
@@ -28,6 +27,12 @@ from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
+from app.html_sanitize import (
+    body_html_for_llm,
+    body_styles_vs_head,
+    strip_style_tags,
+    wrap_body_for_llm,
+)
 from app.llm_router import LlmResult, complete_openai_only, complete_resume
 from app.models import Account, ResumeLLMCache, UserExtra
 
@@ -43,20 +48,22 @@ log = logging.getLogger(__name__)
 # contract — the template is the candidate's real data; only fields the
 # prompt asks for are rewritten.
 _SYSTEM_RULES = (
-    "You are editing a resume HTML template IN PLACE. The uploaded template "
-    "already contains the candidate's real data (name, contact, education, "
-    "company names, dates, locations, project titles). The candidate's "
-    "custom prompt below tells you which fields to rewrite for this "
-    "particular job — typically the headline / title, the per-company role "
-    "label, achievement bullets, and the summary.\n"
+    "You are editing a resume HTML body IN PLACE. The input is the "
+    "candidate's resume body with CSS already removed — styles are restored "
+    "server-side and must not appear in your output. The body already "
+    "contains the candidate's real data (name, contact, education, company "
+    "names, dates, locations, project titles). The candidate's custom prompt "
+    "below tells you which fields to rewrite for this particular job — "
+    "typically the headline / title, the per-company role label, achievement "
+    "bullets, and the summary.\n"
     "\n"
     "ABSOLUTE RULES — these override anything in the custom prompt:\n"
     "1. Output ONLY the page's <body> element — everything from the opening "
     "<body ...> tag through the closing </body>, inclusive. Do NOT output the "
-    "DOCTYPE, <html>, <head>, <style>, or <link> tags. They are fixed and are "
-    "re-attached automatically; emitting them wastes output and they are "
-    "discarded. Preserve every element inside <body> BYTE-FOR-BYTE except for "
-    "the specific text nodes the custom prompt asks you to rewrite.\n"
+    "DOCTYPE, <html>, <head>, <style>, or <link> tags. CSS is not in the "
+    "input and must not be invented or emitted; it is re-attached "
+    "automatically. Preserve every element inside <body> BYTE-FOR-BYTE except "
+    "for the specific text nodes the custom prompt asks you to rewrite.\n"
     "2. Within the body, do NOT modify, reorder, rename, add, or remove: "
     "class names, ids, inline style attributes, href targets, font links, or "
     "DOM structure.\n"
@@ -122,6 +129,21 @@ def _body_inner_html(html: str) -> Optional[str]:
     return html[m.end():end]
 
 
+def _normalize_dashes_body_only(html: str) -> str:
+    """Normalize em dashes inside <body> only — never touch <style>/<head>."""
+    m = _BODY_OPEN_RE.search(html or "")
+    if not m:
+        return _normalize_dashes(html)
+    end = (html or "").lower().rfind("</body>")
+    if end == -1 or end < m.end():
+        return _normalize_dashes(html)
+    return (
+        html[:m.end()]
+        + _normalize_dashes(html[m.end():end])
+        + html[end:]
+    )
+
+
 def _reassemble_body(template_html: str, model_output: str) -> str:
     """Splice the model's rewritten body into the template, keeping the
     template's DOCTYPE/<head>/<style>/<link> shell byte-for-byte. The model is
@@ -143,22 +165,56 @@ def _reassemble_body(template_html: str, model_output: str) -> str:
     return template_html[:m.end()] + inner + template_html[end:]
 
 
-def _extract_style_block(html: str) -> str:
-    """Return the FIRST <style>…</style> block's body, lowercased + stripped
-    of whitespace, for byte-equal comparison between template and LLM
-    output. If no <style> tag, return empty string (templates without inline
-    style are accepted as-is)."""
-    soup = BeautifulSoup(html or "", "html.parser")
-    el = soup.find("style")
-    if el is None:
-        return ""
-    return re.sub(r"\s+", "", el.get_text() or "").lower()
+def _ensure_body_styles(out_html: str, template_html: str) -> str:
+    """Re-inject original body-origin <style> tags after splice if missing.
+
+    Head styles already survive via `_reassemble_body`. Templates that store
+    CSS inside <body> lose those tags when the body is replaced — restore them
+    immediately after the opening <body…> so layout matches the upload.
+    """
+    body_styles, _head_styles = body_styles_vs_head(template_html or "")
+    if not body_styles:
+        return out_html
+    # Already present (e.g. model copied them, or template had no clean body
+    # and we fell back to raw model output that kept styles).
+    if all(tag in (out_html or "") for tag in body_styles):
+        return out_html
+    m = _BODY_OPEN_RE.search(out_html or "")
+    if not m:
+        return out_html
+    injection = "".join(body_styles)
+    return out_html[:m.end()] + injection + out_html[m.end():]
 
 
-def _validate_llm_html(template: str, out_html: str) -> None:
-    """Guards: output parses, has html/body, and the <style> block (if any)
-    survived byte-for-byte. The system prompt forbids touching <style>; this
-    enforces it. Raises HTTPException on failure."""
+def _model_body_fragment(model_raw: str) -> str:
+    """Strip fences + any sneaked <style> from model output; wrap as <body>."""
+    raw = _strip_fences(model_raw)
+    inner = _body_inner_html(raw)
+    if inner is None:
+        inner = (raw or "").strip()
+    inner = strip_style_tags(inner)
+    return f"<body>{inner}</body>"
+
+
+def _finalize_resume_html(template: str, model_raw: str) -> str:
+    """Assemble final HTML: template shell + cleaned model body + body styles.
+
+    CSS never comes from the model. Em-dash normalization applies to body text
+    only so stylesheet content is preserved byte-for-byte.
+    """
+    fragment = _model_body_fragment(model_raw)
+    out = _reassemble_body(template, fragment)
+    out = _ensure_body_styles(out, template)
+    out = _normalize_dashes_body_only(out)
+    return out
+
+
+def _validate_llm_html(out_html: str) -> None:
+    """Structural guards only: non-empty, has html or body.
+
+    Style equality is no longer checked — CSS is isolated from the LLM and
+    reattached from the uploaded template by construction.
+    """
     if not (out_html or "").strip():
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -170,15 +226,6 @@ def _validate_llm_html(template: str, out_html: str) -> None:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Resume LLM output is not a full HTML document.",
         )
-    tpl_style = _extract_style_block(template)
-    out_style = _extract_style_block(out_html)
-    if tpl_style and tpl_style != out_style:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Resume LLM modified the template's <style> block. "
-                   "Re-run the generation; if it keeps happening, raise the "
-                   "issue — the model is drifting from the template.",
-        )
 
 
 def _build_resume_prompt(
@@ -187,17 +234,16 @@ def _build_resume_prompt(
     template_html: str,
     prompt_body: Optional[str] = None,
 ) -> str:
-    """Compose the LLM prompt: system rules → template HTML → custom prompt
-    body (if any) → JD. The template carries all candidate data; no separate
-    candidate-fields block.
+    """Compose the LLM prompt: system rules → body-only HTML → custom prompt
+    body (if any) → JD.
+
+    `template_html` must be style-stripped body markup (see
+    `body_html_for_llm` / `wrap_body_for_llm`). CSS never enters this prompt.
 
     Ordering is deliberate for OpenAI prompt caching: the account-stable
-    prefix (system rules + template) comes FIRST so it warm-hits across
+    prefix (system rules + body) comes FIRST so it warm-hits across
     generations, and the per-generation parts (custom prompt, JD) come LAST.
-    The custom prompt sits after the template — putting it before would
-    bust the cache for the much larger template that follows it. When no
-    custom prompt is supplied, the model gets just the system rules — no
-    built-in content guidance."""
+    """
     body = (prompt_body or "").strip()
     custom_block = (
         "\n\nCUSTOM PROMPT (the candidate's guidance — follow it within "
@@ -214,8 +260,8 @@ def _build_resume_prompt(
         jd = jd[:cap].rstrip() + "\n[... job description truncated ...]"
     return (
         _SYSTEM_RULES
-        + "\n\n=== TEMPLATE HTML (the candidate's resume — rewrite its body "
-          "text in place; return ONLY the <body> element) ===\n"
+        + "\n\n=== RESUME BODY HTML (CSS removed — rewrite text in place; "
+          "return ONLY the <body> element; do not emit <style>) ===\n"
         + template_html
         + custom_block
         + "\n\n=== JOB DESCRIPTION ===\n"
@@ -359,17 +405,15 @@ async def _resume_llm_output(
 
     result = await complete_resume(prompt, user)
 
-    body_fragment = _strip_fences(result.text)
-    out_html = _reassemble_body(template, body_fragment)
     try:
-        _validate_llm_html(template, out_html)
+        out_html = _finalize_resume_html(template, result.text)
+        _validate_llm_html(out_html)
     except HTTPException:
         if result.provider == "free":
             log.warning("free resume output failed HTML validation — retrying OpenAI")
             result = await complete_openai_only(prompt, purpose="resume")
-            body_fragment = _strip_fences(result.text)
-            out_html = _reassemble_body(template, body_fragment)
-            _validate_llm_html(template, out_html)
+            out_html = _finalize_resume_html(template, result.text)
+            _validate_llm_html(out_html)
         else:
             raise
 
@@ -531,10 +575,10 @@ async def generate_resume(
     prompt_body: Optional[str] = None,
     owner: Optional[UserExtra] = None,
 ) -> GeneratedResume:
-    """Run the full pipeline: LLM rewrites the template's <body> text (or a
+    """Run the full pipeline: LLM rewrites style-stripped body text (or a
     content-hash cache hit reuses a prior output, skipping the call), the body
-    is spliced back into the template shell, Playwright renders the HTML to
-    PDF, optional S3 upload."""
+    is spliced back into the template shell with original CSS restored,
+    Playwright renders the HTML to PDF, optional S3 upload."""
     template = (account.styleTemplate or "").strip()
     if not template:
         raise HTTPException(
@@ -548,18 +592,16 @@ async def generate_resume(
         account.name, account.id, company,
     )
 
-    prompt = _build_resume_prompt(account, job_description, template, prompt_body=prompt_body)
+    llm_body = wrap_body_for_llm(body_html_for_llm(template))
+    prompt = _build_resume_prompt(account, job_description, llm_body, prompt_body=prompt_body)
     llm_result = await _resume_llm_output(prompt, owner, template)
     raw = llm_result.text
     usage = llm_result.usage
 
-    # The model returns only the rewritten <body>; splice it back into the
-    # template's shell so the DOCTYPE/<head>/<style> stay byte-for-byte
-    # identical (CSS cannot drift) and we don't pay output tokens to re-emit
-    # them. Tolerates a full-document or bare-fragment response too.
-    body_fragment = _strip_fences(raw)
-    out_html = _normalize_dashes(_reassemble_body(template, body_fragment))
-    _validate_llm_html(template, out_html)
+    # Model returns rewritten body only; CSS is reattached from the uploaded
+    # template (head styles via splice, body-origin styles via reinjection).
+    out_html = _finalize_resume_html(template, raw)
+    _validate_llm_html(out_html)
 
     pdf_bytes = await _html_to_pdf(
         out_html,
