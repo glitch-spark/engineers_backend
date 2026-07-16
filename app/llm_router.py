@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
-import time
-from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
@@ -15,13 +12,11 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 
 from app.config import get_settings
 from app.free_llm import (
-    DEFAULT_RPM_LIMIT,
     FREE_LLM_RESUME_MAX_OUTPUT_TOKENS,
     FREE_LLM_RESUME_TIMEOUT_SECONDS,
     FREE_LLM_SCREENING_TIMEOUT_SECONDS,
     FREE_LLM_TEST_TIMEOUT_SECONDS,
     NVIDIA_BASE_URL,
-    RPM_WINDOW_SECONDS,
     FreeLlmPreset,
     clamp_max_tokens,
     get_preset,
@@ -32,9 +27,6 @@ log = logging.getLogger(__name__)
 
 LlmProvider = Literal["free", "openai"]
 
-# In-process sliding window: api_key_hash -> deque[timestamp]
-_rate_windows: dict[str, deque[float]] = defaultdict(deque)
-
 
 @dataclass
 class LlmResult:
@@ -44,29 +36,6 @@ class LlmResult:
     usage: dict
     fallback_used: bool
     fallback_reason: Optional[str] = None
-
-
-def _key_hash(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-
-
-def rate_limit_allows(api_key: str, *, limit: int = DEFAULT_RPM_LIMIT) -> bool:
-    """Return True if a free-tier call is allowed under the RPM window."""
-    now = time.monotonic()
-    window = _rate_windows[_key_hash(api_key)]
-    cutoff = now - RPM_WINDOW_SECONDS
-    while window and window[0] < cutoff:
-        window.popleft()
-    return len(window) < limit
-
-
-def rate_limit_record(api_key: str) -> None:
-    _rate_windows[_key_hash(api_key)].append(time.monotonic())
-
-
-def clear_rate_limits() -> None:
-    """Test helper — reset all windows."""
-    _rate_windows.clear()
 
 
 def free_llm_configured(user: Optional[UserExtra]) -> bool:
@@ -211,61 +180,52 @@ async def complete_with_fallback(
     validate: Optional[Callable[[str], None]] = None,
     purpose: str = "llm",
 ) -> LlmResult:
-    """Try free NVIDIA tier when configured; fall back to OpenAI on limit/errors/bad output."""
+    """Try free NVIDIA tier when configured; fall back to OpenAI on errors/bad output."""
     settings = get_settings()
     preset, max_tokens, api_key = resolve_free_preset(user) if user else (None, 8192, "")
     attempted_free = False
     fallback_reason: Optional[str] = None
 
     if preset and api_key:
-        if rate_limit_allows(api_key):
-            attempted_free = True
-            try:
-                rate_limit_record(api_key)
-                free_timeout = _free_timeout_for_purpose(purpose)
-                free_max_tokens = _free_max_tokens_for_purpose(purpose, max_tokens)
-                text, usage = await _free_chat_completion(
-                    prompt,
-                    preset,
-                    api_key,
-                    free_max_tokens,
-                    timeout=free_timeout,
-                )
-                if not text.strip():
-                    raise ValueError("empty free LLM output")
-                if validate:
-                    validate(text)
-                log.info(
-                    "%s via free model=%s in=%s out=%s",
-                    purpose,
-                    preset.model,
-                    usage.get("input", "?"),
-                    usage.get("output", "?"),
-                )
-                return LlmResult(
-                    text=text,
-                    provider="free",
-                    model=preset.model,
-                    usage=usage,
-                    fallback_used=False,
-                )
-            except Exception as exc:
-                fallback_reason = _free_llm_user_message(exc, timeout_seconds=free_timeout)
-                log.warning(
-                    "%s free LLM failed (model=%s): %s — falling back to OpenAI",
-                    purpose,
-                    preset.model,
-                    exc,
-                )
-                if not _free_error_retryable(exc) and not validate:
-                    pass
-        else:
-            log.info("%s free LLM rate limit reached — falling back to OpenAI", purpose)
-            attempted_free = True
-            fallback_reason = (
-                "Free-tier rate limit reached (40 requests/min). "
-                "Fell back to OpenAI for this request."
+        attempted_free = True
+        try:
+            free_timeout = _free_timeout_for_purpose(purpose)
+            free_max_tokens = _free_max_tokens_for_purpose(purpose, max_tokens)
+            text, usage = await _free_chat_completion(
+                prompt,
+                preset,
+                api_key,
+                free_max_tokens,
+                timeout=free_timeout,
             )
+            if not text.strip():
+                raise ValueError("empty free LLM output")
+            if validate:
+                validate(text)
+            log.info(
+                "%s via free model=%s in=%s out=%s",
+                purpose,
+                preset.model,
+                usage.get("input", "?"),
+                usage.get("output", "?"),
+            )
+            return LlmResult(
+                text=text,
+                provider="free",
+                model=preset.model,
+                usage=usage,
+                fallback_used=False,
+            )
+        except Exception as exc:
+            fallback_reason = _free_llm_user_message(exc, timeout_seconds=free_timeout)
+            log.warning(
+                "%s free LLM failed (model=%s): %s — falling back to OpenAI",
+                purpose,
+                preset.model,
+                exc,
+            )
+            if not _free_error_retryable(exc) and not validate:
+                pass
 
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured and free LLM unavailable")
@@ -421,9 +381,6 @@ async def test_free_connection(user: UserExtra) -> dict:
     preset, max_tokens, api_key = resolve_free_preset(user)
     if preset is None or not api_key:
         raise ValueError("Free LLM model and API key must be configured")
-    if not rate_limit_allows(api_key):
-        raise ValueError("Rate limit reached (~40 requests/minute). Try again shortly.")
-    rate_limit_record(api_key)
     test_timeout = float(FREE_LLM_TEST_TIMEOUT_SECONDS)
     try:
         text, _usage = await _free_chat_completion(
