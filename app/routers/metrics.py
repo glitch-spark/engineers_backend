@@ -10,9 +10,12 @@ Bid = ResumeApplication. Income = sum of approved Transaction.amount.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
+import math
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
@@ -21,6 +24,7 @@ from app.models import Interview, ResumeApplication, Transaction, UserExtra, Wee
 from app.routers._util import parse_date
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
+log = logging.getLogger(__name__)
 
 
 def _window_for_range(days: int) -> tuple[datetime, datetime]:
@@ -68,12 +72,189 @@ async def _bid_count(user_id, start: datetime, end: datetime) -> int:
     ).count()
 
 
-async def _interview_count(user_id, start: datetime, end: datetime) -> int:
-    # Use scheduledAt: that's when the interview "happened" in user time.
-    # createdAt is when the row was logged, often after the fact.
+# Rounds excluded from interview KPIs / leaderboard (matches Interviews board).
+_ROUND_COUNT_EXCLUDED = frozenset({
+    "ai_interview",
+    "rejected",
+    "home_assessment",
+})
+
+# Board-style breakdown labels (order preserved for display).
+_BREAKDOWN_ORDER = (
+    ("intro", "Intro"),
+    ("tech", "Tech"),
+    ("hiring", "Hiring"),
+    ("panel", "Panel"),
+    ("final", "Final"),
+)
+
+
+def _breakdown_group(stage: str) -> Optional[str]:
+    if stage in _ROUND_COUNT_EXCLUDED:
+        return None
+    if stage == "intro":
+        return "intro"
+    if stage in {
+        "tech", "tech1", "tech2",
+        "tech_round_1", "tech_round_2",
+        "live_coding", "system_design",
+    }:
+        return "tech"
+    if stage in {"cultural", "hiring_manager"}:
+        return "hiring"
+    if stage == "panel":
+        return "panel"
+    if stage in {"final", "offer"}:
+        return "final"
+    return None
+
+
+def _empty_breakdown() -> dict[str, int]:
+    return {key: 0 for key, _ in _BREAKDOWN_ORDER}
+
+
+def _format_breakdown(counts: dict[str, int]) -> list[dict]:
+    """[{label, count}, ...] with zero counts omitted."""
+    return [
+        {"label": label, "count": int(counts.get(key, 0))}
+        for key, label in _BREAKDOWN_ORDER
+        if int(counts.get(key, 0)) > 0
+    ]
+
+
+def _norm_stage(stage: Any) -> Optional[str]:
+    if stage is None:
+        return None
+    if hasattr(stage, "value"):
+        stage = stage.value
+    s = str(stage).strip()
+    if s.startswith("InterviewStage."):
+        s = s.split(".", 1)[1]
+    if s in ("tech", "tech1"):
+        return "tech_round_1"
+    if s == "tech2":
+        return "tech_round_2"
+    if s == "hiring_manager":
+        return "cultural"
+    return s or None
+
+
+def _norm_status(status: Any) -> str:
+    if status is None:
+        return ""
+    if hasattr(status, "value"):
+        status = status.value
+    return str(status).strip()
+
+
+def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _dt_in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool:
+    d = _as_aware(dt)
+    if d is None:
+        return False
+    return _as_aware(start) <= d <= _as_aware(end)  # type: ignore[operator]
+
+
+def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime]]]:
+    """Trail of (stage, scheduledAt) — history keeps its own dates; tip uses iv.scheduledAt."""
+    trail: list[tuple[str, Optional[datetime]]] = []
+
+    def push(stage_raw: Any, dt: Optional[datetime]) -> None:
+        stage = _norm_stage(stage_raw)
+        if not stage:
+            return
+        if trail and trail[-1][0] == stage:
+            if dt is not None:
+                trail[-1] = (stage, dt)
+            return
+        trail.append((stage, dt))
+
+    for h in (iv.stageHistory or []):
+        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None))
+    push(iv.stage, iv.scheduledAt)
+    return trail
+
+
+def _count_interview_rounds(
+    iv: Interview, start: datetime, end: datetime,
+) -> tuple[int, int, dict[str, int]]:
+    """Return (countable_rounds, canceled, breakdown_counts).
+
+    Canceled = status scheduled + current stage rejected (not done / canceled).
+    Countable rounds exclude AI Interview, Home Assessment, Rejected badges.
+    """
+    status = _norm_status(iv.status)
+    stage = _norm_stage(iv.stage)
+    rounds = _dated_rounds(iv)
+    breakdown = _empty_breakdown()
+
+    if status == "scheduled" and stage == "rejected":
+        touches = _dt_in_range(iv.scheduledAt, start, end) or any(
+            _dt_in_range(dt, start, end) for _, dt in rounds
+        )
+        return (0, 1 if touches else 0, breakdown)
+
+    n = 0
+    for s, dt in rounds:
+        if s in _ROUND_COUNT_EXCLUDED:
+            continue
+        if not _dt_in_range(dt, start, end):
+            continue
+        group = _breakdown_group(s)
+        if not group:
+            continue
+        breakdown[group] = breakdown.get(group, 0) + 1
+        n += 1
+    return n, 0, breakdown
+
+
+async def _load_interviews_for_window(user_ids: list, start: datetime, end: datetime) -> list[Interview]:
+    if not user_ids:
+        return []
     return await Interview.find(
-        {"createdBy": user_id, "scheduledAt": {"$gte": start, "$lte": end}}
-    ).count()
+        {
+            "createdBy": {"$in": user_ids},
+            "$or": [
+                {"scheduledAt": {"$gte": start, "$lte": end}},
+                {"stageHistory.scheduledAt": {"$gte": start, "$lte": end}},
+            ],
+        }
+    ).to_list()
+
+
+async def _interview_stats_by_user(user_ids: list, start: datetime, end: datetime) -> dict:
+    """Per-user {interviews, canceled, breakdown} using stage-badge dates."""
+    out: dict = {
+        uid: {"interviews": 0, "canceled": 0, "breakdown": _empty_breakdown()}
+        for uid in user_ids
+    }
+    for iv in await _load_interviews_for_window(user_ids, start, end):
+        uid = iv.createdBy
+        if uid not in out:
+            out[uid] = {"interviews": 0, "canceled": 0, "breakdown": _empty_breakdown()}
+        rounds, canceled, bd = _count_interview_rounds(iv, start, end)
+        out[uid]["interviews"] += rounds
+        out[uid]["canceled"] += canceled
+        for k, v in bd.items():
+            out[uid]["breakdown"][k] = out[uid]["breakdown"].get(k, 0) + v
+    return out
+
+
+async def _interview_count(user_id, start: datetime, end: datetime) -> int:
+    stats = await _interview_stats_by_user([user_id], start, end)
+    return int(stats.get(user_id, {}).get("interviews", 0))
+
+
+async def _interviews_by_user(user_ids, start, end) -> dict:
+    stats = await _interview_stats_by_user(user_ids, start, end)
+    return {uid: int(s.get("interviews", 0)) for uid, s in stats.items()}
 
 
 _BUCKET_UNIT = {"day": "day", "week": "week", "month": "month"}
@@ -255,18 +436,6 @@ async def _bids_by_user(user_ids, start, end) -> dict:
     return {d["_id"]: int(d["value"]) for d in docs}
 
 
-async def _interviews_by_user(user_ids, start, end) -> dict:
-    pipeline = [
-        {"$match": {
-            "createdBy": {"$in": user_ids},
-            "scheduledAt": {"$gte": start, "$lte": end},
-        }},
-        {"$group": {"_id": "$createdBy", "value": {"$sum": 1}}},
-    ]
-    docs = await Interview.aggregate(pipeline).to_list()
-    return {d["_id"]: int(d["value"]) for d in docs}
-
-
 @router.get("/leaderboard")
 async def leaderboard(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -365,16 +534,20 @@ def _current_iso_week_start() -> tuple[datetime, int, int]:
 
 def _resolve_lb_range(range_str: str) -> tuple[datetime, datetime, datetime, datetime, str]:
     """Parse the range query into (start, end, prev_start, prev_end, label).
-    Accepts 'week' (current ISO Mon–now) or an int day-count."""
+    'week' = current Monday 00:00 → Saturday 23:59:59 (same as Interviews board).
+    Otherwise an int day-count ending now."""
     now = datetime.now(timezone.utc)
     range_str = (range_str or "week").strip().lower()
     if range_str == "week":
-        start, _, _ = _current_iso_week_start()
-        end = now
-        length = end - start
-        prev_end = start
-        prev_start = prev_end - length
-        return start, end, prev_start, prev_end, "This week"
+        _, _, week_start, _ = _app_week_info(now)
+        start = week_start.replace(tzinfo=timezone.utc)
+        # Monday + 5 days = Saturday (end of day) — matches Interviews default filter.
+        end = (week_start + timedelta(days=5)).replace(
+            hour=23, minute=59, second=59, microsecond=999000, tzinfo=timezone.utc,
+        )
+        prev_start = start - timedelta(days=7)
+        prev_end = end - timedelta(days=7)
+        return start, end, prev_start, prev_end, "This week (Mon–Sat)"
     try:
         days = int(range_str)
     except ValueError:
@@ -451,24 +624,106 @@ async def _trend_by_user(user_ids: list, weeks: int = 8) -> dict:
     return out
 
 
-async def _weekly_targets_by_user(user_ids: list, year: int, week: int) -> dict:
-    """Read each user's WeeklyPlan for (year, week). Pull bids+interviews
-    target from the stored metrics list. Returns dict[user_id] ->
-    {bidsTarget, interviewsTarget}."""
+def _app_week_info(dt: datetime) -> tuple[int, int, datetime, datetime]:
+    """Match WeeklyPlan.tsx getWeekInfo (calendar-year week, JS getDay semantics)."""
+    if dt.tzinfo is not None:
+        local = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        local = dt.replace(tzinfo=None) if hasattr(dt, "tzinfo") else dt
+    year = local.year
+    start_of_year = datetime(year, 1, 1)
+    days = (local.date() - start_of_year.date()).days
+    # JS Date#getDay: Sun=0 … Sat=6. Python weekday: Mon=0 … Sun=6.
+    js_jan1 = (start_of_year.weekday() + 1) % 7
+    week_number = int(math.ceil((days + js_jan1 + 1) / 7)) or 1
+    js_dow = (local.weekday() + 1) % 7
+    monday_offset = -6 if js_dow == 0 else 1 - js_dow
+    start_date = datetime(local.year, local.month, local.day) + timedelta(days=monday_offset)
+    start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = start_date + timedelta(days=6, hours=23, minutes=59, seconds=59, microseconds=999000)
+    return week_number, year, start_date, end_date
+
+
+def _blank_plan_metrics() -> dict:
+    return {"bidsTarget": 0, "bidsActual": 0, "interviewsTarget": 0}
+
+
+def _metrics_from_plan(plan: WeeklyPlan) -> dict:
+    out = _blank_plan_metrics()
+    for m in (plan.metrics or []):
+        if m.key == "bids":
+            out["bidsTarget"] = int(m.target or 0)
+            out["bidsActual"] = int(m.actual or 0)
+        elif m.key == "interviews":
+            out["interviewsTarget"] = int(m.target or 0)
+    return out
+
+
+async def _ensure_plan_metrics(plan: WeeklyPlan) -> WeeklyPlan:
+    """Populate metrics via the same extractor as 'Run Progress Report' when bids plan is missing."""
+    current = _metrics_from_plan(plan)
+    if current["bidsTarget"] > 0:
+        return plan
+    if not (plan.content or "").strip() and not (plan.result or "").strip():
+        return plan
+    try:
+        from app.routers.weekly_plans import _apply_badge_interview_counts, _set_interviews_metric
+        from app.weekly_report import extract_metrics
+        metrics = await extract_metrics(plan.content or "", plan.result or "")
+        plan.metrics = _set_interviews_metric(metrics, target=0, actual=0)
+        await _apply_badge_interview_counts(plan)
+        await plan.save()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("weekly plan metric extract failed for %s: %s", plan.id, exc)
+    return plan
+
+
+async def _weekly_targets_by_user(user_ids: list, year: int, week: int, *, week_start: datetime, week_end: datetime) -> dict:
+    """Pull bids/interviews plan metrics for the given week.
+
+    Matches Weekly Plan the same way the UI does:
+    - by app weekNumber/year (not ISO week), and
+    - by startDate/endDate overlap as a fallback.
+    If stored bids target is 0 but plan text exists, runs Progress Report extraction.
+    """
     if not user_ids:
         return {}
-    plans = await WeeklyPlan.find({
+
+    # Prefer exact weekNumber/year (how Weekly Plan stores rows), then date overlap.
+    plans_by_key = await WeeklyPlan.find({
         "userId": {"$in": user_ids},
         "year": year,
         "weekNumber": week,
     }).to_list()
-    out: dict = {u: {"bidsTarget": 0, "interviewsTarget": 0} for u in user_ids}
+
+    ws = week_start.replace(tzinfo=None) if week_start.tzinfo else week_start
+    we = week_end.replace(tzinfo=None) if week_end.tzinfo else week_end
+    plans_by_dates = await WeeklyPlan.find({
+        "userId": {"$in": user_ids},
+        "startDate": {"$lte": we},
+        "endDate": {"$gte": ws},
+    }).to_list()
+
+    by_id: dict = {}
+    for p in plans_by_key + plans_by_dates:
+        by_id[str(p.id)] = p
+    plans = list(by_id.values())
+
+    # Fill missing bids targets using the Progress Report extractor (persisted).
+    await asyncio.gather(*[_ensure_plan_metrics(p) for p in plans])
+
+    out: dict = {u: _blank_plan_metrics() for u in user_ids}
     for p in plans:
-        for m in (p.metrics or []):
-            if m.key == "bids":
-                out[p.userId]["bidsTarget"] = int(m.target or 0)
-            elif m.key == "interviews":
-                out[p.userId]["interviewsTarget"] = int(m.target or 0)
+        uid = p.userId
+        if uid not in out:
+            out[uid] = _blank_plan_metrics()
+        m = _metrics_from_plan(p)
+        # Keep the larger bids target if multiple plans somehow match.
+        if m["bidsTarget"] >= out[uid]["bidsTarget"]:
+            out[uid]["bidsTarget"] = m["bidsTarget"]
+            out[uid]["bidsActual"] = m["bidsActual"]
+        if m["interviewsTarget"] >= out[uid]["interviewsTarget"]:
+            out[uid]["interviewsTarget"] = m["interviewsTarget"]
     return out
 
 
@@ -487,40 +742,67 @@ async def leaderboard_consolidated(
     opt_in_users = await UserExtra.find({"role": {"$ne": "admin"}}).to_list()
     user_ids = [u.id for u in opt_in_users]
 
-    cur_bids = await _bids_by_user(user_ids, start, end)
-    cur_iv = await _interviews_by_user(user_ids, start, end)
-    prev_bids = await _bids_by_user(user_ids, prev_start, prev_end)
-    prev_iv = await _interviews_by_user(user_ids, prev_start, prev_end)
+    cur_bids_tailor = await _bids_by_user(user_ids, start, end)
+    cur_iv_stats = await _interview_stats_by_user(user_ids, start, end)
+    prev_bids_tailor = await _bids_by_user(user_ids, prev_start, prev_end)
+    prev_iv_stats = await _interview_stats_by_user(user_ids, prev_start, prev_end)
     trend = await _trend_by_user(user_ids, weeks=trendWeeks)
 
-    # Targets only meaningful for the current-week scope.
+    # Weekly plan bids (Plan) — used for bidder ranking + conversion when range=week.
     targets: dict = {}
+    prev_targets: dict = {}
     if range == "week":
-        _monday, iso_year, iso_week = _current_iso_week_start()
-        targets = await _weekly_targets_by_user(user_ids, iso_year, iso_week)
+        week_number, year, week_start, week_end = _app_week_info(datetime.now(timezone.utc))
+        targets = await _weekly_targets_by_user(
+            user_ids, year, week_number, week_start=week_start, week_end=week_end,
+        )
+        prev_anchor = week_start - timedelta(days=3)  # mid prior week
+        prev_week_number, prev_year, prev_week_start, prev_week_end = _app_week_info(prev_anchor)
+        prev_targets = await _weekly_targets_by_user(
+            user_ids, prev_year, prev_week_number,
+            week_start=prev_week_start, week_end=prev_week_end,
+        )
 
     rows: list[dict] = []
     for u in opt_in_users:
-        b = int(cur_bids.get(u.id, 0))
-        i = int(cur_iv.get(u.id, 0))
-        pb = int(prev_bids.get(u.id, 0))
-        pi = int(prev_iv.get(u.id, 0))
+        tailor = int(cur_bids_tailor.get(u.id, 0))
+        prev_tailor = int(prev_bids_tailor.get(u.id, 0))
+        t = targets.get(u.id, {"bidsTarget": 0, "bidsActual": 0, "interviewsTarget": 0})
+        pt = prev_targets.get(u.id, {"bidsTarget": 0, "bidsActual": 0, "interviewsTarget": 0})
+        plan = int(t.get("bidsTarget") or 0)
+        prev_plan = int(pt.get("bidsTarget") or 0)
+
+        # Rank / conversion use planned bids when a plan exists; else tailored resumes.
+        b = plan if plan > 0 else tailor
+        pb = prev_plan if prev_plan > 0 else prev_tailor
+
+        i = int(cur_iv_stats.get(u.id, {}).get("interviews", 0))
+        ic = int(cur_iv_stats.get(u.id, {}).get("canceled", 0))
+        ib = _format_breakdown(cur_iv_stats.get(u.id, {}).get("breakdown") or {})
+        pi = int(prev_iv_stats.get(u.id, {}).get("interviews", 0))
+        pic = int(prev_iv_stats.get(u.id, {}).get("canceled", 0))
         conv = (i / b) if b >= _CONVERSION_MIN_BIDS else 0.0
         prev_conv = (pi / pb) if pb >= _CONVERSION_MIN_BIDS else 0.0
-        t = targets.get(u.id, {"bidsTarget": 0, "interviewsTarget": 0})
 
         rows.append({
             "userId": str(u.id),
             "name": _display_name(u),
             "image": getattr(u, "image", None) or None,
             "bids": b,
+            "bidsPlan": plan,
+            "bidsTailor": tailor,
             "interviews": i,
+            "interviewsCanceled": ic,
+            "interviewBreakdown": ib,
             "conversion": round(conv, 4),
             "qualifiesConversion": b >= _CONVERSION_MIN_BIDS,
-            "bidsTarget": int(t.get("bidsTarget") or 0),
+            "bidsTarget": plan,
             "interviewsTarget": int(t.get("interviewsTarget") or 0),
             "prevBids": pb,
+            "prevBidsPlan": prev_plan,
+            "prevBidsTailor": prev_tailor,
             "prevInterviews": pi,
+            "prevInterviewsCanceled": pic,
             "prevConversion": round(prev_conv, 4),
             "trend": trend.get(u.id, []),
         })
@@ -541,7 +823,19 @@ async def leaderboard_consolidated(
         if not ranked:
             return None
         winner = min(ranked, key=lambda r: r[f"rank_{key}"])
-        return {"userId": winner["userId"], "name": winner["name"], "image": winner["image"], "value": winner[key]}
+        out = {
+            "userId": winner["userId"],
+            "name": winner["name"],
+            "image": winner["image"],
+            "value": winner[key],
+        }
+        if key == "interviews":
+            out["breakdown"] = winner.get("interviewBreakdown") or []
+            out["canceled"] = winner.get("interviewsCanceled") or 0
+        if key == "bids" and range == "week":
+            out["bidsPlan"] = winner.get("bidsPlan") or 0
+            out["bidsTailor"] = winner.get("bidsTailor") or 0
+        return out
 
     champions = {
         "bids": _champ("bids"),
@@ -555,6 +849,7 @@ async def leaderboard_consolidated(
         your_stats = {
             "bids": your_row["bids"],
             "interviews": your_row["interviews"],
+            "interviewsCanceled": your_row["interviewsCanceled"],
             "conversion": your_row["conversion"],
             "rankBids": your_row.get("rank_bids"),
             "rankInterviews": your_row.get("rank_interviews"),
@@ -563,8 +858,12 @@ async def leaderboard_consolidated(
             "interviewsTarget": your_row["interviewsTarget"],
             "prevBids": your_row["prevBids"],
             "prevInterviews": your_row["prevInterviews"],
+            "prevInterviewsCanceled": your_row["prevInterviewsCanceled"],
             "prevConversion": your_row["prevConversion"],
         }
+        if range == "week":
+            your_stats["bidsPlan"] = your_row["bidsPlan"]
+            your_stats["bidsTailor"] = your_row["bidsTailor"]
 
     return {
         "range": range,

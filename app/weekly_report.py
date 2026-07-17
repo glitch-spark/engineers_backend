@@ -33,8 +33,9 @@ _PROMPT = (
     "- bids: job applies, applications, 'bids', 'job bids', 'total bids', "
     "submissions. If a 'Total Bids: N' (or similar total) is given, use that "
     "N — do NOT also sum per-country / per-profile sub-lines.\n"
-    "- interviews: interviews, 'intro calls', 'intro call invitations', "
-    "screening calls, phone screens, recruiter calls, scheduled or done.\n"
+    "- interviews: ALWAYS emit key='interviews' with target=0 and actual=0. "
+    "Do NOT parse interview counts from the text — the app fills those from "
+    "the interview board (stage badges) after extraction.\n"
     "- resume: resume or profile work — updates, maintenance, or NEW profiles "
     "created (e.g. 'Brazil: two profiles, Argentina: 1 profile' => count the "
     "profiles).\n"
@@ -127,6 +128,8 @@ async def extract_metrics(plan_text: str, followup_text: str) -> list[WeeklyMetr
         forced_count = key in ("bids", "interviews", "resume")
         unit = "count" if forced_count else ("hours" if str(r.get("unit") or "").strip().lower() == "hours" else "count")
         out[key] = WeeklyMetric(key=key, label=_CORE_KEYS.get(key, label), target=target, actual=actual, unit=unit)
+    # Interview counts come from the interview board (stage badges), never from text.
+    out["interviews"] = WeeklyMetric(key="interviews", label=_CORE_KEYS["interviews"], target=0, actual=0, unit="count")
     # Preserve core order first, then extras.
     ordered = [out[k] for k in _CORE_KEYS if k in out]
     ordered += [v for k, v in out.items() if k not in _CORE_KEYS]

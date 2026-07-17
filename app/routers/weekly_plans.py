@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,6 +10,102 @@ from app.models.weekly_plan import CORE_METRICS, WeeklyMetric
 from app.routers._util import doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
+
+
+def _naive_dt(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _plan_week_bounds(plan: WeeklyPlan) -> tuple[datetime, datetime]:
+    """Monday 00:00 → Sunday 23:59:59.999 from the plan's startDate."""
+    start = _naive_dt(plan.startDate).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=6, hours=23, minutes=59, seconds=59, microseconds=999000)
+    return start, end
+
+
+def _next_week_bounds(week_start: datetime) -> tuple[datetime, datetime]:
+    next_start = week_start + timedelta(days=7)
+    next_end = next_start + timedelta(days=6, hours=23, minutes=59, seconds=59, microseconds=999000)
+    return next_start, next_end
+
+
+def _set_interviews_metric(metrics: list[WeeklyMetric], *, target: int, actual: int) -> list[WeeklyMetric]:
+    out: list[WeeklyMetric] = []
+    found = False
+    for m in metrics:
+        if m.key == "interviews":
+            out.append(WeeklyMetric(
+                key="interviews",
+                label=m.label or "Interviews",
+                target=max(0, int(target)),
+                actual=max(0, int(actual)),
+                unit="count",
+            ))
+            found = True
+        else:
+            out.append(m)
+    if not found:
+        out.append(WeeklyMetric(
+            key="interviews",
+            label="Interviews",
+            target=max(0, int(target)),
+            actual=max(0, int(actual)),
+            unit="count",
+        ))
+    return out
+
+
+async def _apply_badge_interview_counts(plan: WeeklyPlan) -> None:
+    """Overwrite interviews metrics from stage-badge board counts (not free text).
+
+    - interviews.actual = countable badges in this plan's week
+    - interviews.target = prior week's nextInterviewTarget when set (else keep
+      any existing target, typically 0 after we clear AI interview numbers)
+    - nextInterviewTarget = countable badges already scheduled next week
+    """
+    from app.routers.metrics import _interview_count
+
+    start, end = _plan_week_bounds(plan)
+    next_start, next_end = _next_week_bounds(start)
+
+    this_week = await _interview_count(plan.userId, start, end)
+    next_week = await _interview_count(plan.userId, next_start, next_end)
+
+    # Prefer the forward-looking goal set on the previous week's review.
+    prev_start = start - timedelta(days=7)
+    prev_plan = await WeeklyPlan.find_one({
+        "userId": plan.userId,
+        "startDate": {
+            "$gte": prev_start - timedelta(hours=12),
+            "$lte": prev_start + timedelta(hours=12),
+        },
+    })
+    if prev_plan is None:
+        # Fallback: previous calendar weekNumber/year (handles year wrap).
+        prev_week = plan.weekNumber - 1
+        prev_year = plan.year
+        if prev_week < 1:
+            prev_week = 52
+            prev_year = plan.year - 1
+        prev_plan = await WeeklyPlan.find_one({
+            "userId": plan.userId,
+            "year": prev_year,
+            "weekNumber": prev_week,
+        })
+
+    existing_target = 0
+    for m in (plan.metrics or []):
+        if m.key == "interviews":
+            existing_target = int(m.target or 0)
+            break
+    target = existing_target
+    if prev_plan is not None and prev_plan.nextInterviewTarget is not None:
+        target = max(0, int(prev_plan.nextInterviewTarget))
+
+    plan.metrics = _set_interviews_metric(list(plan.metrics or []), target=target, actual=this_week)
+    plan.nextInterviewTarget = next_week
 
 
 class MetricIn(BaseModel):
@@ -76,7 +172,11 @@ async def progress_report(
     follow-up -> structured metrics), persist the metrics onto each plan,
     and return a per-user rollup. Re-running overwrites (picks up text
     edits). Non-admins may only re-analyze their own plans (to avoid
-    rewriting teammates' metrics); admins may scope via `userId`."""
+    rewriting teammates' metrics); admins may scope via `userId`.
+
+    Interview counts are NOT taken from free text — after extraction they are
+    overwritten from stage-badge board counts for this week and next week
+    (`nextInterviewTarget`)."""
     from app.weekly_report import extract_metrics
 
     is_admin = user.role == "admin"
@@ -90,15 +190,19 @@ async def progress_report(
     if weekNumber is not None:
         query["weekNumber"] = weekNumber
 
-    plans = await WeeklyPlan.find(query).sort([("year", -1), ("weekNumber", -1)]).to_list()
+    plans = await WeeklyPlan.find(query).sort([("year", 1), ("weekNumber", 1)]).to_list()
     # Guardrail: cap how many plans one run will process (cost control).
+    # Process oldest → newest so each week's nextInterviewTarget can seed
+    # the following week's interviews target in the same run.
     MAX_PLANS = 200
     capped = plans[:MAX_PLANS]
 
     processed = 0
     for p in capped:
         metrics = await extract_metrics(p.content or "", p.result or "")
-        p.metrics = metrics
+        # Drop any AI-extracted interview numbers — board badges are source of truth.
+        p.metrics = _set_interviews_metric(metrics, target=0, actual=0)
+        await _apply_badge_interview_counts(p)
         if (p.result or "").strip():
             p.status = "reviewed"
         await p.save()
