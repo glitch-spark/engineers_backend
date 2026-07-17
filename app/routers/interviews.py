@@ -228,6 +228,36 @@ async def _populate_account(items: Iterable[dict], *, field: str = "accountId") 
     return items
 
 
+def _stage_filter_values(stage: str) -> list[str]:
+    """Expand a list-filter stage into concrete stored stage values."""
+    raw = (stage or "").strip()
+    if not raw:
+        return []
+    # Board-level Tech → any tech sub-stage (incl. legacy).
+    if raw == "tech":
+        return [
+            InterviewStage.tech.value,
+            InterviewStage.tech_round_1.value,
+            InterviewStage.tech_round_2.value,
+            InterviewStage.live_coding.value,
+            InterviewStage.system_design.value,
+            InterviewStage.home_assessment.value,
+            "tech1",
+            "tech2",
+        ]
+    normalized = _normalize_stage(raw) or raw
+    if normalized not in STAGES and raw not in STAGES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
+    vals = {normalized, raw}
+    if normalized == InterviewStage.cultural.value:
+        vals.add("hiring_manager")
+    if normalized == InterviewStage.tech_round_1.value:
+        vals.update({"tech", "tech1"})
+    if normalized == InterviewStage.tech_round_2.value:
+        vals.add("tech2")
+    return list(vals)
+
+
 @router.get("")
 async def list_interviews(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -252,15 +282,39 @@ async def list_interviews(
         date_filter["$gte"] = f_dt
     if t_dt:
         date_filter["$lte"] = t_dt
-    if date_filter:
-        query["scheduledAt"] = date_filter
+
+    stage_vals = _stage_filter_values(stage) if stage else []
+
+    if date_filter and stage_vals:
+        # Stage filter = “has this stage badge with a date in range”, not “current pan”.
+        query["$or"] = [
+            {
+                "stageHistory": {
+                    "$elemMatch": {
+                        "stage": {"$in": stage_vals},
+                        "scheduledAt": date_filter,
+                    }
+                }
+            },
+            {
+                "stage": {"$in": stage_vals},
+                "scheduledAt": date_filter,
+            },
+        ]
+    elif date_filter:
+        # Include cards whose current schedule OR any stage-round date falls in range.
+        query["$or"] = [
+            {"scheduledAt": date_filter},
+            {"stageHistory.scheduledAt": date_filter},
+        ]
+    elif stage_vals:
+        query["$or"] = [
+            {"stage": {"$in": stage_vals}},
+            {"stageHistory.stage": {"$in": stage_vals}},
+        ]
 
     if accountId:
         query["accountId"] = to_object_id(accountId)
-    if stage:
-        if stage not in STAGES:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
-        query["stage"] = stage
     if status_:
         if status_ not in STATUSES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
