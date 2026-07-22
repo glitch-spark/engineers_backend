@@ -20,6 +20,7 @@ from app.resume_service import (
     generate_resume,
     generate_presigned_get,
     s3_enabled,
+    trim_jd,
 )
 from app.routers._util import doc_to_dict, to_object_id
 
@@ -333,7 +334,7 @@ def _build_screening_prompt(
         )
 
     if (jd or "").strip():
-        parts.append(f"Job description:\n{jd}")
+        parts.append(f"Job description:\n{trim_jd(jd)}")
 
     indexed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
     if (screening_prompt or "").strip():
