@@ -84,6 +84,29 @@ _SYSTEM_RULES = (
     "fences. No prose. No comments before or after it.\n"
 )
 
+# Soft-trim marker appended when a JD exceeds RESUME_JD_MAX_CHARS.
+_JD_TRUNCATION_MARKER = "\n[... job description truncated ...]"
+
+
+def trim_jd(job_description: str) -> str:
+    """Soft-cap JD chars for LLM prompts. Core requirements sit up front;
+    the tail is usually benefits / EEO / legal boilerplate. Tunable via
+    RESUME_JD_MAX_CHARS (~12000 ≈ 3K tokens)."""
+    jd = (job_description or "").strip()
+    cap = getattr(get_settings(), "RESUME_JD_MAX_CHARS", 12000) or 12000
+    if len(jd) > cap:
+        return jd[:cap].rstrip() + _JD_TRUNCATION_MARKER
+    return jd
+
+
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+
+def _collapse_blank_lines(html: str) -> str:
+    """Light whitespace trim: collapse 3+ consecutive newlines to 2. Does
+    not touch intra-tag spaces or <pre> content shape beyond blank runs."""
+    return _BLANK_LINES_RE.sub("\n\n", html or "")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -237,32 +260,29 @@ def _build_resume_prompt(
     """Compose the LLM prompt: system rules → body-only HTML → custom prompt
     body (if any) → JD.
 
-    `template_html` must be style-stripped body markup (see
-    `body_html_for_llm` / `wrap_body_for_llm`). CSS never enters this prompt.
+    Prefer callers to pass style-stripped body markup (see
+    `body_html_for_llm` / `wrap_body_for_llm`). Full documents are also
+    accepted — CSS is stripped defensively so it never enters the prompt.
 
     Ordering is deliberate for OpenAI prompt caching: the account-stable
     prefix (system rules + body) comes FIRST so it warm-hits across
     generations, and the per-generation parts (custom prompt, JD) come LAST.
     """
+    body_html = _collapse_blank_lines(
+        wrap_body_for_llm(body_html_for_llm(template_html))
+    )
     body = (prompt_body or "").strip()
     custom_block = (
         "\n\nCUSTOM PROMPT (the candidate's guidance — follow it within "
         "the absolute rules above):\n" + body
         if body else ""
     )
-    # Soft-trim the JD before sending. Core role requirements live in the
-    # first few KB; the tail is usually benefits / EEO / legal boilerplate
-    # with little tailoring signal. Capping cuts input tokens with no
-    # quality loss. Tunable via RESUME_JD_MAX_CHARS.
-    jd = (job_description or "").strip()
-    cap = getattr(get_settings(), "RESUME_JD_MAX_CHARS", 12000) or 12000
-    if len(jd) > cap:
-        jd = jd[:cap].rstrip() + "\n[... job description truncated ...]"
+    jd = trim_jd(job_description)
     return (
         _SYSTEM_RULES
         + "\n\n=== RESUME BODY HTML (CSS removed — rewrite text in place; "
           "return ONLY the <body> element; do not emit <style>) ===\n"
-        + template_html
+        + body_html
         + custom_block
         + "\n\n=== JOB DESCRIPTION ===\n"
         + jd
@@ -681,9 +701,9 @@ async def generate_cover_letter(
         "=== CANDIDATE RESUME (source of all factual claims) ===\n"
         + (candidate_resume_text or "(no resume text supplied)").strip()
     )
+    jd = trim_jd(job_description) or "(no JD supplied)"
     parts.append(
-        "=== JOB DESCRIPTION (what the letter must address) ===\n"
-        + (job_description or "(no JD supplied)").strip()
+        "=== JOB DESCRIPTION (what the letter must address) ===\n" + jd
     )
     text, usage = await _openai_call("\n\n".join(parts))
     return _strip_fences(text), usage

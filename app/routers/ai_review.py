@@ -18,6 +18,8 @@ router = APIRouter(prefix="/ai-review", tags=["ai-review"])
 
 MAX_CUSTOM_PROMPT_CHARS = 4000
 MAX_RESUME_CHARS = 4000
+MAX_TRANSCRIPT_CHARS = 20_000
+_JSON_SEP = (",", ":")
 
 
 async def _user_from_token(token: str) -> UserExtra:
@@ -80,7 +82,7 @@ async def _build_interview_contexts(interview_ids: list[PydanticObjectId]) -> li
             "scheduled_at": iv.scheduledAt.isoformat() if iv.scheduledAt else None,
             "resume_filename": resume_filename,
             "resume_markdown": resume_markdown,
-            "transcript": iv.transcript or "",
+            "transcript": _truncate(iv.transcript or "", MAX_TRANSCRIPT_CHARS),
             "note": iv.note or "",
         })
     return contexts
@@ -150,7 +152,9 @@ async def stream_ai_review(
     if not system_prompt:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Resolved system prompt is empty")
 
-    user_message = "Interviews:\n" + json.dumps(contexts, indent=2, ensure_ascii=False)
+    user_message = "Interviews:\n" + json.dumps(
+        contexts, ensure_ascii=False, separators=_JSON_SEP
+    )
 
     settings = get_settings()
     openai_key = getattr(settings, "OPENAI_API_KEY", None)
@@ -357,7 +361,9 @@ async def interview_chat(
     if global_prefix:
         system_prompt = f"{global_prefix}\n\n{system_prompt}"
 
-    context_blob = "Interview context (JSON):\n" + json.dumps(contexts[0], indent=2, ensure_ascii=False)
+    context_blob = "Interview context (JSON):\n" + json.dumps(
+        contexts[0], ensure_ascii=False, separators=_JSON_SEP
+    )
 
     settings = get_settings()
     openai_key = getattr(settings, "OPENAI_API_KEY", None)

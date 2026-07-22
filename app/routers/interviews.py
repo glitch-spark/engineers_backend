@@ -832,10 +832,10 @@ async def analyze_interviews(
             "- Quote 5-10 word snippets from samples when citing evidence.\n"
             "- If a section has nothing to say, return an empty array — do NOT fabricate.\n"
             "- Output ONLY the JSON object. No markdown fences, no commentary.\n\n"
-            f"Filter context:\n{json.dumps(filter_context, ensure_ascii=False)}\n\n"
-            f"Per-stage digest:\n{json.dumps(digest, ensure_ascii=False)}\n\n"
+            f"Filter context:\n{json.dumps(filter_context, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            f"Per-stage digest:\n{json.dumps(digest, ensure_ascii=False, separators=(',', ':'))}\n\n"
             f"Recent AI follow-up questions the candidate asked (uncertainty signal):\n"
-            f"{json.dumps(follow_up_digest, ensure_ascii=False)}"
+            f"{json.dumps(follow_up_digest, ensure_ascii=False, separators=(',', ':'))}"
         )
 
         try:
@@ -948,11 +948,12 @@ async def analyze_chat(
         raise HTTPException(status_code=400, detail="no user message in body")
 
     system_prompt = _ANALYZE_CHAT_PROMPT.format(failure_modes=FAILURE_MODES)
+    _json_sep = (",", ":")
     grounding = (
         "Filter the user is viewing:\n"
-        f"{json.dumps(body.filterContext or {}, ensure_ascii=False)}\n\n"
+        f"{json.dumps(body.filterContext or {}, ensure_ascii=False, separators=_json_sep)}\n\n"
         "Analysis result the user is viewing:\n"
-        f"{json.dumps(body.result or {}, ensure_ascii=False)}"
+        f"{json.dumps(body.result or {}, ensure_ascii=False, separators=_json_sep)}"
     )
 
     chat_messages: list[dict] = [
