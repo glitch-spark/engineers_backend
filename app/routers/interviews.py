@@ -217,7 +217,13 @@ async def _populate_account(items: Iterable[dict], *, field: str = "accountId") 
         acc_id = item.get(field)
         acc = by_id.get(str(acc_id)) if acc_id else None
         if acc is not None:
-            item[field] = {"_id": str(acc.id), "name": acc.name, "email": ""}
+            item[field] = {
+                "_id": str(acc.id),
+                "name": acc.name,
+                "country": acc.country,
+                "region": acc.region,
+                "email": "",
+            }
             # Resolve the resume filename for this interview's resumeId, if present.
             resume_id = item.get("resumeId")
             if resume_id:

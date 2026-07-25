@@ -31,6 +31,10 @@ class Account(TimestampedDocument):
     # Profile label, e.g. "AI Full-stack" / "Backend". Identifies the profile
     # in lists, dropdowns, S3 paths, and generated-resume filenames.
     name: str
+    # Optional ISO 3166-1 alpha-2 country code (e.g. "US", "BR") for the profile.
+    country: Optional[str] = None
+    # Optional hiring region: Latam | EU | Canada | US | Asia.
+    region: Optional[str] = None
     createdBy: PydanticObjectId
     resumes: List[Resume] = []
 
