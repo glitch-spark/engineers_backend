@@ -76,6 +76,8 @@ def _strip_markdown_from_account(payload: dict) -> dict:
 
 class AccountCreate(BaseModel):
     name: str
+    country: Optional[str] = None
+    region: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
     resumePromptBody: Optional[str] = None
     styleTemplate: Optional[str] = None
@@ -88,6 +90,8 @@ class AccountCreate(BaseModel):
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
     resumePromptBody: Optional[str] = None
     styleTemplate: Optional[str] = None
@@ -97,6 +101,39 @@ class AccountUpdate(BaseModel):
     screeningPrompt: Optional[str] = None
     coverLetterPrompt: Optional[str] = None
     showInGenerate: Optional[bool] = None
+
+
+ALLOWED_REGIONS = frozenset({"Latam", "EU", "Canada", "US", "Asia"})
+
+
+def _normalize_country(raw: Optional[str]) -> Optional[str]:
+    """Store ISO alpha-2 uppercase, or None when cleared/empty."""
+    if raw is None:
+        return None
+    code = (raw or "").strip().upper()
+    if not code:
+        return None
+    if len(code) != 2 or not code.isalpha():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="country must be a 2-letter ISO code",
+        )
+    return code
+
+
+def _normalize_region(raw: Optional[str]) -> Optional[str]:
+    """Store one of ALLOWED_REGIONS, or None when cleared/empty."""
+    if raw is None:
+        return None
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if value not in ALLOWED_REGIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"region must be one of: {', '.join(sorted(ALLOWED_REGIONS))}",
+        )
+    return value
 
 
 @router.get("/lookup")
@@ -113,6 +150,8 @@ async def lookup_accounts(
             {
                 "_id": str(a.id),
                 "name": a.name,
+                "country": a.country,
+                "region": a.region,
                 "hasTemplate": bool((a.styleTemplate or "").strip()),
                 "hasPrompt": bool((a.resumePromptBody or "").strip()),
                 "createdBy": str(a.createdBy),
@@ -186,6 +225,8 @@ async def create_account(
     resumes = _validate_and_normalize_resumes(body.resumes or [])
     kwargs: dict = dict(
         name=body.name,
+        country=_normalize_country(body.country),
+        region=_normalize_region(body.region),
         createdBy=user.id,
         resumes=resumes,
         resumePromptBody=body.resumePromptBody,
@@ -215,6 +256,11 @@ async def update_account(
 
     if body.name is not None:
         acc.name = body.name
+    if body.country is not None:
+        # Allow clearing with "" — normalize to None.
+        acc.country = _normalize_country(body.country)
+    if body.region is not None:
+        acc.region = _normalize_region(body.region)
     if body.resumes is not None:
         acc.resumes = _validate_and_normalize_resumes(body.resumes)
     if body.resumePromptBody is not None:
