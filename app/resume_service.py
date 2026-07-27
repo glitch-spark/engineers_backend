@@ -668,6 +668,10 @@ _COVER_LETTER_SYSTEM = (
     "name.\n"
     "- If the resume lacks evidence for a JD requirement, do not claim "
     "it — pivot to adjacent strengths.\n"
+    "- Do NOT include personal contact details (phone number, email, "
+    "mailing address, LinkedIn URL, portfolio URL, or similar) unless the "
+    "custom prompt below explicitly asks for them. Candidate name is "
+    "allowed when natural; everything else stays out by default.\n"
 )
 
 
