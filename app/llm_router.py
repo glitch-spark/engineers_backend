@@ -343,6 +343,9 @@ def _answers_from_parsed(parsed: object) -> list[str]:
 
 
 def parse_screening_answers(raw: str, questions: list[str]) -> list[str]:
+    # Lazy import: resume_service imports this module at top level.
+    from app.resume_service import _normalize_dashes
+
     answers: list[str] = []
     parsed = _try_parse_jsonish(raw)
     if parsed is not None:
@@ -355,7 +358,7 @@ def parse_screening_answers(raw: str, questions: list[str]) -> list[str]:
         answers = [_coerce_screening_answer(c) for c in chunks if c.strip()]
     while len(answers) < len(questions):
         answers.append("")
-    return answers[: len(questions)]
+    return [_normalize_dashes(a) for a in answers[: len(questions)]]
 
 
 def _validate_screening_output(raw: str, questions: list[str]) -> None:
