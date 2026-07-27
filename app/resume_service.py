@@ -132,9 +132,18 @@ def _strip_fences(s: str) -> str:
     return s.strip()
 
 
-def _normalize_dashes(html: str) -> str:
-    """Replace typographic em dashes with ASCII hyphens for PDF compatibility."""
-    return (html or "").replace("\u2014", "-")
+# Typographic “long” dashes LLMs often emit → ASCII hyphen-minus.
+_LONG_DASH_TRANSLATE = str.maketrans({
+    "\u2012": "-",  # figure dash ‒
+    "\u2013": "-",  # en dash –
+    "\u2014": "-",  # em dash —
+    "\u2015": "-",  # horizontal bar ―
+})
+
+
+def _normalize_dashes(text: str) -> str:
+    """Replace common typographic long dashes with ASCII hyphens."""
+    return (text or "").translate(_LONG_DASH_TRANSLATE)
 
 
 _BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
@@ -153,7 +162,7 @@ def _body_inner_html(html: str) -> Optional[str]:
 
 
 def _normalize_dashes_body_only(html: str) -> str:
-    """Normalize em dashes inside <body> only — never touch <style>/<head>."""
+    """Normalize long dashes inside <body> only — never touch <style>/<head>."""
     m = _BODY_OPEN_RE.search(html or "")
     if not m:
         return _normalize_dashes(html)
@@ -710,4 +719,4 @@ async def generate_cover_letter(
         "=== JOB DESCRIPTION (what the letter must address) ===\n" + jd
     )
     text, usage = await _openai_call("\n\n".join(parts))
-    return _strip_fences(text), usage
+    return _normalize_dashes(_strip_fences(text)), usage
