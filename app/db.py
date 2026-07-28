@@ -36,6 +36,7 @@ from app.models import (
     UserExtra,
     WeeklyPlan,
 )
+from app.models.slack_alert_log import SlackAlertLog
 
 DOCUMENT_MODELS = [
     UserExtra,
@@ -56,6 +57,7 @@ DOCUMENT_MODELS = [
     EmailRule,
     EmailClassificationCache,
     ResumeLLMCache,
+    SlackAlertLog,
 ]
 
 

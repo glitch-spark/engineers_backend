@@ -21,6 +21,7 @@ from app.routers import (
     profile,
     resume,
     skills,
+    slack_bot,
     transactions,
     users,
     weekly_plans,
@@ -82,6 +83,8 @@ def create_app() -> FastAPI:
     app.include_router(integrations.router)
     app.include_router(integrations.oauth_router)
     app.include_router(integrations.outlook_oauth_router)
+    app.include_router(slack_bot.router)
+    app.include_router(slack_bot.cron_router)
 
     return app
 
