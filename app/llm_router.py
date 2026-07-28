@@ -327,19 +327,76 @@ def _try_parse_jsonish(raw: str) -> object | None:
 
 
 def _answers_from_parsed(parsed: object) -> list[str]:
+    """Extract a list of plain answer strings from a parsed LLM payload.
+
+    Handles double-encoded JSON strings and full `{"answers":[...]}` blobs
+    stuffed into a single string element (common free-LLM wrapping).
+    """
     if isinstance(parsed, dict):
-        if isinstance(parsed.get("answers"), list):
-            return [_coerce_screening_answer(a) for a in parsed["answers"]]
+        ans = parsed.get("answers")
+        if isinstance(ans, list):
+            # Full payload mistakenly nested as the sole answers[0] element.
+            if len(ans) == 1:
+                only = ans[0]
+                if isinstance(only, str):
+                    nested = _try_parse_jsonish(only.strip())
+                    if nested is not None:
+                        expanded = _answers_from_parsed(nested)
+                        if len(expanded) > 1 or (expanded and expanded[0] and expanded[0] != only.strip()):
+                            return expanded
+                elif isinstance(only, (dict, list)):
+                    expanded = _answers_from_parsed(only)
+                    if len(expanded) > 1:
+                        return expanded
+            return [_coerce_screening_answer(a) for a in ans]
+        if isinstance(ans, str):
+            nested = _try_parse_jsonish(ans.strip())
+            if nested is not None:
+                return _answers_from_parsed(nested)
         # Single Q&A object mistakenly returned as the whole payload.
         if "answer" in parsed:
             return [_coerce_screening_answer(parsed)]
         return []
     if isinstance(parsed, list):
+        if len(parsed) == 1:
+            only = parsed[0]
+            if isinstance(only, str):
+                nested = _try_parse_jsonish(only.strip())
+                if nested is not None:
+                    expanded = _answers_from_parsed(nested)
+                    if len(expanded) > 1:
+                        return expanded
+            elif isinstance(only, (dict, list)):
+                expanded = _answers_from_parsed(only)
+                if len(expanded) > 1:
+                    return expanded
         return [_coerce_screening_answer(a) for a in parsed]
     if isinstance(parsed, str):
+        text = parsed.strip()
+        if not text:
+            return []
+        nested = _try_parse_jsonish(text)
+        # Recurse when the string unwraps to a structured payload (double-encoded
+        # JSON). Avoid infinite loops on plain strings that parse to themselves.
+        if nested is not None and not (isinstance(nested, str) and nested == text):
+            return _answers_from_parsed(nested)
         coerced = _coerce_screening_answer(parsed)
         return [coerced] if coerced else []
     return []
+
+
+def _expand_if_single_payload(answers: list[str]) -> list[str]:
+    """If fallback left one blob that is a full answers JSON, expand it."""
+    non_empty = [a for a in answers if (a or "").strip()]
+    if len(non_empty) != 1:
+        return answers
+    nested = _try_parse_jsonish(non_empty[0].strip())
+    if nested is None:
+        return answers
+    expanded = _answers_from_parsed(nested)
+    if len(expanded) > 1 and any(a.strip() for a in expanded):
+        return expanded
+    return answers
 
 
 def parse_screening_answers(raw: str, questions: list[str]) -> list[str]:
@@ -356,6 +413,9 @@ def parse_screening_answers(raw: str, questions: list[str]) -> list[str]:
     if not answers:
         chunks = re.split(r"^\s*\d+\.\s*", raw, flags=re.MULTILINE)
         answers = [_coerce_screening_answer(c) for c in chunks if c.strip()]
+        answers = _expand_if_single_payload(answers)
+    else:
+        answers = _expand_if_single_payload(answers)
     while len(answers) < len(questions):
         answers.append("")
     return [_normalize_dashes(a) for a in answers[: len(questions)]]

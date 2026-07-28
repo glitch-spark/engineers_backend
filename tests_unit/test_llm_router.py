@@ -121,6 +121,47 @@ def test_parse_screening_answers_stringified_dict_entries():
     ]
 
 
+def test_parse_screening_answers_double_encoded_json_string():
+    """Model returns a JSON string whose contents are the answers object.
+
+    Previously this stuffed the escaped blob into Q1 and left the rest empty.
+    """
+    inner = {
+        "answers": [
+            "I led the architectural design and deployment of AI systems.",
+            "I would implement comprehensive logging and monitoring.",
+            "I regularly attend conferences and take online courses.",
+            "I would need input from data scientists and product managers.",
+        ]
+    }
+    raw = json.dumps(json.dumps(inner))
+    qs = ["Q1", "Q2", "Q3", "Q4"]
+    out = parse_screening_answers(raw, qs)
+    assert out == inner["answers"]
+    assert not out[0].strip().startswith("{")
+    assert not out[0].strip().startswith('"')
+
+
+def test_parse_screening_answers_full_payload_stuffed_in_answers_zero():
+    """Full {"answers":[...]} JSON string stuffed into answers[0]."""
+    inner_answers = [
+        "First real answer",
+        "Second real answer",
+        "Third real answer",
+        "Fourth real answer",
+    ]
+    raw = json.dumps({"answers": [json.dumps({"answers": inner_answers})]})
+    out = parse_screening_answers(raw, ["Q1", "Q2", "Q3", "Q4"])
+    assert out == inner_answers
+
+
+def test_parse_screening_answers_stringified_answers_array_field():
+    """answers field is a stringified JSON array instead of a list."""
+    answers = ["Alpha", "Beta", "Gamma"]
+    raw = json.dumps({"answers": json.dumps(answers)})
+    assert parse_screening_answers(raw, ["Q1", "Q2", "Q3"]) == answers
+
+
 def test_free_llm_user_message_timeout():
     from openai import APITimeoutError
 
