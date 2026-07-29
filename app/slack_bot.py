@@ -1,14 +1,17 @@
-"""Slack interview bot: OAuth identity link + private DM reminders.
+"""Slack interview bot: OAuth identity link + private daily digest DMs.
 
 Uses the workspace Bot Token for chat.postMessage DMs. Users connect via
 Slack OAuth (user_scope=identity.basic) so we store their Slack member id
 on UserExtra — never post interview details to a shared channel.
+
+Interviews are date-only, so there is no T-30 reminder — only a daily digest
+at each user's chosen time/timezone.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -17,6 +20,7 @@ import httpx
 from beanie import PydanticObjectId
 
 from app.config import get_settings
+from app.know_your_why import know_your_why_for_date
 from app.models import Interview, UserExtra
 from app.models.interview import InterviewStatus
 from app.models.slack_alert_log import SlackAlertLog
@@ -27,6 +31,7 @@ _SLACK_AUTHORIZE = "https://slack.com/oauth/v2/authorize"
 _SLACK_TOKEN = "https://slack.com/api/oauth.v2.access"
 _SLACK_API = "https://slack.com/api"
 _USER_SCOPE = "identity.basic"
+_DEFAULT_TZ = "America/New_York"
 
 
 def slack_bot_configured() -> bool:
@@ -41,17 +46,33 @@ def slack_oauth_configured() -> bool:
     )
 
 
-def _app_tz() -> ZoneInfo:
-    name = (get_settings().APP_TIMEZONE or "").strip() or "UTC"
+def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
+    """IANA timezone for Slack digest: user override → APP_TIMEZONE → America/New_York."""
+    candidates: list[str] = []
+    if user is not None and (user.slackTimezone or "").strip():
+        candidates.append(user.slackTimezone.strip())
+    app = (get_settings().APP_TIMEZONE or "").strip()
+    if app:
+        candidates.append(app)
+    candidates.append(_DEFAULT_TZ)
+    for name in candidates:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            log.warning("slack_bot: invalid timezone=%r — trying next", name)
+    return ZoneInfo("UTC")
+
+
+def validate_timezone(name: str) -> str:
+    """Return stripped IANA name or raise ValueError."""
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise ValueError("timezone is required")
     try:
-        return ZoneInfo(name)
-    except Exception:
-        log.warning("slack_bot: invalid APP_TIMEZONE=%r — UTC", name)
-        return ZoneInfo("UTC")
-
-
-def _now_app() -> datetime:
-    return datetime.now(_app_tz())
+        ZoneInfo(cleaned)
+    except Exception as exc:
+        raise ValueError(f"invalid timezone: {cleaned}") from exc
+    return cleaned
 
 
 def _frontend_link(path: str) -> str:
@@ -132,19 +153,24 @@ async def send_dm(slack_user_id: str, *, text: str, blocks: Optional[list[dict]]
         return False
 
 
-def _fmt_when(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_app_tz())
-    local = dt.astimezone(_app_tz())
-    return local.strftime("%a %b %d · %I:%M %p %Z")
+def _fmt_date(dt: datetime) -> str:
+    """Date-only label — interviews are calendar dates, not clock times."""
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.strftime("%a %b %d")
 
 
-def _interview_blocks(title: str, interviews: list[Interview]) -> list[dict[str, Any]]:
+def _interview_blocks(
+    title: str,
+    interviews: list[Interview],
+    *,
+    why: str,
+) -> list[dict[str, Any]]:
     lines = []
     for iv in interviews:
         company = (iv.companyName or "Interview").strip()
         stage = iv.stage.value if iv.stage else "—"
-        when = _fmt_when(iv.scheduledAt)
+        when = _fmt_date(iv.scheduledAt) if iv.scheduledAt else "—"
         pos = (iv.appliedPosition or "").strip()
         extra = f" · {pos}" if pos else ""
         lines.append(f"• *{company}*{extra}\n  {when} · `{stage}`")
@@ -158,6 +184,16 @@ def _interview_blocks(title: str, interviews: list[Interview]) -> list[dict[str,
                 "type": "mrkdwn",
                 "text": f"<{_frontend_link('/interviews')}|Open interviews>",
             },
+        },
+        {"type": "divider"},
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Know your why*\n_{why}_",
+                }
+            ],
         },
     ]
 
@@ -186,18 +222,6 @@ async def _mark_sent(
         log.debug("slack_bot mark_sent race kind=%s: %s", kind, exc)
 
 
-def reminder_window(
-    now: datetime,
-    *,
-    minutes: int,
-    skew_seconds: int = 90,
-) -> tuple[datetime, datetime]:
-    """Return [target − skew, target + skew] for scheduledAt matching."""
-    target = now + timedelta(minutes=minutes)
-    skew = timedelta(seconds=skew_seconds)
-    return target - skew, target + skew
-
-
 def digest_slot_open(
     now_local: datetime,
     *,
@@ -208,6 +232,13 @@ def digest_slot_open(
     """True if now is within [digest_time, digest_time + window)."""
     slot = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
     return slot <= now_local < slot + timedelta(minutes=window_minutes)
+
+
+def calendar_day_bounds(day: date) -> tuple[datetime, datetime]:
+    """Naive [day 00:00, next day 00:00) for date-only scheduledAt (stored as T12:00)."""
+    start = datetime(day.year, day.month, day.day, 0, 0, 0)
+    end = start + timedelta(days=1)
+    return start, end
 
 
 async def _linked_users() -> list[UserExtra]:
@@ -225,68 +256,25 @@ _SKIP_STATUSES = {
 }
 
 
-def _as_naive_utc_bounds(start: datetime, end: datetime) -> tuple[datetime, datetime]:
-    """Interview.scheduledAt is often naive; compare with naive UTC window."""
-    def to_naive_utc(dt: datetime) -> datetime:
-        if dt.tzinfo is None:
-            return dt
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-
-    return to_naive_utc(start), to_naive_utc(end)
-
-
-async def run_t30_for_user(user: UserExtra, now: datetime) -> int:
-    """Send T-30 DMs for this user. Returns number of DMs sent."""
-    slack_id = (user.slackUserId or "").strip()
-    if not slack_id:
-        return 0
-    minutes = get_settings().SLACK_REMINDER_MINUTES or 30
-    start, end = reminder_window(now, minutes=minutes)
-    start_n, end_n = _as_naive_utc_bounds(start, end)
-
-    candidates = await Interview.find(
-        {
-            "createdBy": user.id,
-            "scheduledAt": {"$gte": start_n, "$lte": end_n},
-        }
-    ).to_list()
-
-    sent = 0
-    for iv in candidates:
-        if iv.status in _SKIP_STATUSES:
-            continue
-        kind = f"t30:{iv.id}"
-        if await _already_sent(user.id, kind):
-            continue
-        title = "Interview in 30 minutes"
-        blocks = _interview_blocks(title, [iv])
-        text = f"Interview reminder: {iv.companyName or 'upcoming'} at {_fmt_when(iv.scheduledAt)}"
-        ok = await send_dm(slack_id, text=text, blocks=blocks)
-        if ok:
-            await _mark_sent(user.id, kind, interview_id=iv.id)
-            sent += 1
-    return sent
-
-
-async def run_digest_for_user(user: UserExtra, now_local: datetime) -> int:
-    """Send morning digest if in slot and not yet sent today."""
+async def run_digest_for_user(user: UserExtra) -> int:
+    """Send daily digest if in slot and not yet sent today. Returns 1 if DM sent."""
     slack_id = (user.slackUserId or "").strip()
     if not slack_id:
         return 0
     s = get_settings()
+    tz = resolve_user_tz(user)
+    now_local = datetime.now(tz)
     hour = user.slackDigestHour if user.slackDigestHour is not None else s.SLACK_DIGEST_HOUR
     minute = user.slackDigestMinute if user.slackDigestMinute is not None else s.SLACK_DIGEST_MINUTE
     if not digest_slot_open(now_local, hour=hour, minute=minute):
         return 0
-    day_key = now_local.strftime("%Y-%m-%d")
+    day = now_local.date()
+    day_key = day.isoformat()
     kind = f"digest:{day_key}"
     if await _already_sent(user.id, kind):
         return 0
 
-    day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
-    start_n = day_start.replace(tzinfo=None)
-    end_n = day_end.replace(tzinfo=None)
+    start_n, end_n = calendar_day_bounds(day)
     interviews = await Interview.find(
         {
             "createdBy": user.id,
@@ -298,9 +286,10 @@ async def run_digest_for_user(user: UserExtra, now_local: datetime) -> int:
         await _mark_sent(user.id, kind)
         return 0
 
+    why = know_your_why_for_date(day)
     title = f"Today's interviews ({len(interviews)})"
-    blocks = _interview_blocks(title, interviews)
-    text = f"You have {len(interviews)} interview(s) today."
+    blocks = _interview_blocks(title, interviews, why=why)
+    text = f"You have {len(interviews)} interview(s) today. Know your why: {why}"
     ok = await send_dm(slack_id, text=text, blocks=blocks)
     if ok:
         await _mark_sent(user.id, kind)
@@ -309,18 +298,14 @@ async def run_digest_for_user(user: UserExtra, now_local: datetime) -> int:
 
 
 async def run_alert_tick() -> dict[str, int]:
-    """Cron entrypoint: T-30 + digest for every linked user."""
+    """Cron entrypoint: daily digest for every linked user."""
     if not slack_bot_configured():
-        return {"users": 0, "t30": 0, "digest": 0, "skipped": 1}
+        return {"users": 0, "digest": 0, "skipped": 1}
     users = await _linked_users()
-    now_local = _now_app()
-    now_utc = datetime.now(timezone.utc)
-    t30_total = 0
     digest_total = 0
     for user in users:
         try:
-            t30_total += await run_t30_for_user(user, now_utc)
-            digest_total += await run_digest_for_user(user, now_local)
+            digest_total += await run_digest_for_user(user)
         except Exception as exc:
             log.exception("slack_bot tick failed for user=%s: %s", user.id, exc)
-    return {"users": len(users), "t30": t30_total, "digest": digest_total, "skipped": 0}
+    return {"users": len(users), "digest": digest_total, "skipped": 0}

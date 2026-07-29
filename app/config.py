@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     SLACK_CLIENT_SECRET: Optional[str] = None
     SLACK_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/slack/oauth-callback"
     SLACK_BOT_CRON_SECRET: Optional[str] = None
-    SLACK_REMINDER_MINUTES: int = 30
     SLACK_DIGEST_HOUR: int = 8
     SLACK_DIGEST_MINUTE: int = 0
     JWT_EXPIRES_MIN: int = 720

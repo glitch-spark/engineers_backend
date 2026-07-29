@@ -17,13 +17,16 @@ from pydantic import BaseModel, Field
 from app.config import get_settings
 from app.deps import get_current_user
 from app.models import UserExtra
+from app.know_your_why import know_your_why_for_date
 from app.slack_bot import (
     build_oauth_authorize_url,
     exchange_oauth_code,
+    resolve_user_tz,
     run_alert_tick,
     send_dm,
     slack_bot_configured,
     slack_oauth_configured,
+    validate_timezone,
 )
 
 log = logging.getLogger(__name__)
@@ -71,9 +74,13 @@ def _frontend_redirect(*, status_value: str, detail: Optional[str] = None) -> Re
 def _slack_profile_fields(user: UserExtra) -> dict:
     connected = bool((user.slackUserId or "").strip())
     s = get_settings()
+    tz_name = (user.slackTimezone or "").strip() or (
+        (s.APP_TIMEZONE or "").strip() or "America/New_York"
+    )
     return {
         "slackConnected": connected,
         "slackAlertsEnabled": bool(user.slackAlertsEnabled),
+        "slackTimezone": tz_name,
         "slackDigestHour": (
             user.slackDigestHour
             if user.slackDigestHour is not None
@@ -91,6 +98,7 @@ def _slack_profile_fields(user: UserExtra) -> dict:
 
 class SlackPrefsUpdate(BaseModel):
     slackAlertsEnabled: Optional[bool] = None
+    slackTimezone: Optional[str] = None
     slackDigestHour: Optional[int] = Field(default=None, ge=0, le=23)
     slackDigestMinute: Optional[int] = Field(default=None, ge=0, le=59)
 
@@ -162,6 +170,14 @@ async def slack_prefs(
 ) -> dict:
     if body.slackAlertsEnabled is not None:
         user.slackAlertsEnabled = body.slackAlertsEnabled
+    if body.slackTimezone is not None:
+        try:
+            user.slackTimezone = validate_timezone(body.slackTimezone)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
     if body.slackDigestHour is not None:
         user.slackDigestHour = body.slackDigestHour
     if body.slackDigestMinute is not None:
@@ -183,9 +199,10 @@ async def slack_test_dm(user: Annotated[UserExtra, Depends(get_current_user)]) -
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Connect Slack before sending a test DM",
         )
+    why = know_your_why_for_date(datetime.now(resolve_user_tz(user)).date())
     ok = await send_dm(
         slack_id,
-        text="Engineers bot is connected. You'll get interview reminders here.",
+        text="Engineers bot is connected. You'll get a daily interview digest here.",
         blocks=[
             {
                 "type": "section",
@@ -193,11 +210,18 @@ async def slack_test_dm(user: Annotated[UserExtra, Depends(get_current_user)]) -
                     "type": "mrkdwn",
                     "text": (
                         "*Engineers bot connected*\n"
-                        "You'll get a DM ~30 minutes before each interview "
-                        "and a morning digest of today's interviews."
+                        "You'll get a private DM with today's interviews "
+                        "at your chosen digest time (Profile → Slack)."
                     ),
                 },
-            }
+            },
+            {"type": "divider"},
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f"*Know your why*\n_{why}_"},
+                ],
+            },
         ],
     )
     if not ok:

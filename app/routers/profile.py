@@ -45,9 +45,13 @@ class PasswordChange(BaseModel):
 def _slack_profile_fields(user: UserExtra) -> dict:
     s = get_settings()
     connected = bool((user.slackUserId or "").strip())
+    tz_name = (user.slackTimezone or "").strip() or (
+        (s.APP_TIMEZONE or "").strip() or "America/New_York"
+    )
     return {
         "slackConnected": connected,
         "slackAlertsEnabled": bool(user.slackAlertsEnabled),
+        "slackTimezone": tz_name,
         "slackDigestHour": (
             user.slackDigestHour
             if user.slackDigestHour is not None
