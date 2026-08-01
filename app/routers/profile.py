@@ -10,7 +10,12 @@ from app.free_llm import api_key_hint, clamp_max_tokens, get_preset, preset_cata
 from app.llm_router import test_free_connection
 from app.models import UserExtra
 from app.security import hash_password, verify_password
-from app.slack_bot import slack_bot_configured, slack_oauth_configured
+from app.slack_bot import (
+    normalize_slack_timezone,
+    slack_bot_configured,
+    slack_oauth_configured,
+)
+from app.slack_timezones import slack_timezone_catalog
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -45,13 +50,16 @@ class PasswordChange(BaseModel):
 def _slack_profile_fields(user: UserExtra) -> dict:
     s = get_settings()
     connected = bool((user.slackUserId or "").strip())
-    tz_name = (user.slackTimezone or "").strip() or (
-        (s.APP_TIMEZONE or "").strip() or "America/New_York"
+    tz_name = normalize_slack_timezone(
+        (user.slackTimezone or "").strip()
+        or (s.APP_TIMEZONE or "").strip()
+        or "America/New_York"
     )
     return {
         "slackConnected": connected,
         "slackAlertsEnabled": bool(user.slackAlertsEnabled),
         "slackTimezone": tz_name,
+        "slackTimezones": slack_timezone_catalog(),
         "slackDigestHour": (
             user.slackDigestHour
             if user.slackDigestHour is not None
