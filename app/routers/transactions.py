@@ -189,9 +189,48 @@ async def list_transactions(
     rows = await Transaction.find(query).sort([("date", -1)]).skip(skip).limit(limit).to_list()
     txs_out = await populate_owner(rows, field="userId")
 
+    # Per-user income (amount > 0) / outcome (amount < 0) for the same filters.
+    totals_pipeline = [
+        {"$match": query},
+        {"$group": {
+            "_id": "$userId",
+            "income": {
+                "$sum": {"$cond": [{"$gt": ["$amount", 0]}, "$amount", 0]},
+            },
+            "outcome": {
+                "$sum": {"$cond": [{"$lt": ["$amount", 0]}, {"$abs": "$amount"}, 0]},
+            },
+            "net": {"$sum": "$amount"},
+            "count": {"$sum": 1},
+        }},
+        {"$sort": {"net": -1}},
+    ]
+    totals_rows = await Transaction.aggregate(totals_pipeline).to_list()
+    user_ids = [r["_id"] for r in totals_rows if r.get("_id") is not None]
+    owners: dict[str, UserExtra] = {}
+    if user_ids:
+        for u in await UserExtra.find({"_id": {"$in": user_ids}}).to_list():
+            owners[str(u.id)] = u
+
+    user_totals = []
+    for r in totals_rows:
+        uid = str(r["_id"]) if r.get("_id") is not None else ""
+        owner = owners.get(uid)
+        user_totals.append({
+            "userId": uid,
+            "name": (owner.name if owner else None) or (owner.email if owner else None) or uid,
+            "email": owner.email if owner else None,
+            "image": owner.image if owner else None,
+            "income": float(r.get("income") or 0),
+            "outcome": float(r.get("outcome") or 0),
+            "net": float(r.get("net") or 0),
+            "count": int(r.get("count") or 0),
+        })
+
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
         "transactions": txs_out,
+        "userTotals": user_totals,
         "pagination": {
             "page": page,
             "limit": limit,
