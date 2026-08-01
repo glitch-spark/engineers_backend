@@ -8,6 +8,12 @@ from __future__ import annotations
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+# Ensure IANA DB is available on slim images (Railway) without system zoneinfo.
+try:
+    import tzdata  # noqa: F401
+except ImportError:
+    pass
+
 # (iana_id, label) — 27 entries, UTC−12 … UTC+14 inclusive.
 # Prefer widely-shipped zone names so Railway/older tzdata accept them.
 SLACK_DIGEST_TIMEZONES: tuple[tuple[str, str], ...] = (
