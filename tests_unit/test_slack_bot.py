@@ -8,6 +8,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.know_your_why import know_your_why_for_date
 from app.slack_bot import calendar_day_bounds, digest_slot_open, validate_timezone
+from app.slack_timezones import SLACK_DIGEST_TIMEZONES, normalize_slack_timezone
 
 
 def test_digest_slot_open_inside_window():
@@ -29,15 +30,24 @@ def test_calendar_day_bounds():
 
 
 def test_validate_timezone_ok():
+    assert validate_timezone("Asia/Hong_Kong") == "Asia/Hong_Kong"
     assert validate_timezone("America/New_York") == "America/New_York"
 
 
 def test_validate_timezone_invalid():
     try:
-        validate_timezone("Not/AZone")
+        validate_timezone("Asia/Famagusta")
         assert False, "expected ValueError"
-    except ValueError:
-        pass
+    except ValueError as exc:
+        assert "invalid timezone" in str(exc)
+
+
+def test_normalize_unknown_falls_back():
+    assert normalize_slack_timezone("Asia/Famagusta") == "America/New_York"
+
+
+def test_catalog_has_27_hourly_offsets():
+    assert len(SLACK_DIGEST_TIMEZONES) == 27
 
 
 def test_know_your_why_stable_for_date():

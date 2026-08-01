@@ -21,6 +21,7 @@ from app.know_your_why import know_your_why_for_date
 from app.slack_bot import (
     build_oauth_authorize_url,
     exchange_oauth_code,
+    normalize_slack_timezone,
     resolve_user_tz,
     run_alert_tick,
     send_dm,
@@ -28,6 +29,8 @@ from app.slack_bot import (
     slack_oauth_configured,
     validate_timezone,
 )
+from app.slack_timezones import slack_timezone_catalog
+
 
 log = logging.getLogger(__name__)
 
@@ -74,13 +77,16 @@ def _frontend_redirect(*, status_value: str, detail: Optional[str] = None) -> Re
 def _slack_profile_fields(user: UserExtra) -> dict:
     connected = bool((user.slackUserId or "").strip())
     s = get_settings()
-    tz_name = (user.slackTimezone or "").strip() or (
-        (s.APP_TIMEZONE or "").strip() or "America/New_York"
+    tz_name = normalize_slack_timezone(
+        (user.slackTimezone or "").strip()
+        or (s.APP_TIMEZONE or "").strip()
+        or "America/New_York"
     )
     return {
         "slackConnected": connected,
         "slackAlertsEnabled": bool(user.slackAlertsEnabled),
         "slackTimezone": tz_name,
+        "slackTimezones": slack_timezone_catalog(),
         "slackDigestHour": (
             user.slackDigestHour
             if user.slackDigestHour is not None

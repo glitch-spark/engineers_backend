@@ -24,6 +24,7 @@ from app.know_your_why import know_your_why_for_date
 from app.models import Interview, UserExtra
 from app.models.interview import InterviewStatus
 from app.models.slack_alert_log import SlackAlertLog
+from app.slack_timezones import normalize_slack_timezone, validate_timezone, zoneinfo_for_slack
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +32,6 @@ _SLACK_AUTHORIZE = "https://slack.com/oauth/v2/authorize"
 _SLACK_TOKEN = "https://slack.com/api/oauth.v2.access"
 _SLACK_API = "https://slack.com/api"
 _USER_SCOPE = "identity.basic"
-_DEFAULT_TZ = "America/New_York"
 
 
 def slack_bot_configured() -> bool:
@@ -47,32 +47,11 @@ def slack_oauth_configured() -> bool:
 
 
 def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
-    """IANA timezone for Slack digest: user override → APP_TIMEZONE → America/New_York."""
-    candidates: list[str] = []
+    """IANA timezone for Slack digest from the fixed GMT-offset allowlist."""
     if user is not None and (user.slackTimezone or "").strip():
-        candidates.append(user.slackTimezone.strip())
+        return zoneinfo_for_slack(user.slackTimezone)
     app = (get_settings().APP_TIMEZONE or "").strip()
-    if app:
-        candidates.append(app)
-    candidates.append(_DEFAULT_TZ)
-    for name in candidates:
-        try:
-            return ZoneInfo(name)
-        except Exception:
-            log.warning("slack_bot: invalid timezone=%r — trying next", name)
-    return ZoneInfo("UTC")
-
-
-def validate_timezone(name: str) -> str:
-    """Return stripped IANA name or raise ValueError."""
-    cleaned = (name or "").strip()
-    if not cleaned:
-        raise ValueError("timezone is required")
-    try:
-        ZoneInfo(cleaned)
-    except Exception as exc:
-        raise ValueError(f"invalid timezone: {cleaned}") from exc
-    return cleaned
+    return zoneinfo_for_slack(app or None)
 
 
 def _frontend_link(path: str) -> str:
