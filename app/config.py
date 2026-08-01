@@ -14,6 +14,16 @@ class Settings(BaseSettings):
     APP_BASE_URL: str = "http://localhost:8080"
     APP_TIMEZONE: str = "America/New_York"
     SLACK_WEBHOOK_URL: Optional[str] = None
+    # Slack interview bot (private DMs). Bot token sends messages; OAuth
+    # client identifies which Slack user connected. Cron secret protects the
+    # scheduled tick endpoint. All optional so the app boots without Slack.
+    SLACK_BOT_TOKEN: Optional[str] = None
+    SLACK_CLIENT_ID: Optional[str] = None
+    SLACK_CLIENT_SECRET: Optional[str] = None
+    SLACK_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/slack/oauth-callback"
+    SLACK_BOT_CRON_SECRET: Optional[str] = None
+    SLACK_DIGEST_HOUR: int = 8
+    SLACK_DIGEST_MINUTE: int = 0
     JWT_EXPIRES_MIN: int = 720
     OPENAI_API_KEY: Optional[str] = None
     # Streamed AI Review (interview): chat-completions, long-form. Mini is enough.

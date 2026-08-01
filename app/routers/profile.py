@@ -5,10 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
+from app.config import get_settings
 from app.free_llm import api_key_hint, clamp_max_tokens, get_preset, preset_catalog_public
 from app.llm_router import test_free_connection
 from app.models import UserExtra
 from app.security import hash_password, verify_password
+from app.slack_bot import slack_bot_configured, slack_oauth_configured
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -38,6 +40,31 @@ class FreeLlmSettingsUpdate(BaseModel):
 class PasswordChange(BaseModel):
     currentPassword: str
     newPassword: str
+
+
+def _slack_profile_fields(user: UserExtra) -> dict:
+    s = get_settings()
+    connected = bool((user.slackUserId or "").strip())
+    tz_name = (user.slackTimezone or "").strip() or (
+        (s.APP_TIMEZONE or "").strip() or "America/New_York"
+    )
+    return {
+        "slackConnected": connected,
+        "slackAlertsEnabled": bool(user.slackAlertsEnabled),
+        "slackTimezone": tz_name,
+        "slackDigestHour": (
+            user.slackDigestHour
+            if user.slackDigestHour is not None
+            else s.SLACK_DIGEST_HOUR
+        ),
+        "slackDigestMinute": (
+            user.slackDigestMinute
+            if user.slackDigestMinute is not None
+            else s.SLACK_DIGEST_MINUTE
+        ),
+        "slackOAuthConfigured": slack_oauth_configured(),
+        "slackBotConfigured": slack_bot_configured(),
+    }
 
 
 def _parse_dt(s: str) -> Optional[datetime]:
@@ -93,6 +120,7 @@ async def get_profile(user: Annotated[UserExtra, Depends(get_current_user)]) -> 
             "screeningPromptBody": user.screeningPromptBody or "",
             "coverLetterPromptBody": user.coverLetterPromptBody or "",
             **_free_llm_profile_fields(user),
+            **_slack_profile_fields(user),
         }
     }
 

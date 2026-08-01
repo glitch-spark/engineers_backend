@@ -42,6 +42,13 @@ class UserExtra(TimestampedDocument):
     freeLlmMaxTokens: Optional[int] = None
     freeLlmKeyVerified: bool = False
 
+    # Slack interview bot — private daily digest DMs.
+    slackUserId: Optional[str] = None
+    slackAlertsEnabled: bool = True
+    slackTimezone: Optional[str] = None  # IANA, e.g. America/New_York
+    slackDigestHour: Optional[int] = None
+    slackDigestMinute: Optional[int] = None
+
     class Settings:
         name = "userextras"
         indexes = [

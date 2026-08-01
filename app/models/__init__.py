@@ -11,6 +11,7 @@ from app.models.interview_chat_log import InterviewChatLog
 from app.models.interview_question import InterviewQuestion
 from app.models.resume_application import ResumeApplication
 from app.models.resume_cache import ResumeLLMCache
+from app.models.slack_alert_log import SlackAlertLog
 from app.models.transaction import Transaction
 from app.models.user_extra import UserExtra
 from app.models.weekly_plan import WeeklyPlan
@@ -31,6 +32,7 @@ __all__ = [
     "ResumeApplication",
     "ResumeLLMCache",
     "Skill",
+    "SlackAlertLog",
     "Transaction",
     "UserExtra",
     "WeeklyPlan",
