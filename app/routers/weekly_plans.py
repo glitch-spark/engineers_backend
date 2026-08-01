@@ -57,21 +57,44 @@ def _set_interviews_metric(metrics: list[WeeklyMetric], *, target: int, actual: 
     return out
 
 
-async def _apply_badge_interview_counts(plan: WeeklyPlan) -> None:
+async def _apply_badge_interview_counts(plan: WeeklyPlan) -> dict:
     """Overwrite interviews metrics from stage-badge board counts (not free text).
 
     - interviews.actual = countable badges in this plan's week
     - interviews.target = prior week's nextInterviewTarget when set (else keep
       any existing target, typically 0 after we clear AI interview numbers)
     - nextInterviewTarget = countable badges already scheduled next week
+
+    Returns a this-week / next-week snapshot for the UI:
+    `{ thisWeekTotal, thisWeekCanceled, thisWeekBreakdown, thisWeekSummary, nextWeek }`.
     """
-    from app.routers.metrics import _interview_count
+    from app.routers.metrics import (
+        _format_breakdown,
+        _interview_stats_by_user,
+    )
 
     start, end = _plan_week_bounds(plan)
     next_start, next_end = _next_week_bounds(start)
 
-    this_week = await _interview_count(plan.userId, start, end)
-    next_week = await _interview_count(plan.userId, next_start, next_end)
+    this_stats = await _interview_stats_by_user([plan.userId], start, end)
+    next_stats = await _interview_stats_by_user([plan.userId], next_start, next_end)
+
+    def _row(stats: dict) -> dict:
+        if plan.userId in stats:
+            return stats[plan.userId] or {}
+        # Beanie/ObjectId key variants
+        for k, v in stats.items():
+            if str(k) == str(plan.userId):
+                return v or {}
+        return {}
+
+    this_row = _row(this_stats)
+    next_row = _row(next_stats)
+
+    this_week = int(this_row.get("interviews", 0) or 0)
+    this_canceled = int(this_row.get("canceled", 0) or 0)
+    this_breakdown = _format_breakdown(this_row.get("breakdown") or {})
+    next_week = int(next_row.get("interviews", 0) or 0)
 
     # Prefer the forward-looking goal set on the previous week's review.
     prev_start = start - timedelta(days=7)
@@ -106,6 +129,18 @@ async def _apply_badge_interview_counts(plan: WeeklyPlan) -> None:
 
     plan.metrics = _set_interviews_metric(list(plan.metrics or []), target=target, actual=this_week)
     plan.nextInterviewTarget = next_week
+
+    parts = [f"{b['label']}-{b['count']}" for b in this_breakdown]
+    summary = f"{this_week}({', '.join(parts)})" if parts else str(this_week)
+    summary = f"{summary}/ Canceled-{this_canceled}"
+
+    return {
+        "thisWeekTotal": this_week,
+        "thisWeekCanceled": this_canceled,
+        "thisWeekBreakdown": this_breakdown,
+        "thisWeekSummary": summary,
+        "nextWeek": next_week,
+    }
 
 
 class MetricIn(BaseModel):
@@ -368,7 +403,31 @@ async def list_plans(
         .limit(limit)
         .to_list()
     )
+
+    # Refresh board interview counts on every page visit so next-week /
+    # this-week numbers stay current without requiring Progress Report.
+    interview_board: dict[str, dict] = {}
+    for p in plans:
+        try:
+            snap = await _apply_badge_interview_counts(p)
+            await p.save()
+            interview_board[str(p.id)] = snap
+        except Exception:  # noqa: BLE001
+            # Keep listing resilient if a single plan's board lookup fails.
+            interview_board[str(p.id)] = {
+                "thisWeekTotal": 0,
+                "thisWeekCanceled": 0,
+                "thisWeekBreakdown": [],
+                "thisWeekSummary": "0/ Canceled-0",
+                "nextWeek": int(p.nextInterviewTarget or 0),
+            }
+
     plans_out = await populate_owner(plans, field="userId", only=("name", "email"))
+    for row in plans_out:
+        pid = str(row.get("_id") or "")
+        if pid in interview_board:
+            row["interviewBoard"] = interview_board[pid]
+            row["nextInterviewTarget"] = interview_board[pid]["nextWeek"]
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
