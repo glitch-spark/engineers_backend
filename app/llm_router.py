@@ -288,15 +288,70 @@ def _coerce_screening_answer(item: object) -> str:
     return str(item).strip()
 
 
+def _escape_raw_controls_in_json_strings(text: str) -> str:
+    """Escape raw newlines/tabs inside JSON strings (common free-LLM bug).
+
+    Valid JSON forbids unescaped control characters in strings; models often
+    emit real newlines inside quoted answer text. Walk the text and escape
+    those controls only while inside a double-quoted string.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_string = False
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _loads_json_lenient(text: str) -> object | None:
+    """json.loads, then retry after escaping raw controls inside strings."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    repaired = _escape_raw_controls_in_json_strings(text)
+    if repaired == text:
+        return None
+    try:
+        return json.loads(repaired)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def _try_parse_jsonish(raw: str) -> object | None:
     """Parse JSON, or common near-JSON / Python-literal payloads from LLMs."""
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE).strip()
     if not cleaned:
         return None
-    try:
-        return json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError):
-        pass
+    parsed = _loads_json_lenient(cleaned)
+    if parsed is not None:
+        return parsed
     # Models sometimes emit Python dict/list literals (single quotes).
     try:
         import ast
@@ -312,18 +367,28 @@ def _try_parse_jsonish(raw: str) -> object | None:
         end = cleaned.rfind(closer)
         if start >= 0 and end > start:
             snippet = cleaned[start : end + 1]
+            parsed = _loads_json_lenient(snippet)
+            if parsed is not None:
+                return parsed
             try:
-                return json.loads(snippet)
-            except (json.JSONDecodeError, ValueError):
-                try:
-                    import ast
+                import ast
 
-                    value = ast.literal_eval(snippet)
-                    if isinstance(value, (dict, list)):
-                        return value
-                except (SyntaxError, ValueError):
-                    pass
+                value = ast.literal_eval(snippet)
+                if isinstance(value, (dict, list)):
+                    return value
+            except (SyntaxError, ValueError):
+                pass
     return None
+
+
+def _looks_like_answers_wrapper_blob(text: str) -> bool:
+    """True when an answer string is still a full {"answers":[...]} JSON dump."""
+    t = (text or "").strip()
+    if not t.startswith("{"):
+        return False
+    # Peek near the start so long answer prose with the word "answers" is fine.
+    head = t[:120].replace(" ", "")
+    return '"answers"' in head or "'answers'" in head
 
 
 def _answers_from_parsed(parsed: object) -> list[str]:
@@ -425,6 +490,10 @@ def _validate_screening_output(raw: str, questions: list[str]) -> None:
     answers = parse_screening_answers(raw, questions)
     if not any(a.strip() for a in answers):
         raise ValueError("screening LLM returned no parseable answers")
+    # Reject leftover wrapper dumps so free→OpenAI fallback retries instead of
+    # storing raw JSON (with visible \n escapes) as answer text.
+    if any(_looks_like_answers_wrapper_blob(a) for a in answers):
+        raise ValueError("screening LLM returned unparsed answers JSON wrapper")
 
 
 async def complete_screening(prompt: str, user: Optional[UserExtra], questions: list[str]) -> LlmResult:
