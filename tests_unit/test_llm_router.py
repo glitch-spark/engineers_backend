@@ -13,6 +13,7 @@ from app.llm_router import (
     _free_llm_user_message,
     _free_max_tokens_for_purpose,
     _free_timeout_for_purpose,
+    _validate_screening_output,
     free_llm_configured,
     parse_screening_answers,
 )
@@ -160,6 +161,66 @@ def test_parse_screening_answers_stringified_answers_array_field():
     answers = ["Alpha", "Beta", "Gamma"]
     raw = json.dumps({"answers": json.dumps(answers)})
     assert parse_screening_answers(raw, ["Q1", "Q2", "Q3"]) == answers
+
+
+def test_parse_screening_answers_multiline_email_payload():
+    """Valid JSON with real newlines inside answer strings unwraps cleanly."""
+    a1 = (
+        "Subject: Update on Quantitative Healthcare Survey\n\n"
+        "Dear [Client's Name],\n\n"
+        "I wanted to update you on the status of our quantitative healthcare survey."
+    )
+    a2 = (
+        "In a recent project, I utilized AI-driven tools like Qualtrics "
+        "for survey programming and data analysis."
+    )
+    raw = json.dumps({"answers": [a1, a2]})
+    out = parse_screening_answers(raw, ["Q1", "Q2"])
+    assert out == [a1, a2]
+    assert "\n\n" in out[0]
+    assert not out[0].strip().startswith("{")
+    assert "\\n" not in out[0]
+
+
+def test_parse_screening_answers_unescaped_newlines_inside_strings():
+    """Invalid JSON with raw newlines inside quoted strings still unwraps."""
+    raw = (
+        '{\n'
+        '  "answers": [\n'
+        '    "Subject: Update\n\nDear Client",\n'
+        '    "Second answer here"\n'
+        "  ]\n"
+        "}"
+    )
+    out = parse_screening_answers(raw, ["Q1", "Q2"])
+    assert out == ["Subject: Update\n\nDear Client", "Second answer here"]
+    assert not out[0].strip().startswith("{")
+
+
+def test_validate_screening_passes_after_successful_unwrap():
+    _validate_screening_output(
+        json.dumps({"answers": ["Plain one", "Plain two"]}),
+        ["Q1", "Q2"],
+    )
+
+
+def test_validate_screening_rejects_unrepairable_wrapper_left_in_answer():
+    """If parse cannot unwrap and leaves a wrapper-looking string, raise."""
+    import pytest
+    from app.llm_router import _looks_like_answers_wrapper_blob
+
+    assert _looks_like_answers_wrapper_blob('{"answers":["a","b"]}')
+    assert not _looks_like_answers_wrapper_blob(
+        "I discussed answers with the team yesterday."
+    )
+
+    # Broken object with no salvageable array/list — stays as a wrapper blob.
+    broken = '{"answers": oops}'
+    out = parse_screening_answers(broken, ["Q1"])
+    assert len(out) == 1
+    assert _looks_like_answers_wrapper_blob(out[0])
+    with pytest.raises(ValueError, match="unparsed answers JSON wrapper"):
+        _validate_screening_output(broken, ["Q1"])
 
 
 def test_free_llm_user_message_timeout():
