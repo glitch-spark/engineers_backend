@@ -8,6 +8,7 @@ from app.models.email_message import EmailMessage
 from app.models.email_rule import EmailRule
 from app.models.interview import Interview
 from app.models.interview_chat_log import InterviewChatLog
+from app.models.interview_prep import InterviewPrompt, InterviewTemplateAnswer
 from app.models.interview_question import InterviewQuestion
 from app.models.resume_application import ResumeApplication
 from app.models.resume_cache import ResumeLLMCache
@@ -28,7 +29,9 @@ __all__ = [
     "GlobalPrompt",
     "Interview",
     "InterviewChatLog",
+    "InterviewPrompt",
     "InterviewQuestion",
+    "InterviewTemplateAnswer",
     "ResumeApplication",
     "ResumeLLMCache",
     "Skill",
