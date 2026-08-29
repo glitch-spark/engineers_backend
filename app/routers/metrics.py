@@ -906,7 +906,7 @@ async def dashboard_feed(
     iv_events: list[dict] = []
     now = datetime.now(timezone.utc)
     for iv in ivs:
-        sched = iv.scheduledAt
+        sched = _as_aware(iv.scheduledAt)
         if sched and sched <= now:
             iv_events.append({
                 "kind": "interview_done" if iv.status and str(iv.status) in ("completed", "passed", "failed") else "interview_past",

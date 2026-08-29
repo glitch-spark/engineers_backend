@@ -5,6 +5,7 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
+from app.alerts_service import upsert_charge_from_transaction
 from app.deps import get_current_user
 from app.models import Transaction, UserExtra
 from app.routers._util import ci_regex, doc_to_dict, parse_date, populate_owner, to_object_id
@@ -14,6 +15,25 @@ router = APIRouter(prefix="/transactions", tags=["transactions"])
 
 
 _LAST4_RE = re.compile(r"^\d{4}$")
+_BILLING_CYCLES = ("one_time", "monthly")
+
+
+def _validate_billing_cycle(value: Optional[str], *, required: bool = False) -> Optional[str]:
+    if value is None or value == "":
+        if required:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="billingCycle is required")
+        return None
+    if value not in _BILLING_CYCLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="billingCycle must be 'one_time' or 'monthly'",
+        )
+    return value
+
+
+def _clean_card_label(value: Optional[str]) -> Optional[str]:
+    text = (value or "").strip()
+    return text or None
 
 
 def _validate_pay_method(pay_method: Optional[str], card_last4: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -43,6 +63,8 @@ class TransactionCreate(BaseModel):
     notes: Optional[str] = ""
     payMethod: Optional[str] = None
     cardLast4: Optional[str] = None
+    cardLabel: Optional[str] = None
+    billingCycle: Optional[str] = "monthly"
 
 
 class TransactionUpdate(BaseModel):
@@ -53,6 +75,35 @@ class TransactionUpdate(BaseModel):
     status: Optional[str] = None
     payMethod: Optional[str] = None
     cardLast4: Optional[str] = None
+    cardLabel: Optional[str] = None
+    billingCycle: Optional[str] = None
+
+
+@router.get("/card-hints")
+async def card_hints(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Distinct last-4 + label pairs the current user has already logged."""
+    pipeline = [
+        {"$match": {
+            "userId": user.id,
+            "payMethod": "card",
+            "cardLast4": {"$nin": [None, ""]},
+        }},
+        {"$sort": {"updatedAt": -1}},
+        {"$group": {
+            "_id": "$cardLast4",
+            "cardLabel": {"$first": "$cardLabel"},
+        }},
+        {"$limit": 20},
+    ]
+    rows = await Transaction.aggregate(pipeline).to_list()
+    return {
+        "cards": [
+            {"cardLast4": r["_id"], "cardLabel": r.get("cardLabel") or ""}
+            for r in rows if r.get("_id")
+        ]
+    }
 
 
 @router.get("/summary")
@@ -257,6 +308,8 @@ async def create_transaction(
     if not body.payMethod:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payMethod is required")
     pay_method, card_last4 = _validate_pay_method(body.payMethod, body.cardLast4)
+    billing_cycle = _validate_billing_cycle(body.billingCycle) or "monthly"
+    card_label = _clean_card_label(body.cardLabel) if pay_method == "card" else None
 
     tx = Transaction(
         userId=user.id,
@@ -267,8 +320,11 @@ async def create_transaction(
         status="pending",
         payMethod=pay_method,
         cardLast4=card_last4,
+        cardLabel=card_label,
+        billingCycle=billing_cycle,
     )
     await tx.insert()
+    await upsert_charge_from_transaction(tx)
 
     await notify_new_transaction(
         creator_email=user.email or "",
@@ -336,8 +392,13 @@ async def update_transaction(
             # Updating only last4 on an existing card payment.
             pm, l4 = _validate_pay_method("card", body.cardLast4)
             tx.cardLast4 = l4
+        if body.cardLabel is not None:
+            tx.cardLabel = _clean_card_label(body.cardLabel) if tx.payMethod == "card" else None
+        if body.billingCycle is not None:
+            tx.billingCycle = _validate_billing_cycle(body.billingCycle) or tx.billingCycle
 
     await tx.save()
+    await upsert_charge_from_transaction(tx)
     return doc_to_dict(tx)
 
 

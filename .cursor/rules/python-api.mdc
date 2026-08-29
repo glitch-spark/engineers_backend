@@ -1,0 +1,13 @@
+---
+description: FastAPI router and model conventions
+globs: app/**/*.py
+alwaysApply: false
+---
+
+# Python API
+
+- Validate at the router (`HTTPException` 400), not with hidden defaults that change meaning.
+- Serialize with `doc_to_dict` so `_id` stays camelCase for the SPA.
+- Cron/tick jobs must be idempotent (unique keys / existing-row checks).
+- One-shot CLI processes (`app.alerts_tick`) must close the Mongo client so the process exits.
+- Prefer small pure helpers (see `app/alerts.py`) so scheduling math is unit-tested without Mongo.

@@ -12,6 +12,8 @@ from app.models.interview_prep import InterviewPrompt, InterviewTemplateAnswer
 from app.models.interview_question import InterviewQuestion
 from app.models.resume_application import ResumeApplication
 from app.models.resume_cache import ResumeLLMCache
+from app.models.notification import Notification
+from app.models.recurring_charge import RecurringCharge
 from app.models.slack_alert_log import SlackAlertLog
 from app.models.transaction import Transaction
 from app.models.user_extra import UserExtra
@@ -32,6 +34,8 @@ __all__ = [
     "InterviewPrompt",
     "InterviewQuestion",
     "InterviewTemplateAnswer",
+    "Notification",
+    "RecurringCharge",
     "ResumeApplication",
     "ResumeLLMCache",
     "Skill",
