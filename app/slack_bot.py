@@ -21,7 +21,7 @@ from beanie import PydanticObjectId
 
 from app.config import get_settings
 from app.know_your_why import know_your_why_for_date
-from app.models import Interview, UserExtra
+from app.models import Account, Interview, UserExtra
 from app.models.interview import InterviewStatus
 from app.models.slack_alert_log import SlackAlertLog
 from app.slack_timezones import normalize_slack_timezone, validate_timezone, zoneinfo_for_slack
@@ -139,12 +139,41 @@ def _fmt_date(dt: datetime) -> str:
     return dt.strftime("%a %b %d")
 
 
+def _country_flag(code: Optional[str]) -> str:
+    """Regional-indicator flag emoji from ISO alpha-2 (e.g. "US" → 🇺🇸)."""
+    cc = (code or "").strip().upper()
+    if len(cc) != 2 or not cc.isalpha():
+        return ""
+    return "".join(chr(127397 + ord(ch)) for ch in cc)
+
+
+def _profile_label(account: Optional[Account]) -> str:
+    """"🇧🇷 BR · Latam · AI Full-stack" — mirrors the web interview cards,
+    with the country code kept for clients that don't render flag emoji."""
+    if account is None:
+        return ""
+    flag = _country_flag(account.country)
+    country = f"{flag} {(account.country or '').strip().upper()}".strip() if flag else ""
+    parts = [country, (account.region or "").strip(), (account.name or "").strip()]
+    return " · ".join(p for p in parts if p)
+
+
+async def _profile_labels(interviews: list[Interview]) -> dict[str, str]:
+    account_ids = {iv.accountId for iv in interviews if iv.accountId}
+    if not account_ids:
+        return {}
+    accounts = await Account.find({"_id": {"$in": list(account_ids)}}).to_list()
+    return {str(a.id): _profile_label(a) for a in accounts}
+
+
 def _interview_blocks(
     title: str,
     interviews: list[Interview],
     *,
     why: str,
+    profiles: Optional[dict[str, str]] = None,
 ) -> list[dict[str, Any]]:
+    profiles = profiles or {}
     lines = []
     for iv in interviews:
         company = (iv.companyName or "Interview").strip()
@@ -152,7 +181,9 @@ def _interview_blocks(
         when = _fmt_date(iv.scheduledAt) if iv.scheduledAt else "—"
         pos = (iv.appliedPosition or "").strip()
         extra = f" · {pos}" if pos else ""
-        lines.append(f"• *{company}*{extra}\n  {when} · `{stage}`")
+        profile = profiles.get(str(iv.accountId)) if iv.accountId else ""
+        profile_line = f"\n  {profile}" if profile else ""
+        lines.append(f"• *{company}*{extra}{profile_line}\n  {when} · `{stage}`")
     body = "\n\n".join(lines) if lines else "_No interviews._"
     return [
         {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
@@ -267,7 +298,8 @@ async def run_digest_for_user(user: UserExtra) -> int:
 
     why = know_your_why_for_date(day)
     title = f"Today's interviews ({len(interviews)})"
-    blocks = _interview_blocks(title, interviews, why=why)
+    profiles = await _profile_labels(interviews)
+    blocks = _interview_blocks(title, interviews, why=why, profiles=profiles)
     text = f"You have {len(interviews)} interview(s) today. Know your why: {why}"
     ok = await send_dm(slack_id, text=text, blocks=blocks)
     if ok:

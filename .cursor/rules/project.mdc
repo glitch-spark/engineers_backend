@@ -1,0 +1,15 @@
+---
+description: Engineers backend stack, roles, and data rules
+alwaysApply: true
+---
+
+# engineers_backend
+
+FastAPI + Beanie/Motor on MongoDB Atlas. Keep existing collection names (`userextras`, `transactions`, …) — do not rename for cleanliness (ADR-0003).
+
+- Roles: `admin`, `staff`, `accountant`. JWT bearer in `Authorization`.
+- Slack is optional: no-op when tokens/webhooks are unset.
+- Card numbers: store **last 4 only**. Never persist a full PAN.
+- New Beanie models must be imported in `app/models/__init__.py` and listed in `DOCUMENT_MODELS` in `app/db.py`.
+- Internal cron routes live under `/internal/*` and require `X-Cron-Secret` (`SLACK_BOT_CRON_SECRET`).
+- Railway cron is a **sibling service** that runs `python -m app.alerts_tick` and **exits**. Do not put `cronSchedule` on the uvicorn API.

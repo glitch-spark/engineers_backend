@@ -6,6 +6,15 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 log = logging.getLogger(__name__)
 
+_client = None
+
+
+async def close_db() -> None:
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
+
 # Index names left behind by older schema versions. Drop on startup so
 # unique constraints from the old (profileId, sync-only) shape don't reject
 # inserts under the new schema (accountId-based, multiple jobs per company).
@@ -31,6 +40,8 @@ from app.models import (
     InterviewPrompt,
     InterviewQuestion,
     InterviewTemplateAnswer,
+    Notification,
+    RecurringCharge,
     ResumeApplication,
     ResumeLLMCache,
     Skill,
@@ -62,6 +73,8 @@ DOCUMENT_MODELS = [
     EmailClassificationCache,
     ResumeLLMCache,
     SlackAlertLog,
+    Notification,
+    RecurringCharge,
 ]
 
 
@@ -131,11 +144,40 @@ async def _migrate_default_leaderboard_optin(database) -> None:
         log.warning("leaderboard opt-in migration failed: %s", exc)
 
 
-async def init_db() -> None:
+async def _migrate_billing_cycle(database) -> None:
+    """Existing ledger rows were treated as monthly. Fill the new field."""
+    coll = database["transactions"]
+    try:
+        result = await coll.update_many(
+            {"$or": [
+                {"billingCycle": {"$exists": False}},
+                {"billingCycle": None},
+            ]},
+            {"$set": {"billingCycle": "monthly"}},
+        )
+        if result.modified_count:
+            log.info("billingCycle default monthly: updated %d transactions", result.modified_count)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("billingCycle migration failed: %s", exc)
+
+
+async def init_db():
+    global _client
     uri = os.environ["MONGODB_URI"]
     client = AsyncIOMotorClient(uri)
+    _client = client
     database = client.get_default_database()
     await _drop_stale_indexes(database)
     await _migrate_legacy_resume_apps(database)
     await _migrate_default_leaderboard_optin(database)
+    await _migrate_billing_cycle(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
+    try:
+        from app.alerts_service import seed_recurring_charges_from_transactions
+
+        seeded = await seed_recurring_charges_from_transactions()
+        if seeded:
+            log.info("seeded %d recurring charges from transactions", seeded)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("recurring charge seed failed: %s", exc)
+    return client

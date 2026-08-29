@@ -52,7 +52,14 @@ curl -X POST https://<api>/internal/slack-bot/tick \
 
 The job sends a daily digest (when in the user’s digest window) listing that
 user’s interviews for the calendar day in their timezone (`createdBy` only),
-plus today’s Know your why quote.
+plus today’s Know your why quote. Each interview line shows company · position,
+the profile’s country flag/code · region · profile name, then date · stage:
+
+```
+• Acme · Senior Backend
+  🇧🇷 BR · Latam · AI Full-stack
+  Sat Aug 29 · ai_interview
+```
 
 ## 5. Privacy
 

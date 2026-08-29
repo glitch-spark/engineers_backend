@@ -6,8 +6,18 @@ from datetime import date, datetime
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
+from types import SimpleNamespace
+
 from app.know_your_why import know_your_why_for_date
-from app.slack_bot import calendar_day_bounds, digest_slot_open, validate_timezone
+from app.models.interview import InterviewStage
+from app.slack_bot import (
+    _country_flag,
+    _interview_blocks,
+    _profile_label,
+    calendar_day_bounds,
+    digest_slot_open,
+    validate_timezone,
+)
 from app.slack_timezones import SLACK_DIGEST_TIMEZONES, normalize_slack_timezone
 
 
@@ -48,6 +58,53 @@ def test_normalize_unknown_falls_back():
 
 def test_catalog_has_27_hourly_offsets():
     assert len(SLACK_DIGEST_TIMEZONES) == 27
+
+
+def test_country_flag():
+    assert _country_flag("us") == "🇺🇸"
+    assert _country_flag("BR") == "🇧🇷"
+    assert _country_flag("") == ""
+    assert _country_flag("USA") == ""
+
+
+def _fake_interview(*, account_id="acc1", position=None):
+    return SimpleNamespace(
+        accountId=account_id,
+        scheduledAt=datetime(2026, 8, 29, 12, 0, 0),
+        stage=InterviewStage.ai_interview,
+        companyName="Acme",
+        appliedPosition=position,
+    )
+
+
+def test_profile_label_parts():
+    full = SimpleNamespace(name="AI Full-stack", country="br", region="Latam")
+    assert _profile_label(full) == "🇧🇷 BR · Latam · AI Full-stack"
+    bare = SimpleNamespace(name="Backend", country=None, region=None)
+    assert _profile_label(bare) == "Backend"
+    assert _profile_label(None) == ""
+
+
+def test_interview_blocks_include_profile_line():
+    interview = _fake_interview(position="Senior Backend")
+    blocks = _interview_blocks(
+        "Today's interviews (1)",
+        [interview],
+        why="Show up curious.",
+        profiles={"acc1": "🇧🇷 BR · Latam · AI Full-stack"},
+    )
+    body = blocks[1]["text"]["text"]
+    assert body == (
+        "• *Acme* · Senior Backend\n"
+        "  🇧🇷 BR · Latam · AI Full-stack\n"
+        "  Sat Aug 29 · `ai_interview`"
+    )
+
+
+def test_interview_blocks_without_profile_match():
+    interview = _fake_interview(account_id="missing")
+    body = _interview_blocks("t", [interview], why="w")[1]["text"]["text"]
+    assert body == "• *Acme*\n  Sat Aug 29 · `ai_interview`"
 
 
 def test_know_your_why_stable_for_date():
