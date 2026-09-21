@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.alerts_service import upsert_charge_from_transaction
 from app.deps import get_current_user
@@ -56,6 +56,14 @@ def _validate_pay_method(pay_method: Optional[str], card_last4: Optional[str]) -
     return "card", last4
 
 
+def _coerce_id(value: Any) -> Any:
+    """SPA sometimes sends a populated user dict instead of an id string."""
+    if isinstance(value, dict):
+        raw = value.get("_id") or value.get("id")
+        return str(raw) if raw is not None else None
+    return value
+
+
 class TransactionCreate(BaseModel):
     date: str
     amount: float
@@ -66,6 +74,11 @@ class TransactionCreate(BaseModel):
     cardLabel: Optional[str] = None
     billingCycle: Optional[str] = "monthly"
     payerId: Optional[str] = None
+
+    @field_validator("payerId", mode="before")
+    @classmethod
+    def _payer_id_create(cls, v: Any) -> Any:
+        return _coerce_id(v)
 
 
 class TransactionUpdate(BaseModel):
@@ -80,9 +93,15 @@ class TransactionUpdate(BaseModel):
     billingCycle: Optional[str] = None
     payerId: Optional[str] = None
 
+    @field_validator("payerId", mode="before")
+    @classmethod
+    def _payer_id_update(cls, v: Any) -> Any:
+        return _coerce_id(v)
+
 
 async def _resolve_payer_id(raw: Optional[str], default_id) -> Any:
-    """Validate payerId against userextras. Empty/omitted → default (the owner)."""
+    """Validate payerId against userextras. Empty/omitted → default (the owner).
+    Self-pay is allowed (owner may also be the payer)."""
     if raw is None or raw == "":
         return default_id
     oid = to_object_id(raw)
@@ -90,6 +109,10 @@ async def _resolve_payer_id(raw: Optional[str], default_id) -> Any:
     if found is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payer not found")
     return oid
+
+
+def _tx_payer_id(tx: Transaction) -> str:
+    return str(tx.payerId) if tx.payerId is not None else str(tx.userId)
 
 
 def _format_totals(rows: list[dict], people: dict[str, UserExtra], id_key: str) -> list[dict]:
@@ -160,7 +183,7 @@ async def transactions_summary(
         if userId:
             match["userId"] = to_object_id(userId)
     else:
-        match["userId"] = user.id
+        match["$or"] = [{"userId": user.id}, {"payerId": user.id}]
 
     start = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
     end = datetime(year, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc)
@@ -225,7 +248,10 @@ async def list_transactions(
     payMethod: str = Query(""),
 ) -> dict:
     is_admin = user.role == "admin"
-    query: dict[str, Any] = {} if is_admin else {"userId": user.id}
+    query: dict[str, Any] = {}
+    if not is_admin:
+        # Owner of the request OR assigned as payer.
+        query["$or"] = [{"userId": user.id}, {"payerId": user.id}]
 
     date_filter: dict = {}
     f_dt = parse_date(from_)
@@ -245,15 +271,19 @@ async def list_transactions(
     if payMethod in ("coin", "card"):
         query["payMethod"] = payMethod
 
+    extra: list[dict] = []
     if search:
-        query["$or"] = [
+        search_or = [
             {"description": ci_regex(search)},
             {"notes": ci_regex(search)},
             {"userId.name": ci_regex(search)},
             {"userId.email": ci_regex(search)},
         ]
+        if "$or" in query:
+            extra.append({"$or": search_or})
+        else:
+            query["$or"] = search_or
 
-    extra: list[dict] = []
     if fromSearch:
         extra.append({"$expr": {"$regexMatch": {
             "input": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date"}},
@@ -387,10 +417,13 @@ async def update_transaction(
 
     is_admin = user.role == "admin"
     is_owner = str(tx.userId) == str(user.id)
-    if not is_admin and not is_owner:
+    is_payer = str(user.id) == _tx_payer_id(tx)
+    if not is_admin and not is_owner and not is_payer:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
-    if is_admin and body.status and body.status in ("approved", "rejected"):
+    if body.status and body.status in ("approved", "rejected"):
+        if not is_admin and not is_payer:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="only the payer can approve")
         if tx.status != body.status:
             tx.status = body.status
             tx.approvedBy = user.id
