@@ -142,3 +142,111 @@ async def test_summary_staff_sees_only_own(client, staff_user, staff_user_2, aut
     r = await client.get("/transactions/summary?year=2026", headers=auth_header(staff_user_2))
     assert r.status_code == 200
     assert r.json()["stats"]["totalCount"] == 0
+
+
+async def test_create_defaults_payer_to_owner(client, staff_user, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-03-01", "amount": -10, "payMethod": "coin"},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["payerId"] == str(staff_user.id)
+
+    listed = await client.get("/transactions", headers=auth_header(staff_user))
+    assert listed.status_code == 200
+    row = listed.json()["transactions"][0]
+    assert row["payerName"] == staff_user.name
+    assert row["payerEmail"] == staff_user.email
+
+
+async def test_create_with_admin_payer(client, staff_user, admin_user, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-03-02",
+            "amount": -25,
+            "payMethod": "coin",
+            "payerId": str(admin_user.id),
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["payerId"] == str(admin_user.id)
+
+    listed = await client.get("/transactions", headers=auth_header(staff_user))
+    row = listed.json()["transactions"][0]
+    assert row["ownerEmail"] == staff_user.email
+    assert row["payerEmail"] == admin_user.email
+    assert row["payerName"] == admin_user.name
+
+
+async def test_create_unknown_payer_returns_400(client, staff_user, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-03-03",
+            "amount": -5,
+            "payMethod": "coin",
+            "payerId": "000000000000000000000000",
+        },
+    )
+    assert r.status_code == 400
+
+
+async def test_payer_totals_split_and_total_outcome(client, staff_user, admin_user, auth_header):
+    await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-03-04",
+            "amount": -40,
+            "payMethod": "coin",
+            "payerId": str(admin_user.id),
+        },
+    )
+    await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-03-05",
+            "amount": -10,
+            "payMethod": "coin",
+            "payerId": str(staff_user.id),
+        },
+    )
+    await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-03-06", "amount": 15, "payMethod": "coin"},
+    )
+
+    r = await client.get("/transactions", headers=auth_header(admin_user))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "payerTotals" in body
+    by_payer = {p["payerId"]: p for p in body["payerTotals"]}
+    assert by_payer[str(admin_user.id)]["outcome"] == 40
+    assert by_payer[str(staff_user.id)]["outcome"] == 10
+    assert by_payer[str(staff_user.id)]["income"] == 15
+    assert by_payer[str(staff_user.id)]["net"] == 5
+    assert body["totalOutcome"] == 50
+
+
+async def test_update_payer(client, staff_user, admin_user, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-03-07", "amount": -8, "payMethod": "coin"},
+    )
+    tx_id = r.json()["_id"]
+    r = await client.put(
+        f"/transactions/{tx_id}",
+        headers=auth_header(staff_user),
+        json={"payerId": str(admin_user.id)},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["payerId"] == str(admin_user.id)
+

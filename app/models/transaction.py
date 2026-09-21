@@ -32,6 +32,10 @@ class Transaction(TimestampedDocument):
     # Recurring vs one-off. Default monthly so historical rows and older
     # clients keep the previous "everything is a monthly card charge" meaning.
     billingCycle: Optional[BillingCycle] = "monthly"
+    # Who actually paid. Distinct from userId (the row owner / creator).
+    # Optional on the model so pre-payer rows still load; new creates default
+    # to the owner when the client omits it.
+    payerId: Optional[PydanticObjectId] = None
 
     class Settings:
         name = "transactions"

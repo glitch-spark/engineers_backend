@@ -43,29 +43,50 @@ async def populate_owner(
     *,
     field: str,
     only: Optional[tuple] = None,
+    extra: Optional[tuple[tuple[str, str], ...]] = None,
 ) -> list:
+    """Populate `field` as the owner (ownerEmail/Name/Image) and optionally
+    extra `(id_field, prefix)` pairs — e.g. `(("payerId", "payer"),)` adds
+    payerEmail/payerName/payerImage and replaces that id with the user dict.
+    """
     docs = list(docs)
-    owner_ids = list({getattr(d, field) for d in docs if getattr(d, field) is not None})
-    users = await UserExtra.find({"_id": {"$in": owner_ids}}).to_list() if owner_ids else []
+    extra = extra or ()
+    user_ids: list = []
+    seen: set[str] = set()
+    for d in docs:
+        for id_field, _ in ((field, "owner"), *extra):
+            value = getattr(d, id_field, None)
+            if value is None:
+                continue
+            key = str(value)
+            if key not in seen:
+                seen.add(key)
+                user_ids.append(value)
+    users = await UserExtra.find({"_id": {"$in": user_ids}}).to_list() if user_ids else []
     by_id = {str(u.id): u for u in users}
+
+    def _attach(item: dict, d: Document, id_field: str, prefix: str) -> None:
+        uid = getattr(d, id_field, None)
+        person = by_id.get(str(uid)) if uid is not None else None
+        if person is not None:
+            person_dict = doc_to_dict(person)
+            if only is not None:
+                keep = set(only) | {"_id", "image"}
+                person_dict = {k: v for k, v in person_dict.items() if k in keep}
+            item[id_field] = person_dict
+            item[f"{prefix}Email"] = person.email
+            item[f"{prefix}Name"] = person.name
+            item[f"{prefix}Image"] = getattr(person, "image", None) or None
+        else:
+            item[f"{prefix}Email"] = None
+            item[f"{prefix}Name"] = None
+            item[f"{prefix}Image"] = None
 
     out = []
     for d in docs:
         item = doc_to_dict(d)
-        owner_id = getattr(d, field, None)
-        owner = by_id.get(str(owner_id)) if owner_id is not None else None
-        if owner is not None:
-            owner_dict = doc_to_dict(owner)
-            if only is not None:
-                keep = set(only) | {"_id", "image"}
-                owner_dict = {k: v for k, v in owner_dict.items() if k in keep}
-            item[field] = owner_dict
-            item["ownerEmail"] = owner.email
-            item["ownerName"] = owner.name
-            item["ownerImage"] = getattr(owner, "image", None) or None
-        else:
-            item["ownerEmail"] = None
-            item["ownerName"] = None
-            item["ownerImage"] = None
+        _attach(item, d, field, "owner")
+        for id_field, prefix in extra:
+            _attach(item, d, id_field, prefix)
         out.append(item)
     return out

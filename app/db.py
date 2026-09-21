@@ -161,6 +161,42 @@ async def _migrate_billing_cycle(database) -> None:
         log.warning("billingCycle migration failed: %s", exc)
 
 
+async def _migrate_legacy_payer_to_admin(database) -> None:
+    """Pre-payer ledger rows through today were paid by admin. Stamp payerId
+    on anything missing it with date <= end of today. Idempotent."""
+    from datetime import datetime, timezone
+
+    users = database["userextras"]
+    txs = database["transactions"]
+    try:
+        admin = await users.find_one({"role": "admin"}, sort=[("createdAt", 1)])
+        if admin is None:
+            log.warning("legacy payer backfill skipped: no admin user")
+            return
+        now = datetime.now(timezone.utc)
+        cutoff = datetime(now.year, now.month, now.day, 23, 59, 59, 999000)
+        result = await txs.update_many(
+            {
+                "$and": [
+                    {"$or": [
+                        {"payerId": {"$exists": False}},
+                        {"payerId": None},
+                    ]},
+                    {"date": {"$lte": cutoff}},
+                ]
+            },
+            {"$set": {"payerId": admin["_id"]}},
+        )
+        if result.modified_count:
+            log.info(
+                "legacy payer -> admin %s: updated %d transactions",
+                admin.get("email") or admin["_id"],
+                result.modified_count,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("legacy payer backfill failed: %s", exc)
+
+
 async def init_db():
     global _client
     uri = os.environ["MONGODB_URI"]
@@ -171,6 +207,7 @@ async def init_db():
     await _migrate_legacy_resume_apps(database)
     await _migrate_default_leaderboard_optin(database)
     await _migrate_billing_cycle(database)
+    await _migrate_legacy_payer_to_admin(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
     try:
         from app.alerts_service import seed_recurring_charges_from_transactions

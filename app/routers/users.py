@@ -46,7 +46,7 @@ async def lookup_users(
     rows = await UserExtra.find(query).to_list()
     return {
         "users": [
-            {"_id": str(u.id), "name": u.name, "email": u.email}
+            {"_id": str(u.id), "name": u.name, "email": u.email, "role": u.role}
             for u in rows
         ]
     }

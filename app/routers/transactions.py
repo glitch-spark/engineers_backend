@@ -65,6 +65,7 @@ class TransactionCreate(BaseModel):
     cardLast4: Optional[str] = None
     cardLabel: Optional[str] = None
     billingCycle: Optional[str] = "monthly"
+    payerId: Optional[str] = None
 
 
 class TransactionUpdate(BaseModel):
@@ -77,6 +78,44 @@ class TransactionUpdate(BaseModel):
     cardLast4: Optional[str] = None
     cardLabel: Optional[str] = None
     billingCycle: Optional[str] = None
+    payerId: Optional[str] = None
+
+
+async def _resolve_payer_id(raw: Optional[str], default_id) -> Any:
+    """Validate payerId against userextras. Empty/omitted → default (the owner)."""
+    if raw is None or raw == "":
+        return default_id
+    oid = to_object_id(raw)
+    found = await UserExtra.get(oid)
+    if found is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payer not found")
+    return oid
+
+
+def _format_totals(rows: list[dict], people: dict[str, UserExtra], id_key: str) -> list[dict]:
+    out = []
+    for r in rows:
+        uid = str(r["_id"]) if r.get("_id") is not None else ""
+        person = people.get(uid)
+        out.append({
+            id_key: uid,
+            "name": (person.name if person else None) or (person.email if person else None) or uid,
+            "email": person.email if person else None,
+            "image": person.image if person else None,
+            "income": float(r.get("income") or 0),
+            "outcome": float(r.get("outcome") or 0),
+            "net": float(r.get("net") or 0),
+            "count": int(r.get("count") or 0),
+        })
+    return out
+
+
+_TOTALS_GROUP = {
+    "income": {"$sum": {"$cond": [{"$gt": ["$amount", 0]}, "$amount", 0]}},
+    "outcome": {"$sum": {"$cond": [{"$lt": ["$amount", 0]}, {"$abs": "$amount"}, 0]}},
+    "net": {"$sum": "$amount"},
+    "count": {"$sum": 1},
+}
 
 
 @router.get("/card-hints")
@@ -238,50 +277,47 @@ async def list_transactions(
     skip = (page - 1) * limit
     total = await Transaction.find(query).count()
     rows = await Transaction.find(query).sort([("date", -1)]).skip(skip).limit(limit).to_list()
-    txs_out = await populate_owner(rows, field="userId")
+    txs_out = await populate_owner(rows, field="userId", extra=(("payerId", "payer"),))
+    for item in txs_out:
+        # Pre-payer rows have no payerId — surface the owner so the table
+        # still has a Payer cell.
+        if not item.get("payerName") and not item.get("payerEmail"):
+            item["payerName"] = item.get("ownerName")
+            item["payerEmail"] = item.get("ownerEmail")
+            item["payerImage"] = item.get("ownerImage")
+            if item.get("payerId") is None:
+                item["payerId"] = item.get("userId")
 
-    # Per-user income (amount > 0) / outcome (amount < 0) for the same filters.
-    totals_pipeline = [
+    owner_pipeline = [
         {"$match": query},
-        {"$group": {
-            "_id": "$userId",
-            "income": {
-                "$sum": {"$cond": [{"$gt": ["$amount", 0]}, "$amount", 0]},
-            },
-            "outcome": {
-                "$sum": {"$cond": [{"$lt": ["$amount", 0]}, {"$abs": "$amount"}, 0]},
-            },
-            "net": {"$sum": "$amount"},
-            "count": {"$sum": 1},
-        }},
+        {"$group": {"_id": "$userId", **_TOTALS_GROUP}},
         {"$sort": {"net": -1}},
     ]
-    totals_rows = await Transaction.aggregate(totals_pipeline).to_list()
-    user_ids = [r["_id"] for r in totals_rows if r.get("_id") is not None]
-    owners: dict[str, UserExtra] = {}
-    if user_ids:
-        for u in await UserExtra.find({"_id": {"$in": user_ids}}).to_list():
-            owners[str(u.id)] = u
+    payer_pipeline = [
+        {"$match": query},
+        {"$group": {"_id": {"$ifNull": ["$payerId", "$userId"]}, **_TOTALS_GROUP}},
+        {"$sort": {"outcome": -1}},
+    ]
+    owner_rows = await Transaction.aggregate(owner_pipeline).to_list()
+    payer_rows = await Transaction.aggregate(payer_pipeline).to_list()
+    people_ids = [
+        r["_id"] for r in owner_rows + payer_rows if r.get("_id") is not None
+    ]
+    people: dict[str, UserExtra] = {}
+    if people_ids:
+        for u in await UserExtra.find({"_id": {"$in": people_ids}}).to_list():
+            people[str(u.id)] = u
 
-    user_totals = []
-    for r in totals_rows:
-        uid = str(r["_id"]) if r.get("_id") is not None else ""
-        owner = owners.get(uid)
-        user_totals.append({
-            "userId": uid,
-            "name": (owner.name if owner else None) or (owner.email if owner else None) or uid,
-            "email": owner.email if owner else None,
-            "image": owner.image if owner else None,
-            "income": float(r.get("income") or 0),
-            "outcome": float(r.get("outcome") or 0),
-            "net": float(r.get("net") or 0),
-            "count": int(r.get("count") or 0),
-        })
+    user_totals = _format_totals(owner_rows, people, "userId")
+    payer_totals = _format_totals(payer_rows, people, "payerId")
+    total_outcome = sum(p["outcome"] for p in payer_totals)
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
         "transactions": txs_out,
         "userTotals": user_totals,
+        "payerTotals": payer_totals,
+        "totalOutcome": total_outcome,
         "pagination": {
             "page": page,
             "limit": limit,
@@ -310,6 +346,7 @@ async def create_transaction(
     pay_method, card_last4 = _validate_pay_method(body.payMethod, body.cardLast4)
     billing_cycle = _validate_billing_cycle(body.billingCycle) or "monthly"
     card_label = _clean_card_label(body.cardLabel) if pay_method == "card" else None
+    payer_id = await _resolve_payer_id(body.payerId, user.id)
 
     tx = Transaction(
         userId=user.id,
@@ -322,6 +359,7 @@ async def create_transaction(
         cardLast4=card_last4,
         cardLabel=card_label,
         billingCycle=billing_cycle,
+        payerId=payer_id,
     )
     await tx.insert()
     await upsert_charge_from_transaction(tx)
@@ -396,6 +434,8 @@ async def update_transaction(
             tx.cardLabel = _clean_card_label(body.cardLabel) if tx.payMethod == "card" else None
         if body.billingCycle is not None:
             tx.billingCycle = _validate_billing_cycle(body.billingCycle) or tx.billingCycle
+        if body.payerId is not None:
+            tx.payerId = await _resolve_payer_id(body.payerId, tx.userId)
 
     await tx.save()
     await upsert_charge_from_transaction(tx)
