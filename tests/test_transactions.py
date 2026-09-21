@@ -250,3 +250,99 @@ async def test_update_payer(client, staff_user, admin_user, auth_header):
     assert r.status_code == 200, r.text
     assert r.json()["payerId"] == str(admin_user.id)
 
+
+async def test_approve_with_populated_payer_object(client, staff_user, admin_user, auth_header):
+    """SPA used to spread the listed row (payerId as a user dict) on approve."""
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-03-08",
+            "amount": -12,
+            "payMethod": "coin",
+            "payerId": str(admin_user.id),
+        },
+    )
+    tx_id = r.json()["_id"]
+    r = await client.put(
+        f"/transactions/{tx_id}",
+        headers=auth_header(admin_user),
+        json={
+            "status": "approved",
+            "payerId": {
+                "_id": str(admin_user.id),
+                "name": admin_user.name,
+                "email": admin_user.email,
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "approved"
+    assert r.json()["approvedBy"] == str(admin_user.id)
+
+
+async def test_payer_staff_can_list_and_approve(client, staff_user, staff_user_2, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-03-09",
+            "amount": -30,
+            "payMethod": "coin",
+            "payerId": str(staff_user_2.id),
+        },
+    )
+    tx_id = r.json()["_id"]
+
+    listed = await client.get("/transactions", headers=auth_header(staff_user_2))
+    assert listed.status_code == 200
+    ids = [t["_id"] for t in listed.json()["transactions"]]
+    assert tx_id in ids
+
+    r = await client.put(
+        f"/transactions/{tx_id}",
+        headers=auth_header(staff_user_2),
+        json={"status": "approved"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "approved"
+
+
+async def test_non_payer_staff_cannot_approve(client, staff_user, staff_user_2, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-03-10", "amount": -4, "payMethod": "coin"},
+    )
+    tx_id = r.json()["_id"]
+    r = await client.put(
+        f"/transactions/{tx_id}",
+        headers=auth_header(staff_user_2),
+        json={"status": "approved"},
+    )
+    assert r.status_code == 403
+
+
+async def test_self_payer_admin_can_request_and_approve(client, admin_user, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(admin_user),
+        json={
+            "date": "2026-03-11",
+            "amount": -9,
+            "payMethod": "coin",
+            "payerId": str(admin_user.id),
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["payerId"] == str(admin_user.id)
+    assert r.json()["userId"] == str(admin_user.id)
+    tx_id = r.json()["_id"]
+    r = await client.put(
+        f"/transactions/{tx_id}",
+        headers=auth_header(admin_user),
+        json={"status": "approved"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "approved"
+
