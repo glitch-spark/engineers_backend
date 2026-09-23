@@ -32,8 +32,14 @@ class FreeLlmPreset:
     model: str
     default_max_tokens: int
     extra_body: Optional[dict[str, Any]] = None
-    temperature: float = 1.0
-    top_p: float = 0.95
+    # None = omit from the NVIDIA body (some models reject unexposed params).
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 0.95
+    # NVIDIA catalog / vision-capable models expect content parts, not a raw string.
+    content_as_parts: bool = False
+    system_prompt: Optional[str] = None
+    # Reasoning models spend tokens on thinking before content; 16 is too small.
+    test_max_tokens: int = 16
 
 
 FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
@@ -68,14 +74,20 @@ FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
         label="GLM 5.3",
         model="z-ai/glm-5.3",
         default_max_tokens=16384,
+        temperature=0.5,
         top_p=1.0,
+        system_prompt="You are a helpful assistant.",
     ),
     FreeLlmPreset(
         id="kimi-k3",
         label="Kimi K3",
         model="moonshotai/kimi-k3",
         default_max_tokens=16384,
-        extra_body={"reasoning_effort": "low"},
+        temperature=1.0,
+        top_p=None,  # NVIDIA: top_p / penalties are fixed and not exposed
+        extra_body={"reasoning_effort": "max"},
+        content_as_parts=True,
+        test_max_tokens=1024,
     ),
 )
 
@@ -86,6 +98,29 @@ def get_preset(preset_id: Optional[str]) -> Optional[FreeLlmPreset]:
     if not preset_id:
         return None
     return _PRESET_BY_ID.get(preset_id.strip())
+
+
+def build_free_chat_kwargs(preset: FreeLlmPreset, prompt: str, max_tokens: int) -> dict[str, Any]:
+    """OpenAI-SDK kwargs for NVIDIA Integrate, shaped per-model."""
+    content: Any = (
+        [{"type": "text", "text": prompt}] if preset.content_as_parts else prompt
+    )
+    messages: list[dict[str, Any]] = []
+    if preset.system_prompt:
+        messages.append({"role": "system", "content": preset.system_prompt})
+    messages.append({"role": "user", "content": content})
+    kwargs: dict[str, Any] = {
+        "model": preset.model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    if preset.temperature is not None:
+        kwargs["temperature"] = preset.temperature
+    if preset.top_p is not None:
+        kwargs["top_p"] = preset.top_p
+    if preset.extra_body:
+        kwargs["extra_body"] = dict(preset.extra_body)
+    return kwargs
 
 
 def preset_catalog_public() -> list[dict[str, Any]]:

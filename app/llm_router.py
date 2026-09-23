@@ -18,6 +18,7 @@ from app.free_llm import (
     FREE_LLM_TEST_TIMEOUT_SECONDS,
     NVIDIA_BASE_URL,
     FreeLlmPreset,
+    build_free_chat_kwargs,
     clamp_max_tokens,
     get_preset,
 )
@@ -90,6 +91,28 @@ def _free_max_tokens_for_purpose(purpose: str, max_tokens: int) -> int:
     return max_tokens
 
 
+def _message_text(message: object) -> str:
+    """Final assistant text only — never use Kimi reasoning_content as the answer."""
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if isinstance(part, dict):
+                if part.get("type") in (None, "text"):
+                    parts.append(str(part.get("text") or ""))
+                continue
+            text = getattr(part, "text", None)
+            if text:
+                parts.append(str(text))
+        return "".join(parts).strip()
+    return (str(content).strip() if content else "")
+
+
 async def _free_chat_completion(
     prompt: str,
     preset: FreeLlmPreset,
@@ -99,19 +122,11 @@ async def _free_chat_completion(
     timeout: float = FREE_LLM_RESUME_TIMEOUT_SECONDS,
 ) -> tuple[str, dict]:
     client = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=timeout)
-    kwargs: dict = {
-        "model": preset.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": preset.temperature,
-        "top_p": preset.top_p,
-    }
-    if preset.extra_body:
-        kwargs["extra_body"] = preset.extra_body
+    kwargs = build_free_chat_kwargs(preset, prompt, max_tokens)
     response = await client.chat.completions.create(**kwargs)
     text = ""
     if response.choices:
-        text = (response.choices[0].message.content or "").strip()
+        text = _message_text(response.choices[0].message)
     usage_out: dict = {}
     if response.usage:
         if response.usage.prompt_tokens is not None:
@@ -519,7 +534,7 @@ async def test_free_connection(user: UserExtra) -> dict:
             "Reply with exactly: ok",
             preset,
             api_key,
-            min(max_tokens, 16),
+            min(max_tokens, preset.test_max_tokens),
             timeout=test_timeout,
         )
     except Exception as exc:

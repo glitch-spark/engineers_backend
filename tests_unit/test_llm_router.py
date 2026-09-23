@@ -8,11 +8,18 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from types import SimpleNamespace
 
-from app.free_llm import api_key_hint, clamp_max_tokens, get_preset, preset_catalog_public
+from app.free_llm import (
+    api_key_hint,
+    build_free_chat_kwargs,
+    clamp_max_tokens,
+    get_preset,
+    preset_catalog_public,
+)
 from app.llm_router import (
     _free_llm_user_message,
     _free_max_tokens_for_purpose,
     _free_timeout_for_purpose,
+    _message_text,
     _validate_screening_output,
     free_llm_configured,
     parse_screening_answers,
@@ -39,12 +46,58 @@ def test_get_preset_known_and_unknown():
     glm53 = get_preset("glm-5.3")
     assert glm53 is not None
     assert glm53.model == "z-ai/glm-5.3"
+    assert glm53.temperature == 0.5
     assert glm53.top_p == 1.0
+    assert glm53.system_prompt == "You are a helpful assistant."
     kimi = get_preset("kimi-k3")
     assert kimi is not None
     assert kimi.model == "moonshotai/kimi-k3"
-    assert kimi.extra_body == {"reasoning_effort": "low"}
+    assert kimi.extra_body == {"reasoning_effort": "max"}
+    assert kimi.top_p is None
+    assert kimi.content_as_parts is True
+    assert kimi.test_max_tokens == 1024
     assert get_preset("unknown-model") is None
+
+
+def test_glm53_payload_matches_nvidia_catalog():
+    glm53 = get_preset("glm-5.3")
+    assert glm53 is not None
+    kwargs = build_free_chat_kwargs(glm53, "Which number is larger, 9.11 or 9.8?", 1024)
+    assert kwargs["model"] == "z-ai/glm-5.3"
+    assert kwargs["messages"] == [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Which number is larger, 9.11 or 9.8?"},
+    ]
+    assert kwargs["temperature"] == 0.5
+    assert kwargs["top_p"] == 1.0
+    assert "extra_body" not in kwargs
+
+
+def test_kimi_payload_omits_top_p_and_uses_content_parts():
+    kimi = get_preset("kimi-k3")
+    assert kimi is not None
+    kwargs = build_free_chat_kwargs(kimi, "Hello", 256)
+    assert kwargs["model"] == "moonshotai/kimi-k3"
+    assert kwargs["messages"][0]["content"] == [{"type": "text", "text": "Hello"}]
+    assert kwargs["temperature"] == 1.0
+    assert "top_p" not in kwargs
+    assert kwargs["extra_body"] == {"reasoning_effort": "max"}
+
+
+def test_deepseek_payload_keeps_string_content_and_top_p():
+    deepseek = get_preset("deepseek-v4-pro")
+    assert deepseek is not None
+    kwargs = build_free_chat_kwargs(deepseek, "Hello", 128)
+    assert kwargs["messages"][0]["content"] == "Hello"
+    assert kwargs["top_p"] == 0.95
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"thinking": False}}
+
+
+def test_message_text_ignores_reasoning_and_joins_parts():
+    assert _message_text(SimpleNamespace(content="  ok  ", reasoning_content="think")) == "ok"
+    assert _message_text(
+        SimpleNamespace(content=[{"type": "text", "text": "hel"}, {"type": "text", "text": "lo"}])
+    ) == "hello"
 
 
 def test_clamp_max_tokens():
