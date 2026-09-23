@@ -63,6 +63,20 @@ FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
         default_max_tokens=16384,
         top_p=1.0,
     ),
+    FreeLlmPreset(
+        id="glm-5.3",
+        label="GLM 5.3",
+        model="z-ai/glm-5.3",
+        default_max_tokens=16384,
+        top_p=1.0,
+    ),
+    FreeLlmPreset(
+        id="kimi-k3",
+        label="Kimi K3",
+        model="moonshotai/kimi-k3",
+        default_max_tokens=16384,
+        extra_body={"reasoning_effort": "low"},
+    ),
 )
 
 _PRESET_BY_ID = {p.id: p for p in FREE_LLM_PRESETS}

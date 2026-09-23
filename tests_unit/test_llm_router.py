@@ -19,16 +19,31 @@ from app.llm_router import (
 )
 
 
-def test_preset_catalog_has_four_models():
+def test_preset_catalog_has_six_models():
     models = preset_catalog_public()
-    assert len(models) == 4
+    assert len(models) == 6
     ids = {m["id"] for m in models}
-    assert ids == {"deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "glm-5.2"}
+    assert ids == {
+        "deepseek-v4-pro",
+        "minimax-m3",
+        "minimax-m2.7",
+        "glm-5.2",
+        "glm-5.3",
+        "kimi-k3",
+    }
 
 
 def test_get_preset_known_and_unknown():
     assert get_preset("minimax-m3") is not None
     assert get_preset("glm-5.2") is not None
+    glm53 = get_preset("glm-5.3")
+    assert glm53 is not None
+    assert glm53.model == "z-ai/glm-5.3"
+    assert glm53.top_p == 1.0
+    kimi = get_preset("kimi-k3")
+    assert kimi is not None
+    assert kimi.model == "moonshotai/kimi-k3"
+    assert kimi.extra_body == {"reasoning_effort": "low"}
     assert get_preset("unknown-model") is None
 
 
