@@ -49,6 +49,7 @@ def test_get_preset_known_and_unknown():
     assert glm53.temperature == 0.5
     assert glm53.top_p == 1.0
     assert glm53.system_prompt == "You are a helpful assistant."
+    assert glm53.test_max_tokens == 256
     kimi = get_preset("kimi-k3")
     assert kimi is not None
     assert kimi.model == "moonshotai/kimi-k3"
@@ -56,6 +57,8 @@ def test_get_preset_known_and_unknown():
     assert kimi.top_p is None
     assert kimi.content_as_parts is True
     assert kimi.test_max_tokens == 1024
+    assert kimi.test_timeout_seconds == 300
+    assert kimi.min_timeout_seconds == 300
     assert get_preset("unknown-model") is None
 
 
@@ -312,6 +315,9 @@ def test_free_llm_user_message_invalid_key():
 def test_free_timeout_and_token_caps_by_purpose():
     assert _free_timeout_for_purpose("resume") == 480.0
     assert _free_timeout_for_purpose("screening") == 120.0
+    kimi = get_preset("kimi-k3")
+    assert _free_timeout_for_purpose("screening", kimi) == 300.0
+    assert _free_timeout_for_purpose("resume", kimi) == 480.0
     assert _free_max_tokens_for_purpose("resume", 8192) == 8192
     assert _free_max_tokens_for_purpose("resume", 16384) == 16000
     assert _free_max_tokens_for_purpose("resume", 2048) == 2048

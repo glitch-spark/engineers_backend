@@ -15,7 +15,6 @@ from app.free_llm import (
     FREE_LLM_RESUME_MAX_OUTPUT_TOKENS,
     FREE_LLM_RESUME_TIMEOUT_SECONDS,
     FREE_LLM_SCREENING_TIMEOUT_SECONDS,
-    FREE_LLM_TEST_TIMEOUT_SECONDS,
     NVIDIA_BASE_URL,
     FreeLlmPreset,
     build_free_chat_kwargs,
@@ -77,12 +76,15 @@ def _free_llm_user_message(exc: Exception, *, timeout_seconds: float) -> str:
     return f"Free LLM request failed: {exc}"
 
 
-def _free_timeout_for_purpose(purpose: str) -> float:
+def _free_timeout_for_purpose(purpose: str, preset: Optional[FreeLlmPreset] = None) -> float:
     if purpose == "resume":
-        return float(FREE_LLM_RESUME_TIMEOUT_SECONDS)
-    if purpose == "screening":
-        return float(FREE_LLM_SCREENING_TIMEOUT_SECONDS)
-    return float(FREE_LLM_RESUME_TIMEOUT_SECONDS)
+        base = float(FREE_LLM_RESUME_TIMEOUT_SECONDS)
+    elif purpose == "screening":
+        base = float(FREE_LLM_SCREENING_TIMEOUT_SECONDS)
+    else:
+        base = float(FREE_LLM_RESUME_TIMEOUT_SECONDS)
+    floor = float(preset.min_timeout_seconds) if preset and preset.min_timeout_seconds else 0.0
+    return max(base, floor)
 
 
 def _free_max_tokens_for_purpose(purpose: str, max_tokens: int) -> int:
@@ -204,7 +206,7 @@ async def complete_with_fallback(
     if preset and api_key:
         attempted_free = True
         try:
-            free_timeout = _free_timeout_for_purpose(purpose)
+            free_timeout = _free_timeout_for_purpose(purpose, preset)
             free_max_tokens = _free_max_tokens_for_purpose(purpose, max_tokens)
             text, usage = await _free_chat_completion(
                 prompt,
@@ -528,7 +530,7 @@ async def test_free_connection(user: UserExtra) -> dict:
     preset, max_tokens, api_key = resolve_free_preset(user)
     if preset is None or not api_key:
         raise ValueError("Free LLM model and API key must be configured")
-    test_timeout = float(FREE_LLM_TEST_TIMEOUT_SECONDS)
+    test_timeout = float(preset.test_timeout_seconds)
     try:
         text, _usage = await _free_chat_completion(
             "Reply with exactly: ok",

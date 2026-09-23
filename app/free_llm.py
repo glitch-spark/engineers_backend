@@ -40,6 +40,9 @@ class FreeLlmPreset:
     system_prompt: Optional[str] = None
     # Reasoning models spend tokens on thinking before content; 16 is too small.
     test_max_tokens: int = 16
+    test_timeout_seconds: int = FREE_LLM_TEST_TIMEOUT_SECONDS
+    # Floor applied on top of purpose timeouts (Kimi max reasoning is slow).
+    min_timeout_seconds: int = 0
 
 
 FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
@@ -77,6 +80,7 @@ FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
         temperature=0.5,
         top_p=1.0,
         system_prompt="You are a helpful assistant.",
+        test_max_tokens=256,
     ),
     FreeLlmPreset(
         id="kimi-k3",
@@ -88,6 +92,8 @@ FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
         extra_body={"reasoning_effort": "max"},
         content_as_parts=True,
         test_max_tokens=1024,
+        test_timeout_seconds=300,
+        min_timeout_seconds=300,
     ),
 )
 
