@@ -43,7 +43,11 @@ Only users who connect receive DMs. Unconnected teammates get nothing.
 
 ## 4. Cron
 
-Hit the tick endpoint every 1–5 minutes (Render Cron, GitHub Actions, or crontab):
+Railway sibling (same service as in-app alerts): start command `python -m app.alerts_tick`,
+schedule `*/5 * * * *`. That process calls `run_alert_tick()` first, then the inbox tick.
+Copy `SLACK_BOT_TOKEN` and `FRONTEND_ORIGIN` onto that service. Do not cron the uvicorn API.
+
+HTTP fallback every 1–5 minutes (GitHub Actions or crontab):
 
 ```bash
 curl -X POST https://<api>/internal/slack-bot/tick \

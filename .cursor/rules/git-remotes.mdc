@@ -1,11 +1,10 @@
 ---
-description: Push and open PRs only on glitch-spark, never bcano-office
+description: Canonical remote is glitch-spark/engineers_backend
 alwaysApply: true
 ---
 
 # Git remotes
 
-- Push and open PRs only on `spark` → `glitch-spark/engineers_backend`.
-- Never `git push`, force-push, or `gh pr create` against `bcano-office` / `origin` when origin is bcano.
-- Treat `origin` / `bcano-office` as read-only (fetch/compare only).
-- Default for this machine: `spark` remote. Base branch is usually `dev`.
+- Real repo: `origin` → `https://github.com/glitch-spark/engineers_backend`
+- Push, pull, and open PRs on `origin`. Base branch is `dev`.
+- `bcano` (`bcano-office/engineers_backend`) is optional fetch/compare only.
