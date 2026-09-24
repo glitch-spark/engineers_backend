@@ -429,7 +429,22 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     ).sort([("scheduledAt", 1)]).to_list()
     interviews = [iv for iv in interviews if iv.status not in _SKIP_STATUSES]
     if not interviews:
-        return 0, "no_interviews"
+        text = "You have no interviews today. Have a rest."
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Today's interviews", "emoji": True},
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": text},
+            },
+        ]
+        ok = await send_dm(slack_id, text=text, blocks=blocks)
+        if ok:
+            await _mark_sent(user.id, kind)
+            return 1, None
+        return 0, "dm_failed"
 
     why = know_your_why_for_date(day)
     title = f"Today's interviews ({len(interviews)})"

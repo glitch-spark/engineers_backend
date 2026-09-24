@@ -59,8 +59,8 @@ Creating or changing an interview’s date, stage, status, or company also DMs
 that interview’s owner immediately (same bot thread as Test DM). The cron job
 still sends a daily digest (when in the user’s digest window) listing that
 user’s interviews for the calendar day in their timezone (`createdBy` only),
-plus today’s Know your why quote. Empty days are not marked sent, so a later
-same-window tick can still fire. Each interview is a labeled field block:
+plus today’s Know your why quote. Empty days still get a rest-day DM and are
+marked sent. Each interview is a labeled field block:
 
 ```
 *Profile Name:* AI Full-stack

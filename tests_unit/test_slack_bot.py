@@ -268,7 +268,7 @@ async def test_notify_interview_dm_sends_to_owner():
 
 
 @pytest.mark.asyncio
-async def test_digest_empty_day_is_not_marked_sent():
+async def test_digest_empty_day_sends_rest_message():
     from app.slack_bot import _digest_for_user
 
     user = SimpleNamespace(
@@ -280,14 +280,18 @@ async def test_digest_empty_day_is_not_marked_sent():
         slackDigestMinute=0,
     )
     mark = AsyncMock()
+    send = AsyncMock(return_value=True)
     find = SimpleNamespace(sort=lambda *_a, **_k: SimpleNamespace(to_list=AsyncMock(return_value=[])))
     with (
         patch("app.slack_bot.digest_slot_open", return_value=True),
         patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
         patch("app.slack_bot._mark_sent", mark),
+        patch("app.slack_bot.send_dm", send),
         patch("app.slack_bot.Interview.find", return_value=find),
     ):
         sent, reason = await _digest_for_user(user)
-    assert sent == 0
-    assert reason == "no_interviews"
-    mark.assert_not_awaited()
+    assert sent == 1
+    assert reason is None
+    send.assert_awaited_once()
+    assert send.await_args.kwargs["text"] == "You have no interviews today. Have a rest."
+    mark.assert_awaited_once()
