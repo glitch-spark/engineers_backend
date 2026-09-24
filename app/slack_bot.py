@@ -1,11 +1,12 @@
-"""Slack interview bot: OAuth identity link + private daily digest DMs.
+"""Slack interview bot: OAuth identity link + private DMs.
 
 Uses the workspace Bot Token for chat.postMessage DMs. Users connect via
 Slack OAuth (user_scope=identity.basic) so we store their Slack member id
 on UserExtra — never post interview details to a shared channel.
 
-Interviews are date-only, so there is no T-30 reminder — only a daily digest
-at each user's chosen time/timezone.
+Sends an instant DM when an interview is created or meaningfully updated,
+plus a daily digest at each user's chosen time/timezone. Interviews are
+date-only, so there is no T-30 reminder.
 """
 
 from __future__ import annotations
@@ -266,23 +267,112 @@ _SKIP_STATUSES = {
 }
 
 
+def interview_dm_eligible(user: Optional[UserExtra]) -> bool:
+    """True if this user should receive interview bot DMs."""
+    if user is None:
+        return False
+    if not (user.slackUserId or "").strip():
+        return False
+    if user.slackAlertsEnabled is False:
+        return False
+    return True
+
+
+def _enum_key(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    text = str(raw).strip()
+    return text or None
+
+
+def _naive_dt(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
+
+
+def interview_update_is_noteworthy(
+    *,
+    prev_scheduled_at: Optional[datetime],
+    new_scheduled_at: Optional[datetime],
+    prev_stage: Any,
+    new_stage: Any,
+    prev_status: Any,
+    new_status: Any,
+    prev_company: Optional[str],
+    new_company: Optional[str],
+) -> bool:
+    """True when schedule, stage, status, or company changed (not note/transcript)."""
+    if _naive_dt(prev_scheduled_at) != _naive_dt(new_scheduled_at):
+        return True
+    if _enum_key(prev_stage) != _enum_key(new_stage):
+        return True
+    if _enum_key(prev_status) != _enum_key(new_status):
+        return True
+    if (prev_company or "").strip() != (new_company or "").strip():
+        return True
+    return False
+
+
+async def notify_interview_dm(
+    interview: Interview,
+    *,
+    kind: str = "created",
+) -> bool:
+    """Best-effort private DM to the interview owner. Never raises."""
+    try:
+        if not slack_bot_configured():
+            return False
+        owner = await UserExtra.get(interview.createdBy)
+        if not interview_dm_eligible(owner):
+            return False
+        slack_id = (owner.slackUserId or "").strip()
+        title = "New interview" if kind == "created" else "Interview updated"
+        when = _fmt_date(interview.scheduledAt) if interview.scheduledAt else "—"
+        company = (interview.companyName or "Interview").strip()
+        why_day = (
+            interview.scheduledAt.date()
+            if interview.scheduledAt is not None
+            else datetime.now(resolve_user_tz(owner)).date()
+        )
+        why = know_your_why_for_date(why_day)
+        profiles = await _profile_labels([interview])
+        blocks = _interview_blocks(title, [interview], why=why, profiles=profiles)
+        text = f"{title}: {company} on {when}"
+        return await send_dm(slack_id, text=text, blocks=blocks)
+    except Exception:
+        log.exception("slack_bot notify_interview_dm crashed kind=%s", kind)
+        return False
+
+
 async def run_digest_for_user(user: UserExtra) -> int:
     """Send daily digest if in slot and not yet sent today. Returns 1 if DM sent."""
+    sent, reason = await _digest_for_user(user)
+    if sent == 0 and reason:
+        logger = log.debug if reason == "outside_slot" else log.info
+        logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
+    return sent
+
+
+async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     slack_id = (user.slackUserId or "").strip()
     if not slack_id:
-        return 0
+        return 0, "not_linked"
     s = get_settings()
     tz = resolve_user_tz(user)
     now_local = datetime.now(tz)
     hour = user.slackDigestHour if user.slackDigestHour is not None else s.SLACK_DIGEST_HOUR
     minute = user.slackDigestMinute if user.slackDigestMinute is not None else s.SLACK_DIGEST_MINUTE
     if not digest_slot_open(now_local, hour=hour, minute=minute):
-        return 0
+        return 0, "outside_slot"
     day = now_local.date()
     day_key = day.isoformat()
     kind = f"digest:{day_key}"
     if await _already_sent(user.id, kind):
-        return 0
+        return 0, "already_sent"
 
     start_n, end_n = calendar_day_bounds(day)
     interviews = await Interview.find(
@@ -293,8 +383,7 @@ async def run_digest_for_user(user: UserExtra) -> int:
     ).sort([("scheduledAt", 1)]).to_list()
     interviews = [iv for iv in interviews if iv.status not in _SKIP_STATUSES]
     if not interviews:
-        await _mark_sent(user.id, kind)
-        return 0
+        return 0, "no_interviews"
 
     why = know_your_why_for_date(day)
     title = f"Today's interviews ({len(interviews)})"
@@ -304,8 +393,8 @@ async def run_digest_for_user(user: UserExtra) -> int:
     ok = await send_dm(slack_id, text=text, blocks=blocks)
     if ok:
         await _mark_sent(user.id, kind)
-        return 1
-    return 0
+        return 1, None
+    return 0, "dm_failed"
 
 
 async def run_alert_tick() -> dict[str, int]:
@@ -314,9 +403,22 @@ async def run_alert_tick() -> dict[str, int]:
         return {"users": 0, "digest": 0, "skipped": 1}
     users = await _linked_users()
     digest_total = 0
+    skips = {
+        "outside_slot": 0,
+        "already_sent": 0,
+        "no_interviews": 0,
+        "dm_failed": 0,
+        "not_linked": 0,
+    }
     for user in users:
         try:
-            digest_total += await run_digest_for_user(user)
+            sent, reason = await _digest_for_user(user)
+            digest_total += sent
+            if sent == 0 and reason:
+                if reason in skips:
+                    skips[reason] += 1
+                logger = log.debug if reason == "outside_slot" else log.info
+                logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
         except Exception as exc:
             log.exception("slack_bot tick failed for user=%s: %s", user.id, exc)
-    return {"users": len(users), "digest": digest_total, "skipped": 0}
+    return {"users": len(users), "digest": digest_total, "skipped": 0, **skips}

@@ -23,7 +23,7 @@ from app.models import (
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack import notify_new_interview
+from app.slack_bot import interview_update_is_noteworthy, notify_interview_dm
 
 log = logging.getLogger(__name__)
 
@@ -421,15 +421,7 @@ async def create_interview(
     except Exception as exc:  # noqa: BLE001
         log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
 
-    try:
-        await notify_new_interview(
-            creator_email=user.email or "",
-            account_email="",
-            stage=stage_val or "",
-            scheduled_at=sched.strftime("%Y-%m-%d %H:%M"),
-        )
-    except Exception:
-        pass
+    await notify_interview_dm(iv, kind="created")
 
     return doc_to_dict(iv)
 
@@ -450,6 +442,11 @@ async def update_interview(
     if not is_admin and not is_owner:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
+    prev_sched = iv.scheduledAt
+    prev_stage = iv.stage
+    prev_status = iv.status
+    prev_company = iv.companyName
+
     if body.accountId is not None:
         new_account_oid = to_object_id(body.accountId)
         account = await Account.get(new_account_oid)
@@ -461,7 +458,6 @@ async def update_interview(
 
     new_sched = iv.scheduledAt
     new_ends = iv.endsAt
-    prev_sched = iv.scheduledAt
     if body.scheduledAt is not None:
         sched = _parse_datetime(body.scheduledAt)
         if sched is None:
@@ -565,6 +561,18 @@ async def update_interview(
 
     if transcript_changed and (iv.transcript or "").strip():
         asyncio.create_task(extract_and_score(iv))
+
+    if interview_update_is_noteworthy(
+        prev_scheduled_at=prev_sched,
+        new_scheduled_at=iv.scheduledAt,
+        prev_stage=prev_stage,
+        new_stage=iv.stage,
+        prev_status=prev_status,
+        new_status=iv.status,
+        prev_company=prev_company,
+        new_company=iv.companyName,
+    ):
+        await notify_interview_dm(iv, kind="updated")
 
     return doc_to_dict(iv)
 

@@ -2,6 +2,9 @@
 
 import os
 from datetime import date, datetime
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
@@ -9,13 +12,16 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from types import SimpleNamespace
 
 from app.know_your_why import know_your_why_for_date
-from app.models.interview import InterviewStage
+from app.models.interview import InterviewStage, InterviewStatus
 from app.slack_bot import (
     _country_flag,
     _interview_blocks,
     _profile_label,
     calendar_day_bounds,
     digest_slot_open,
+    interview_dm_eligible,
+    interview_update_is_noteworthy,
+    notify_interview_dm,
     validate_timezone,
 )
 from app.slack_timezones import SLACK_DIGEST_TIMEZONES, normalize_slack_timezone
@@ -112,3 +118,107 @@ def test_know_your_why_stable_for_date():
     b = know_your_why_for_date(date(2026, 7, 28))
     assert a == b
     assert isinstance(a, str) and len(a) > 10
+
+
+def test_interview_dm_eligible():
+    assert interview_dm_eligible(None) is False
+    assert interview_dm_eligible(SimpleNamespace(slackUserId="", slackAlertsEnabled=True)) is False
+    assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=False)) is False
+    assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=True)) is True
+    assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=None)) is True
+
+
+def test_interview_update_is_noteworthy_schedule_stage_status_company():
+    base = dict(
+        prev_scheduled_at=datetime(2026, 9, 24, 12, 0, 0),
+        new_scheduled_at=datetime(2026, 9, 24, 12, 0, 0),
+        prev_stage=InterviewStage.intro,
+        new_stage=InterviewStage.intro,
+        prev_status=InterviewStatus.scheduled,
+        new_status=InterviewStatus.scheduled,
+        prev_company="Acme",
+        new_company="Acme",
+    )
+    assert interview_update_is_noteworthy(**base) is False
+    assert interview_update_is_noteworthy(
+        **{**base, "new_scheduled_at": datetime(2026, 9, 25, 12, 0, 0)}
+    ) is True
+    assert interview_update_is_noteworthy(
+        **{**base, "new_stage": InterviewStage.tech}
+    ) is True
+    assert interview_update_is_noteworthy(
+        **{**base, "new_status": InterviewStatus.canceled}
+    ) is True
+    assert interview_update_is_noteworthy(**{**base, "new_company": "Globex"}) is True
+    assert interview_update_is_noteworthy(**{**base, "new_company": "Acme "}) is False
+
+
+@pytest.mark.asyncio
+async def test_notify_interview_dm_skips_when_bot_unconfigured():
+    interview = _fake_interview()
+    interview.createdBy = "user1"
+    with patch("app.slack_bot.slack_bot_configured", return_value=False):
+        assert await notify_interview_dm(interview, kind="created") is False
+
+
+@pytest.mark.asyncio
+async def test_notify_interview_dm_skips_ineligible_owner():
+    interview = _fake_interview()
+    interview.createdBy = "user1"
+    owner = SimpleNamespace(slackUserId="", slackAlertsEnabled=True)
+    with (
+        patch("app.slack_bot.slack_bot_configured", return_value=True),
+        patch("app.slack_bot.UserExtra.get", AsyncMock(return_value=owner)),
+        patch("app.slack_bot.send_dm", AsyncMock()) as send,
+    ):
+        assert await notify_interview_dm(interview, kind="created") is False
+        send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notify_interview_dm_sends_to_owner():
+    interview = _fake_interview(position="Senior Backend")
+    interview.createdBy = "user1"
+    owner = SimpleNamespace(
+        slackUserId="U123",
+        slackAlertsEnabled=True,
+        slackTimezone="America/New_York",
+    )
+    send = AsyncMock(return_value=True)
+    with (
+        patch("app.slack_bot.slack_bot_configured", return_value=True),
+        patch("app.slack_bot.UserExtra.get", AsyncMock(return_value=owner)),
+        patch("app.slack_bot._profile_labels", AsyncMock(return_value={"acc1": "Backend"})),
+        patch("app.slack_bot.send_dm", send),
+    ):
+        assert await notify_interview_dm(interview, kind="created") is True
+    send.assert_awaited_once()
+    kwargs = send.await_args.kwargs
+    assert kwargs["text"].startswith("New interview:")
+    assert kwargs["blocks"][0]["text"]["text"] == "New interview"
+
+
+@pytest.mark.asyncio
+async def test_digest_empty_day_is_not_marked_sent():
+    from app.slack_bot import _digest_for_user
+
+    user = SimpleNamespace(
+        id="user1",
+        slackUserId="U123",
+        slackAlertsEnabled=True,
+        slackTimezone="America/New_York",
+        slackDigestHour=8,
+        slackDigestMinute=0,
+    )
+    mark = AsyncMock()
+    find = SimpleNamespace(sort=lambda *_a, **_k: SimpleNamespace(to_list=AsyncMock(return_value=[])))
+    with (
+        patch("app.slack_bot.digest_slot_open", return_value=True),
+        patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
+        patch("app.slack_bot._mark_sent", mark),
+        patch("app.slack_bot.Interview.find", return_value=find),
+    ):
+        sent, reason = await _digest_for_user(user)
+    assert sent == 0
+    assert reason == "no_interviews"
+    mark.assert_not_awaited()
