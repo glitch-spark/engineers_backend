@@ -10,13 +10,17 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from app.know_your_why import know_your_why_for_date
 from app.models.interview import InterviewStage, InterviewStatus
 from app.slack_bot import (
     _country_flag,
+    _fmt_scheduled,
     _interview_blocks,
+    _interview_fields,
     _profile_label,
+    _stage_label,
     calendar_day_bounds,
     digest_slot_open,
     interview_dm_eligible,
@@ -73,44 +77,85 @@ def test_country_flag():
     assert _country_flag("USA") == ""
 
 
-def _fake_interview(*, account_id="acc1", position=None):
+def _fake_interview(*, account_id="acc1", position=None, job_url=None, stage=None):
     return SimpleNamespace(
         accountId=account_id,
         scheduledAt=datetime(2026, 8, 29, 12, 0, 0),
-        stage=InterviewStage.ai_interview,
+        stage=stage or InterviewStage.ai_interview,
         companyName="Acme",
         appliedPosition=position,
+        jobUrl=job_url,
     )
 
 
-def test_profile_label_parts():
+def test_profile_label_is_name_only():
     full = SimpleNamespace(name="AI Full-stack", country="br", region="Latam")
-    assert _profile_label(full) == "🇧🇷 BR · Latam · AI Full-stack"
+    assert _profile_label(full) == "AI Full-stack"
     bare = SimpleNamespace(name="Backend", country=None, region=None)
     assert _profile_label(bare) == "Backend"
     assert _profile_label(None) == ""
 
 
-def test_interview_blocks_include_profile_line():
+def test_fmt_scheduled_mdy_and_abbrev():
+    chicago = ZoneInfo("America/Chicago")
+    assert _fmt_scheduled(datetime(2026, 9, 23, 12, 0, 0), chicago) == "9/23/26 CDT"
+    assert _fmt_scheduled(None, chicago) == "—"
+
+
+def test_stage_label_humanizes():
+    assert _stage_label(InterviewStage.intro) == "Intro"
+    assert _stage_label(InterviewStage.tech_round_1) == "Tech Round 1"
+    assert _stage_label(InterviewStage.ai_interview) == "AI Interview"
+    assert _stage_label(None) == "—"
+
+
+def test_interview_fields_with_job_url():
+    interview = _fake_interview(
+        position="Senior Software Engineer",
+        job_url="https://jobs.example.com/acme",
+        stage=InterviewStage.intro,
+    )
+    interview.scheduledAt = datetime(2026, 9, 23, 12, 0, 0)
+    body = _interview_fields(
+        interview,
+        profile="Martin Zhang",
+        tz=ZoneInfo("America/Chicago"),
+    )
+    assert body == (
+        "*Profile Name:* Martin Zhang\n"
+        "*Company Name:* <https://jobs.example.com/acme|Acme>\n"
+        "*Applied Position:* Senior Software Engineer "
+        "(<https://jobs.example.com/acme|Job description>)\n"
+        "*Interview Stage:* Intro\n"
+        "*Scheduled Time:* 9/23/26 CDT"
+    )
+
+
+def test_interview_blocks_digest_includes_why_and_link():
     interview = _fake_interview(position="Senior Backend")
     blocks = _interview_blocks(
         "Today's interviews (1)",
         [interview],
         why="Show up curious.",
-        profiles={"acc1": "🇧🇷 BR · Latam · AI Full-stack"},
+        profiles={"acc1": "AI Full-stack"},
+        tz=ZoneInfo("UTC"),
+        include_open_link=True,
     )
     body = blocks[1]["text"]["text"]
-    assert body == (
-        "• *Acme* · Senior Backend\n"
-        "  🇧🇷 BR · Latam · AI Full-stack\n"
-        "  Sat Aug 29 · `ai_interview`"
-    )
+    assert "*Profile Name:* AI Full-stack" in body
+    assert "*Company Name:* Acme" in body
+    assert "*Interview Stage:* AI Interview" in body
+    assert any("Open interviews" in str(b) for b in blocks)
+    assert any("Know your why" in str(b) for b in blocks)
 
 
-def test_interview_blocks_without_profile_match():
+def test_interview_blocks_instant_omits_why_and_link():
     interview = _fake_interview(account_id="missing")
-    body = _interview_blocks("t", [interview], why="w")[1]["text"]["text"]
-    assert body == "• *Acme*\n  Sat Aug 29 · `ai_interview`"
+    blocks = _interview_blocks("New interview", [interview], tz=ZoneInfo("UTC"))
+    blob = str(blocks)
+    assert "Know your why" not in blob
+    assert "Open interviews" not in blob
+    assert "*Profile Name:* —" in blocks[1]["text"]["text"]
 
 
 def test_know_your_why_stable_for_date():
@@ -196,6 +241,10 @@ async def test_notify_interview_dm_sends_to_owner():
     kwargs = send.await_args.kwargs
     assert kwargs["text"].startswith("New interview:")
     assert kwargs["blocks"][0]["text"]["text"] == "New interview"
+    blob = str(kwargs["blocks"])
+    assert "Know your why" not in blob
+    assert "Open interviews" not in blob
+    assert "*Interview Stage:* AI Interview" in kwargs["blocks"][1]["text"]["text"]
 
 
 @pytest.mark.asyncio
