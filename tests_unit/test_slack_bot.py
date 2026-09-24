@@ -1,7 +1,7 @@
 """Unit tests for Slack digest helpers and Know your why."""
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,7 +24,11 @@ from app.slack_bot import (
     notify_interview_dm,
     validate_timezone,
 )
-from app.slack_timezones import SLACK_DIGEST_TIMEZONES, normalize_slack_timezone
+from app.slack_timezones import (
+    SLACK_DIGEST_TIMEZONES,
+    normalize_slack_timezone,
+    slack_timezone_catalog,
+)
 
 
 def test_digest_slot_open_inside_window():
@@ -64,6 +68,22 @@ def test_normalize_unknown_falls_back():
 
 def test_catalog_has_27_hourly_offsets():
     assert len(SLACK_DIGEST_TIMEZONES) == 27
+    assert len(slack_timezone_catalog()) == 27
+
+
+def test_catalog_offset_follows_daylight_time():
+    summer = slack_timezone_catalog(when=datetime(2026, 7, 15, 16, tzinfo=timezone.utc))
+    winter = slack_timezone_catalog(when=datetime(2026, 1, 15, 16, tzinfo=timezone.utc))
+    by_summer = {row["value"]: row["label"] for row in summer}
+    by_winter = {row["value"]: row["label"] for row in winter}
+    assert by_summer["America/New_York"] == "America/New York (GMT−4:00)"
+    assert by_winter["America/New_York"] == "America/New York (GMT−5:00)"
+    assert by_summer["Europe/Paris"] == "Europe/Paris (GMT+2:00)"
+    assert by_winter["Europe/Paris"] == "Europe/Paris (GMT+1:00)"
+    assert by_summer["Pacific/Auckland"] == "Pacific/Auckland (GMT+12:00)"
+    assert by_winter["Pacific/Auckland"] == "Pacific/Auckland (GMT+13:00)"
+    assert by_summer["Asia/Tokyo"] == "Asia/Tokyo (GMT+9:00)"
+    assert by_winter["Etc/GMT+12"] == "UTC−12:00"
 
 
 def test_country_flag():
