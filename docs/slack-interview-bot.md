@@ -2,8 +2,8 @@
 
 Instant DMs when you add or reschedule an interview, plus a per-user morning
 digest via a Slack App bot (date-only interviews — no T-30). Interview details
-are never posted to a shared channel. Each message includes a “Know your why”
-line.
+are never posted to a shared channel. The daily digest includes a “Know your
+why” line; instant create/update DMs do not.
 
 ## 1. Create the Slack App
 
@@ -60,13 +60,14 @@ that interview’s owner immediately (same bot thread as Test DM). The cron job
 still sends a daily digest (when in the user’s digest window) listing that
 user’s interviews for the calendar day in their timezone (`createdBy` only),
 plus today’s Know your why quote. Empty days are not marked sent, so a later
-same-window tick can still fire. Each interview line shows company · position,
-the profile’s country flag/code · region · profile name, then date · stage:
+same-window tick can still fire. Each interview is a labeled field block:
 
 ```
-• Acme · Senior Backend
-  🇧🇷 BR · Latam · AI Full-stack
-  Sat Aug 29 · ai_interview
+*Profile Name:* AI Full-stack
+*Company Name:* <https://jobs.example.com/acme|Acme>
+*Applied Position:* Senior Backend (<https://jobs.example.com/acme|Job description>)
+*Interview Stage:* Intro
+*Scheduled Time:* 9/23/26 CDT
 ```
 
 ## 5. Privacy

@@ -133,11 +133,32 @@ async def send_dm(slack_user_id: str, *, text: str, blocks: Optional[list[dict]]
         return False
 
 
-def _fmt_date(dt: datetime) -> str:
-    """Date-only label — interviews are calendar dates, not clock times."""
-    if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
-    return dt.strftime("%a %b %d")
+def _fmt_scheduled(dt: Optional[datetime], tz: ZoneInfo) -> str:
+    """Calendar date as M/D/YY plus the zone abbrev for that date."""
+    if dt is None:
+        return "—"
+    naive = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+    day = naive.date()
+    local = datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=tz)
+    abbrev = (local.strftime("%Z") or "").strip() or "UTC"
+    return f"{day.month}/{day.day}/{day.strftime('%y')} {abbrev}"
+
+
+def _stage_label(stage: Any) -> str:
+    key = _enum_key(stage)
+    if not key:
+        return "—"
+    if key == "ai_interview":
+        return "AI Interview"
+    return " ".join(part.capitalize() for part in key.split("_"))
+
+
+def _mrkdwn_link(url: Optional[str], label: str) -> str:
+    href = (url or "").strip()
+    safe = (label or "").replace("|", " ").replace(">", "").strip() or "link"
+    if href.startswith("http://") or href.startswith("https://"):
+        return f"<{href}|{safe}>"
+    return safe
 
 
 def _country_flag(code: Optional[str]) -> str:
@@ -149,14 +170,10 @@ def _country_flag(code: Optional[str]) -> str:
 
 
 def _profile_label(account: Optional[Account]) -> str:
-    """"🇧🇷 BR · Latam · AI Full-stack" — mirrors the web interview cards,
-    with the country code kept for clients that don't render flag emoji."""
+    """Account display name only (no flag/region)."""
     if account is None:
         return ""
-    flag = _country_flag(account.country)
-    country = f"{flag} {(account.country or '').strip().upper()}".strip() if flag else ""
-    parts = [country, (account.region or "").strip(), (account.name or "").strip()]
-    return " · ".join(p for p in parts if p)
+    return (account.name or "").strip()
 
 
 async def _profile_labels(interviews: list[Interview]) -> dict[str, str]:
@@ -167,46 +184,75 @@ async def _profile_labels(interviews: list[Interview]) -> dict[str, str]:
     return {str(a.id): _profile_label(a) for a in accounts}
 
 
+def _interview_fields(
+    interview: Interview,
+    *,
+    profile: str,
+    tz: ZoneInfo,
+) -> str:
+    company = (getattr(interview, "companyName", None) or "").strip() or "—"
+    job_url = (getattr(interview, "jobUrl", None) or "").strip() or None
+    company_value = _mrkdwn_link(job_url, company) if job_url else company
+    position = (getattr(interview, "appliedPosition", None) or "").strip() or "—"
+    if job_url:
+        position = f"{position} ({_mrkdwn_link(job_url, 'Job description')})"
+    return "\n".join(
+        [
+            f"*Profile Name:* {profile.strip() or '—'}",
+            f"*Company Name:* {company_value}",
+            f"*Applied Position:* {position}",
+            f"*Interview Stage:* {_stage_label(getattr(interview, 'stage', None))}",
+            f"*Scheduled Time:* {_fmt_scheduled(getattr(interview, 'scheduledAt', None), tz)}",
+        ]
+    )
+
+
 def _interview_blocks(
     title: str,
     interviews: list[Interview],
     *,
-    why: str,
+    why: Optional[str] = None,
     profiles: Optional[dict[str, str]] = None,
+    tz: Optional[ZoneInfo] = None,
+    include_open_link: bool = False,
 ) -> list[dict[str, Any]]:
     profiles = profiles or {}
-    lines = []
+    zone = tz or ZoneInfo("UTC")
+    chunks = []
     for iv in interviews:
-        company = (iv.companyName or "Interview").strip()
-        stage = iv.stage.value if iv.stage else "—"
-        when = _fmt_date(iv.scheduledAt) if iv.scheduledAt else "—"
-        pos = (iv.appliedPosition or "").strip()
-        extra = f" · {pos}" if pos else ""
         profile = profiles.get(str(iv.accountId)) if iv.accountId else ""
-        profile_line = f"\n  {profile}" if profile else ""
-        lines.append(f"• *{company}*{extra}{profile_line}\n  {when} · `{stage}`")
-    body = "\n\n".join(lines) if lines else "_No interviews._"
-    return [
+        chunks.append(_interview_fields(iv, profile=profile or "", tz=zone))
+    body = "\n\n".join(chunks) if chunks else "_No interviews._"
+    blocks: list[dict[str, Any]] = [
         {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
         {"type": "section", "text": {"type": "mrkdwn", "text": body}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"<{_frontend_link('/interviews')}|Open interviews>",
-            },
-        },
-        {"type": "divider"},
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Know your why*\n_{why}_",
-                }
-            ],
-        },
     ]
+    if include_open_link:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"<{_frontend_link('/interviews')}|Open interviews>",
+                },
+            }
+        )
+    if why:
+        blocks.extend(
+            [
+                {"type": "divider"},
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Know your why*\n_{why}_",
+                        }
+                    ],
+                },
+            ]
+        )
+    return blocks
 
 
 async def _already_sent(user_id: PydanticObjectId, kind: str) -> bool:
@@ -331,16 +377,16 @@ async def notify_interview_dm(
             return False
         slack_id = (owner.slackUserId or "").strip()
         title = "New interview" if kind == "created" else "Interview updated"
-        when = _fmt_date(interview.scheduledAt) if interview.scheduledAt else "—"
+        tz = resolve_user_tz(owner)
+        when = _fmt_scheduled(interview.scheduledAt, tz)
         company = (interview.companyName or "Interview").strip()
-        why_day = (
-            interview.scheduledAt.date()
-            if interview.scheduledAt is not None
-            else datetime.now(resolve_user_tz(owner)).date()
-        )
-        why = know_your_why_for_date(why_day)
         profiles = await _profile_labels([interview])
-        blocks = _interview_blocks(title, [interview], why=why, profiles=profiles)
+        blocks = _interview_blocks(
+            title,
+            [interview],
+            profiles=profiles,
+            tz=tz,
+        )
         text = f"{title}: {company} on {when}"
         return await send_dm(slack_id, text=text, blocks=blocks)
     except Exception:
@@ -388,7 +434,14 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     why = know_your_why_for_date(day)
     title = f"Today's interviews ({len(interviews)})"
     profiles = await _profile_labels(interviews)
-    blocks = _interview_blocks(title, interviews, why=why, profiles=profiles)
+    blocks = _interview_blocks(
+        title,
+        interviews,
+        why=why,
+        profiles=profiles,
+        tz=tz,
+        include_open_link=True,
+    )
     text = f"You have {len(interviews)} interview(s) today. Know your why: {why}"
     ok = await send_dm(slack_id, text=text, blocks=blocks)
     if ok:
