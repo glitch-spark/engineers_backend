@@ -50,10 +50,14 @@ def test_get_preset_known_and_unknown():
     assert glm53.top_p == 1.0
     assert glm53.system_prompt == "You are a helpful assistant."
     assert glm53.test_max_tokens == 256
+    assert glm53.extra_body == {
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {"reasoning_effort": "high"},
+    }
     kimi = get_preset("kimi-k3")
     assert kimi is not None
     assert kimi.model == "moonshotai/kimi-k3"
-    assert kimi.extra_body == {"reasoning_effort": "max"}
+    assert kimi.extra_body == {"reasoning_effort": "high"}
     assert kimi.top_p is None
     assert kimi.content_as_parts is True
     assert kimi.test_max_tokens == 1024
@@ -73,7 +77,10 @@ def test_glm53_payload_matches_nvidia_catalog():
     ]
     assert kwargs["temperature"] == 0.5
     assert kwargs["top_p"] == 1.0
-    assert "extra_body" not in kwargs
+    assert kwargs["extra_body"] == {
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {"reasoning_effort": "high"},
+    }
 
 
 def test_kimi_payload_omits_top_p_and_uses_content_parts():
@@ -84,7 +91,7 @@ def test_kimi_payload_omits_top_p_and_uses_content_parts():
     assert kwargs["messages"][0]["content"] == [{"type": "text", "text": "Hello"}]
     assert kwargs["temperature"] == 1.0
     assert "top_p" not in kwargs
-    assert kwargs["extra_body"] == {"reasoning_effort": "max"}
+    assert kwargs["extra_body"] == {"reasoning_effort": "high"}
 
 
 def test_deepseek_payload_keeps_string_content_and_top_p():

@@ -41,7 +41,7 @@ class FreeLlmPreset:
     # Reasoning models spend tokens on thinking before content; 16 is too small.
     test_max_tokens: int = 16
     test_timeout_seconds: int = FREE_LLM_TEST_TIMEOUT_SECONDS
-    # Floor applied on top of purpose timeouts (Kimi max reasoning is slow).
+    # Floor applied on top of purpose timeouts (Kimi high reasoning is slow).
     min_timeout_seconds: int = 0
 
 
@@ -79,6 +79,11 @@ FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
         default_max_tokens=16384,
         temperature=0.5,
         top_p=1.0,
+        # Unset defaults to max (~16 min on resume). high finishes inside 480s.
+        extra_body={
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        },
         system_prompt="You are a helpful assistant.",
         test_max_tokens=256,
     ),
@@ -89,7 +94,7 @@ FREE_LLM_PRESETS: tuple[FreeLlmPreset, ...] = (
         default_max_tokens=16384,
         temperature=1.0,
         top_p=None,  # NVIDIA: top_p / penalties are fixed and not exposed
-        extra_body={"reasoning_effort": "max"},
+        extra_body={"reasoning_effort": "high"},
         content_as_parts=True,
         test_max_tokens=1024,
         test_timeout_seconds=300,
