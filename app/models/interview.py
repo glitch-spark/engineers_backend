@@ -1,7 +1,8 @@
 import hashlib
 from datetime import datetime
+from datetime import timezone as dt_timezone
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
 from beanie import PydanticObjectId
@@ -77,6 +78,31 @@ class InterviewStageEvent(BaseModel):
         return data
 
 
+CallerMethod = Literal["video", "phone_hushed", "phone_slynumber"]
+
+
+class InterviewCaller(BaseModel):
+    """Optional request for a caller (a coworker) to join this interview."""
+
+    enabled: bool = False
+    callerName: str = "TBD"
+    # Exact start in UTC; None means the time is still TBD.
+    startsAt: Optional[datetime] = None
+    timezone: Optional[str] = None  # IANA id from the Slack timezone allowlist
+    method: Optional[CallerMethod] = None
+    methodValue: str = ""
+    coworkerIds: List[PydanticObjectId] = []
+    slackChannelTs: Optional[str] = None
+
+    @field_validator("startsAt", mode="after")
+    @classmethod
+    def _utc_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        # Mongo returns naive datetimes; tag them UTC so JSON carries the offset.
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=dt_timezone.utc)
+        return v
+
+
 class Interview(TimestampedDocument):
     accountId: PydanticObjectId
     resumeId: Optional[PydanticObjectId] = None  # legacy; no longer surfaced in UI
@@ -93,6 +119,7 @@ class Interview(TimestampedDocument):
     transcript: str = ""
     note: str = ""
     stageHistory: List[InterviewStageEvent] = []
+    caller: Optional[InterviewCaller] = None
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -118,4 +145,5 @@ class Interview(TimestampedDocument):
             IndexModel([("accountId", 1)]),
             IndexModel([("stage", 1)]),
             IndexModel([("status", 1)]),
+            IndexModel([("caller.coworkerIds", 1)]),
         ]

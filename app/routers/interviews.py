@@ -23,8 +23,20 @@ from app.models import (
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus
+from app.interview_caller import (
+    CallerError,
+    CallerIn,
+    build_caller,
+    caller_snapshot,
+    is_coworker,
+    resync_caller_day,
+)
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack_bot import interview_update_is_noteworthy, notify_interview_dm
+from app.slack_bot import (
+    interview_update_is_noteworthy,
+    notify_caller_channel,
+    notify_interview_dm,
+)
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +151,7 @@ class InterviewCreate(BaseModel):
     note: Optional[str] = ""
     # Same ordered path the edit form sends — otherwise prior rounds are dropped.
     stageHistory: Optional[List[StageHistoryItemIn]] = None
+    caller: Optional[CallerIn] = None
 
 
 class StageCreate(BaseModel):
@@ -172,6 +185,45 @@ class InterviewUpdate(BaseModel):
     note: Optional[str] = None
     # Ordered stage entries — replaces history so mistaken board moves can be fixed.
     stageHistory: Optional[List[StageHistoryItemIn]] = None
+    caller: Optional[CallerIn] = None
+
+
+async def _apply_caller(iv: Interview, body: CallerIn, *, user: UserExtra) -> None:
+    raw_ids = [str(i).strip() for i in (body.coworkerIds or []) if str(i).strip()]
+    valid: set[str] = set()
+    if body.enabled and raw_ids:
+        oids = [to_object_id(i) for i in raw_ids]
+        rows = await UserExtra.find(
+            {"_id": {"$in": oids}, "isActive": {"$ne": False}}
+        ).to_list()
+        valid = {str(u.id) for u in rows}
+    owner = user if str(user.id) == str(iv.createdBy) else await UserExtra.get(iv.createdBy)
+    try:
+        iv.caller = build_caller(
+            body,
+            scheduled_at=iv.scheduledAt,
+            owner_id=iv.createdBy,
+            valid_coworker_ids=valid,
+            default_tz=owner.slackTimezone if owner else None,
+            previous=iv.caller,
+        )
+    except CallerError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+async def _post_caller_channel(iv: Interview, *, kind: str) -> None:
+    ts = await notify_caller_channel(iv, kind=kind)
+    if ts and iv.caller is not None and iv.caller.slackChannelTs != ts:
+        iv.caller.slackChannelTs = ts
+        await iv.save()
+
+
+def _can_view(iv: Interview, user: UserExtra) -> bool:
+    return (
+        user.role == "admin"
+        or str(iv.createdBy) == str(user.id)
+        or is_coworker(iv.caller, user.id)
+    )
 
 
 def _parse_datetime(s: str) -> Optional[datetime]:
@@ -336,9 +388,14 @@ async def _after_save(
     prev_stage: Any,
     prev_status: Any,
     prev_company: Optional[str],
+    prev_caller: Optional[tuple] = None,
     extract_stage_ids: Iterable[Optional[str]] = (),
 ) -> None:
     """Pipeline re-sync, transcript extraction and Slack DM after an update."""
+    new_caller = caller_snapshot(iv.caller)
+    if new_caller is not None and new_caller != prev_caller:
+        await _post_caller_channel(iv, kind="created" if prev_caller is None else "updated")
+
     try:
         from app.routers.applications import attach_interview_to_app
         await attach_interview_to_app(user_id=user.id, interview=iv)
@@ -364,7 +421,33 @@ async def _after_save(
 async def _interview_out(iv: Interview) -> dict:
     rows = await populate_owner([iv], field="createdBy")
     out = await _populate_account(rows)
+    out = await _populate_coworkers(out)
     return out[0]
+
+
+async def _populate_coworkers(items: Iterable[dict]) -> list:
+    """Attach `caller.coworkers` [{_id, name, email}] next to `caller.coworkerIds`."""
+    items = list(items)
+    ids: set[str] = set()
+    for item in items:
+        caller = item.get("caller") or {}
+        ids.update(str(i) for i in caller.get("coworkerIds") or [])
+    users = (
+        await UserExtra.find({"_id": {"$in": [to_object_id(i) for i in ids]}}).to_list()
+        if ids
+        else []
+    )
+    by_id = {str(u.id): u for u in users}
+    for item in items:
+        caller = item.get("caller")
+        if not caller:
+            continue
+        caller["coworkers"] = [
+            {"_id": cid, "name": by_id[cid].name, "email": by_id[cid].email}
+            for cid in (str(i) for i in caller.get("coworkerIds") or [])
+            if cid in by_id
+        ]
+    return items
 
 
 async def _populate_account(items: Iterable[dict], *, field: str = "accountId") -> list:
@@ -502,7 +585,7 @@ async def list_interviews(
     total = await Interview.find(query).count()
     rows = await Interview.find(query).sort([("scheduledAt", direction)]).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
-    rows_out = await _populate_account(rows_with_owner)
+    rows_out = await _populate_coworkers(await _populate_account(rows_with_owner))
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -527,7 +610,7 @@ async def get_interview(
     iv = await Interview.get(oid)
     if iv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if user.role != "admin" and str(iv.createdBy) != str(user.id):
+    if not _can_view(iv, user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     if migrate_legacy_stage_fields(iv):
         await iv.save()
@@ -597,6 +680,8 @@ async def create_interview(
     else:
         iv.transcript = body.transcript or ""
         iv.note = body.note or ""
+    if body.caller is not None and body.caller.enabled:
+        await _apply_caller(iv, body.caller, user=user)
     await iv.insert()
 
     if (body.transcript or "").strip():
@@ -610,6 +695,8 @@ async def create_interview(
         log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
 
     await notify_interview_dm(iv, kind="created")
+    if caller_snapshot(iv.caller) is not None:
+        await _post_caller_channel(iv, kind="created")
 
     return doc_to_dict(iv)
 
@@ -634,6 +721,7 @@ async def update_interview(
     prev_stage = iv.stage
     prev_status = iv.status
     prev_company = iv.companyName
+    prev_caller = caller_snapshot(iv.caller)
     migrated = migrate_legacy_stage_fields(iv)
 
     if body.accountId is not None:
@@ -751,6 +839,11 @@ async def update_interview(
         if body.note is not None:
             iv.note = body.note
 
+    if body.caller is not None:
+        await _apply_caller(iv, body.caller, user=user)
+    else:
+        resync_caller_day(iv.caller, iv.scheduledAt)
+
     await iv.save()
 
     if removed_stage_ids:
@@ -772,6 +865,7 @@ async def update_interview(
         prev_stage=prev_stage,
         prev_status=prev_status,
         prev_company=prev_company,
+        prev_caller=prev_caller,
         extract_stage_ids=extract_ids,
     )
     return doc_to_dict(iv)
@@ -785,6 +879,7 @@ async def add_interview_stage(
 ) -> dict:
     iv = await _load_editable(iv_id, user)
     prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
+    prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
 
     stage_val = _coerce_write_stage(body.stage)
@@ -815,6 +910,7 @@ async def add_interview_stage(
         )
     iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
+    resync_caller_day(iv.caller, iv.scheduledAt)
     await iv.save()
 
     await _after_save(
@@ -824,6 +920,7 @@ async def add_interview_stage(
         prev_stage=prev_stage,
         prev_status=prev_status,
         prev_company=prev_company,
+        prev_caller=prev_caller,
         extract_stage_ids=[entry.id] if entry.transcript.strip() else [],
     )
     return await _interview_out(iv)
@@ -838,6 +935,7 @@ async def update_interview_stage(
 ) -> dict:
     iv = await _load_editable(iv_id, user)
     prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
+    prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
     entry = iv.stageHistory[idx]
@@ -866,6 +964,7 @@ async def update_interview_stage(
     _reject_adjacent_duplicate(iv)
     if idx == len(iv.stageHistory) - 1:
         _sync_top_from_tip(iv)
+        resync_caller_day(iv.caller, iv.scheduledAt)
     await iv.save()
 
     extract_ids: list[Optional[str]] = []
@@ -881,6 +980,7 @@ async def update_interview_stage(
         prev_stage=prev_stage,
         prev_status=prev_status,
         prev_company=prev_company,
+        prev_caller=prev_caller,
         extract_stage_ids=extract_ids,
     )
     return await _interview_out(iv)
@@ -894,6 +994,7 @@ async def delete_interview_stage(
 ) -> dict:
     iv = await _load_editable(iv_id, user)
     prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
+    prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
     if len(iv.stageHistory) <= 1:
@@ -904,6 +1005,7 @@ async def delete_interview_stage(
     iv.stageHistory.pop(idx)
     _reject_adjacent_duplicate(iv)
     _sync_top_from_tip(iv)
+    resync_caller_day(iv.caller, iv.scheduledAt)
     await iv.save()
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
 
@@ -914,6 +1016,7 @@ async def delete_interview_stage(
         prev_stage=prev_stage,
         prev_status=prev_status,
         prev_company=prev_company,
+        prev_caller=prev_caller,
     )
     return await _interview_out(iv)
 
@@ -951,7 +1054,7 @@ async def list_interview_questions(
     iv = await Interview.get(oid)
     if iv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if user.role != "admin" and str(iv.createdBy) != str(user.id):
+    if not _can_view(iv, user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     tip = _tip(iv)
     sid = stage_id or (tip.id if tip else None)
