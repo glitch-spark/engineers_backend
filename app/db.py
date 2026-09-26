@@ -46,6 +46,7 @@ from app.models import (
     ResumeLLMCache,
     Skill,
     Transaction,
+    DailyPlan,
     UserExtra,
     WeeklyPlan,
 )
@@ -55,6 +56,7 @@ DOCUMENT_MODELS = [
     UserExtra,
     Transaction,
     Account,
+    DailyPlan,
     WeeklyPlan,
     Interview,
     InterviewChatLog,

@@ -33,7 +33,7 @@ from asgi_lifespan import LifespanManager  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 from app.main import app as fastapi_app  # noqa: E402
-from app.models import Account, Interview, Notification, RecurringCharge, Transaction, UserExtra, WeeklyPlan  # noqa: E402
+from app.models import Account, DailyPlan, Interview, Notification, RecurringCharge, Transaction, UserExtra, WeeklyPlan  # noqa: E402
 from app.security import create_access_token, hash_password  # noqa: E402
 
 
@@ -58,7 +58,7 @@ async def client(app) -> AsyncIterator[AsyncClient]:
 
 @pytest_asyncio.fixture(autouse=True)
 async def db_clean(app) -> AsyncIterator[None]:
-    for model in (UserExtra, Transaction, Account, WeeklyPlan, Interview, Notification, RecurringCharge):
+    for model in (UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge):
         await model.delete_all()
     yield
 
