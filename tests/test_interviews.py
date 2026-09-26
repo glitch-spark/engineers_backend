@@ -80,6 +80,167 @@ async def test_interview_crud_round_trip(client, staff_user, auth_header):
     assert r.status_code == 200
 
 
+async def _create_intro(client, staff_user, auth_header, **extras) -> dict:
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post(
+        "/interviews",
+        headers=auth_header(staff_user),
+        json=_payload(
+            account=acc,
+            scheduled_at="2026-04-25T14:30:00Z",
+            stage="intro",
+            status="completed",
+            **extras,
+        ),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def test_create_puts_transcript_note_status_on_tip_stage(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header, transcript="intro script", note="intro note")
+    tip = iv["stageHistory"][-1]
+    assert tip["id"]
+    assert tip["stage"] == "intro"
+    assert tip["status"] == "completed"
+    assert tip["transcript"] == "intro script"
+    assert tip["note"] == "intro note"
+    assert iv["transcript"] == ""
+
+
+async def test_stage_add_edit_delete_round_trip(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header, transcript="intro script")
+    iv_id = iv["_id"]
+    intro_id = iv["stageHistory"][0]["id"]
+    h = auth_header(staff_user)
+
+    r = await client.post(
+        f"/interviews/{iv_id}/stages",
+        headers=h,
+        json={"stage": "tech_round_1", "scheduledAt": "2026-05-02", "status": "scheduled"},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert [e["stage"] for e in body["stageHistory"]] == ["intro", "tech_round_1"]
+    assert body["stage"] == "tech_round_1"
+    assert body["status"] == "scheduled"
+    assert body["scheduledAt"].startswith("2026-05-02")
+    tech_id = body["stageHistory"][-1]["id"]
+
+    r = await client.patch(
+        f"/interviews/{iv_id}/stages/{tech_id}",
+        headers=h,
+        json={"note": "tech note", "status": "passed"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "passed"
+    assert body["stageHistory"][-1]["note"] == "tech note"
+    assert body["stageHistory"][0]["transcript"] == "intro script"
+    assert body["stageHistory"][0]["note"] == ""
+
+    # Editing a non-tip stage does not change the interview-level status.
+    r = await client.patch(
+        f"/interviews/{iv_id}/stages/{intro_id}",
+        headers=h,
+        json={"status": "failed"},
+    )
+    assert r.status_code == 200
+    assert r.json()["stageHistory"][0]["status"] == "failed"
+    assert r.json()["status"] == "passed"
+    assert r.json()["stage"] == "tech_round_1"
+
+    r = await client.delete(f"/interviews/{iv_id}/stages/{tech_id}", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [e["stage"] for e in body["stageHistory"]] == ["intro"]
+    assert body["stage"] == "intro"
+
+    r = await client.delete(f"/interviews/{iv_id}/stages/{intro_id}", headers=h)
+    assert r.status_code == 400
+
+
+async def test_stage_cannot_repeat_current_stage(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.post(
+        f"/interviews/{iv['_id']}/stages",
+        headers=auth_header(staff_user),
+        json={"stage": "intro", "scheduledAt": "2026-05-02"},
+    )
+    assert r.status_code == 400
+
+
+async def test_stage_endpoints_forbidden_for_other_users(client, staff_user, staff_user_2, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.post(
+        f"/interviews/{iv['_id']}/stages",
+        headers=auth_header(staff_user_2),
+        json={"stage": "final"},
+    )
+    assert r.status_code == 403
+
+
+async def test_put_with_stage_history_keeps_per_stage_notes(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header, transcript="intro script")
+    iv_id = iv["_id"]
+    h = auth_header(staff_user)
+    r = await client.post(
+        f"/interviews/{iv_id}/stages",
+        headers=h,
+        json={"stage": "final", "scheduledAt": "2026-05-10", "note": "final note"},
+    )
+    history = r.json()["stageHistory"]
+
+    # Modal save: explicit history + top-level note edits the current (tip) round only.
+    r = await client.put(
+        f"/interviews/{iv_id}",
+        headers=h,
+        json={
+            "stage": "final",
+            "stageHistory": [
+                {"id": e["id"], "stage": e["stage"], "scheduledAt": e["scheduledAt"][:10]}
+                for e in history
+            ],
+            "note": "final note edited",
+        },
+    )
+    assert r.status_code == 200, r.text
+    out = r.json()["stageHistory"]
+    assert [e["id"] for e in out] == [e["id"] for e in history]
+    assert out[0]["transcript"] == "intro script"
+    assert out[1]["note"] == "final note edited"
+
+
+async def test_get_migrates_legacy_interview_fields(client, staff_user, auth_header):
+    from app.models import Interview
+    from app.models.interview import InterviewStage, InterviewStatus
+
+    acc = await _make_account(owner_id=staff_user.id)
+    legacy = Interview(
+        accountId=acc.id,
+        createdBy=staff_user.id,
+        scheduledAt=datetime(2026, 4, 25, 14, 30),
+        stage=InterviewStage.intro,
+        status=InterviewStatus.completed,
+        transcript="old script",
+        note="old note",
+        stageHistory=[],
+    )
+    await legacy.insert()
+
+    r = await client.get(f"/interviews/{legacy.id}", headers=auth_header(staff_user))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["transcript"] == ""
+    tip = body["stageHistory"][-1]
+    assert tip["transcript"] == "old script"
+    assert tip["note"] == "old note"
+    assert tip["status"] == "completed"
+
+    r2 = await client.get(f"/interviews/{legacy.id}", headers=auth_header(staff_user))
+    assert r2.json()["stageHistory"][-1]["id"] == tip["id"]
+
+
 async def test_create_invalid_stage_returns_400(client, staff_user, auth_header):
     acc = await _make_account(owner_id=staff_user.id)
     r = await client.post(
@@ -232,7 +393,7 @@ async def test_staff_can_read_others_interviews(client, staff_user, staff_user_2
     assert r.status_code == 200
     body = r.json()
     assert body["pagination"]["total"] == 1
-    assert body["interviews"][0]["transcript"] == "<p>secret content</p>"
+    assert body["interviews"][0]["stageHistory"][-1]["transcript"] == "<p>secret content</p>"
 
 
 async def test_staff_cannot_update_others_interview(client, staff_user, staff_user_2, auth_header):

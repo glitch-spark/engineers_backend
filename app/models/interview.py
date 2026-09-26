@@ -1,9 +1,11 @@
+import hashlib
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
+from uuid import uuid4
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
@@ -45,13 +47,34 @@ class InterviewStatus(str, Enum):
     canceled = "canceled"
 
 
+def stage_event_id(stage: str, at: Any, scheduled_at: Any = None) -> str:
+    """Deterministic id for legacy entries saved before stages had ids, so the
+    same entry keeps the same id across reads until it is persisted."""
+    seed = f"{stage}|{at}|{scheduled_at}"
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
+
+
 class InterviewStageEvent(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
     stage: str
     at: datetime
     by: Optional[PydanticObjectId] = None
     source: Optional[str] = None  # 'create' | 'manual' | 'board' | 'edit' | 'seed'
     # Interview scheduled date for this round (when they sat this stage).
     scheduledAt: Optional[datetime] = None
+    status: Optional[InterviewStatus] = None
+    transcript: str = ""
+    note: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_id(cls, data):
+        if isinstance(data, dict) and not data.get("id"):
+            data = dict(data)
+            data["id"] = stage_event_id(
+                str(data.get("stage") or ""), data.get("at"), data.get("scheduledAt"),
+            )
+        return data
 
 
 class Interview(TimestampedDocument):

@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Iterable, List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -133,8 +134,25 @@ class InterviewCreate(BaseModel):
 
 
 class StageHistoryItemIn(BaseModel):
+    id: Optional[str] = None
     stage: str
     scheduledAt: Optional[str] = None  # ISO or YYYY-MM-DD
+
+
+class StageCreate(BaseModel):
+    stage: str
+    scheduledAt: Optional[str] = None
+    status: Optional[str] = None
+    transcript: Optional[str] = None
+    note: Optional[str] = None
+
+
+class StagePatch(BaseModel):
+    stage: Optional[str] = None
+    scheduledAt: Optional[str] = None
+    status: Optional[str] = None
+    transcript: Optional[str] = None
+    note: Optional[str] = None
 
 
 class InterviewUpdate(BaseModel):
@@ -170,8 +188,18 @@ def _set_stage_history(
     items: list[StageHistoryItemIn],
     *,
     by: Any,
-) -> None:
-    """Replace stageHistory from an ordered list (edit-form fixups)."""
+) -> set[str]:
+    """Replace stageHistory from an ordered list (edit-form fixups).
+
+    Entries are matched to existing ones by id (then by stage) so each round's
+    status, transcript and note survive. Returns ids of entries that were dropped.
+    """
+    by_id = {e.id: e for e in iv.stageHistory}
+    by_stage: dict[str, list[InterviewStageEvent]] = {}
+    for e in iv.stageHistory:
+        by_stage.setdefault(_normalize_stage(e.stage) or e.stage, []).append(e)
+    used: set[str] = set()
+
     cleaned: list[InterviewStageEvent] = []
     now = datetime.now(timezone.utc)
     for item in items:
@@ -180,22 +208,161 @@ def _set_stage_history(
             continue
         if s not in STAGES:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid stage in history: {s}")
+        sched = _parse_datetime(item.scheduledAt) if item.scheduledAt else None
         if cleaned and cleaned[-1].stage == s:
             # Prefer a newer scheduledAt when consolidating duplicates.
-            sched = _parse_datetime(item.scheduledAt) if item.scheduledAt else None
             if sched is not None:
                 cleaned[-1].scheduledAt = sched
             continue
-        cleaned.append(
+        prev = by_id.get(item.id) if item.id else None
+        if prev is not None and prev.id in used:
+            prev = None
+        if prev is None:
+            prev = next((e for e in by_stage.get(s, []) if e.id not in used), None)
+        if prev is not None:
+            used.add(prev.id)
+            cleaned.append(
+                prev.model_copy(
+                    update={"stage": s, "scheduledAt": sched if sched is not None else prev.scheduledAt}
+                )
+            )
+        else:
+            cleaned.append(
+                InterviewStageEvent(stage=s, at=now, by=by, source="edit", scheduledAt=sched)
+            )
+    iv.stageHistory = cleaned
+    return set(by_id) - used
+
+
+def _utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None or dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _tip(iv: Interview) -> Optional[InterviewStageEvent]:
+    return iv.stageHistory[-1] if iv.stageHistory else None
+
+
+def _find_stage(iv: Interview, stage_id: str) -> int:
+    for idx, e in enumerate(iv.stageHistory):
+        if e.id == stage_id:
+            return idx
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="stage not found")
+
+
+def migrate_legacy_stage_fields(iv: Interview) -> bool:
+    """Move interview-level transcript/note/status onto the tip stage.
+
+    Seeds stageHistory from the current stage when it is empty. Idempotent:
+    top-level transcript/note are cleared once moved. Returns True if changed.
+    """
+    changed = False
+    if not iv.stageHistory and iv.stage is not None:
+        iv.stageHistory.append(
             InterviewStageEvent(
-                stage=s,
-                at=now,
-                by=by,
-                source="edit",
-                scheduledAt=_parse_datetime(item.scheduledAt) if item.scheduledAt else None,
+                stage=_stage_value(iv.stage) or "",
+                at=iv.createdAt or datetime.now(timezone.utc),
+                by=iv.createdBy,
+                source="seed",
+                scheduledAt=iv.scheduledAt,
+                status=iv.status,
             )
         )
-    iv.stageHistory = cleaned
+        changed = True
+    tip = _tip(iv)
+    if tip is None:
+        return changed
+    if tip.status is None and iv.status is not None:
+        tip.status = iv.status
+        changed = True
+    if (iv.transcript or "").strip():
+        if not (tip.transcript or "").strip():
+            tip.transcript = iv.transcript
+        iv.transcript = ""
+        changed = True
+    if (iv.note or "").strip():
+        if not (tip.note or "").strip():
+            tip.note = iv.note
+        iv.note = ""
+        changed = True
+    return changed
+
+
+def _sync_top_from_tip(iv: Interview) -> None:
+    """Interview-level stage/status/scheduledAt always mirror the latest stage."""
+    tip = _tip(iv)
+    if tip is None:
+        return
+    s = _normalize_stage(tip.stage)
+    iv.stage = InterviewStage(s) if s in STAGES else None
+    iv.status = tip.status
+    if tip.scheduledAt is not None:
+        cur = _utc_naive(iv.scheduledAt)
+        new = _utc_naive(tip.scheduledAt)
+        if cur is None or cur.date() != new.date():
+            iv.scheduledAt = tip.scheduledAt
+    start = _utc_naive(iv.scheduledAt)
+    ends = _utc_naive(iv.endsAt)
+    if start is not None and (ends is None or ends <= start):
+        iv.endsAt = start + timedelta(hours=1)
+
+
+def _reject_adjacent_duplicate(iv: Interview) -> None:
+    for a, b in zip(iv.stageHistory, iv.stageHistory[1:]):
+        if _normalize_stage(a.stage) == _normalize_stage(b.stage):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{a.stage} cannot directly follow itself",
+            )
+
+
+async def _load_editable(iv_id: str, user: UserExtra) -> Interview:
+    iv = await Interview.get(to_object_id(iv_id))
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if user.role != "admin" and str(iv.createdBy) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    return iv
+
+
+async def _after_save(
+    iv: Interview,
+    *,
+    user: UserExtra,
+    prev_sched: Optional[datetime],
+    prev_stage: Any,
+    prev_status: Any,
+    prev_company: Optional[str],
+    extract_stage_ids: Iterable[Optional[str]] = (),
+) -> None:
+    """Pipeline re-sync, transcript extraction and Slack DM after an update."""
+    try:
+        from app.routers.applications import attach_interview_to_app
+        await attach_interview_to_app(user_id=user.id, interview=iv)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pipeline auto-link failed for interview %s on update: %s", iv.id, exc)
+
+    for sid in extract_stage_ids:
+        asyncio.create_task(extract_and_score(iv, sid))
+
+    if interview_update_is_noteworthy(
+        prev_scheduled_at=prev_sched,
+        new_scheduled_at=iv.scheduledAt,
+        prev_stage=prev_stage,
+        new_stage=iv.stage,
+        prev_status=prev_status,
+        new_status=iv.status,
+        prev_company=prev_company,
+        new_company=iv.companyName,
+    ):
+        await notify_interview_dm(iv, kind="updated")
+
+
+async def _interview_out(iv: Interview) -> dict:
+    rows = await populate_owner([iv], field="createdBy")
+    out = await _populate_account(rows)
+    return out[0]
 
 
 async def _populate_account(items: Iterable[dict], *, field: str = "accountId") -> list:
@@ -360,9 +527,14 @@ async def get_interview(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if user.role != "admin" and str(iv.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
-    rows = await populate_owner([iv], field="createdBy")
-    out = await _populate_account(rows)
-    return out[0]
+    if migrate_legacy_stage_fields(iv):
+        await iv.save()
+        tip = _tip(iv)
+        if tip is not None:
+            await InterviewQuestion.find(
+                {"interviewId": iv.id, "stageId": None}
+            ).update({"$set": {"stageId": tip.id}})
+    return await _interview_out(iv)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -403,16 +575,22 @@ async def create_interview(
         appliedPosition=body.appliedPosition or None,
         jobUrl=body.jobUrl or None,
         mainTechStack=body.mainTechStack or None,
-        transcript=body.transcript or "",
-        note=body.note or "",
         stageHistory=[],
     )
     if stage_val:
         _append_stage_history(iv, stage_val, by=user.id, source="create")
+    tip = _tip(iv)
+    if tip is not None:
+        tip.status = iv.status
+        tip.transcript = body.transcript or ""
+        tip.note = body.note or ""
+    else:
+        iv.transcript = body.transcript or ""
+        iv.note = body.note or ""
     await iv.insert()
 
-    if (iv.transcript or "").strip():
-        asyncio.create_task(extract_and_score(iv))
+    if (body.transcript or "").strip():
+        asyncio.create_task(extract_and_score(iv, tip.id if tip else None))
 
     # Auto-link to pipeline (idempotent + best-effort).
     try:
@@ -446,6 +624,7 @@ async def update_interview(
     prev_stage = iv.stage
     prev_status = iv.status
     prev_company = iv.companyName
+    migrated = migrate_legacy_stage_fields(iv)
 
     if body.accountId is not None:
         new_account_oid = to_object_id(body.accountId)
@@ -487,8 +666,9 @@ async def update_interview(
 
     iv.scheduledAt = new_sched
     iv.endsAt = new_ends
+    removed_stage_ids: set[str] = set()
     if body.stageHistory is not None:
-        _set_stage_history(iv, body.stageHistory, by=user.id)
+        removed_stage_ids = _set_stage_history(iv, body.stageHistory, by=user.id)
 
     if body.stage is not None:
         if body.stage == "":
@@ -544,37 +724,183 @@ async def update_interview(
         iv.jobUrl = body.jobUrl or None
     if body.mainTechStack is not None:
         iv.mainTechStack = body.mainTechStack or None
-    transcript_changed = body.transcript is not None and body.transcript != (iv.transcript or "")
-    if body.transcript is not None:
-        iv.transcript = body.transcript
-    if body.note is not None:
-        iv.note = body.note
+
+    # The modal/panel edit the current round: transcript, note and status land on the tip.
+    tip = _tip(iv)
+    target_transcript = tip.transcript if tip is not None else (iv.transcript or "")
+    transcript_changed = body.transcript is not None and body.transcript != (target_transcript or "")
+    if tip is not None:
+        tip.status = iv.status
+        if body.transcript is not None:
+            tip.transcript = body.transcript
+        if body.note is not None:
+            tip.note = body.note
+    else:
+        if body.transcript is not None:
+            iv.transcript = body.transcript
+        if body.note is not None:
+            iv.note = body.note
 
     await iv.save()
 
-    # Re-sync pipeline (stage bump + outcome flip on status changes).
-    try:
-        from app.routers.applications import attach_interview_to_app
-        await attach_interview_to_app(user_id=user.id, interview=iv)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("pipeline auto-link failed for interview %s on update: %s", iv.id, exc)
+    if removed_stage_ids:
+        await InterviewQuestion.find(
+            {"interviewId": iv.id, "stageId": {"$in": list(removed_stage_ids)}}
+        ).delete()
+    if migrated and tip is not None:
+        await InterviewQuestion.find(
+            {"interviewId": iv.id, "stageId": None}
+        ).update({"$set": {"stageId": tip.id}})
 
-    if transcript_changed and (iv.transcript or "").strip():
-        asyncio.create_task(extract_and_score(iv))
-
-    if interview_update_is_noteworthy(
-        prev_scheduled_at=prev_sched,
-        new_scheduled_at=iv.scheduledAt,
+    extract_ids: list[Optional[str]] = []
+    if transcript_changed and (body.transcript or "").strip():
+        extract_ids.append(tip.id if tip is not None else None)
+    await _after_save(
+        iv,
+        user=user,
+        prev_sched=prev_sched,
         prev_stage=prev_stage,
-        new_stage=iv.stage,
         prev_status=prev_status,
-        new_status=iv.status,
         prev_company=prev_company,
-        new_company=iv.companyName,
-    ):
-        await notify_interview_dm(iv, kind="updated")
-
+        extract_stage_ids=extract_ids,
+    )
     return doc_to_dict(iv)
+
+
+@router.post("/{iv_id}/stages", status_code=status.HTTP_201_CREATED)
+async def add_interview_stage(
+    iv_id: str,
+    body: StageCreate,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    iv = await _load_editable(iv_id, user)
+    prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
+    migrate_legacy_stage_fields(iv)
+
+    stage_val = _coerce_write_stage(body.stage)
+    if body.status and body.status not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    sched = None
+    if body.scheduledAt:
+        sched = _parse_datetime(body.scheduledAt)
+        if sched is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
+
+    entry = InterviewStageEvent(
+        id=uuid4().hex,
+        stage=stage_val,
+        at=datetime.now(timezone.utc),
+        by=user.id,
+        source="stage",
+        scheduledAt=sched or datetime.now(timezone.utc),
+        status=InterviewStatus(body.status) if body.status else None,
+        transcript=body.transcript or "",
+        note=body.note or "",
+    )
+    iv.stageHistory.append(entry)
+    _reject_adjacent_duplicate(iv)
+    _sync_top_from_tip(iv)
+    await iv.save()
+
+    await _after_save(
+        iv,
+        user=user,
+        prev_sched=prev_sched,
+        prev_stage=prev_stage,
+        prev_status=prev_status,
+        prev_company=prev_company,
+        extract_stage_ids=[entry.id] if entry.transcript.strip() else [],
+    )
+    return await _interview_out(iv)
+
+
+@router.patch("/{iv_id}/stages/{stage_id}")
+async def update_interview_stage(
+    iv_id: str,
+    stage_id: str,
+    body: StagePatch,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    iv = await _load_editable(iv_id, user)
+    prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
+    migrate_legacy_stage_fields(iv)
+    idx = _find_stage(iv, stage_id)
+    entry = iv.stageHistory[idx]
+
+    if body.stage is not None:
+        entry.stage = _coerce_write_stage(body.stage)
+    if body.scheduledAt is not None:
+        sched = _parse_datetime(body.scheduledAt)
+        if sched is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
+        entry.scheduledAt = sched
+    if body.status is not None:
+        if body.status == "":
+            entry.status = None
+        elif body.status not in STATUSES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+        else:
+            entry.status = InterviewStatus(body.status)
+    transcript_changed = body.transcript is not None and body.transcript != entry.transcript
+    if body.transcript is not None:
+        entry.transcript = body.transcript
+    if body.note is not None:
+        entry.note = body.note
+    iv.stageHistory[idx] = entry
+
+    _reject_adjacent_duplicate(iv)
+    if idx == len(iv.stageHistory) - 1:
+        _sync_top_from_tip(iv)
+    await iv.save()
+
+    extract_ids: list[Optional[str]] = []
+    if transcript_changed:
+        if entry.transcript.strip():
+            extract_ids.append(entry.id)
+        else:
+            await InterviewQuestion.find({"interviewId": iv.id, "stageId": entry.id}).delete()
+    await _after_save(
+        iv,
+        user=user,
+        prev_sched=prev_sched,
+        prev_stage=prev_stage,
+        prev_status=prev_status,
+        prev_company=prev_company,
+        extract_stage_ids=extract_ids,
+    )
+    return await _interview_out(iv)
+
+
+@router.delete("/{iv_id}/stages/{stage_id}")
+async def delete_interview_stage(
+    iv_id: str,
+    stage_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    iv = await _load_editable(iv_id, user)
+    prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
+    migrate_legacy_stage_fields(iv)
+    idx = _find_stage(iv, stage_id)
+    if len(iv.stageHistory) <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An interview needs at least one stage",
+        )
+    iv.stageHistory.pop(idx)
+    _reject_adjacent_duplicate(iv)
+    _sync_top_from_tip(iv)
+    await iv.save()
+    await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
+
+    await _after_save(
+        iv,
+        user=user,
+        prev_sched=prev_sched,
+        prev_stage=prev_stage,
+        prev_status=prev_status,
+        prev_company=prev_company,
+    )
+    return await _interview_out(iv)
 
 
 @router.delete("/{iv_id}")
@@ -604,6 +930,7 @@ async def delete_interview(
 async def list_interview_questions(
     iv_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    stage_id: Optional[str] = Query(None, alias="stageId"),
 ) -> dict:
     oid = to_object_id(iv_id)
     iv = await Interview.get(oid)
@@ -611,8 +938,14 @@ async def list_interview_questions(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if user.role != "admin" and str(iv.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    tip = _tip(iv)
+    sid = stage_id or (tip.id if tip else None)
+    query: dict[str, Any] = {"interviewId": oid, "stageId": sid}
+    if tip is not None and sid == tip.id:
+        # Questions extracted before stages had ids belong to the current round.
+        query = {"interviewId": oid, "stageId": {"$in": [sid, None]}}
     rows = (
-        await InterviewQuestion.find({"interviewId": oid})
+        await InterviewQuestion.find(query)
         .sort([("createdAt", 1)])
         .to_list()
     )
@@ -623,18 +956,19 @@ async def list_interview_questions(
 async def reextract_interview(
     iv_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    stage_id: Optional[str] = Query(None, alias="stageId"),
 ) -> dict:
     """Force re-extraction. Useful after fixing transcript or for legacy rows
     that never went through the auto-trigger."""
-    oid = to_object_id(iv_id)
-    iv = await Interview.get(oid)
-    if iv is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if user.role != "admin" and str(iv.createdBy) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
-    if not (iv.transcript or "").strip():
+    iv = await _load_editable(iv_id, user)
+    if iv.stageHistory:
+        entry = iv.stageHistory[_find_stage(iv, stage_id)] if stage_id else iv.stageHistory[-1]
+        transcript, sid = entry.transcript, entry.id
+    else:
+        transcript, sid = iv.transcript, None
+    if not (transcript or "").strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No transcript to extract")
-    asyncio.create_task(extract_and_score(iv))
+    asyncio.create_task(extract_and_score(iv, sid))
     return {"ok": True, "message": "extraction queued"}
 
 

@@ -82,10 +82,26 @@ async def _build_interview_contexts(interview_ids: list[PydanticObjectId]) -> li
             "scheduled_at": iv.scheduledAt.isoformat() if iv.scheduledAt else None,
             "resume_filename": resume_filename,
             "resume_markdown": resume_markdown,
-            "transcript": _truncate(iv.transcript or "", MAX_TRANSCRIPT_CHARS),
-            "note": iv.note or "",
+            "transcript": _truncate(_combined_stage_text(iv, "transcript"), MAX_TRANSCRIPT_CHARS),
+            "note": _combined_stage_text(iv, "note"),
         })
     return contexts
+
+
+def _combined_stage_text(iv: Interview, field: str) -> str:
+    """Per-stage transcripts/notes joined under round headers; legacy interview-level text as fallback."""
+    parts: list[str] = []
+    for e in iv.stageHistory:
+        text = (getattr(e, field, "") or "").strip()
+        if not text:
+            continue
+        label = e.stage.replace("_", " ").title()
+        if e.scheduledAt:
+            label += f" ({e.scheduledAt.strftime('%b')} {e.scheduledAt.day})"
+        parts.append(f"## {label}\n{text}")
+    if parts:
+        return "\n\n".join(parts)
+    return getattr(iv, field, "") or ""
 
 
 def _sse(data: dict, event: Optional[str] = None) -> str:

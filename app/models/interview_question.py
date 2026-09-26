@@ -20,6 +20,7 @@ class InterviewQuestion(TimestampedDocument):
     userId: PydanticObjectId        # owner — the interview creator
     accountId: Optional[PydanticObjectId] = None
     stage: Optional[str] = None     # snapshot at extraction time
+    stageId: Optional[str] = None   # InterviewStageEvent.id the transcript came from
     companyName: Optional[str] = None
 
     question: str
@@ -37,4 +38,5 @@ class InterviewQuestion(TimestampedDocument):
         indexes = [
             IndexModel([("userId", 1), ("stage", 1), ("createdAt", -1)], name="user_stage_recent"),
             IndexModel([("interviewId", 1)], name="by_interview"),
+            IndexModel([("interviewId", 1), ("stageId", 1)], name="by_interview_stage"),
         ]
