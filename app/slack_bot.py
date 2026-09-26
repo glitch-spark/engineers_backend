@@ -2,11 +2,13 @@
 
 Uses the workspace Bot Token for chat.postMessage DMs. Users connect via
 Slack OAuth (user_scope=identity.basic) so we store their Slack member id
-on UserExtra — never post interview details to a shared channel.
+on UserExtra. The only channel post is the opt-in "Caller needed" message,
+which goes to the private SLACK_CALLER_CHANNEL_ID.
 
 Sends an instant DM when an interview is created or meaningfully updated,
-plus a daily digest at each user's chosen time/timezone. Interviews are
-date-only, so there is no T-30 reminder.
+plus a daily digest at each user's chosen time/timezone that also lists
+calls the user joins as a coworker. Interviews are date-only unless caller
+mode sets an exact start, so there is no T-30 reminder.
 """
 
 from __future__ import annotations
@@ -25,7 +27,12 @@ from app.know_your_why import know_your_why_for_date
 from app.models import Account, Interview, UserExtra
 from app.models.interview import InterviewStatus
 from app.models.slack_alert_log import SlackAlertLog
-from app.slack_timezones import normalize_slack_timezone, validate_timezone, zoneinfo_for_slack
+from app.slack_timezones import (
+    format_gmt_offset,
+    normalize_slack_timezone,
+    validate_timezone,
+    zoneinfo_for_slack,
+)
 
 log = logging.getLogger(__name__)
 
@@ -394,6 +401,261 @@ async def notify_interview_dm(
         return False
 
 
+_METHOD_LABELS = {
+    "video": "Video meeting",
+    "phone_hushed": "Phone (Hushed)",
+    "phone_slynumber": "Phone (Slynumber)",
+}
+
+
+def fmt_caller_time(starts_at: Optional[datetime], tz: ZoneInfo, *, with_day: bool = True) -> str:
+    """"Tue 9/29 10:30 AM EDT (GMT−4:00)", or "TBD" without an exact start."""
+    if starts_at is None:
+        return "TBD"
+    aware = starts_at if starts_at.tzinfo else starts_at.replace(tzinfo=timezone.utc)
+    local = aware.astimezone(tz)
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    abbrev = (local.strftime("%Z") or "").strip()
+    if not with_day:
+        return f"{clock} {abbrev}".strip()
+    gmt = format_gmt_offset(local.utcoffset() or timedelta(0))
+    day = f"{local.strftime('%a')} {local.month}/{local.day}"
+    return f"{day} {clock} {abbrev} ({gmt})"
+
+
+def _method_text(caller: Any) -> str:
+    label = _METHOD_LABELS.get(getattr(caller, "method", None) or "", "")
+    value = (getattr(caller, "methodValue", "") or "").strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        value = _mrkdwn_link(value, value)
+    if label and value:
+        return f"{label} — {value}"
+    return label or value or "TBD"
+
+
+def _mention(user: Optional[UserExtra]) -> str:
+    if user is None:
+        return "someone"
+    slack_id = (user.slackUserId or "").strip()
+    if slack_id:
+        return f"<@{slack_id}>"
+    return (user.name or user.email or "someone").strip()
+
+
+def caller_channel_text(
+    interview: Interview,
+    *,
+    account: Optional[Account],
+    owner: Optional[UserExtra],
+    coworkers: list[UserExtra],
+    kind: str = "created",
+) -> str:
+    caller = interview.caller
+    tz = zoneinfo_for_slack(getattr(caller, "timezone", None))
+    company = (interview.companyName or "").strip() or "—"
+    job_url = (interview.jobUrl or "").strip()
+    recruiter = (interview.interviewerName or "").strip() or "—"
+    flag = _country_flag(account.country if account else None)
+    if flag and recruiter != "—":
+        recruiter = f"{recruiter} {flag}"
+    headline = (
+        f":telephone_receiver: *Caller needed* — posted by {_mention(owner)}"
+        if kind == "created"
+        else f":pencil2: *Caller details updated* by {_mention(owner)}"
+    )
+    lines = [
+        headline,
+        f"*Profile:* {_profile_label(account) or '—'}",
+        f"*Company name:* {company}",
+        f"*JD Link:* {job_url or '—'}",
+        f"*Recruiter name:* {recruiter}",
+        f"*Stage:* {_stage_label(interview.stage)}",
+        f"*Interview time:* {fmt_caller_time(getattr(caller, 'startsAt', None), tz)}",
+        f"*Method:* {_method_text(caller)}",
+        f"*Caller assigned:* {(getattr(caller, 'callerName', '') or '').strip() or 'TBD'}",
+    ]
+    if coworkers:
+        lines.append(f"*Coworkers:* {' '.join(_mention(u) for u in coworkers)}")
+    return "\n".join(lines)
+
+
+async def notify_caller_channel(interview: Interview, *, kind: str = "created") -> Optional[str]:
+    """Post the caller request to the private caller channel. Never raises.
+
+    Updates reply in the original message's thread. Returns the parent
+    message ts so the caller can persist it.
+    """
+    try:
+        caller = interview.caller
+        channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
+        if caller is None or not caller.enabled or not channel or not slack_bot_configured():
+            return None
+        account = await Account.get(interview.accountId) if interview.accountId else None
+        owner = await UserExtra.get(interview.createdBy)
+        coworkers = (
+            await UserExtra.find({"_id": {"$in": list(caller.coworkerIds)}}).to_list()
+            if caller.coworkerIds
+            else []
+        )
+        parent_ts = (caller.slackChannelTs or "").strip() or None
+        effective_kind = kind if parent_ts else "created"
+        text = caller_channel_text(
+            interview,
+            account=account,
+            owner=owner,
+            coworkers=coworkers,
+            kind=effective_kind,
+        )
+        payload: dict[str, Any] = {
+            "channel": channel,
+            "text": text,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        if effective_kind != "created":
+            payload["thread_ts"] = parent_ts
+        res = await _slack_api("chat.postMessage", payload)
+        if effective_kind != "created":
+            return parent_ts
+        return res.get("ts") or None
+    except Exception as exc:
+        log.warning("slack_bot caller channel post failed kind=%s: %s", kind, exc)
+        return None
+
+
+def _caller_start(iv: Interview) -> Optional[datetime]:
+    caller = getattr(iv, "caller", None)
+    if caller is None or not caller.enabled:
+        return None
+    return caller.startsAt
+
+
+def _by_start(interviews: list[Interview]) -> list[Interview]:
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    return sorted(interviews, key=lambda iv: (_caller_start(iv) is None, _caller_start(iv) or far))
+
+
+def split_digest_interviews(
+    interviews: list[Interview],
+    user_id: Any,
+) -> tuple[list[Interview], list[Interview]]:
+    """(owned by user, joined as coworker). Owning wins when both apply."""
+    mine: list[Interview] = []
+    with_caller: list[Interview] = []
+    seen: set[str] = set()
+    for iv in interviews:
+        key = str(iv.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        if str(iv.createdBy) == str(user_id):
+            mine.append(iv)
+        else:
+            with_caller.append(iv)
+    return _by_start(mine), _by_start(with_caller)
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def digest_summary(mine: int, with_caller: int) -> str:
+    total = mine + with_caller
+    head = f"You have {_plural(total, 'interview')} today"
+    if with_caller:
+        head += f" ({mine} yours, {with_caller} as caller)"
+    enjoy = "Enjoy your interview" if total == 1 else "Enjoy your interviews"
+    return f"{head}. {enjoy}, and good luck! :four_leaf_clover:"
+
+
+def _digest_line(
+    n: int,
+    iv: Interview,
+    *,
+    profile: str,
+    tz: ZoneInfo,
+    host: Optional[str] = None,
+) -> str:
+    starts = _caller_start(iv)
+    parts: list[str] = []
+    if starts is not None:
+        parts.append(f"*{fmt_caller_time(starts, tz, with_day=False)}*")
+    elif host is not None:
+        parts.append("*Time TBD*")
+    parts.append(profile.strip() or "—")
+    company = (iv.companyName or "").strip() or "—"
+    job_url = (iv.jobUrl or "").strip()
+    parts.append(_mrkdwn_link(job_url, company) if job_url else company)
+    parts.append(_stage_label(iv.stage))
+    if host is not None:
+        parts.append(f"host {host}")
+        method = _method_text(iv.caller)
+        if method != "TBD":
+            parts.append(method)
+    return f"{n}. " + " · ".join(parts)
+
+
+def digest_blocks(
+    mine: list[Interview],
+    with_caller: list[Interview],
+    *,
+    profiles: dict[str, str],
+    hosts: dict[str, str],
+    tz: ZoneInfo,
+    why: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    total = len(mine) + len(with_caller)
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"Today's interviews ({total})", "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": digest_summary(len(mine), len(with_caller))},
+        },
+    ]
+    n = 0
+
+    def section(title: str, rows: list[Interview], *, as_caller: bool) -> None:
+        nonlocal n
+        lines = []
+        for iv in rows:
+            n += 1
+            profile = profiles.get(str(iv.accountId), "") if iv.accountId else ""
+            host = hosts.get(str(iv.createdBy), "someone") if as_caller else None
+            lines.append(_digest_line(n, iv, profile=profile, tz=tz, host=host))
+        blocks.append({"type": "divider"})
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*{title} ({len(rows)})*\n" + "\n".join(lines)},
+            }
+        )
+
+    if mine:
+        section("My interviews", mine, as_caller=False)
+    if with_caller:
+        section("Calls with you as caller", with_caller, as_caller=True)
+    blocks.append(
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"<{_frontend_link('/interviews')}|Open interviews>"},
+        }
+    )
+    if why:
+        blocks.extend(
+            [
+                {"type": "divider"},
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"*Know your why*\n_{why}_"}],
+                },
+            ]
+        )
+    return blocks
+
+
 async def run_digest_for_user(user: UserExtra) -> int:
     """Send daily digest if in slot and not yet sent today. Returns 1 if DM sent."""
     sent, reason = await _digest_for_user(user)
@@ -423,12 +685,16 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     start_n, end_n = calendar_day_bounds(day)
     interviews = await Interview.find(
         {
-            "createdBy": user.id,
+            "$or": [
+                {"createdBy": user.id},
+                {"caller.enabled": True, "caller.coworkerIds": user.id},
+            ],
             "scheduledAt": {"$gte": start_n, "$lt": end_n},
         }
     ).sort([("scheduledAt", 1)]).to_list()
     interviews = [iv for iv in interviews if iv.status not in _SKIP_STATUSES]
-    if not interviews:
+    mine, with_caller = split_digest_interviews(interviews, user.id)
+    if not mine and not with_caller:
         text = "You have no interviews today. Have a rest."
         blocks = [
             {
@@ -447,17 +713,21 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
         return 0, "dm_failed"
 
     why = know_your_why_for_date(day)
-    title = f"Today's interviews ({len(interviews)})"
     profiles = await _profile_labels(interviews)
-    blocks = _interview_blocks(
-        title,
-        interviews,
-        why=why,
-        profiles=profiles,
-        tz=tz,
-        include_open_link=True,
+    owner_ids = {iv.createdBy for iv in with_caller}
+    owners = (
+        await UserExtra.find({"_id": {"$in": list(owner_ids)}}).to_list() if owner_ids else []
     )
-    text = f"You have {len(interviews)} interview(s) today. Know your why: {why}"
+    hosts = {str(u.id): _mention(u) for u in owners}
+    text = digest_summary(len(mine), len(with_caller))
+    blocks = digest_blocks(
+        mine,
+        with_caller,
+        profiles=profiles,
+        hosts=hosts,
+        tz=tz,
+        why=why,
+    )
     ok = await send_dm(slack_id, text=text, blocks=blocks)
     if ok:
         await _mark_sent(user.id, kind)
