@@ -32,11 +32,7 @@ from app.interview_caller import (
     resync_caller_day,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack_bot import (
-    interview_update_is_noteworthy,
-    notify_caller_channel,
-    notify_interview_dm,
-)
+from app.slack_bot import notify_caller_channel
 
 log = logging.getLogger(__name__)
 
@@ -382,14 +378,10 @@ async def _after_save(
     iv: Interview,
     *,
     user: UserExtra,
-    prev_sched: Optional[datetime],
-    prev_stage: Any,
-    prev_status: Any,
-    prev_company: Optional[str],
     prev_caller: Optional[tuple] = None,
     extract_stage_ids: Iterable[Optional[str]] = (),
 ) -> None:
-    """Pipeline re-sync, transcript extraction and Slack DM after an update."""
+    """Pipeline re-sync and transcript extraction after an update."""
     new_caller = caller_snapshot(iv.caller)
     if new_caller is not None and new_caller != prev_caller:
         await _post_caller_channel(iv, kind="created" if prev_caller is None else "updated")
@@ -402,18 +394,6 @@ async def _after_save(
 
     for sid in extract_stage_ids:
         asyncio.create_task(extract_and_score(iv, sid))
-
-    if interview_update_is_noteworthy(
-        prev_scheduled_at=prev_sched,
-        new_scheduled_at=iv.scheduledAt,
-        prev_stage=prev_stage,
-        new_stage=iv.stage,
-        prev_status=prev_status,
-        new_status=iv.status,
-        prev_company=prev_company,
-        new_company=iv.companyName,
-    ):
-        await notify_interview_dm(iv, kind="updated")
 
 
 async def _interview_out(iv: Interview) -> dict:
@@ -684,7 +664,6 @@ async def create_interview(
     except Exception as exc:  # noqa: BLE001
         log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
 
-    await notify_interview_dm(iv, kind="created")
     if caller_snapshot(iv.caller) is not None:
         await _post_caller_channel(iv, kind="created")
 
@@ -708,9 +687,6 @@ async def update_interview(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     prev_sched = iv.scheduledAt
-    prev_stage = iv.stage
-    prev_status = iv.status
-    prev_company = iv.companyName
     prev_caller = caller_snapshot(iv.caller)
     migrated = migrate_legacy_stage_fields(iv)
 
@@ -851,10 +827,6 @@ async def update_interview(
     await _after_save(
         iv,
         user=user,
-        prev_sched=prev_sched,
-        prev_stage=prev_stage,
-        prev_status=prev_status,
-        prev_company=prev_company,
         prev_caller=prev_caller,
         extract_stage_ids=extract_ids,
     )
@@ -868,7 +840,6 @@ async def add_interview_stage(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     iv = await _load_editable(iv_id, user)
-    prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
     prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
 
@@ -901,10 +872,6 @@ async def add_interview_stage(
     await _after_save(
         iv,
         user=user,
-        prev_sched=prev_sched,
-        prev_stage=prev_stage,
-        prev_status=prev_status,
-        prev_company=prev_company,
         prev_caller=prev_caller,
         extract_stage_ids=[entry.id] if entry.transcript.strip() else [],
     )
@@ -919,7 +886,6 @@ async def update_interview_stage(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     iv = await _load_editable(iv_id, user)
-    prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
     prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
@@ -961,10 +927,6 @@ async def update_interview_stage(
     await _after_save(
         iv,
         user=user,
-        prev_sched=prev_sched,
-        prev_stage=prev_stage,
-        prev_status=prev_status,
-        prev_company=prev_company,
         prev_caller=prev_caller,
         extract_stage_ids=extract_ids,
     )
@@ -978,7 +940,6 @@ async def delete_interview_stage(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     iv = await _load_editable(iv_id, user)
-    prev_sched, prev_stage, prev_status, prev_company = iv.scheduledAt, iv.stage, iv.status, iv.companyName
     prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
@@ -997,10 +958,6 @@ async def delete_interview_stage(
     await _after_save(
         iv,
         user=user,
-        prev_sched=prev_sched,
-        prev_stage=prev_stage,
-        prev_status=prev_status,
-        prev_company=prev_company,
         prev_caller=prev_caller,
     )
     return await _interview_out(iv)
