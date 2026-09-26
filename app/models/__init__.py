@@ -17,6 +17,7 @@ from app.models.recurring_charge import RecurringCharge
 from app.models.slack_alert_log import SlackAlertLog
 from app.models.transaction import Transaction
 from app.models.user_extra import UserExtra
+from app.models.daily_plan import DailyPlan
 from app.models.weekly_plan import WeeklyPlan
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "AiReviewRun",
     "AnalyzeChatLog",
     "Application",
+    "DailyPlan",
     "EmailAccount",
     "EmailClassificationCache",
     "EmailMessage",

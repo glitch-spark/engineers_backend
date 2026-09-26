@@ -26,6 +26,7 @@ from app.routers import (
     transactions,
     users,
     weekly_plans,
+    daily_plans,
     alerts,
 )
 
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
     app.include_router(alerts.router)
     app.include_router(alerts.cron_router)
     app.include_router(weekly_plans.router)
+    app.include_router(daily_plans.router)
     app.include_router(interviews.router)
     app.include_router(skills.router)
     app.include_router(global_prompt.router)
