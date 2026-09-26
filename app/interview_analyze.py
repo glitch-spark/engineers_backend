@@ -14,7 +14,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import List
+from typing import List, Optional
 
 from app.config import get_settings
 from app.models import Interview, InterviewQuestion
@@ -32,13 +32,29 @@ def _strip_fences(s: str) -> str:
     return re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip(), flags=re.MULTILINE)
 
 
-async def extract_and_score(interview: Interview) -> int:
-    """Run the full pipeline for one interview. Returns count of questions
-    persisted. No-op when transcript empty. Idempotent — replaces all prior
-    questions for the interview if transcript hash differs."""
-    transcript = (interview.transcript or "").strip()
+async def extract_and_score(interview: Interview, stage_id: Optional[str] = None) -> int:
+    """Run the full pipeline for one interview stage (the tip when `stage_id`
+    is omitted). Returns count of questions persisted. No-op when transcript
+    empty. Idempotent — replaces that stage's prior questions if the transcript
+    hash differs."""
+    if interview.stageHistory:
+        entry = (
+            next((e for e in interview.stageHistory if e.id == stage_id), None)
+            if stage_id
+            else interview.stageHistory[-1]
+        )
+        if entry is None:
+            log.info("interview %s has no stage %s; skipping extraction", interview.id, stage_id)
+            return 0
+        transcript = (entry.transcript or "").strip()
+        sid: Optional[str] = entry.id
+        stage = entry.stage
+    else:
+        transcript = (interview.transcript or "").strip()
+        sid = None
+        stage = interview.stage.value if interview.stage else None
     if not transcript:
-        log.info("interview %s has no transcript; skipping extraction", interview.id)
+        log.info("interview %s stage %s has no transcript; skipping extraction", interview.id, sid)
         return 0
 
     settings = get_settings()
@@ -48,14 +64,14 @@ async def extract_and_score(interview: Interview) -> int:
 
     tx_hash = _transcript_hash(transcript)
     existing = await InterviewQuestion.find_one(
-        {"interviewId": interview.id, "transcriptVersion": tx_hash}
+        {"interviewId": interview.id, "stageId": sid, "transcriptVersion": tx_hash}
     )
     if existing is not None:
         log.info("interview %s already extracted at hash=%s; skipping", interview.id, tx_hash)
         return 0
 
-    # Wipe any stale questions for this interview so we don't double-count.
-    await InterviewQuestion.find({"interviewId": interview.id}).delete()
+    # Wipe any stale questions for this stage so we don't double-count.
+    await InterviewQuestion.find({"interviewId": interview.id, "stageId": sid}).delete()
 
     # Cap transcript size to keep prompt bounded.
     snippet = transcript[:_MAX_TRANSCRIPT_CHARS]
@@ -112,7 +128,7 @@ async def extract_and_score(interview: Interview) -> int:
         "Score each candidate answer 0-10 and write a one-line improvement tip per question. "
         "Use the rubric: 0-3 weak (missed concepts, low depth); 4-6 mixed (partial); 7-8 solid; "
         "9-10 strong (deep, structured, senior-level).\n\n"
-        f"Stage: {interview.stage or 'unknown'}\n"
+        f"Stage: {stage or 'unknown'}\n"
         f"Position: {interview.appliedPosition or 'unknown'}\n"
         f"Company: {interview.companyName or 'unknown'}\n\n"
         'Return STRICT JSON: {"scores": [{"i": <idx>, "score": <0-10>, "rationale": "<one-line>", "tip": "<one-line>"}]}\n\n'
@@ -146,7 +162,8 @@ async def extract_and_score(interview: Interview) -> int:
                 interviewId=interview.id,
                 userId=interview.createdBy,
                 accountId=interview.accountId if not isinstance(interview.accountId, str) else None,
-                stage=interview.stage,
+                stage=stage,
+                stageId=sid,
                 companyName=interview.companyName,
                 question=q[:2000],
                 candidateAnswer=a[:5000],
