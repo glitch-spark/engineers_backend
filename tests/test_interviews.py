@@ -574,3 +574,67 @@ async def test_users_lookup_returns_all_for_non_admin(client, staff_user, staff_
 async def test_users_lookup_requires_auth(client):
     r = await client.get("/users/lookup")
     assert r.status_code == 401
+
+
+async def test_caller_mode_create_and_coworker_can_view(
+    client, staff_user, staff_user_2, admin_user, make_user, auth_header
+):
+    outsider = await make_user(name="Outsider", email="out@example.com")
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post(
+        "/interviews",
+        headers=auth_header(staff_user),
+        json=_payload(
+            account=acc,
+            scheduled_at="2026-09-29T12:00:00",
+            caller={
+                "enabled": True,
+                "time": "21:15",
+                "timezone": "America/New_York",
+                "method": "video",
+                "methodValue": "https://meet.example/abc",
+                "coworkerIds": [str(staff_user_2.id), str(staff_user.id)],
+            },
+        ),
+    )
+    assert r.status_code == 201, r.text
+    caller = r.json()["caller"]
+    assert caller["enabled"] is True
+    assert caller["callerName"] == "TBD"
+    assert caller["startsAt"].startswith("2026-09-30T01:15:00")
+    assert caller["coworkerIds"] == [str(staff_user_2.id)]
+    iv_id = r.json()["_id"]
+
+    r = await client.get(f"/interviews/{iv_id}", headers=auth_header(staff_user_2))
+    assert r.status_code == 200
+    assert [c["name"] for c in r.json()["caller"]["coworkers"]] == ["Staff Two"]
+
+    r = await client.get(f"/interviews/{iv_id}", headers=auth_header(outsider))
+    assert r.status_code == 403
+
+    r = await client.put(f"/interviews/{iv_id}", headers=auth_header(staff_user_2), json={"note": "x"})
+    assert r.status_code == 403
+
+    r = await client.put(
+        f"/interviews/{iv_id}",
+        headers=auth_header(staff_user),
+        json={"caller": {"enabled": False}},
+    )
+    assert r.status_code == 200
+    assert r.json()["caller"]["enabled"] is False
+    r = await client.get(f"/interviews/{iv_id}", headers=auth_header(staff_user_2))
+    assert r.status_code == 403
+
+
+async def test_caller_mode_rejects_bad_timezone_and_unknown_coworker(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    for caller in (
+        {"enabled": True, "timezone": "Mars/Olympus"},
+        {"enabled": True, "coworkerIds": ["64b7f0000000000000000000"]},
+    ):
+        r = await client.post(
+            "/interviews",
+            headers=auth_header(staff_user),
+            json=_payload(account=acc, scheduled_at="2026-09-29T12:00:00", caller=caller),
+        )
+        assert r.status_code == 400, r.text

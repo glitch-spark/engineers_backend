@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     SLACK_BOT_CRON_SECRET: Optional[str] = None
     SLACK_DIGEST_HOUR: int = 8
     SLACK_DIGEST_MINUTE: int = 0
+    SLACK_CALLER_CHANNEL_ID: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720
     OPENAI_API_KEY: Optional[str] = None
     # Streamed AI Review (interview): chat-completions, long-form. Mini is enough.
