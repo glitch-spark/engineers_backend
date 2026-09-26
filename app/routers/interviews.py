@@ -118,6 +118,12 @@ def _append_stage_history(
     )
 
 
+class StageHistoryItemIn(BaseModel):
+    id: Optional[str] = None
+    stage: str
+    scheduledAt: Optional[str] = None  # ISO or YYYY-MM-DD
+
+
 class InterviewCreate(BaseModel):
     accountId: str
     scheduledAt: str
@@ -131,12 +137,8 @@ class InterviewCreate(BaseModel):
     mainTechStack: Optional[str] = None
     transcript: Optional[str] = ""
     note: Optional[str] = ""
-
-
-class StageHistoryItemIn(BaseModel):
-    id: Optional[str] = None
-    stage: str
-    scheduledAt: Optional[str] = None  # ISO or YYYY-MM-DD
+    # Same ordered path the edit form sends — otherwise prior rounds are dropped.
+    stageHistory: Optional[List[StageHistoryItemIn]] = None
 
 
 class StageCreate(BaseModel):
@@ -543,7 +545,8 @@ async def create_interview(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     stage_val = _coerce_write_stage(body.stage) if body.stage else None
-    if body.status is not None and body.status not in STATUSES:
+    status_val = (body.status or "").strip() or None
+    if status_val is not None and status_val not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     sched = _parse_datetime(body.scheduledAt)
     if sched is None:
@@ -569,7 +572,7 @@ async def create_interview(
         scheduledAt=sched,
         endsAt=ends,
         stage=InterviewStage(stage_val) if stage_val else None,
-        status=InterviewStatus(body.status) if body.status else None,
+        status=InterviewStatus(status_val) if status_val else None,
         companyName=body.companyName or None,
         interviewerName=body.interviewerName or None,
         appliedPosition=body.appliedPosition or None,
@@ -577,8 +580,15 @@ async def create_interview(
         mainTechStack=body.mainTechStack or None,
         stageHistory=[],
     )
+    if body.stageHistory:
+        _set_stage_history(iv, body.stageHistory, by=user.id)
     if stage_val:
-        _append_stage_history(iv, stage_val, by=user.id, source="create")
+        last = _normalize_stage(iv.stageHistory[-1].stage) if iv.stageHistory else None
+        if last != stage_val:
+            _append_stage_history(iv, stage_val, by=user.id, source="create")
+    _sync_top_from_tip(iv)
+    if status_val:
+        iv.status = InterviewStatus(status_val)
     tip = _tip(iv)
     if tip is not None:
         tip.status = iv.status
@@ -797,8 +807,13 @@ async def add_interview_stage(
         transcript=body.transcript or "",
         note=body.note or "",
     )
+    prev_tip = iv.stageHistory[-1] if iv.stageHistory else None
+    if prev_tip is not None and _normalize_stage(prev_tip.stage) == stage_val:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{stage_val} cannot directly follow itself",
+        )
     iv.stageHistory.append(entry)
-    _reject_adjacent_duplicate(iv)
     _sync_top_from_tip(iv)
     await iv.save()
 

@@ -108,6 +108,48 @@ async def test_create_puts_transcript_note_status_on_tip_stage(client, staff_use
     assert iv["transcript"] == ""
 
 
+async def test_create_persists_stage_history_path(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post(
+        "/interviews",
+        headers=auth_header(staff_user),
+        json=_payload(
+            account=acc,
+            scheduled_at="2026-04-25T14:30:00Z",
+            stage="tech_round_1",
+            status="scheduled",
+            stageHistory=[
+                {"stage": "ai_interview", "scheduledAt": "2026-04-20"},
+                {"stage": "intro", "scheduledAt": "2026-04-22"},
+                {"stage": "tech_round_1", "scheduledAt": "2026-04-25"},
+            ],
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert [e["stage"] for e in r.json()["stageHistory"]] == [
+        "ai_interview",
+        "intro",
+        "tech_round_1",
+    ]
+    assert r.json()["stage"] == "tech_round_1"
+
+
+async def test_create_empty_status_is_ok(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post(
+        "/interviews",
+        headers=auth_header(staff_user),
+        json=_payload(
+            account=acc,
+            scheduled_at="2026-04-25T14:30:00Z",
+            stage="intro",
+            status="",
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["status"] is None
+
+
 async def test_stage_add_edit_delete_round_trip(client, staff_user, auth_header):
     iv = await _create_intro(client, staff_user, auth_header, transcript="intro script")
     iv_id = iv["_id"]

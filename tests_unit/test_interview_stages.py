@@ -111,6 +111,22 @@ def test_sync_keeps_time_when_same_calendar_day():
     assert iv.scheduledAt == datetime(2026, 4, 25, 14, 30)
 
 
+def test_create_history_keeps_prior_rounds():
+    iv = _iv()
+    _set_stage_history(
+        iv,
+        [
+            StageHistoryItemIn(stage="ai_interview", scheduledAt="2026-04-20"),
+            StageHistoryItemIn(stage="intro", scheduledAt="2026-04-22"),
+            StageHistoryItemIn(stage="tech_round_1", scheduledAt="2026-04-25"),
+        ],
+        by=None,
+    )
+    _sync_top_from_tip(iv)
+    assert [e.stage for e in iv.stageHistory] == ["ai_interview", "intro", "tech_round_1"]
+    assert iv.stage == InterviewStage.tech_round_1
+
+
 def test_reject_adjacent_duplicate():
     iv = _iv(stageHistory=[
         InterviewStageEvent(stage="intro", at=AT),
