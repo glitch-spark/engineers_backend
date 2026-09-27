@@ -10,6 +10,7 @@ from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.daily_plan import DailyPlan
 from app.routers._util import populate_owner, to_object_id
+from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
 router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
 
@@ -43,6 +44,14 @@ def _parse_day(value: str) -> datetime:
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date")
     return datetime(parsed.year, parsed.month, parsed.day)
+
+
+async def _sync_slack(plan: DailyPlan, owner: UserExtra) -> None:
+    """Post or edit the plan's Slack message; remember where it lives."""
+    posted = await sync_daily_plan_message(plan, owner)
+    if posted and posted != (plan.slackChannel, plan.slackTs):
+        plan.slackChannel, plan.slackTs = posted
+        await plan.save()
 
 
 def _week_fields(day: datetime) -> tuple[int, int]:
@@ -127,6 +136,7 @@ async def create_plan(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Daily plan already exists for this date",
         )
+    await _sync_slack(plan, user)
     populated = await populate_owner([plan], field="userId", only=("name", "email"))
     return populated[0]
 
@@ -144,6 +154,7 @@ async def update_plan(
     if str(plan.userId) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
+    before = (plan.date, plan.today, plan.tomorrow)
     if body.date is not None:
         if not body.date.strip():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Date is required")
@@ -165,6 +176,8 @@ async def update_plan(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Daily plan already exists for this date",
         )
+    if (plan.date, plan.today, plan.tomorrow) != before or not plan.slackTs:
+        await _sync_slack(plan, user)
     populated = await populate_owner([plan], field="userId", only=("name", "email"))
     return populated[0]
 
@@ -182,4 +195,5 @@ async def delete_plan(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
     await plan.delete()
+    await delete_daily_plan_message(plan)
     return {"message": "Daily plan deleted successfully"}

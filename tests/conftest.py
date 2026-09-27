@@ -20,6 +20,7 @@ if not TEST_URI:
 os.environ["MONGODB_URI"] = TEST_URI
 os.environ.setdefault("AUTH_SECRET", "test-secret-for-pytest-only")
 os.environ["SLACK_WEBHOOK_URL"] = ""  # ensure slack notify is a no-op
+os.environ["SLACK_DAILY_PLAN_CHANNEL_ID"] = ""  # never post test plans to Slack
 os.environ.setdefault("FRONTEND_ORIGIN", "http://test.localhost")
 os.environ.setdefault("APP_BASE_URL", "http://test.localhost")
 os.environ.setdefault("APP_TIMEZONE", "UTC")
