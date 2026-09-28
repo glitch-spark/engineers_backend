@@ -2,8 +2,9 @@
 
 Uses the workspace Bot Token for chat.postMessage DMs. Users connect via
 Slack OAuth (user_scope=identity.basic) so we store their Slack member id
-on UserExtra. The only channel post is the opt-in "Caller needed" message,
-which goes to the private SLACK_CALLER_CHANNEL_ID.
+on UserExtra. Channel posts: the opt-in "Caller needed" message in the
+private SLACK_CALLER_CHANNEL_ID, and each daily plan in
+SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
 Sends an instant DM when an interview is created or meaningfully updated,
 plus a daily digest at each user's chosen time/timezone that also lists
@@ -521,6 +522,84 @@ async def notify_caller_channel(interview: Interview, *, kind: str = "created") 
     except Exception as exc:
         log.warning("slack_bot caller channel post failed kind=%s: %s", kind, exc)
         return None
+
+
+# Slack errors meaning the stored post is gone, so we post a fresh one.
+_MESSAGE_GONE = {"message_not_found", "channel_not_found", "cant_update_message"}
+
+
+def _slack_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _plan_day_label(day: datetime, offset: int = 0) -> str:
+    """Matches the SPA's planDayLabel, e.g. `9/27(Sun)`."""
+    d = day + timedelta(days=offset)
+    return f"{d.month}/{d.day}({d.strftime('%a')})"
+
+
+def daily_plan_text(plan: Any, owner: Optional[UserExtra]) -> str:
+    today = (plan.today or "").strip()
+    tomorrow = (plan.tomorrow or "").strip()
+    return "\n".join(
+        [
+            f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
+            f"*{_plan_day_label(plan.date)}*",
+            _slack_escape(today) if today else "—",
+            f"*{_plan_day_label(plan.date, 1)}*",
+            _slack_escape(tomorrow) if tomorrow else "—",
+            f"<{_frontend_link('/report')}|Open Report>",
+        ]
+    )
+
+
+async def sync_daily_plan_message(
+    plan: Any, owner: Optional[UserExtra]
+) -> Optional[tuple[str, str]]:
+    """Post the plan to SLACK_DAILY_PLAN_CHANNEL_ID, or edit the existing post
+    in place. Never raises. Returns the live post's (channel, ts), or None when
+    Slack is off or the call failed.
+    """
+    try:
+        if not slack_bot_configured():
+            return None
+        text = daily_plan_text(plan, owner)
+        channel = (plan.slackChannel or "").strip()
+        ts = (plan.slackTs or "").strip()
+        if channel and ts:
+            try:
+                await _slack_api("chat.update", {"channel": channel, "ts": ts, "text": text})
+                return channel, ts
+            except RuntimeError as exc:
+                if str(exc) not in _MESSAGE_GONE:
+                    raise
+                log.info("slack_bot daily plan post %s gone (%s); reposting", ts, exc)
+        target = (get_settings().SLACK_DAILY_PLAN_CHANNEL_ID or "").strip()
+        if not target:
+            return None
+        res = await _slack_api(
+            "chat.postMessage",
+            {"channel": target, "text": text, "unfurl_links": False, "unfurl_media": False},
+        )
+        new_ts = res.get("ts")
+        if not new_ts:
+            return None
+        return res.get("channel") or target, new_ts
+    except Exception as exc:
+        log.warning("slack_bot daily plan sync failed for plan %s: %s", plan.id, exc)
+        return None
+
+
+async def delete_daily_plan_message(plan: Any) -> None:
+    """Remove the plan's Slack post, if any. Never raises."""
+    channel = (plan.slackChannel or "").strip()
+    ts = (plan.slackTs or "").strip()
+    if not channel or not ts or not slack_bot_configured():
+        return
+    try:
+        await _slack_api("chat.delete", {"channel": channel, "ts": ts})
+    except Exception as exc:
+        log.warning("slack_bot daily plan delete failed for plan %s: %s", plan.id, exc)
 
 
 def _caller_start(iv: Interview) -> Optional[datetime]:

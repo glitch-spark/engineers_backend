@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 
 from beanie import PydanticObjectId
 from pymongo import IndexModel
@@ -19,6 +20,9 @@ class DailyPlan(TimestampedDocument):
     weekNumber: int
     today: str = ""
     tomorrow: str = ""
+    # Bot post in SLACK_DAILY_PLAN_CHANNEL_ID, kept so edits update it in place.
+    slackChannel: Optional[str] = None
+    slackTs: Optional[str] = None
 
     class Settings:
         name = "dailyplans"
