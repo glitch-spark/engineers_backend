@@ -538,7 +538,26 @@ def _plan_day_label(day: datetime, offset: int = 0) -> str:
     return f"{d.month}/{d.day}({d.strftime('%a')})"
 
 
+def _regular_plan_lines(plan: Any) -> list[str]:
+    lines = [
+        f"*{_plan_day_label(plan.date)}*",
+        f"Bids — by bidder {plan.bidsByBidder or 0}, hands-on {plan.bidsHandsOn or 0}",
+        f"Interviews — done {plan.interviewsDone or 0}, new invitations {plan.interviewsNew or 0}",
+    ]
+    for item in getattr(plan, "customItems", None) or []:
+        lines.append(f"{_slack_escape(item.label)} — {item.value or 0}")
+    return lines
+
+
 def daily_plan_text(plan: Any, owner: Optional[UserExtra]) -> str:
+    if getattr(plan, "planType", "custom") == "regular":
+        return "\n".join(
+            [
+                f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
+                *_regular_plan_lines(plan),
+                f"<{_frontend_link('/report')}|Open Report>",
+            ]
+        )
     today = (plan.today or "").strip()
     tomorrow = (plan.tomorrow or "").strip()
     return "\n".join(

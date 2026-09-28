@@ -1,30 +1,45 @@
-from datetime import datetime
-from typing import Annotated, Any, Optional
+from datetime import date, datetime
+from typing import Annotated, Any, Literal, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from pymongo.errors import DuplicateKeyError
 
 from app.alerts import app_week_key
+from app.config import get_settings
+from app.daily_plan_stats import METRICS, PERIODS, build_series, sum_totals, window_start
 from app.deps import get_current_user
 from app.models import UserExtra
-from app.models.daily_plan import DailyPlan
+from app.models.daily_plan import DailyPlan, DailyPlanItem
 from app.routers._util import populate_owner, to_object_id
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
 router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
 
+PLAN_TYPES = ("custom", "regular")
+MAX_CUSTOM_ITEMS = 20
 
-class DailyPlanCreate(BaseModel):
-    date: str
-    today: Optional[str] = None
-    tomorrow: Optional[str] = None
+
+class DailyPlanItemIn(BaseModel):
+    label: str = ""
+    value: int = 0
 
 
 class DailyPlanUpdate(BaseModel):
     date: Optional[str] = None
+    planType: Optional[str] = None
     today: Optional[str] = None
     tomorrow: Optional[str] = None
+    bidsHandsOn: Optional[int] = None
+    bidsByBidder: Optional[int] = None
+    interviewsDone: Optional[int] = None
+    interviewsNew: Optional[int] = None
+    customItems: Optional[list[DailyPlanItemIn]] = None
+
+
+class DailyPlanCreate(DailyPlanUpdate):
+    date: str
 
 
 def _reject_admin(user: UserExtra) -> None:
@@ -52,6 +67,73 @@ async def _sync_slack(plan: DailyPlan, owner: UserExtra) -> None:
     if posted and posted != (plan.slackChannel, plan.slackTs):
         plan.slackChannel, plan.slackTs = posted
         await plan.save()
+
+
+def _apply_fields(plan: DailyPlan, body: DailyPlanUpdate) -> None:
+    """Copy the plan type, notes and counts that were sent; 400 on bad values."""
+    if body.planType is not None:
+        if body.planType not in PLAN_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="planType must be 'custom' or 'regular'",
+            )
+        plan.planType = body.planType
+    if body.today is not None:
+        plan.today = body.today
+    if body.tomorrow is not None:
+        plan.tomorrow = body.tomorrow
+    for field in METRICS:
+        value = getattr(body, field)
+        if value is None:
+            continue
+        if value < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field} cannot be negative",
+            )
+        setattr(plan, field, value)
+    if body.customItems is not None:
+        if len(body.customItems) > MAX_CUSTOM_ITEMS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"At most {MAX_CUSTOM_ITEMS} custom items",
+            )
+        items = []
+        for item in body.customItems:
+            label = item.label.strip()
+            if not label:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Custom items need a name",
+                )
+            if item.value < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{label} cannot be negative",
+                )
+            items.append(DailyPlanItem(label=label, value=item.value))
+        plan.customItems = items
+
+
+def _slack_snapshot(plan: DailyPlan) -> tuple:
+    """Everything the Slack post shows, so unchanged saves skip the edit."""
+    return (
+        plan.date,
+        plan.planType,
+        plan.today,
+        plan.tomorrow,
+        *(getattr(plan, m) for m in METRICS),
+        tuple((i.label, i.value) for i in plan.customItems),
+    )
+
+
+def _app_today() -> date:
+    tz_name = (get_settings().APP_TIMEZONE or "").strip() or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).date()
 
 
 def _week_fields(day: datetime) -> tuple[int, int]:
@@ -108,6 +190,44 @@ async def list_plans(
     }
 
 
+@router.get("/stats")
+async def plan_stats(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    bucket: Literal["day", "week", "month"] = Query("day"),
+    userId: Optional[str] = Query(None),
+    to: Optional[str] = Query(None, description="Last day of the window (YYYY-MM-DD)"),
+) -> dict:
+    """Regular-plan counts per day, week or month for the dashboard chart.
+
+    The window ends on `to` (the caller's local today; APP_TIMEZONE's today
+    when omitted) and covers the last 14 days, 12 weeks or 12 months. Without
+    `userId` it sums the whole team. Readable by any signed-in user, like the
+    plan list.
+    """
+    today = _parse_day(to).date() if to else _app_today()
+    periods = PERIODS[bucket]
+    start = window_start(today, bucket, periods)
+
+    query: dict[str, Any] = {
+        "planType": "regular",
+        "date": {
+            "$gte": datetime(start.year, start.month, start.day),
+            "$lte": datetime(today.year, today.month, today.day),
+        },
+    }
+    if userId:
+        query["userId"] = to_object_id(userId)
+    plans = await DailyPlan.find(query).to_list()
+
+    series = build_series(plans, today, bucket, periods)
+    return {
+        "bucket": bucket,
+        "window": {"from": start.isoformat(), "to": today.isoformat()},
+        "series": series,
+        "totals": sum_totals(series, plans, start, today),
+    }
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_plan(
     body: DailyPlanCreate,
@@ -121,14 +241,8 @@ async def create_plan(
     year, week_number = _week_fields(day)
     await _duplicate_day(user.id, day)
 
-    plan = DailyPlan(
-        userId=user.id,
-        date=day,
-        year=year,
-        weekNumber=week_number,
-        today=body.today or "",
-        tomorrow=body.tomorrow or "",
-    )
+    plan = DailyPlan(userId=user.id, date=day, year=year, weekNumber=week_number)
+    _apply_fields(plan, body)
     try:
         await plan.insert()
     except DuplicateKeyError:
@@ -154,7 +268,7 @@ async def update_plan(
     if str(plan.userId) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
-    before = (plan.date, plan.today, plan.tomorrow)
+    before = _slack_snapshot(plan)
     if body.date is not None:
         if not body.date.strip():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Date is required")
@@ -164,10 +278,7 @@ async def update_plan(
         plan.date = day
         plan.year = year
         plan.weekNumber = week_number
-    if body.today is not None:
-        plan.today = body.today
-    if body.tomorrow is not None:
-        plan.tomorrow = body.tomorrow
+    _apply_fields(plan, body)
 
     try:
         await plan.save()
@@ -176,7 +287,7 @@ async def update_plan(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Daily plan already exists for this date",
         )
-    if (plan.date, plan.today, plan.tomorrow) != before or not plan.slackTs:
+    if _slack_snapshot(plan) != before or not plan.slackTs:
         await _sync_slack(plan, user)
     populated = await populate_owner([plan], field="userId", only=("name", "email"))
     return populated[0]
