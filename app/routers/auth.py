@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -28,6 +29,8 @@ class UserOut(BaseModel):
     email: Optional[str] = None
     role: str
     image: Optional[str] = None
+    createdAt: Optional[datetime] = None
+    lastLoginAt: Optional[datetime] = None
 
 
 class TokenOut(BaseModel):
@@ -36,10 +39,20 @@ class TokenOut(BaseModel):
     user: UserOut
 
 
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    # Mongo hands back naive UTC datetimes; tag them so the JSON carries "+00:00"
+    # and browsers don't parse them as local time.
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def _user_to_out(u: UserExtra) -> UserOut:
     return UserOut(
         id=str(u.id), name=u.name, email=u.email, role=u.role,
         image=getattr(u, "image", None) or None,
+        createdAt=_as_utc(getattr(u, "createdAt", None)),
+        lastLoginAt=_as_utc(getattr(u, "lastLoginAt", None)),
     )
 
 
@@ -101,6 +114,9 @@ async def login(body: LoginIn) -> TokenOut:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account pending admin approval",
         )
+
+    user.lastLoginAt = datetime.utcnow()
+    await user.set({UserExtra.lastLoginAt: user.lastLoginAt})
 
     token = create_access_token(sub=str(user.id), role=user.role)
     return TokenOut(access_token=token, token_type="bearer", user=_user_to_out(user))
