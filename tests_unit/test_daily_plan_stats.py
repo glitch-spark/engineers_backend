@@ -17,14 +17,12 @@ def _plan(day: date, **kw):
         bidsByBidder=0,
         interviewsDone=0,
         interviewsNew=0,
-        customItems=[],
+        planBidsHandsOn=0,
+        planBidsByBidder=0,
+        planInterviewsScheduled=0,
     )
     base.update(kw)
     return SimpleNamespace(**base)
-
-
-def _item(label: str, value: int):
-    return SimpleNamespace(label=label, value=value)
 
 
 def test_day_window_covers_fourteen_days():
@@ -81,18 +79,64 @@ def test_series_sums_plans_into_their_bucket_and_skips_outside_window():
     assert sep["planCount"] == 2
 
 
-def test_totals_merge_custom_items_by_label():
+def test_planned_counts_land_on_the_next_day():
+    today = date(2026, 9, 28)
+    plans = [
+        _plan(date(2026, 9, 26), bidsByBidder=5, planBidsByBidder=20, planBidsHandsOn=4, planInterviewsScheduled=2),
+    ]
+    series = {r["key"]: r for r in build_series(plans, today, "day", 14)}
+    assert series["2026-09-26"]["bidsByBidder"] == 5
+    assert series["2026-09-26"]["planBidsByBidder"] == 0
+    assert series["2026-09-27"]["planBidsByBidder"] == 20
+    assert series["2026-09-27"]["planBidsHandsOn"] == 4
+    assert series["2026-09-27"]["planInterviewsScheduled"] == 2
+    assert series["2026-09-27"]["planCount"] == 0
+
+
+def test_plan_from_the_day_before_fills_the_first_day():
+    today = date(2026, 9, 27)
+    series = build_series(
+        [_plan(date(2026, 9, 13), bidsHandsOn=99, planBidsHandsOn=7)], today, "day", 14
+    )
+    assert series[0]["key"] == "2026-09-14"
+    assert series[0]["planBidsHandsOn"] == 7
+    assert sum(r["bidsHandsOn"] for r in series) == 0  # its done counts are outside
+    assert sum(r["planCount"] for r in series) == 0
+
+
+def test_plan_for_after_today_is_left_out():
+    today = date(2026, 9, 27)
+    series = build_series([_plan(today, bidsHandsOn=3, planBidsHandsOn=50)], today, "day", 14)
+    assert series[-1]["bidsHandsOn"] == 3
+    assert sum(r["planBidsHandsOn"] for r in series) == 0
+
+
+def test_totals_sum_done_and_planned_counts():
     today = date(2026, 9, 27)
     plans = [
-        _plan(date(2026, 9, 26), bidsByBidder=3, customItems=[_item("Cold emails", 5), _item("Calls", 1)]),
-        _plan(date(2026, 9, 27), bidsByBidder=2, customItems=[_item("cold emails ", 2)]),
-        _plan(date(2026, 1, 1), customItems=[_item("Calls", 50)]),  # outside the window
+        _plan(date(2026, 9, 25), bidsByBidder=3, planBidsByBidder=10),
+        _plan(date(2026, 9, 26), bidsByBidder=2, interviewsNew=1, planInterviewsScheduled=4),
     ]
-    series = build_series(plans, today, "day", 14)
-    totals = sum_totals(series, plans, date(2026, 9, 14), today)
+    totals = sum_totals(build_series(plans, today, "day", 14))
     assert totals["bidsByBidder"] == 5
+    assert totals["interviewsNew"] == 1
+    assert totals["planBidsByBidder"] == 10
+    assert totals["planInterviewsScheduled"] == 4
     assert totals["planCount"] == 2
-    assert totals["customItems"] == [
-        {"label": "Cold emails", "value": 7},
-        {"label": "Calls", "value": 1},
-    ]
+
+
+def test_counted_custom_items_fold_into_today_items():
+    from app.models.daily_plan import fold_counted_items
+
+    raw = {
+        "planType": "regular",
+        "customItems": [{"label": " Cold emails ", "value": 5}, {"label": "  ", "value": 1}, {"label": "Calls"}],
+    }
+    folded = fold_counted_items(raw)
+    assert folded["todayItems"] == ["Cold emails: 5", "Calls: 0"]
+    assert "customItems" not in folded
+    assert "customItems" in raw  # the stored doc is not mutated in place
+
+    kept = fold_counted_items({"customItems": [{"label": "x", "value": 1}], "todayItems": ["new"]})
+    assert kept["todayItems"] == ["new"]
+    assert fold_counted_items({"todayItems": ["a"]}) == {"todayItems": ["a"]}

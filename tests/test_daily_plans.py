@@ -181,7 +181,9 @@ async def test_old_plans_default_to_custom(client, staff_user, auth_header):
     body = r.json()
     assert body["planType"] == "custom"
     assert body["bidsHandsOn"] == 0
-    assert body["customItems"] == []
+    assert body["planBidsHandsOn"] == 0
+    assert body["todayItems"] == []
+    assert body["tomorrowItems"] == []
 
 
 async def test_regular_plan_round_trip(client, staff_user, auth_header):
@@ -195,36 +197,73 @@ async def test_regular_plan_round_trip(client, staff_user, auth_header):
             "bidsByBidder": 12,
             "interviewsDone": 1,
             "interviewsNew": 2,
-            "customItems": [{"label": "  Cold emails ", "value": 5}],
+            "todayItems": ["  Create Linkedin Profile ", "", "Update resume"],
+            "planBidsHandsOn": 5,
+            "planBidsByBidder": 15,
+            "planInterviewsScheduled": 3,
+            "tomorrowItems": ["Prep for Acme"],
         },
     )
     assert r.status_code == 201, r.text
     body = r.json()
     assert body["planType"] == "regular"
     assert body["bidsByBidder"] == 12
-    assert body["customItems"] == [{"label": "Cold emails", "value": 5}]
+    assert body["todayItems"] == ["Create Linkedin Profile", "Update resume"]
+    assert body["planBidsByBidder"] == 15
+    assert body["planInterviewsScheduled"] == 3
+    assert body["tomorrowItems"] == ["Prep for Acme"]
+    assert "customItems" not in body
 
     r = await client.put(
         f"/daily-plans/{body['_id']}",
         headers=auth_header(staff_user),
-        json={"interviewsNew": 3, "customItems": []},
+        json={"interviewsNew": 3, "planInterviewsScheduled": 4, "todayItems": []},
     )
     assert r.status_code == 200, r.text
     assert r.json()["interviewsNew"] == 3
+    assert r.json()["planInterviewsScheduled"] == 4
     assert r.json()["bidsHandsOn"] == 4
-    assert r.json()["customItems"] == []
+    assert r.json()["todayItems"] == []
+    assert r.json()["tomorrowItems"] == ["Prep for Acme"]
 
 
 async def test_regular_plan_rejects_bad_values(client, staff_user, auth_header):
     base = {"date": "2026-09-25", "planType": "regular"}
     for extra in (
         {"bidsHandsOn": -1},
+        {"planBidsByBidder": -1},
         {"planType": "weekly"},
-        {"customItems": [{"label": "  ", "value": 1}]},
-        {"customItems": [{"label": "Calls", "value": -2}]},
+        {"todayItems": ["x" * 201]},
+        {"tomorrowItems": [f"item {n}" for n in range(21)]},
     ):
         r = await client.post("/daily-plans", headers=auth_header(staff_user), json={**base, **extra})
         assert r.status_code == 400, (extra, r.text)
+
+
+async def test_counted_custom_items_read_back_as_today_items(client, staff_user, auth_header):
+    """Plans saved while custom items had a number still load."""
+    from datetime import datetime as dt
+
+    from app.models.daily_plan import DailyPlan
+
+    await DailyPlan.get_motor_collection().insert_one({
+        "userId": staff_user.id,
+        "date": dt(2026, 9, 26),
+        "year": 2026,
+        "weekNumber": 39,
+        "planType": "regular",
+        "bidsByBidder": 7,
+        "customItems": [{"label": "Cold emails", "value": 5}, {"label": "Calls", "value": 2}],
+        "createdAt": dt.utcnow(),
+        "updatedAt": dt.utcnow(),
+    })
+
+    r = await client.get("/daily-plans", headers=auth_header(staff_user))
+    assert r.status_code == 200, r.text
+    plan = r.json()["plans"][0]
+    assert plan["todayItems"] == ["Cold emails: 5", "Calls: 2"]
+    assert plan["bidsByBidder"] == 7
+    assert "customItems" not in plan
 
 
 async def test_stats_sum_regular_plans_per_user_and_team(client, staff_user, staff_user_2, auth_header):
@@ -263,6 +302,25 @@ async def test_stats_sum_regular_plans_per_user_and_team(client, staff_user, sta
     assert body["totals"]["bidsByBidder"] == 15
     assert body["totals"]["interviewsDone"] == 2
     assert body["totals"]["planCount"] == 2
+
+
+async def test_stats_put_planned_counts_on_the_next_day(client, staff_user, auth_header):
+    # Dated the day before the 14-day window, so only its plan for 9/14 counts.
+    await client.post(
+        "/daily-plans",
+        headers=auth_header(staff_user),
+        json={"date": "2026-09-13", "planType": "regular", "bidsHandsOn": 9, "planBidsByBidder": 20},
+    )
+    r = await client.get(
+        f"/daily-plans/stats?bucket=day&to=2026-09-27&userId={staff_user.id}",
+        headers=auth_header(staff_user),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["series"][0]["bucketStart"] == "2026-09-14"
+    assert body["series"][0]["planBidsByBidder"] == 20
+    assert body["totals"]["bidsHandsOn"] == 0
+    assert body["totals"]["planBidsByBidder"] == 20
 
 
 async def test_stats_rejects_bad_bucket_and_date(client, staff_user, auth_header):

@@ -44,22 +44,59 @@ def test_daily_plan_text_labels_mention_and_escapes():
     assert "\n—\n" in text  # empty tomorrow
 
 
-def test_regular_daily_plan_text_lists_counts_and_custom_items():
+def test_regular_daily_plan_text_numbers_both_days():
     plan = _plan(
         planType="regular",
-        bidsHandsOn=4,
-        bidsByBidder=12,
-        interviewsDone=1,
-        interviewsNew=2,
-        customItems=[SimpleNamespace(label="Cold <emails>", value=5)],
+        bidsHandsOn=100,
+        bidsByBidder=150,
+        interviewsDone=2,
+        interviewsNew=3,
+        todayItems=["Create Linkedin Profile", "Update <resume>"],
+        planBidsHandsOn=90,
+        planBidsByBidder=160,
+        planInterviewsScheduled=5,
+        tomorrowItems=["Prep for Acme"],
+    )
+    lines = daily_plan_text(plan, _owner()).splitlines()
+    assert lines[0] == ":spiral_note_pad: *Daily plan* — <@U123>"
+    assert lines[1:-1] == [
+        "*9/27 (Sun)*",
+        "1. Bid",
+        "- Bid (hands-on) : 100",
+        "- Bid (by bidder) : 150",
+        "2. Interview",
+        "Done today : 2",
+        "New invitations : 3",
+        "3. Create Linkedin Profile",
+        "4. Update &lt;resume&gt;",
+        "*9/28 (Mon)*",
+        "1. Bid",
+        "- Bid (hands-on) : 90",
+        "- Bid (by bidder) : 160",
+        "2. Interview",
+        "Scheduled : 5",
+        "3. Prep for Acme",
+    ]
+    assert "Open Report" in lines[-1]
+
+
+def test_regular_daily_plan_text_without_items_or_counts():
+    plan = _plan(
+        planType="regular",
+        bidsHandsOn=0,
+        bidsByBidder=0,
+        interviewsDone=0,
+        interviewsNew=0,
+        todayItems=[],
+        planBidsHandsOn=0,
+        planBidsByBidder=0,
+        planInterviewsScheduled=0,
+        tomorrowItems=[],
     )
     text = daily_plan_text(plan, _owner())
-    assert "*9/27(Sun)*" in text
-    assert "Bids — by bidder 12, hands-on 4" in text
-    assert "Interviews — done 1, new invitations 2" in text
-    assert "Cold &lt;emails&gt; — 5" in text
+    assert "Scheduled : 0" in text
+    assert not any(line.startswith("3. ") for line in text.splitlines())
     assert "Ship" not in text  # the free-text note belongs to custom plans
-    assert "9/28(Mon)" not in text
 
 
 @pytest.mark.asyncio

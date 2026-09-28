@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Annotated, Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
@@ -11,19 +11,16 @@ from app.config import get_settings
 from app.daily_plan_stats import METRICS, PERIODS, build_series, sum_totals, window_start
 from app.deps import get_current_user
 from app.models import UserExtra
-from app.models.daily_plan import DailyPlan, DailyPlanItem
+from app.models.daily_plan import DailyPlan
 from app.routers._util import populate_owner, to_object_id
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
 router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
 
 PLAN_TYPES = ("custom", "regular")
-MAX_CUSTOM_ITEMS = 20
-
-
-class DailyPlanItemIn(BaseModel):
-    label: str = ""
-    value: int = 0
+MAX_ITEMS = 20
+MAX_ITEM_LENGTH = 200
+ITEM_FIELDS = ("todayItems", "tomorrowItems")
 
 
 class DailyPlanUpdate(BaseModel):
@@ -35,7 +32,11 @@ class DailyPlanUpdate(BaseModel):
     bidsByBidder: Optional[int] = None
     interviewsDone: Optional[int] = None
     interviewsNew: Optional[int] = None
-    customItems: Optional[list[DailyPlanItemIn]] = None
+    todayItems: Optional[list[str]] = None
+    planBidsHandsOn: Optional[int] = None
+    planBidsByBidder: Optional[int] = None
+    planInterviewsScheduled: Optional[int] = None
+    tomorrowItems: Optional[list[str]] = None
 
 
 class DailyPlanCreate(DailyPlanUpdate):
@@ -92,27 +93,22 @@ def _apply_fields(plan: DailyPlan, body: DailyPlanUpdate) -> None:
                 detail=f"{field} cannot be negative",
             )
         setattr(plan, field, value)
-    if body.customItems is not None:
-        if len(body.customItems) > MAX_CUSTOM_ITEMS:
+    for field in ITEM_FIELDS:
+        raw = getattr(body, field)
+        if raw is None:
+            continue
+        items = [item.strip() for item in raw if item.strip()]
+        if len(items) > MAX_ITEMS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"At most {MAX_CUSTOM_ITEMS} custom items",
+                detail=f"At most {MAX_ITEMS} custom items per day",
             )
-        items = []
-        for item in body.customItems:
-            label = item.label.strip()
-            if not label:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Custom items need a name",
-                )
-            if item.value < 0:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"{label} cannot be negative",
-                )
-            items.append(DailyPlanItem(label=label, value=item.value))
-        plan.customItems = items
+        if any(len(item) > MAX_ITEM_LENGTH for item in items):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Custom items can be at most {MAX_ITEM_LENGTH} characters",
+            )
+        setattr(plan, field, items)
 
 
 def _slack_snapshot(plan: DailyPlan) -> tuple:
@@ -123,7 +119,7 @@ def _slack_snapshot(plan: DailyPlan) -> tuple:
         plan.today,
         plan.tomorrow,
         *(getattr(plan, m) for m in METRICS),
-        tuple((i.label, i.value) for i in plan.customItems),
+        *(tuple(getattr(plan, f)) for f in ITEM_FIELDS),
     )
 
 
@@ -207,11 +203,13 @@ async def plan_stats(
     today = _parse_day(to).date() if to else _app_today()
     periods = PERIODS[bucket]
     start = window_start(today, bucket, periods)
+    # The plan dated the day before the window holds the window's first planned day.
+    first = start - timedelta(days=1)
 
     query: dict[str, Any] = {
         "planType": "regular",
         "date": {
-            "$gte": datetime(start.year, start.month, start.day),
+            "$gte": datetime(first.year, first.month, first.day),
             "$lte": datetime(today.year, today.month, today.day),
         },
     }
@@ -224,7 +222,7 @@ async def plan_stats(
         "bucket": bucket,
         "window": {"from": start.isoformat(), "to": today.isoformat()},
         "series": series,
-        "totals": sum_totals(series, plans, start, today),
+        "totals": sum_totals(series),
     }
 
 
