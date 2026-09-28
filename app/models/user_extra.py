@@ -21,6 +21,8 @@ class UserExtra(TimestampedDocument):
     # explicitly sets False on new sign-ups (after the very first user, who
     # bootstraps as admin).
     isActive: bool = True
+    # Set on each successful /auth/login (UTC). None until the first login after this field shipped.
+    lastLoginAt: Optional[datetime] = None
 
     # Opt-in to public leaderboard (Phase 1 — name + value visible to all
     # opted-in users). leaderboardName overrides display name on the

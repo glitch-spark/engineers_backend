@@ -63,6 +63,25 @@ async def test_login_returns_token_and_user(client):
     assert body["user"]["role"] == "admin"  # first user
 
 
+async def test_login_records_last_login_and_returns_account_dates(client):
+    await client.post(
+        "/auth/register",
+        json={"username": "alice", "email": "a@x.com", "password": "secret"},
+    )
+    user = await UserExtra.find_one(UserExtra.email == "a@x.com")
+    assert user.lastLoginAt is None
+
+    r = await client.post("/auth/login", json={"username": "alice", "password": "secret"})
+    assert r.status_code == 200, r.text
+    out = r.json()["user"]
+    assert out["createdAt"] and out["lastLoginAt"]
+    # Serialised as UTC so browsers don't read it as local time.
+    assert out["lastLoginAt"].endswith(("+00:00", "Z"))
+
+    user = await UserExtra.find_one(UserExtra.email == "a@x.com")
+    assert user.lastLoginAt is not None
+
+
 async def test_login_works_with_email_or_name(client):
     await client.post(
         "/auth/register",
