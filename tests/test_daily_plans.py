@@ -169,3 +169,104 @@ async def test_admin_lists_newest_created_but_cannot_write(client, staff_user, a
 
     denied = await client.delete(f"/daily-plans/{plan_id}", headers=auth_header(admin_user))
     assert denied.status_code == 403
+
+
+async def test_old_plans_default_to_custom(client, staff_user, auth_header):
+    r = await client.post(
+        "/daily-plans",
+        headers=auth_header(staff_user),
+        json={"date": "2026-01-26", "today": "notes only"},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["planType"] == "custom"
+    assert body["bidsHandsOn"] == 0
+    assert body["customItems"] == []
+
+
+async def test_regular_plan_round_trip(client, staff_user, auth_header):
+    r = await client.post(
+        "/daily-plans",
+        headers=auth_header(staff_user),
+        json={
+            "date": "2026-09-25",
+            "planType": "regular",
+            "bidsHandsOn": 4,
+            "bidsByBidder": 12,
+            "interviewsDone": 1,
+            "interviewsNew": 2,
+            "customItems": [{"label": "  Cold emails ", "value": 5}],
+        },
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["planType"] == "regular"
+    assert body["bidsByBidder"] == 12
+    assert body["customItems"] == [{"label": "Cold emails", "value": 5}]
+
+    r = await client.put(
+        f"/daily-plans/{body['_id']}",
+        headers=auth_header(staff_user),
+        json={"interviewsNew": 3, "customItems": []},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["interviewsNew"] == 3
+    assert r.json()["bidsHandsOn"] == 4
+    assert r.json()["customItems"] == []
+
+
+async def test_regular_plan_rejects_bad_values(client, staff_user, auth_header):
+    base = {"date": "2026-09-25", "planType": "regular"}
+    for extra in (
+        {"bidsHandsOn": -1},
+        {"planType": "weekly"},
+        {"customItems": [{"label": "  ", "value": 1}]},
+        {"customItems": [{"label": "Calls", "value": -2}]},
+    ):
+        r = await client.post("/daily-plans", headers=auth_header(staff_user), json={**base, **extra})
+        assert r.status_code == 400, (extra, r.text)
+
+
+async def test_stats_sum_regular_plans_per_user_and_team(client, staff_user, staff_user_2, auth_header):
+    await client.post(
+        "/daily-plans",
+        headers=auth_header(staff_user),
+        json={"date": "2026-09-26", "planType": "regular", "bidsHandsOn": 4, "bidsByBidder": 10, "interviewsNew": 1},
+    )
+    await client.post(
+        "/daily-plans",
+        headers=auth_header(staff_user),
+        json={"date": "2026-09-27", "planType": "custom", "bidsHandsOn": 99, "today": "not counted"},
+    )
+    await client.post(
+        "/daily-plans",
+        headers=auth_header(staff_user_2),
+        json={"date": "2026-09-27", "planType": "regular", "bidsByBidder": 5, "interviewsDone": 2},
+    )
+
+    r = await client.get(
+        f"/daily-plans/stats?bucket=day&to=2026-09-27&userId={staff_user.id}",
+        headers=auth_header(staff_user_2),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["window"] == {"from": "2026-09-14", "to": "2026-09-27"}
+    assert len(body["series"]) == 14
+    assert body["series"][-2]["bidsHandsOn"] == 4
+    assert body["series"][-1]["bidsHandsOn"] == 0
+    assert body["totals"]["bidsByBidder"] == 10
+    assert body["totals"]["interviewsNew"] == 1
+
+    r = await client.get("/daily-plans/stats?bucket=week&to=2026-09-27", headers=auth_header(staff_user))
+    body = r.json()
+    assert len(body["series"]) == 12
+    assert body["totals"]["bidsByBidder"] == 15
+    assert body["totals"]["interviewsDone"] == 2
+    assert body["totals"]["planCount"] == 2
+
+
+async def test_stats_rejects_bad_bucket_and_date(client, staff_user, auth_header):
+    r = await client.get("/daily-plans/stats?bucket=year", headers=auth_header(staff_user))
+    assert r.status_code in (400, 422)
+    r = await client.get("/daily-plans/stats?to=not-a-date", headers=auth_header(staff_user))
+    assert r.status_code == 400

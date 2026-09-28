@@ -44,6 +44,24 @@ def test_daily_plan_text_labels_mention_and_escapes():
     assert "\n—\n" in text  # empty tomorrow
 
 
+def test_regular_daily_plan_text_lists_counts_and_custom_items():
+    plan = _plan(
+        planType="regular",
+        bidsHandsOn=4,
+        bidsByBidder=12,
+        interviewsDone=1,
+        interviewsNew=2,
+        customItems=[SimpleNamespace(label="Cold <emails>", value=5)],
+    )
+    text = daily_plan_text(plan, _owner())
+    assert "*9/27(Sun)*" in text
+    assert "Bids — by bidder 12, hands-on 4" in text
+    assert "Interviews — done 1, new invitations 2" in text
+    assert "Cold &lt;emails&gt; — 5" in text
+    assert "Ship" not in text  # the free-text note belongs to custom plans
+    assert "9/28(Mon)" not in text
+
+
 @pytest.mark.asyncio
 async def test_sync_skips_when_bot_not_configured():
     api = AsyncMock()
