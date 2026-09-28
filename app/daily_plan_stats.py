@@ -3,6 +3,9 @@
 Pure helpers (no Mongo) so the window and bucket math is unit-tested directly.
 Weeks follow the app's calendar-year week (`app.alerts.app_week_key`), the same
 week the Report filter and each plan's `weekNumber` use.
+
+A plan dated D records what was done on D and the plan for D + 1, so its done
+counts land in D's bucket and its planned counts in the bucket for D + 1.
 """
 
 from __future__ import annotations
@@ -17,7 +20,9 @@ Bucket = Literal["day", "week", "month"]
 # How many buckets the chart shows, ending with the one that holds `today`.
 PERIODS: dict[str, int] = {"day": 14, "week": 12, "month": 12}
 
-METRICS = ("bidsHandsOn", "bidsByBidder", "interviewsDone", "interviewsNew")
+DONE_METRICS = ("bidsHandsOn", "bidsByBidder", "interviewsDone", "interviewsNew")
+PLAN_METRICS = ("planBidsHandsOn", "planBidsByBidder", "planInterviewsScheduled")
+METRICS = DONE_METRICS + PLAN_METRICS
 
 
 def bucket_key(day: date, bucket: Bucket) -> str:
@@ -67,30 +72,23 @@ def build_series(plans: Iterable[Any], today: date, bucket: Bucket, periods: int
         row["bucketEnd"] = day.isoformat()
         day += timedelta(days=1)
 
+    def add(day: date, fields: tuple[str, ...], plan: Any) -> bool:
+        if day < start or day > today:
+            return False
+        row = rows[bucket_key(day, bucket)]
+        for m in fields:
+            row[m] += int(getattr(plan, m, 0) or 0)
+        return True
+
     for plan in plans:
         plan_day = _day(plan.date)
-        if plan_day < start or plan_day > today:
-            continue
-        row = rows[bucket_key(plan_day, bucket)]
-        row["planCount"] += 1
-        for m in METRICS:
-            row[m] += int(getattr(plan, m, 0) or 0)
+        if add(plan_day, DONE_METRICS, plan):
+            rows[bucket_key(plan_day, bucket)]["planCount"] += 1
+        add(plan_day + timedelta(days=1), PLAN_METRICS, plan)
     return list(rows.values())
 
 
-def sum_totals(series: list[dict], plans: Iterable[Any], start: date, today: date) -> dict:
-    """Window totals, plus custom items summed by label (case-insensitive)."""
+def sum_totals(series: list[dict]) -> dict:
     totals: dict[str, Any] = {m: sum(r[m] for r in series) for m in METRICS}
     totals["planCount"] = sum(r["planCount"] for r in series)
-    custom: dict[str, dict] = {}
-    for plan in plans:
-        if not start <= _day(plan.date) <= today:
-            continue
-        for item in getattr(plan, "customItems", None) or []:
-            label = (item.label or "").strip()
-            if not label:
-                continue
-            entry = custom.setdefault(label.lower(), {"label": label, "value": 0})
-            entry["value"] += int(item.value or 0)
-    totals["customItems"] = sorted(custom.values(), key=lambda e: (-e["value"], e["label"].lower()))
     return totals

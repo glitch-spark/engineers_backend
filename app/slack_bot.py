@@ -532,20 +532,26 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _plan_day_label(day: datetime, offset: int = 0) -> str:
-    """Matches the SPA's planDayLabel, e.g. `9/27(Sun)`."""
+def _plan_day_label(day: datetime, offset: int = 0, sep: str = "") -> str:
+    """Matches the SPA's planDayLabel, e.g. `9/27(Sun)`, or `9/27 (Sun)` with `sep=" "`."""
     d = day + timedelta(days=offset)
-    return f"{d.month}/{d.day}({d.strftime('%a')})"
+    return f"{d.month}/{d.day}{sep}({d.strftime('%a')})"
 
 
-def _regular_plan_lines(plan: Any) -> list[str]:
+def _regular_day_lines(
+    day: str, hands_on: int, by_bidder: int, interviews: list[str], items: list[str]
+) -> list[str]:
+    """One day of a regular plan: numbered Bid and Interview, then the items."""
     lines = [
-        f"*{_plan_day_label(plan.date)}*",
-        f"Bids — by bidder {plan.bidsByBidder or 0}, hands-on {plan.bidsHandsOn or 0}",
-        f"Interviews — done {plan.interviewsDone or 0}, new invitations {plan.interviewsNew or 0}",
+        f"*{day}*",
+        "1. Bid",
+        f"- Bid (hands-on) : {hands_on or 0}",
+        f"- Bid (by bidder) : {by_bidder or 0}",
+        "2. Interview",
+        *interviews,
     ]
-    for item in getattr(plan, "customItems", None) or []:
-        lines.append(f"{_slack_escape(item.label)} — {item.value or 0}")
+    for n, item in enumerate(items or [], start=3):
+        lines.append(f"{n}. {_slack_escape(item)}")
     return lines
 
 
@@ -554,7 +560,23 @@ def daily_plan_text(plan: Any, owner: Optional[UserExtra]) -> str:
         return "\n".join(
             [
                 f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
-                *_regular_plan_lines(plan),
+                *_regular_day_lines(
+                    _plan_day_label(plan.date, sep=" "),
+                    plan.bidsHandsOn,
+                    plan.bidsByBidder,
+                    [
+                        f"Done today : {plan.interviewsDone or 0}",
+                        f"New invitations : {plan.interviewsNew or 0}",
+                    ],
+                    plan.todayItems,
+                ),
+                *_regular_day_lines(
+                    _plan_day_label(plan.date, 1, sep=" "),
+                    plan.planBidsHandsOn,
+                    plan.planBidsByBidder,
+                    [f"Scheduled : {plan.planInterviewsScheduled or 0}"],
+                    plan.tomorrowItems,
+                ),
                 f"<{_frontend_link('/report')}|Open Report>",
             ]
         )
