@@ -14,6 +14,7 @@ from app.routers import (
     ai_review,
     applications,
     auth as auth_router,
+    dashboard,
     global_prompt,
     integrations,
     interview_prep,
@@ -85,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(interview_prep.router)
     app.include_router(ai_review.router)
     app.include_router(metrics.router)
+    app.include_router(dashboard.router)
     app.include_router(resume.router)
     app.include_router(applications.router)
     app.include_router(integrations.router)
