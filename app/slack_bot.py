@@ -800,10 +800,14 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     interviews = await Interview.find(
         {
             "$or": [
-                {"createdBy": user.id},
-                {"caller.enabled": True, "caller.coworkerIds": user.id},
+                {"createdBy": user.id, "scheduledAt": {"$gte": start_n, "$lt": end_n}},
+                # Callers live on rounds: match the coworker's round on this day.
+                {"stageHistory": {"$elemMatch": {
+                    "caller.enabled": True,
+                    "caller.coworkerIds": user.id,
+                    "scheduledAt": {"$gte": start_n, "$lt": end_n},
+                }}},
             ],
-            "scheduledAt": {"$gte": start_n, "$lt": end_n},
         }
     ).sort([("scheduledAt", 1)]).to_list()
     interviews = [iv for iv in interviews if iv.status not in _SKIP_STATUSES]

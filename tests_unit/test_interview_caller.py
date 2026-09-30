@@ -108,3 +108,14 @@ def test_cancel_kinds():
         caller_post_kind(s, s, round_deleted=True),
     ):
         assert kind == "canceled"
+
+
+def test_no_cancel_reply_for_rounds_that_are_not_scheduled():
+    done = round_caller_snapshot(_entry(status="completed"))
+    canceled = round_caller_snapshot(_entry(status="canceled"))
+    # Deleting an old interview must not post "Canceled" for calls that happened…
+    assert caller_post_kind(done, done, round_deleted=True) is None
+    assert caller_post_kind(done, None) is None
+    # …nor a second "Canceled" for a round that already was.
+    assert caller_post_kind(canceled, None) is None
+    assert caller_post_kind(canceled, canceled, round_deleted=True) is None

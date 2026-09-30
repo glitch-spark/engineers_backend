@@ -335,3 +335,40 @@ def test_stage_event_accepts_round_fields():
     e = InterviewStageEvent(stage="intro", at=NOW, interviewerName="D", caller={"enabled": True})
     assert e.interviewerName == "D"
     assert e.caller.enabled is True
+
+
+def test_legacy_noon_tip_takes_caller_time():
+    noon = datetime(2026, 9, 1, 12)
+    raw = _iv([_entry("a", "intro", "scheduled", when=noon)])
+    raw["caller"] = {"enabled": True, "startsAt": datetime(2026, 9, 1, 18, 30)}
+    raw["scheduledAt"] = datetime(2026, 9, 1, 15)
+    raw["endsAt"] = datetime(2026, 9, 1, 16)
+    tip = resolve_interview(raw, now=NOW).doc["stageHistory"][-1]
+    assert tip["scheduledAt"] == datetime(2026, 9, 1, 18, 30)
+    assert tip["endsAt"] == datetime(2026, 9, 1, 19, 30)  # the interview's 1 h duration
+
+
+def test_legacy_noon_tip_takes_top_level_time_on_same_date():
+    noon = datetime(2026, 9, 1, 12)
+    raw = _iv([_entry("a", "intro", "completed", when=noon)])
+    raw["scheduledAt"] = datetime(2026, 9, 1, 14, 30)
+    raw["endsAt"] = datetime(2026, 9, 1, 15, 15)
+    tip = resolve_interview(raw, now=NOW).doc["stageHistory"][-1]
+    assert (tip["scheduledAt"], tip["endsAt"]) == (datetime(2026, 9, 1, 14, 30), datetime(2026, 9, 1, 15, 15))
+
+
+def test_legacy_noon_tip_without_real_time_stays_all_day():
+    noon = datetime(2026, 9, 1, 12)
+    raw = _iv([_entry("a", "intro", "completed", when=noon)])
+    raw["scheduledAt"] = noon
+    raw["endsAt"] = datetime(2026, 9, 1, 13)
+    tip = resolve_interview(raw, now=NOW).doc["stageHistory"][-1]
+    assert tip["scheduledAt"] == noon
+    assert tip.get("endsAt") is None  # stays a date-only (all-day) round
+
+
+def test_legacy_time_fix_is_idempotent():
+    raw = _iv([_entry("a", "intro", "scheduled", when=datetime(2026, 9, 1, 12))])
+    raw["caller"] = {"enabled": True, "startsAt": datetime(2026, 9, 1, 18, 30)}
+    r1 = resolve_interview(raw, now=NOW)
+    assert sum(resolve_interview(r1.doc, now=NOW).rules.values()) == 0

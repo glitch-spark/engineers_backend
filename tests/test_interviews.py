@@ -841,3 +841,11 @@ async def test_list_sort_company_is_case_insensitive(client, staff_user, auth_he
         })
     r = await client.get("/interviews?sort=company&dir=asc", headers=h)
     assert [i["companyName"] for i in r.json()["interviews"]] == ["Alpha", "beta", "zeta"]
+
+
+async def test_create_and_put_return_populated_interview(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    assert isinstance(iv["accountId"], dict) and iv["accountId"]["email"] == "acme@example.com"
+    r = await client.put(f"/interviews/{iv['_id']}", headers=auth_header(staff_user), json={"jobUrl": "https://x.test/j"})
+    assert r.json()["accountId"]["email"] == "acme@example.com"
+    assert r.json()["ownerEmail"] == staff_user.email

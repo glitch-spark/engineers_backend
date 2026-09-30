@@ -196,7 +196,34 @@ def resolve_interview(raw: dict, *, now: datetime) -> Resolution:
     # Rule 7: interviewer / caller / end time live on rounds; copy the
     # interview-level values onto the latest round, then mirror it back.
     copied = False
+    # Legacy date-only rounds sit at 12:00 UTC with no end; their real time
+    # lives on the caller start or on the interview-level scheduledAt (same
+    # date). Move it onto the round; otherwise keep it a date-only round.
+    tip_start = _utc_naive(tip.get("scheduledAt"))
+    legacy_noon = (
+        tip_start is not None and not tip.get("endsAt")
+        and (tip_start.hour, tip_start.minute, tip_start.second, tip_start.microsecond) == (12, 0, 0, 0)
+    )
+    if legacy_noon:
+        caller = tip.get("caller") or doc.get("caller") or {}
+        caller_start = _utc_naive(caller.get("startsAt")) if isinstance(caller, dict) else None
+        top_start, top_end = _utc_naive(doc.get("scheduledAt")), _utc_naive(doc.get("endsAt"))
+        real = caller_start
+        if real is None and top_start is not None and top_start.date() == tip_start.date() and top_start != tip_start:
+            real = top_start
+        if real is not None:
+            duration = (top_end - top_start) if top_start is not None and top_end is not None else None
+            if duration is None or not (timedelta(0) < duration <= timedelta(days=1)):
+                duration = timedelta(hours=1)
+            tip["scheduledAt"] = real
+            tip["endsAt"] = real + duration
+            doc["scheduledAt"] = real
+            doc["endsAt"] = tip["endsAt"]
+            legacy_noon = False
+            copied = True
     for key in ("interviewerName", "caller", "endsAt"):
+        if key == "endsAt" and legacy_noon:
+            continue  # a date-only round has no end time
         if doc.get(key) and not tip.get(key):
             tip[key] = copy.deepcopy(doc[key])
             copied = True

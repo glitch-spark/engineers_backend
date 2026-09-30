@@ -129,10 +129,11 @@ def caller_post_kind(
         if new is None or round_deleted or new.get("status") == "canceled":
             return None
         return "created"
-    if round_deleted or new is None:
-        return "canceled"
-    if new.get("status") == "canceled" and prev.get("status") != "canceled":
-        return "canceled"
+    # Only a still-scheduled call can be canceled: deleting an old interview or
+    # dropping the caller from a finished/canceled round posts nothing.
+    ending = round_deleted or new is None or new.get("status") == "canceled"
+    if ending:
+        return "canceled" if prev.get("status") == "scheduled" else None
     return "updated" if new != prev else None
 
 

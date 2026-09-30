@@ -43,3 +43,27 @@ def test_sync_top_mirrors_round_fields():
     assert iv.interviewerName == "Dana"
     assert iv.caller == caller
     assert iv.endsAt == AT + timedelta(minutes=30)
+
+
+def test_sync_top_follows_timed_tip_within_same_day():
+    tip = _round("scheduled", stage="panel", endsAt=AT + timedelta(hours=6))
+    tip.scheduledAt = AT + timedelta(hours=5)  # 19:00, same UTC day as the interview's 14:00
+    iv = SimpleNamespace(
+        stage=None, status=None, scheduledAt=AT, endsAt=AT + timedelta(hours=1),
+        interviewerName=None, caller=None, stageHistory=[tip],
+    )
+    _sync_top_from_tip(iv)
+    assert iv.scheduledAt == AT + timedelta(hours=5)
+    assert iv.endsAt == AT + timedelta(hours=6)
+
+
+def test_coworker_on_earlier_round_can_still_view():
+    from bson import ObjectId
+
+    from app.routers.interviews import _can_view
+    mate, owner = ObjectId(), ObjectId()
+    earlier = _round("passed", caller=InterviewCaller(enabled=True, coworkerIds=[mate]))
+    later = _round("scheduled", stage="panel")
+    iv = SimpleNamespace(createdBy=owner, caller=None, stageHistory=[earlier, later])
+    assert _can_view(iv, SimpleNamespace(id=mate, role="staff")) is True
+    assert _can_view(iv, SimpleNamespace(id=ObjectId(), role="staff")) is False

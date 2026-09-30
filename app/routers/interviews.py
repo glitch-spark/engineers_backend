@@ -291,10 +291,12 @@ async def _sync_caller_posts(
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
+    """Admin, owner, or a coworker on any round's caller request."""
     return (
         user.role == "admin"
         or str(iv.createdBy) == str(user.id)
         or is_coworker(iv.caller, user.id)
+        or any(is_coworker(getattr(e, "caller", None), user.id) for e in (iv.stageHistory or []))
     )
 
 
@@ -375,7 +377,9 @@ def _sync_top_from_tip(iv: Interview) -> None:
     if tip.scheduledAt is not None:
         cur = _utc_naive(iv.scheduledAt)
         new = _utc_naive(tip.scheduledAt)
-        if cur is None or cur.date() != new.date():
+        # Timed rounds (they have an end) set the exact start; legacy date-only
+        # rounds only move the interview's date and keep its time.
+        if tip.endsAt is not None or cur is None or cur.date() != new.date():
             iv.scheduledAt = tip.scheduledAt
     if tip.endsAt is not None:
         iv.endsAt = tip.endsAt
@@ -797,7 +801,7 @@ async def create_interview(
     except Exception as exc:  # noqa: BLE001
         log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
     await _sync_caller_posts(iv, {})
-    return doc_to_dict(iv)
+    return await _interview_out(iv)
 
 
 @router.put("/{iv_id}")
@@ -887,7 +891,7 @@ async def update_interview(
         ).update({"$set": {"stageId": tip.id}})
     await _sync_caller_posts(iv, before)
     await _after_save(iv, user=user)
-    return doc_to_dict(iv)
+    return await _interview_out(iv)
 
 
 @router.post("/{iv_id}/stages", status_code=status.HTTP_201_CREATED)

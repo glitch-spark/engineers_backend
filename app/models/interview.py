@@ -162,4 +162,5 @@ class Interview(TimestampedDocument):
             IndexModel([("stage", 1)]),
             IndexModel([("status", 1)]),
             IndexModel([("caller.coworkerIds", 1)]),
+            IndexModel([("stageHistory.caller.coworkerIds", 1)]),
         ]
