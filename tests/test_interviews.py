@@ -794,3 +794,50 @@ async def test_patch_round_date_moves_caller_start(client, staff_user, auth_head
     )
     assert r.status_code == 200, r.text
     assert r.json()["stageHistory"][-1]["caller"]["startsAt"].startswith("2026-05-03T16:00")
+
+
+async def test_list_date_range_matches_any_round(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)  # intro on 2026-04-25
+    h = auth_header(staff_user)
+    await client.post(f"/interviews/{iv['_id']}/stages", headers=h,
+                      json={"stage": "tech_round_1", "scheduledAt": "2026-06-10T10:00:00Z"})
+    r = await client.get("/interviews?from=2026-04-20&to=2026-04-30", headers=h)
+    assert r.json()["pagination"]["total"] == 1  # only the earlier round is in range
+
+
+async def test_list_sort_company_asc(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    h = auth_header(staff_user)
+    for name in ("Zeta", "Alpha", "Mid"):
+        await client.post("/interviews", headers=h, json={
+            "accountId": str(acc.id), "companyName": name,
+            "round": {"stage": "intro", "scheduledAt": "2026-04-25T10:00:00Z"},
+        })
+    r = await client.get("/interviews?sort=company&dir=asc", headers=h)
+    assert [i["companyName"] for i in r.json()["interviews"]] == ["Alpha", "Mid", "Zeta"]
+
+
+async def test_rounds_endpoint_requires_range(client, staff_user, auth_header):
+    r = await client.get("/interviews/rounds", headers=auth_header(staff_user))
+    assert r.status_code == 400
+    r = await client.get("/interviews/rounds?from=2026-01-01&to=2026-06-01", headers=auth_header(staff_user))
+    assert r.status_code == 400  # more than 45 days
+
+
+async def test_rounds_endpoint_route_not_shadowed_by_id(client, staff_user, auth_header):
+    await _create_intro(client, staff_user, auth_header)
+    r = await client.get("/interviews/rounds?from=2026-04-20&to=2026-04-27", headers=auth_header(staff_user))
+    assert r.status_code == 200, r.text
+    assert [row["stage"] for row in r.json()["rounds"]] == ["intro"]
+
+
+async def test_list_sort_company_is_case_insensitive(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    h = auth_header(staff_user)
+    for name in ("zeta", "Alpha", "beta"):
+        await client.post("/interviews", headers=h, json={
+            "accountId": str(acc.id), "companyName": name,
+            "round": {"stage": "intro", "scheduledAt": "2026-04-25T10:00:00Z"},
+        })
+    r = await client.get("/interviews?sort=company&dir=asc", headers=h)
+    assert [i["companyName"] for i in r.json()["interviews"]] == ["Alpha", "beta", "zeta"]

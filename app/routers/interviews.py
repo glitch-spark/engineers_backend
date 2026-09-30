@@ -23,7 +23,7 @@ from app.models import (
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus
-from app.interview_normalize import normalize_stage, pending_question_updates, translate_legacy_write
+from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
     CallerError,
     CallerIn,
@@ -497,18 +497,6 @@ def _stage_filter_values(stage: str) -> list[str]:
     raw = (stage or "").strip()
     if not raw:
         return []
-    # Board-level Tech → any tech sub-stage (incl. legacy).
-    if raw == "tech":
-        return [
-            "tech",
-            InterviewStage.tech_round_1.value,
-            InterviewStage.tech_round_2.value,
-            InterviewStage.live_coding.value,
-            InterviewStage.system_design.value,
-            InterviewStage.home_assessment.value,
-            "tech1",
-            "tech2",
-        ]
     normalized = _normalize_stage(raw) or raw
     if normalized not in STAGES and raw not in STAGES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
@@ -522,6 +510,79 @@ def _stage_filter_values(stage: str) -> list[str]:
     return list(vals)
 
 
+def range_match(from_dt: Optional[datetime], to_dt: Optional[datetime]) -> dict:
+    """Interviews with any round dated in range (or a dated interview with no rounds)."""
+    rng: dict = {}
+    if from_dt is not None:
+        rng["$gte"] = from_dt
+    if to_dt is not None:
+        rng["$lte"] = to_dt
+    if not rng:
+        return {}
+    return {"$or": [
+        {"stageHistory": {"$elemMatch": {"scheduledAt": rng}}},
+        {"stageHistory": {"$size": 0}, "scheduledAt": rng},
+    ]}
+
+
+def _as_naive_utc(value: Any) -> Optional[datetime]:
+    if isinstance(value, str):
+        value = _parse_datetime(value)
+    if not isinstance(value, datetime):
+        return None
+    return _utc_naive(value)
+
+
+def _iso_utc(value: Any) -> Optional[str]:
+    dt = _as_naive_utc(value)
+    return dt.isoformat() + "Z" if dt is not None else None
+
+
+def flatten_rounds(
+    interviews: list[dict],
+    *,
+    from_dt: datetime,
+    to_dt: datetime,
+    stage: str = "",
+    status: str = "",
+) -> list[dict]:
+    """Calendar rows: one per round dated in [from_dt, to_dt), filtered on the round itself."""
+    lo, hi = _utc_naive(from_dt), _utc_naive(to_dt)
+    want_stage = _normalize_stage(stage) if stage else None
+    rows = []
+    for iv in interviews:
+        account = iv.get("accountId") if isinstance(iv.get("accountId"), dict) else {}
+        owner = iv.get("createdBy")
+        owner_id = str(owner.get("_id")) if isinstance(owner, dict) else str(owner or "")
+        for e in iv.get("stageHistory") or []:
+            start = _as_naive_utc(e.get("scheduledAt"))
+            if start is None or not (lo <= start < hi):
+                continue
+            if want_stage and _normalize_stage(e.get("stage")) != want_stage:
+                continue
+            if status and normalize_status(e.get("status")) != status:
+                continue
+            caller = e.get("caller") or {}
+            rows.append({
+                "interviewId": str(iv.get("_id")),
+                "roundId": e.get("id"),
+                "stage": _normalize_stage(e.get("stage")),
+                "status": normalize_status(e.get("status")),
+                "scheduledAt": _iso_utc(start),
+                "endsAt": _iso_utc(e.get("endsAt")),
+                "companyName": iv.get("companyName"),
+                "profileLabel": (account.get("name") or account.get("email") or "").strip() or None,
+                "ownerId": owner_id,
+                "ownerName": iv.get("ownerName") or iv.get("ownerEmail"),
+                "hasCaller": bool(caller.get("enabled")),
+            })
+    rows.sort(key=lambda r: r["scheduledAt"])
+    return rows
+
+
+_SORT_FIELDS = {"latest": "scheduledAt", "company": "companyName", "stage": "stage", "status": "status"}
+
+
 @router.get("")
 async def list_interviews(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -533,50 +594,16 @@ async def list_interviews(
     stage: str = Query(""),
     status_: str = Query("", alias="status"),
     creatorId: str = Query(""),
-    sort: str = Query("desc"),
+    sort: str = Query("latest"),
+    dir: str = Query("desc"),
 ) -> dict:
     # Every authenticated user can list/filter all interviews. Pass creatorId
     # to narrow to one owner; omit it to see everyone.
-    query: dict[str, Any] = {}
+    query: dict[str, Any] = range_match(parse_date(from_), parse_date(to, end_of_day=True))
 
-    date_filter: dict = {}
-    f_dt = parse_date(from_)
-    t_dt = parse_date(to, end_of_day=True)
-    if f_dt:
-        date_filter["$gte"] = f_dt
-    if t_dt:
-        date_filter["$lte"] = t_dt
-
-    stage_vals = _stage_filter_values(stage) if stage else []
-
-    if date_filter and stage_vals:
-        # Stage filter = “has this stage badge with a date in range”, not “current pan”.
-        query["$or"] = [
-            {
-                "stageHistory": {
-                    "$elemMatch": {
-                        "stage": {"$in": stage_vals},
-                        "scheduledAt": date_filter,
-                    }
-                }
-            },
-            {
-                "stage": {"$in": stage_vals},
-                "scheduledAt": date_filter,
-            },
-        ]
-    elif date_filter:
-        # Include cards whose current schedule OR any stage-round date falls in range.
-        query["$or"] = [
-            {"scheduledAt": date_filter},
-            {"stageHistory.scheduledAt": date_filter},
-        ]
-    elif stage_vals:
-        query["$or"] = [
-            {"stage": {"$in": stage_vals}},
-            {"stageHistory.stage": {"$in": stage_vals}},
-        ]
-
+    # Stage and status describe the latest round (mirrored on the interview).
+    if stage:
+        query["stage"] = {"$in": _stage_filter_values(stage)}
     if accountId:
         query["accountId"] = to_object_id(accountId)
     if status_:
@@ -586,10 +613,17 @@ async def list_interviews(
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
 
-    direction = 1 if sort == "asc" else -1
+    # Legacy clients send sort=asc|desc (by date).
+    if sort in ("asc", "desc"):
+        sort, dir = "latest", sort
+    field = _SORT_FIELDS.get(sort, "scheduledAt")
+    direction = 1 if dir == "asc" else -1
     skip = (page - 1) * limit
     total = await Interview.find(query).count()
-    rows = await Interview.find(query).sort([("scheduledAt", direction)]).skip(skip).limit(limit).to_list()
+    # Case-insensitive ordering ("acme" next to "Acme", not after "Zeta").
+    rows = await Interview.find(query, collation={"locale": "en", "strength": 2}).sort(
+        [(field, direction), ("_id", direction)]
+    ).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
     rows_out = await _populate_coworkers(await _populate_account(rows_with_owner))
 
@@ -605,6 +639,38 @@ async def list_interviews(
             "hasPrev": page > 1,
         },
     }
+
+
+@router.get("/rounds")
+async def list_interview_rounds(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+    accountId: str = Query(""),
+    stage: str = Query(""),
+    status_: str = Query("", alias="status"),
+    creatorId: str = Query(""),
+) -> dict:
+    """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list."""
+    f_dt, t_dt = parse_date(from_), parse_date(to)
+    if f_dt is None or t_dt is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from and to are required")
+    if not (timedelta(0) < _utc_naive(t_dt) - _utc_naive(f_dt) <= timedelta(days=45)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="range must be 1 to 45 days")
+    if status_ and status_ not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": f_dt, "$lt": t_dt}}}}
+    if accountId:
+        query["accountId"] = to_object_id(accountId)
+    if creatorId:
+        query["createdBy"] = to_object_id(creatorId)
+    rows = await Interview.find(query).to_list()
+    out = await _populate_coworkers(await _populate_account(await populate_owner(rows, field="createdBy")))
+    rounds = flatten_rounds(out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_)
+    # The interviews behind the rounds, so a click can open the side panel
+    # (GET /{id} is limited to owner/admin/coworker; this feed is not).
+    shown = {r["interviewId"] for r in rounds}
+    return {"rounds": rounds, "interviews": {str(i["_id"]): i for i in out if str(i["_id"]) in shown}}
 
 
 @router.get("/{iv_id}")
