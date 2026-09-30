@@ -539,16 +539,14 @@ def _plan_day_label(day: datetime, offset: int = 0, sep: str = "") -> str:
 
 
 def _regular_day_lines(
-    day: str, hands_on: int, by_bidder: int, interviews: list[str], items: list[str]
+    day: str, hands_on: int, by_bidder: int, interview: str, items: list[str]
 ) -> list[str]:
-    """One day of a regular plan: numbered Bid and Interview, then the items."""
+    """One day of a regular plan: one line each for Bid and Interview, then the items."""
+    hands_on, by_bidder = hands_on or 0, by_bidder or 0
     lines = [
         f"*{day}*",
-        "1. Bid",
-        f"- Bid (hands-on) : {hands_on or 0}",
-        f"- Bid (by bidder) : {by_bidder or 0}",
-        "2. Interview",
-        *interviews,
+        f"1. Bid {hands_on + by_bidder} (hands-on: {hands_on} + bidder: {by_bidder})",
+        f"2. Interview {interview}",
     ]
     for n, item in enumerate(items or [], start=3):
         lines.append(f"{n}. {_slack_escape(item)}")
@@ -564,17 +562,14 @@ def daily_plan_text(plan: Any, owner: Optional[UserExtra]) -> str:
                     _plan_day_label(plan.date, sep=" "),
                     plan.bidsHandsOn,
                     plan.bidsByBidder,
-                    [
-                        f"Done today : {plan.interviewsDone or 0}",
-                        f"New invitations : {plan.interviewsNew or 0}",
-                    ],
+                    f"Done/New Invitation : {plan.interviewsDone or 0}/{plan.interviewsNew or 0}",
                     plan.todayItems,
                 ),
                 *_regular_day_lines(
                     _plan_day_label(plan.date, 1, sep=" "),
                     plan.planBidsHandsOn,
                     plan.planBidsByBidder,
-                    [f"Scheduled : {plan.planInterviewsScheduled or 0}"],
+                    f"Scheduled : {plan.planInterviewsScheduled or 0}",
                     plan.tomorrowItems,
                 ),
                 f"<{_frontend_link('/report')}|Open Report>",
