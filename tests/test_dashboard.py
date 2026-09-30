@@ -4,7 +4,7 @@ import pytest
 from beanie import PydanticObjectId
 
 from app.alerts import app_week_key
-from app.models import DailyPlan, Interview, WeeklyPlan
+from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
 from app.models.interview import InterviewStageEvent
 
 
@@ -296,3 +296,66 @@ async def test_activity_ignores_custom_plans_and_other_users(client, staff_user,
 async def test_activity_bad_ranges_422(client, staff_user, auth_header, qs):
     assert (await client.get(f"/dashboard/activity?{qs}", headers=auth_header(staff_user))).status_code == 422
 
+
+async def test_net_monthly_approved_owner_only_twelve_months(client, staff_user, staff_user_2, auth_header):
+    async def _tx(user, day, amount, status_, payer=None):
+        tx = Transaction(
+            userId=user.id,
+            date=datetime(day.year, day.month, day.day),
+            amount=amount,
+            status=status_,
+            payerId=payer.id if payer else None,
+        )
+        await tx.insert()
+        return tx
+
+    # staff owns:
+    await _tx(staff_user, date(2026, 9, 3), 3000, "approved")
+    await _tx(staff_user, date(2026, 9, 10), -900, "approved")
+    await _tx(staff_user, date(2026, 9, 5), 500, "pending")
+    await _tx(staff_user, date(2026, 8, 2), 700, "rejected")
+    await _tx(staff_user, date(2026, 3, 1), -200, "approved")
+    await _tx(staff_user, date(2025, 9, 20), 100, "approved")  # outside 12-month window
+    # staff_user_2 owns an approved row payerId=staff — must not count for staff
+    await _tx(staff_user_2, date(2026, 9, 4), 999, "approved", payer=staff_user)
+
+    r = await client.get("/dashboard/net-monthly?today=2026-09-15", headers=auth_header(staff_user))
+    assert r.status_code == 200
+    b = r.json()
+    assert len(b["months"]) == 12 and b["months"][0]["period"] == "2025-10" and b["months"][-1]["period"] == "2026-09"
+    assert b["months"][-1] == {"period": "2026-09", "income": 3000, "outcome": 900, "net": 2100}
+    mar = next(m for m in b["months"] if m["period"] == "2026-03")
+    assert mar["net"] == -200
+    assert next(m for m in b["months"] if m["period"] == "2026-08")["net"] == 0
+    assert b["total"] == 1900
+
+
+async def test_net_monthly_new_user_zeros(client, staff_user, auth_header):
+    r = await client.get("/dashboard/net-monthly?today=2026-09-15", headers=auth_header(staff_user))
+    assert r.status_code == 200
+    b = r.json()
+    assert all(m["net"] == 0 for m in b["months"]) and b["total"] == 0
+
+
+async def test_net_monthly_admin_user_id(client, staff_user, admin_user, auth_header):
+    tx = Transaction(
+        userId=staff_user.id,
+        date=datetime(2026, 9, 3),
+        amount=500,
+        status="approved",
+    )
+    await tx.insert()
+
+    r = await client.get(
+        f"/dashboard/net-monthly?userId={staff_user.id}&today=2026-09-15",
+        headers=auth_header(admin_user),
+    )
+    assert r.status_code == 200
+    assert r.json()["months"][-1]["income"] == 500
+
+    assert (
+        await client.get(
+            f"/dashboard/net-monthly?userId={staff_user.id}&today=2026-09-15",
+            headers=auth_header(staff_user),
+        )
+    ).status_code == 403

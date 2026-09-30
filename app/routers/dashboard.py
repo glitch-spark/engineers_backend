@@ -22,6 +22,7 @@ from app.dashboard_stats import (
     bucket_keys,
     bucket_label,
     local_day_start_utc,
+    month_keys,
     pace,
     percentile,
     pick_bucket,
@@ -35,8 +36,9 @@ from app.interview_rounds import (
     empty_breakdown,
     load_interviews_for_window,
 )
-from app.models import DailyPlan, UserExtra, WeeklyPlan
+from app.models import DailyPlan, Transaction, UserExtra, WeeklyPlan
 from app.routers._util import to_object_id
+from app.routers.transactions import _TOTALS_GROUP
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -260,3 +262,62 @@ async def dashboard_activity(
         "series": series_list,
         "totals": totals,
     }
+
+
+@router.get("/net-monthly")
+async def dashboard_net_monthly(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    userId: Optional[str] = Query(None),
+    today: Optional[str] = Query(None),
+) -> dict:
+    sid = await _subject_id(user, userId)
+    day = _today(today)
+    tz = app_tz()
+
+    keys = month_keys(day, 12)
+    first_year, first_month = (int(part) for part in keys[0].split("-"))
+    first_of_oldest_month = date(first_year, first_month, 1)
+    next_month_year, next_month = day.year, day.month + 1
+    if next_month > 12:
+        next_month = 1
+        next_month_year += 1
+    first_of_next_month = date(next_month_year, next_month, 1)
+
+    start_utc = local_day_start_utc(first_of_oldest_month, tz)
+    end_utc = local_day_start_utc(first_of_next_month, tz)
+
+    pipeline = [
+        {
+            "$match": {
+                "userId": sid,
+                "status": "approved",
+                "date": {"$gte": start_utc, "$lt": end_utc},
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {
+                        "format": "%Y-%m",
+                        "date": "$date",
+                        "timezone": tz.key,
+                    }
+                },
+                **_TOTALS_GROUP,
+            }
+        },
+    ]
+    rows = await Transaction.aggregate(pipeline).to_list()
+    by_period = {row["_id"]: row for row in rows}
+
+    months = []
+    total = 0.0
+    for period in keys:
+        row = by_period.get(period)
+        income = round(float(row.get("income") or 0), 2) if row else 0.0
+        outcome = round(float(row.get("outcome") or 0), 2) if row else 0.0
+        net = round(float(row.get("net") or 0), 2) if row else 0.0
+        months.append({"period": period, "income": income, "outcome": outcome, "net": net})
+        total += net
+
+    return {"months": months, "total": round(total, 2)}
