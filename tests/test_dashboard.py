@@ -4,6 +4,7 @@ import pytest
 from beanie import PydanticObjectId
 
 from app.alerts import app_week_key
+from app.config import get_settings
 from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
 from app.models.interview import InterviewStageEvent
 
@@ -359,3 +360,31 @@ async def test_net_monthly_admin_user_id(client, staff_user, admin_user, auth_he
             headers=auth_header(staff_user),
         )
     ).status_code == 403
+
+
+async def test_net_monthly_naive_month_boundaries_regardless_of_app_timezone(
+    client, staff_user, auth_header, monkeypatch
+):
+    # Transaction.date is a calendar date stored as naive midnight (no tz
+    # meaning) — month boundaries/grouping must not convert it through
+    # APP_TIMEZONE, or Sep 1 drifts into "2026-08" under America/New_York
+    # and the 1st of the oldest month can fall outside the match window.
+    monkeypatch.setattr(get_settings(), "APP_TIMEZONE", "America/New_York")
+
+    async def _tx(day, amount):
+        tx = Transaction(
+            userId=staff_user.id,
+            date=datetime(day.year, day.month, day.day),
+            amount=amount,
+            status="approved",
+        )
+        await tx.insert()
+
+    await _tx(date(2026, 9, 1), 3000)
+    await _tx(date(2025, 10, 1), 100)  # the 1st of the oldest month in the window
+
+    r = await client.get("/dashboard/net-monthly?today=2026-09-15", headers=auth_header(staff_user))
+    assert r.status_code == 200
+    b = r.json()
+    assert b["months"][0]["period"] == "2025-10" and b["months"][0]["net"] == 100
+    assert b["months"][-1]["period"] == "2026-09" and b["months"][-1]["net"] == 3000

@@ -271,8 +271,7 @@ async def dashboard_net_monthly(
     today: Optional[str] = Query(None),
 ) -> dict:
     sid = await _subject_id(user, userId)
-    day = _today(today)
-    tz = app_tz()
+    day = _today(today)  # app-timezone "today" — decides which 12 months.
 
     keys = month_keys(day, 12)
     first_year, first_month = (int(part) for part in keys[0].split("-"))
@@ -283,26 +282,25 @@ async def dashboard_net_monthly(
         next_month_year += 1
     first_of_next_month = date(next_month_year, next_month, 1)
 
-    start_utc = local_day_start_utc(first_of_oldest_month, tz)
-    end_utc = local_day_start_utc(first_of_next_month, tz)
+    # Transaction.date is a calendar date stored as naive midnight (see
+    # POST /transactions + /transactions/summary) — NOT a tz-aware instant.
+    # Compare and group it as-is, with no app-timezone conversion, or a
+    # transaction dated the 1st of a month drifts into the previous month's
+    # bucket (or out of the window entirely) once APP_TIMEZONE != UTC.
+    start = _midnight(first_of_oldest_month)
+    end = _midnight(first_of_next_month)
 
     pipeline = [
         {
             "$match": {
                 "userId": sid,
                 "status": "approved",
-                "date": {"$gte": start_utc, "$lt": end_utc},
+                "date": {"$gte": start, "$lt": end},
             }
         },
         {
             "$group": {
-                "_id": {
-                    "$dateToString": {
-                        "format": "%Y-%m",
-                        "date": "$date",
-                        "timezone": tz.key,
-                    }
-                },
+                "_id": {"$dateToString": {"format": "%Y-%m", "date": "$date"}},
                 **_TOTALS_GROUP,
             }
         },
@@ -316,7 +314,7 @@ async def dashboard_net_monthly(
         row = by_period.get(period)
         income = round(float(row.get("income") or 0), 2) if row else 0.0
         outcome = round(float(row.get("outcome") or 0), 2) if row else 0.0
-        net = round(float(row.get("net") or 0), 2) if row else 0.0
+        net = round(income - outcome, 2)
         months.append({"period": period, "income": income, "outcome": outcome, "net": net})
         total += net
 
