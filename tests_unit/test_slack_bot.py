@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from app.know_your_why import know_your_why_for_date
-from app.models.interview import InterviewStage, InterviewStatus
+from app.models.interview import InterviewStage
 from app.slack_bot import (
     _country_flag,
     _fmt_scheduled,
@@ -24,7 +24,6 @@ from app.slack_bot import (
     calendar_day_bounds,
     digest_slot_open,
     interview_dm_eligible,
-    interview_update_is_noteworthy,
     notify_interview_dm,
     validate_timezone,
 )
@@ -191,31 +190,6 @@ def test_interview_dm_eligible():
     assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=False)) is False
     assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=True)) is True
     assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=None)) is True
-
-
-def test_interview_update_is_noteworthy_schedule_stage_status_company():
-    base = dict(
-        prev_scheduled_at=datetime(2026, 9, 24, 12, 0, 0),
-        new_scheduled_at=datetime(2026, 9, 24, 12, 0, 0),
-        prev_stage=InterviewStage.intro,
-        new_stage=InterviewStage.intro,
-        prev_status=InterviewStatus.scheduled,
-        new_status=InterviewStatus.scheduled,
-        prev_company="Acme",
-        new_company="Acme",
-    )
-    assert interview_update_is_noteworthy(**base) is False
-    assert interview_update_is_noteworthy(
-        **{**base, "new_scheduled_at": datetime(2026, 9, 25, 12, 0, 0)}
-    ) is True
-    assert interview_update_is_noteworthy(
-        **{**base, "new_stage": InterviewStage.tech}
-    ) is True
-    assert interview_update_is_noteworthy(
-        **{**base, "new_status": InterviewStatus.canceled}
-    ) is True
-    assert interview_update_is_noteworthy(**{**base, "new_company": "Globex"}) is True
-    assert interview_update_is_noteworthy(**{**base, "new_company": "Acme "}) is False
 
 
 @pytest.mark.asyncio

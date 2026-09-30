@@ -9,42 +9,31 @@ from beanie import PydanticObjectId
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import IndexModel
 
+from app.interview_normalize import normalize_status, resolve_interview
 from app.models.base import TimestampedDocument
 
 
 class InterviewStage(str, Enum):
     intro = "intro"
-    tech = "tech"  # legacy / generic; prefer tech sub-stages below
     tech_round_1 = "tech_round_1"
     tech_round_2 = "tech_round_2"
     live_coding = "live_coding"
     system_design = "system_design"
     home_assessment = "home_assessment"
-    panel = "panel"
     cultural = "cultural"
+    panel = "panel"
     final = "final"
-    rejected = "rejected"
     ai_interview = "ai_interview"
 
 
-# Legacy stage strings still present in old documents; mapped on read so the
-# document loads against the trimmed enum. Writes must use the new values.
-_LEGACY_STAGE_MAP = {
-    "tech1": InterviewStage.tech_round_1,
-    "tech2": InterviewStage.tech_round_2,
-    "hiring_manager": InterviewStage.final,
-    "offer": InterviewStage.final,
-    "others": InterviewStage.intro,
-}
-
-
 class InterviewStatus(str, Enum):
+    """Per-round status. Rejected/canceled are statuses, never stages; legacy
+    values (failed, no_show, rescheduled) are mapped by normalize_status."""
+
     scheduled = "scheduled"
     completed = "completed"
     passed = "passed"
-    failed = "failed"
-    no_show = "no_show"
-    rescheduled = "rescheduled"
+    rejected = "rejected"
     canceled = "canceled"
 
 
@@ -66,6 +55,11 @@ class InterviewStageEvent(BaseModel):
     status: Optional[InterviewStatus] = None
     transcript: str = ""
     note: str = ""
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _legacy_status(cls, v):
+        return normalize_status(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -121,20 +115,15 @@ class Interview(TimestampedDocument):
     stageHistory: List[InterviewStageEvent] = []
     caller: Optional[InterviewCaller] = None
 
-    @field_validator("stage", mode="before")
-    @classmethod
-    def _coerce_legacy_stage(cls, v):
-        if isinstance(v, str) and v in _LEGACY_STAGE_MAP:
-            return _LEGACY_STAGE_MAP[v]
-        return v
-
     @model_validator(mode="before")
     @classmethod
     def _migrate_legacy_fields(cls, data):
-        # Old documents stored interviewer name under `interviewName`.
         if isinstance(data, dict):
+            # Old documents stored interviewer name under `interviewName`.
             if data.get("interviewerName") in (None, "") and data.get("interviewName"):
                 data["interviewerName"] = data["interviewName"]
+            # Unmigrated documents: rejected stage entries / legacy values.
+            data = resolve_interview(data, now=datetime.now(dt_timezone.utc)).doc
         return data
 
     class Settings:

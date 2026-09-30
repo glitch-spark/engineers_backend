@@ -64,7 +64,7 @@ async def test_interview_crud_round_trip(client, staff_user, auth_header):
     row = body["interviews"][0]
     assert row["ownerEmail"] == staff_user.email
     assert row["accountId"]["email"] == "acme@example.com"
-    assert row["stage"] == "tech1"
+    assert row["stage"] == "tech_round_1"
     assert row["endsAt"] is not None
     assert row["resumeFilename"] == "default.md"
 
@@ -74,7 +74,7 @@ async def test_interview_crud_round_trip(client, staff_user, auth_header):
         json={"stage": "tech2"},
     )
     assert r.status_code == 200
-    assert r.json()["stage"] == "tech2"
+    assert r.json()["stage"] == "tech_round_2"
 
     r = await client.delete(f"/interviews/{iv_id}", headers=auth_header(staff_user))
     assert r.status_code == 200
@@ -188,7 +188,7 @@ async def test_stage_add_edit_delete_round_trip(client, staff_user, auth_header)
         json={"status": "failed"},
     )
     assert r.status_code == 200
-    assert r.json()["stageHistory"][0]["status"] == "failed"
+    assert r.json()["stageHistory"][0]["status"] == "rejected"
     assert r.json()["status"] == "passed"
     assert r.json()["stage"] == "tech_round_1"
 
@@ -511,7 +511,7 @@ async def test_filter_by_stage(client, staff_user, auth_header):
     assert r.status_code == 200
     body = r.json()
     assert body["pagination"]["total"] == 1
-    assert body["interviews"][0]["stage"] == "tech1"
+    assert body["interviews"][0]["stage"] == "tech_round_1"
 
 
 async def test_filter_by_creator(client, staff_user, staff_user_2, auth_header):
@@ -680,3 +680,38 @@ async def test_caller_mode_rejects_bad_timezone_and_unknown_coworker(client, sta
             json=_payload(account=acc, scheduled_at="2026-09-29T12:00:00", caller=caller),
         )
         assert r.status_code == 400, r.text
+
+
+async def test_put_legacy_rejected_scheduled_sets_canceled_without_new_round(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.put(
+        f"/interviews/{iv['_id']}",
+        headers=auth_header(staff_user),
+        json={"stage": "rejected", "status": "scheduled", "scheduledAt": "2026-05-01T10:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "canceled"
+    assert body["stage"] == "intro"
+    assert len(body["stageHistory"]) == 1
+
+
+async def test_put_legacy_failed_status_maps_to_rejected(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.put(
+        f"/interviews/{iv['_id']}",
+        headers=auth_header(staff_user),
+        json={"status": "failed"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+
+
+async def test_post_stage_rejected_returns_400(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.post(
+        f"/interviews/{iv['_id']}/stages",
+        headers=auth_header(staff_user),
+        json={"stage": "rejected", "scheduledAt": "2026-05-01T10:00:00Z"},
+    )
+    assert r.status_code == 400

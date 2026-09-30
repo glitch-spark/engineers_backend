@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.deps import get_current_user
+from app.interview_normalize import interview_status_value
 from app.models import Interview, ResumeApplication, Transaction, UserExtra, WeeklyPlan
 from app.routers._util import parse_date
 
@@ -75,7 +76,6 @@ async def _bid_count(user_id, start: datetime, end: datetime) -> int:
 # Rounds excluded from interview KPIs / leaderboard (matches Interviews board).
 _ROUND_COUNT_EXCLUDED = frozenset({
     "ai_interview",
-    "rejected",
     "home_assessment",
 })
 
@@ -162,57 +162,52 @@ def _dt_in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool
     return _as_aware(start) <= d <= _as_aware(end)  # type: ignore[operator]
 
 
-def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime]]]:
-    """Trail of (stage, scheduledAt) — history keeps its own dates; tip uses iv.scheduledAt."""
-    trail: list[tuple[str, Optional[datetime]]] = []
+def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str]]:
+    """Trail of (stage, scheduledAt, status) — history keeps its own dates and
+    statuses; the tip falls back to the interview-level scheduledAt/status."""
+    trail: list[tuple[str, Optional[datetime], str]] = []
 
-    def push(stage_raw: Any, dt: Optional[datetime]) -> None:
+    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any) -> None:
         stage = _norm_stage(stage_raw)
         if not stage:
             return
+        status = _norm_status(status_raw)
         if trail and trail[-1][0] == stage:
-            if dt is not None:
-                trail[-1] = (stage, dt)
+            _, prev_dt, prev_status = trail[-1]
+            trail[-1] = (stage, dt if dt is not None else prev_dt, status or prev_status)
             return
-        trail.append((stage, dt))
+        trail.append((stage, dt, status))
 
     for h in (iv.stageHistory or []):
-        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None))
-    push(iv.stage, iv.scheduledAt)
+        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None), getattr(h, "status", None))
+    push(iv.stage, iv.scheduledAt, iv.status)
     return trail
 
 
 def _count_interview_rounds(
     iv: Interview, start: datetime, end: datetime,
 ) -> tuple[int, int, dict[str, int]]:
-    """Return (countable_rounds, canceled, breakdown_counts).
+    """Return (countable_rounds, canceled, breakdown_counts) for rounds dated in range.
 
-    Canceled = status scheduled + current stage rejected (not done / canceled).
-    Countable rounds exclude AI Interview, Home Assessment, Rejected badges.
+    A round with status canceled counts toward `canceled`, never as held.
+    Countable rounds exclude AI Interview and Home Assessment.
     """
-    status = _norm_status(iv.status)
-    stage = _norm_stage(iv.stage)
-    rounds = _dated_rounds(iv)
     breakdown = _empty_breakdown()
-
-    if status == "scheduled" and stage == "rejected":
-        touches = _dt_in_range(iv.scheduledAt, start, end) or any(
-            _dt_in_range(dt, start, end) for _, dt in rounds
-        )
-        return (0, 1 if touches else 0, breakdown)
-
-    n = 0
-    for s, dt in rounds:
-        if s in _ROUND_COUNT_EXCLUDED:
-            continue
+    n = canceled = 0
+    for s, dt, round_status in _dated_rounds(iv):
         if not _dt_in_range(dt, start, end):
+            continue
+        if round_status == "canceled":
+            canceled += 1
+            continue
+        if s in _ROUND_COUNT_EXCLUDED:
             continue
         group = _breakdown_group(s)
         if not group:
             continue
         breakdown[group] = breakdown.get(group, 0) + 1
         n += 1
-    return n, 0, breakdown
+    return n, canceled, breakdown
 
 
 async def _load_interviews_for_window(user_ids: list, start: datetime, end: datetime) -> list[Interview]:
@@ -909,11 +904,11 @@ async def dashboard_feed(
         sched = _as_aware(iv.scheduledAt)
         if sched and sched <= now:
             iv_events.append({
-                "kind": "interview_done" if iv.status and str(iv.status) in ("completed", "passed", "failed") else "interview_past",
+                "kind": "interview_done" if interview_status_value(iv.status) in ("completed", "passed", "rejected") else "interview_past",
                 "at": sched.isoformat(),
                 "company": iv.companyName,
                 "stage": iv.stage.value if iv.stage else None,
-                "status": str(iv.status) if iv.status else None,
+                "status": interview_status_value(iv.status),
                 "interviewId": str(iv.id),
             })
 

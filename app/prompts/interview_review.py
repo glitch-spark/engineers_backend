@@ -18,7 +18,6 @@ STAGE_LABELS: dict[str, str] = {
     "cultural": "Cultural",
     "final": "Final",
     "ai_interview": "AI Interview",
-    "rejected": "Rejected",
 }
 
 # Named failure-mode catalog. Keep terse — the prompt embeds this verbatim.

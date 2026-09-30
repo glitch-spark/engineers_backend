@@ -23,6 +23,7 @@ from app.models import (
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus
+from app.interview_normalize import normalize_stage, translate_legacy_write
 from app.interview_caller import (
     CallerError,
     CallerIn,
@@ -58,17 +59,8 @@ def _stage_value(stage: Any) -> Optional[str]:
 
 
 def _normalize_stage(stage: Optional[str]) -> Optional[str]:
-    """Map legacy/generic tech keys to a concrete Tech sub-stage."""
-    stage = _stage_value(stage)
-    if not stage:
-        return stage
-    if stage in ("tech", "tech1"):
-        return InterviewStage.tech_round_1.value
-    if stage == "tech2":
-        return InterviewStage.tech_round_2.value
-    if stage == "hiring_manager":
-        return InterviewStage.cultural.value
-    return stage
+    """Map legacy stage keys (tech, tech1, hiring_manager, …) to current values."""
+    return normalize_stage(_stage_value(stage))
 
 
 def _coerce_write_stage(stage: str) -> str:
@@ -474,7 +466,7 @@ def _stage_filter_values(stage: str) -> list[str]:
     # Board-level Tech → any tech sub-stage (incl. legacy).
     if raw == "tech":
         return [
-            InterviewStage.tech.value,
+            "tech",
             InterviewStage.tech_round_1.value,
             InterviewStage.tech_round_2.value,
             InterviewStage.live_coding.value,
@@ -607,8 +599,9 @@ async def create_interview(
     body: InterviewCreate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    stage_val = _coerce_write_stage(body.stage) if body.stage else None
-    status_val = (body.status or "").strip() or None
+    body_stage, body_status = translate_legacy_write(body.stage, body.status)
+    stage_val = _coerce_write_stage(body_stage) if body_stage else None
+    status_val = (body_status or "").strip() or None
     if status_val is not None and status_val not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     sched = _parse_datetime(body.scheduledAt)
@@ -699,6 +692,14 @@ async def update_interview(
     prev_sched = iv.scheduledAt
     prev_caller = caller_snapshot(iv.caller)
     migrated = migrate_legacy_stage_fields(iv)
+
+    # Stale clients still send stage "rejected": set the current round's
+    # status instead, without a new round or a date change.
+    legacy_rejected = normalize_stage(body.stage) == "rejected"
+    body.stage, body.status = translate_legacy_write(body.stage, body.status)
+    if legacy_rejected:
+        body.scheduledAt = None
+        body.endsAt = None
 
     if body.accountId is not None:
         new_account_oid = to_object_id(body.accountId)
@@ -853,6 +854,12 @@ async def add_interview_stage(
     prev_caller = caller_snapshot(iv.caller)
     migrate_legacy_stage_fields(iv)
 
+    if normalize_stage(body.stage) == "rejected":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="rejected is a status; set status on the current round",
+        )
+    _, body.status = translate_legacy_write(None, body.status)
     stage_val = _coerce_write_stage(body.stage)
     if body.status and body.status not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
@@ -906,7 +913,8 @@ async def update_interview_stage(
     idx = _find_stage(iv, stage_id)
     entry = iv.stageHistory[idx]
 
-    if body.stage is not None:
+    body.stage, body.status = translate_legacy_write(body.stage, body.status)
+    if body.stage:
         entry.stage = _coerce_write_stage(body.stage)
     if body.scheduledAt is not None:
         sched = _parse_datetime(body.scheduledAt)

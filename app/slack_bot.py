@@ -313,11 +313,10 @@ async def _linked_users() -> list[UserExtra]:
 
 
 _SKIP_STATUSES = {
-    InterviewStatus.canceled,
     InterviewStatus.completed,
     InterviewStatus.passed,
-    InterviewStatus.failed,
-    InterviewStatus.no_show,
+    InterviewStatus.rejected,
+    InterviewStatus.canceled,
 }
 
 
@@ -338,37 +337,6 @@ def _enum_key(value: Any) -> Optional[str]:
     raw = getattr(value, "value", value)
     text = str(raw).strip()
     return text or None
-
-
-def _naive_dt(value: Optional[datetime]) -> Optional[datetime]:
-    if value is None:
-        return None
-    if value.tzinfo is not None:
-        return value.replace(tzinfo=None)
-    return value
-
-
-def interview_update_is_noteworthy(
-    *,
-    prev_scheduled_at: Optional[datetime],
-    new_scheduled_at: Optional[datetime],
-    prev_stage: Any,
-    new_stage: Any,
-    prev_status: Any,
-    new_status: Any,
-    prev_company: Optional[str],
-    new_company: Optional[str],
-) -> bool:
-    """True when schedule, stage, status, or company changed (not note/transcript)."""
-    if _naive_dt(prev_scheduled_at) != _naive_dt(new_scheduled_at):
-        return True
-    if _enum_key(prev_stage) != _enum_key(new_stage):
-        return True
-    if _enum_key(prev_status) != _enum_key(new_status):
-        return True
-    if (prev_company or "").strip() != (new_company or "").strip():
-        return True
-    return False
 
 
 async def notify_interview_dm(
