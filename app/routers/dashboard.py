@@ -13,7 +13,9 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Annotated, Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.alerts import app_week_key
 from app.dashboard_stats import (
@@ -41,6 +43,10 @@ from app.routers._util import to_object_id
 from app.routers.transactions import _TOTALS_GROUP
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+class _IdOnly(BaseModel):
+    id: PydanticObjectId = Field(alias="_id")
 
 
 def _midnight(d: date) -> datetime:
@@ -162,8 +168,11 @@ async def dashboard_week(
     plan_days = {p.date.date() for p in streak_docs}
     streak_value = streak(plan_days, day)
 
-    # Percentile population: non-admin users with >=1 regular plan in the
-    # last 30 days (app timezone), always including the subject.
+    # Percentile population: non-admin users that still exist, with >=1
+    # regular plan in the last 30 days (app timezone), always including the
+    # subject. Intersecting with existing, non-admin users (rather than just
+    # subtracting admins) drops plans left behind by deleted users, so they
+    # no longer count toward N.
     population_start = day - timedelta(days=29)
     active_docs = await DailyPlan.find(
         {
@@ -171,9 +180,12 @@ async def dashboard_week(
             "date": {"$gte": _midnight(population_start), "$lte": _midnight(day)},
         }
     ).to_list()
-    admins = await UserExtra.find({"role": "admin"}).to_list()
-    admin_ids = {u.id for u in admins}
-    population = {p.userId for p in active_docs} - admin_ids
+    active_ids = list({p.userId for p in active_docs})
+    eligible = await UserExtra.find(
+        {"_id": {"$in": active_ids}, "role": {"$ne": "admin"}},
+        projection_model=_IdOnly,
+    ).to_list()
+    population = {u.id for u in eligible}
     population.add(sid)
 
     score_docs = await DailyPlan.find(

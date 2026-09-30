@@ -191,6 +191,43 @@ async def test_week_percentile_excludes_admins_and_needs_three(
     assert r.json()["bids"]["percentile"] is None
 
 
+async def test_week_interviews_percentile_excludes_deleted_users(
+    client, staff_user, staff_user_2, admin_user, auth_header, make_user
+):
+    # staff A 3 interviews, staff B 1, staff C 0 this week (regular plans).
+    staff_c = await make_user(name="Staff Three", email="staff3@example.com", role="staff")
+    await _plan(staff_user, date(2026, 9, 28), iv=3)
+    await _plan(staff_user_2, date(2026, 9, 28), iv=1)
+    await _plan(staff_c, date(2026, 9, 28), iv=0)
+
+    # A regular plan owned by a user id that no longer exists (deleted user)
+    # must not enlarge the population N.
+    dt = datetime(2026, 9, 28)
+    year, week_number, _ = app_week_key(dt)
+    deleted_plan = DailyPlan(
+        userId=PydanticObjectId(),
+        date=dt,
+        year=year,
+        weekNumber=week_number,
+        planType="regular",
+        bidsHandsOn=0,
+        bidsByBidder=0,
+        interviewsDone=5,
+    )
+    await deleted_plan.insert()
+
+    # A gets top with N still 3 (percent 34), not diluted to N=4 (percent 25)
+    # by the deleted user's plan.
+    r = await client.get("/dashboard/week?today=2026-10-01", headers=auth_header(staff_user))
+    assert r.status_code == 200
+    assert r.json()["interviews"]["percentile"] == {"position": "top", "percent": 34}
+
+    # C's zero score never reads as a percentile, regardless of rank/ties.
+    r = await client.get("/dashboard/week?today=2026-10-01", headers=auth_header(staff_c))
+    assert r.status_code == 200
+    assert r.json()["interviews"]["percentile"] is None
+
+
 async def test_week_user_id_param(client, staff_user, staff_user_2, admin_user, auth_header):
     assert (
         await client.get(f"/dashboard/week?userId={staff_user_2.id}", headers=auth_header(staff_user))

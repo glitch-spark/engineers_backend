@@ -98,6 +98,14 @@ def test_percentile_top_bottom_ties_and_small_team():
     assert percentile(5, [5, 3]) is None
 
 
+def test_percentile_zero_score_is_none():
+    # A zero score should never read as "Top N% of team" — ties with other
+    # zero (or low) scores share the best rank, which would otherwise put a
+    # zero-bid Monday morning at the top of the board.
+    assert percentile(0, [0] * 25) is None
+    assert percentile(0, [5, 3, 0, 0]) is None
+
+
 def test_percentile_avoids_float_ceiling_error():
     # N=25, rank 7 (6 scores strictly higher): 7/25*100 = 28.0 exactly, but
     # float division can round up to 28.000000000000004 -> ceil 29.

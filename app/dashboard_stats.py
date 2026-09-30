@@ -150,7 +150,7 @@ def streak(plan_days: set[date], today: date, max_days: int = 365) -> int:
 
 def percentile(mine: int, scores: list[int]) -> dict | None:
     n = len(scores)
-    if n < 3:
+    if n < 3 or mine == 0:
         return None
     rank = 1 + sum(1 for s in scores if s > mine)
     # Integer ceiling division avoids float error from `round-trip through /`
