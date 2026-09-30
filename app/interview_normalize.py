@@ -192,6 +192,20 @@ def resolve_interview(raw: dict, *, now: datetime) -> Resolution:
             doc["endsAt"] = tip_when + duration
     if (doc.get("stage"), doc.get("status"), doc.get("scheduledAt")) != before:
         rules["top_resynced"] += 1
+
+    # Rule 7: interviewer / caller / end time live on rounds; copy the
+    # interview-level values onto the latest round, then mirror it back.
+    copied = False
+    for key in ("interviewerName", "caller", "endsAt"):
+        if doc.get(key) and not tip.get(key):
+            tip[key] = copy.deepcopy(doc[key])
+            copied = True
+    for key in ("interviewerName", "caller"):
+        if tip.get(key) and doc.get(key) != tip.get(key):
+            doc[key] = copy.deepcopy(tip[key])
+            copied = True
+    if copied:
+        rules["round_fields_copied"] += 1
     return res
 
 

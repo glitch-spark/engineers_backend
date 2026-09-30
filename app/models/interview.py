@@ -44,34 +44,6 @@ def stage_event_id(stage: str, at: Any, scheduled_at: Any = None) -> str:
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
 
 
-class InterviewStageEvent(BaseModel):
-    id: str = Field(default_factory=lambda: uuid4().hex)
-    stage: str
-    at: datetime
-    by: Optional[PydanticObjectId] = None
-    source: Optional[str] = None  # 'create' | 'manual' | 'board' | 'edit' | 'seed'
-    # Interview scheduled date for this round (when they sat this stage).
-    scheduledAt: Optional[datetime] = None
-    status: Optional[InterviewStatus] = None
-    transcript: str = ""
-    note: str = ""
-
-    @field_validator("status", mode="before")
-    @classmethod
-    def _legacy_status(cls, v):
-        return normalize_status(v)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _backfill_id(cls, data):
-        if isinstance(data, dict) and not data.get("id"):
-            data = dict(data)
-            data["id"] = stage_event_id(
-                str(data.get("stage") or ""), data.get("at"), data.get("scheduledAt"),
-            )
-        return data
-
-
 CallerMethod = Literal["video", "phone_hushed", "phone_slynumber"]
 
 
@@ -95,6 +67,39 @@ class InterviewCaller(BaseModel):
         if v is not None and v.tzinfo is None:
             return v.replace(tzinfo=dt_timezone.utc)
         return v
+
+
+class InterviewStageEvent(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    stage: str
+    at: datetime
+    by: Optional[PydanticObjectId] = None
+    source: Optional[str] = None  # 'create' | 'manual' | 'board' | 'edit' | 'seed'
+    # Interview scheduled date for this round (when they sat this stage).
+    scheduledAt: Optional[datetime] = None
+    status: Optional[InterviewStatus] = None
+    transcript: str = ""
+    note: str = ""
+    # Per-round details (phase 2). The interview-level interviewerName/caller
+    # mirror the latest round's for one release.
+    interviewerName: Optional[str] = None
+    endsAt: Optional[datetime] = None
+    caller: Optional[InterviewCaller] = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _legacy_status(cls, v):
+        return normalize_status(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_id(cls, data):
+        if isinstance(data, dict) and not data.get("id"):
+            data = dict(data)
+            data["id"] = stage_event_id(
+                str(data.get("stage") or ""), data.get("at"), data.get("scheduledAt"),
+            )
+        return data
 
 
 class Interview(TimestampedDocument):

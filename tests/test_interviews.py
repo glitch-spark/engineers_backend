@@ -27,6 +27,7 @@ def _payload(*, account, scheduled_at, stage="intro", resume_id=None, **extras):
         "scheduledAt": scheduled_at,
         "endsAt": _ends(scheduled_at),
         "stage": stage,
+        "companyName": "Acme",
     }
     body.update(extras)
     return body
@@ -106,32 +107,6 @@ async def test_create_puts_transcript_note_status_on_tip_stage(client, staff_use
     assert tip["transcript"] == "intro script"
     assert tip["note"] == "intro note"
     assert iv["transcript"] == ""
-
-
-async def test_create_persists_stage_history_path(client, staff_user, auth_header):
-    acc = await _make_account(owner_id=staff_user.id)
-    r = await client.post(
-        "/interviews",
-        headers=auth_header(staff_user),
-        json=_payload(
-            account=acc,
-            scheduled_at="2026-04-25T14:30:00Z",
-            stage="tech_round_1",
-            status="scheduled",
-            stageHistory=[
-                {"stage": "ai_interview", "scheduledAt": "2026-04-20"},
-                {"stage": "intro", "scheduledAt": "2026-04-22"},
-                {"stage": "tech_round_1", "scheduledAt": "2026-04-25"},
-            ],
-        ),
-    )
-    assert r.status_code == 201, r.text
-    assert [e["stage"] for e in r.json()["stageHistory"]] == [
-        "ai_interview",
-        "intro",
-        "tech_round_1",
-    ]
-    assert r.json()["stage"] == "tech_round_1"
 
 
 async def test_create_empty_status_is_ok(client, staff_user, auth_header):
@@ -220,37 +195,6 @@ async def test_stage_endpoints_forbidden_for_other_users(client, staff_user, sta
         json={"stage": "final"},
     )
     assert r.status_code == 403
-
-
-async def test_put_with_stage_history_keeps_per_stage_notes(client, staff_user, auth_header):
-    iv = await _create_intro(client, staff_user, auth_header, transcript="intro script")
-    iv_id = iv["_id"]
-    h = auth_header(staff_user)
-    r = await client.post(
-        f"/interviews/{iv_id}/stages",
-        headers=h,
-        json={"stage": "final", "scheduledAt": "2026-05-10", "note": "final note"},
-    )
-    history = r.json()["stageHistory"]
-
-    # Modal save: explicit history + top-level note edits the current (tip) round only.
-    r = await client.put(
-        f"/interviews/{iv_id}",
-        headers=h,
-        json={
-            "stage": "final",
-            "stageHistory": [
-                {"id": e["id"], "stage": e["stage"], "scheduledAt": e["scheduledAt"][:10]}
-                for e in history
-            ],
-            "note": "final note edited",
-        },
-    )
-    assert r.status_code == 200, r.text
-    out = r.json()["stageHistory"]
-    assert [e["id"] for e in out] == [e["id"] for e in history]
-    assert out[0]["transcript"] == "intro script"
-    assert out[1]["note"] == "final note edited"
 
 
 async def test_get_migrates_legacy_interview_fields(client, staff_user, auth_header):
@@ -628,10 +572,9 @@ async def test_caller_mode_create_and_coworker_can_view(
         headers=auth_header(staff_user),
         json=_payload(
             account=acc,
-            scheduled_at="2026-09-29T12:00:00",
+            scheduled_at="2026-09-30T01:15:00Z",
             caller={
                 "enabled": True,
-                "time": "21:15",
                 "timezone": "America/New_York",
                 "method": "video",
                 "methodValue": "https://meet.example/abc",
@@ -657,13 +600,16 @@ async def test_caller_mode_create_and_coworker_can_view(
     r = await client.put(f"/interviews/{iv_id}", headers=auth_header(staff_user_2), json={"note": "x"})
     assert r.status_code == 403
 
-    r = await client.put(
-        f"/interviews/{iv_id}",
+    r = await client.get(f"/interviews/{iv_id}", headers=auth_header(staff_user))
+    tip_id = r.json()["stageHistory"][-1]["id"]
+    r = await client.patch(
+        f"/interviews/{iv_id}/stages/{tip_id}",
         headers=auth_header(staff_user),
         json={"caller": {"enabled": False}},
     )
     assert r.status_code == 200
     assert r.json()["caller"]["enabled"] is False
+    assert r.json()["stageHistory"][-1]["caller"]["enabled"] is False
     r = await client.get(f"/interviews/{iv_id}", headers=auth_header(staff_user_2))
     assert r.status_code == 403
 
@@ -757,3 +703,94 @@ async def test_stage_move_from_canceled_starts_new_round_scheduled(client, staff
     assert body["stage"] == "tech_round_1"
     assert body["status"] == "scheduled"
     assert body["stageHistory"][0]["status"] == "canceled"
+
+
+async def test_create_with_round_shape(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post("/interviews", headers=auth_header(staff_user), json={
+        "accountId": str(acc.id),
+        "companyName": "Globex",
+        "round": {
+            "stage": "intro", "scheduledAt": "2026-10-01T14:00:00Z", "endsAt": "2026-10-01T14:45:00Z",
+            "interviewerName": "Dana", "note": "n",
+        },
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["companyName"] == "Globex"
+    assert body["status"] == "scheduled"
+    tip = body["stageHistory"][-1]
+    assert (tip["stage"], tip["interviewerName"], tip["note"]) == ("intro", "Dana", "n")
+    assert tip["endsAt"].startswith("2026-10-01T14:45")
+    assert body["interviewerName"] == "Dana"  # top-level mirror
+
+
+async def test_create_requires_company(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post("/interviews", headers=auth_header(staff_user), json={
+        "accountId": str(acc.id), "companyName": " ",
+        "round": {"stage": "intro", "scheduledAt": "2026-10-01T14:00:00Z"},
+    })
+    assert r.status_code == 400
+
+
+async def test_create_legacy_flat_shape_still_works(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header, interviewerName="Lee")
+    assert iv["stageHistory"][-1]["interviewerName"] == "Lee"
+    assert iv["stageHistory"][-1]["status"] == "completed"
+
+
+async def test_put_with_stage_history_returns_400(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.put(
+        f"/interviews/{iv['_id']}", headers=auth_header(staff_user),
+        json={"stageHistory": [{"stage": "intro"}]},
+    )
+    assert r.status_code == 400
+
+
+async def test_add_round_mark_previous_passed(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    r = await client.post(
+        f"/interviews/{iv['_id']}/stages", headers=auth_header(staff_user),
+        json={"stage": "tech_round_1", "scheduledAt": "2026-05-02T10:00:00Z", "markPreviousPassed": True},
+    )
+    assert r.status_code == 201, r.text
+    statuses = [e["status"] for e in r.json()["stageHistory"]]
+    assert statuses == ["passed", "scheduled"]
+
+
+async def test_add_round_keeps_rejected_previous_when_mark_true(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    h = auth_header(staff_user)
+    await client.put(f"/interviews/{iv['_id']}", headers=h, json={"status": "rejected"})
+    r = await client.post(
+        f"/interviews/{iv['_id']}/stages", headers=h,
+        json={"stage": "tech_round_1", "scheduledAt": "2026-05-02T10:00:00Z", "markPreviousPassed": True},
+    )
+    assert [e["status"] for e in r.json()["stageHistory"]] == ["rejected", "scheduled"]
+
+
+async def test_patch_round_interviewer_and_caller(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    tip_id = iv["stageHistory"][-1]["id"]
+    r = await client.patch(
+        f"/interviews/{iv['_id']}/stages/{tip_id}", headers=auth_header(staff_user),
+        json={"interviewerName": "Kim", "caller": {"enabled": True, "callerName": "Sam"}},
+    )
+    assert r.status_code == 200, r.text
+    tip = r.json()["stageHistory"][-1]
+    assert tip["interviewerName"] == "Kim"
+    assert tip["caller"]["callerName"] == "Sam"
+    assert r.json()["caller"]["callerName"] == "Sam"
+
+
+async def test_patch_round_date_moves_caller_start(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header, caller={"enabled": True})
+    tip_id = iv["stageHistory"][-1]["id"]
+    r = await client.patch(
+        f"/interviews/{iv['_id']}/stages/{tip_id}", headers=auth_header(staff_user),
+        json={"scheduledAt": "2026-05-03T16:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["stageHistory"][-1]["caller"]["startsAt"].startswith("2026-05-03T16:00")

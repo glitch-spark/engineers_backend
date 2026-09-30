@@ -298,3 +298,40 @@ def test_new_round_does_not_inherit_previous_outcome():
     assert _carry_status(InterviewStatus.canceled, appended=True) == InterviewStatus.scheduled
     assert _carry_status(InterviewStatus.rejected, appended=True) == InterviewStatus.scheduled
     assert _carry_status(InterviewStatus.canceled, appended=False) == InterviewStatus.canceled
+
+
+def test_round_fields_copied_to_tip():
+    raw = _iv([_entry("a", "intro", "completed")])
+    raw["interviewerName"] = "Dana"
+    raw["caller"] = {"enabled": True, "callerName": "Sam"}
+    raw["endsAt"] = datetime(2026, 9, 1, 1)
+    res = resolve_interview(raw, now=NOW)
+    tip = res.doc["stageHistory"][-1]
+    assert tip["interviewerName"] == "Dana"
+    assert tip["caller"] == {"enabled": True, "callerName": "Sam"}
+    assert tip["endsAt"] == datetime(2026, 9, 1, 1)
+    assert res.rules["round_fields_copied"] == 1
+
+
+def test_round_fields_not_overwritten():
+    raw = _iv([_entry("a", "intro", "completed")])
+    raw["stageHistory"][0]["interviewerName"] = "Lee"
+    raw["interviewerName"] = "Dana"
+    doc = resolve_interview(raw, now=NOW).doc
+    assert doc["stageHistory"][0]["interviewerName"] == "Lee"
+    assert doc["interviewerName"] == "Lee"
+
+
+def test_round_fields_idempotent():
+    raw = _iv([_entry("a", "intro", "completed")])
+    raw["interviewerName"] = "Dana"
+    r1 = resolve_interview(raw, now=NOW)
+    r2 = resolve_interview(r1.doc, now=NOW)
+    assert r2.doc == r1.doc
+    assert sum(r2.rules.values()) == 0
+
+
+def test_stage_event_accepts_round_fields():
+    e = InterviewStageEvent(stage="intro", at=NOW, interviewerName="D", caller={"enabled": True})
+    assert e.interviewerName == "D"
+    assert e.caller.enabled is True

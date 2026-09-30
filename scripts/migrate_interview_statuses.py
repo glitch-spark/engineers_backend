@@ -35,7 +35,7 @@ from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.interview_normalize import Resolution, question_updates, resolve_interview  # noqa: E402
 
-_FIELDS = ("stage", "status", "scheduledAt", "endsAt", "stageHistory")
+_FIELDS = ("stage", "status", "scheduledAt", "endsAt", "interviewerName", "caller", "stageHistory")
 
 
 def changed_fields(raw: dict, doc: dict) -> dict:

@@ -12,14 +12,13 @@ from beanie import PydanticObjectId
 from app.interview_caller import (
     CallerError,
     CallerIn,
-    build_caller,
-    caller_snapshot,
+    build_round_caller,
     is_coworker,
-    resync_caller_day,
+    round_caller_snapshot,
 )
-from app.models.interview import InterviewCaller
+from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.slack_bot import (
-    caller_channel_text,
+    caller_round_text,
     digest_blocks,
     digest_summary,
     fmt_caller_time,
@@ -29,39 +28,32 @@ from app.slack_bot import (
 OWNER = PydanticObjectId()
 B = PydanticObjectId()
 C = PydanticObjectId()
-DAY = datetime(2026, 9, 29, 12, 0, 0)
+START = datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc)
 
 
-def _build(**kw):
+def _build(previous=None, valid=None, **kw):
     body = CallerIn(enabled=True, **kw)
-    return build_caller(
+    return build_round_caller(
         body,
-        scheduled_at=DAY,
+        starts_at=START,
         owner_id=OWNER,
-        valid_coworker_ids={str(B), str(C)},
+        valid_coworker_ids={str(B), str(C)} if valid is None else valid,
         default_tz="America/New_York",
+        previous=previous,
     )
+
+
+def _entry(caller):
+    return InterviewStageEvent(stage="intro", at=START, scheduledAt=START, status="scheduled", caller=caller)
 
 
 def test_defaults_to_tbd_and_owner_timezone():
     c = _build()
     assert c.enabled is True
     assert c.callerName == "TBD"
-    assert c.startsAt is None
+    assert c.startsAt == START  # the caller joins at the round's start
     assert c.timezone == "America/New_York"
     assert c.coworkerIds == []
-
-
-def test_time_in_timezone_converts_to_utc():
-    c = _build(time="10:30", timezone="America/New_York")
-    assert c.startsAt == datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc)
-
-
-def test_evening_new_york_lands_next_day_utc_but_keeps_local_day():
-    c = _build(time="21:15", timezone="America/New_York")
-    assert c.startsAt == datetime(2026, 9, 30, 1, 15, tzinfo=timezone.utc)
-    local = c.startsAt.astimezone(ZoneInfo("America/New_York"))
-    assert local.date().isoformat() == "2026-09-29"
 
 
 def test_rejects_bad_timezone_method_time_and_unknown_coworker():
@@ -69,8 +61,6 @@ def test_rejects_bad_timezone_method_time_and_unknown_coworker():
         _build(timezone="Mars/Olympus")
     with pytest.raises(CallerError):
         _build(method="carrier_pigeon")
-    with pytest.raises(CallerError):
-        _build(time="25:99")
     with pytest.raises(CallerError):
         _build(coworkerIds=[str(PydanticObjectId())])
 
@@ -85,9 +75,9 @@ def test_coworkers_deduped_and_owner_dropped():
 def test_disable_keeps_previous_data_but_turns_off():
     prev = _build(callerName="Sam", coworkerIds=[str(B)])
     prev.slackChannelTs = "123.456"
-    off = build_caller(
+    off = build_round_caller(
         CallerIn(enabled=False),
-        scheduled_at=DAY,
+        starts_at=START,
         owner_id=OWNER,
         valid_coworker_ids=set(),
         default_tz=None,
@@ -95,51 +85,16 @@ def test_disable_keeps_previous_data_but_turns_off():
     )
     assert off.enabled is False
     assert off.callerName == "Sam"
-    assert caller_snapshot(off) is None
+    assert round_caller_snapshot(_entry(off)) is None
     assert not is_coworker(off, B)
 
 
 def test_update_keeps_slack_thread_ts():
     prev = _build()
     prev.slackChannelTs = "111.222"
-    nxt = build_caller(
-        CallerIn(enabled=True, callerName="Sam"),
-        scheduled_at=DAY,
-        owner_id=OWNER,
-        valid_coworker_ids=set(),
-        default_tz=None,
-        previous=prev,
-    )
+    nxt = _build(previous=prev, valid=set(), callerName="Sam")
     assert nxt.slackChannelTs == "111.222"
-    assert caller_snapshot(nxt) != caller_snapshot(prev)
-
-
-def test_resync_moves_start_to_new_day_keeping_local_time():
-    c = _build(time="10:30", timezone="America/New_York")
-    resync_caller_day(c, datetime(2026, 10, 2, 12, 0, 0))
-    local = c.startsAt.astimezone(ZoneInfo("America/New_York"))
-    assert (local.date().isoformat(), local.hour, local.minute) == ("2026-10-02", 10, 30)
-
-
-def test_form_date_wins_over_utc_scheduled_at():
-    # 9 PM New York on 9/29 is sent by the UI as scheduledAt 9/30 01:00 UTC.
-    c = build_caller(
-        CallerIn(enabled=True, date="2026-09-29", time="21:00", timezone="America/New_York"),
-        scheduled_at=datetime(2026, 9, 30, 1, 0, 0),
-        owner_id=OWNER,
-        valid_coworker_ids=set(),
-        default_tz=None,
-    )
-    assert c.startsAt == datetime(2026, 9, 30, 1, 0, tzinfo=timezone.utc)
-    with pytest.raises(CallerError):
-        _build(date="29/09/2026")
-
-
-def test_resync_is_noop_for_evening_call_stored_as_next_utc_day():
-    c = _build(time="21:00", timezone="America/New_York")
-    before = c.startsAt
-    resync_caller_day(c, datetime(2026, 9, 30, 1, 0, 0))
-    assert c.startsAt == before
+    assert round_caller_snapshot(_entry(nxt)) != round_caller_snapshot(_entry(prev))
 
 
 def test_naive_start_from_mongo_is_tagged_utc():
@@ -218,11 +173,14 @@ def _user(name, slack=None):
     return SimpleNamespace(name=name, email=f"{name}@x.com", slackUserId=slack)
 
 
-def test_caller_channel_text_with_and_without_time():
+def test_caller_round_text_with_and_without_details():
     account = SimpleNamespace(name="Orion Osborn", country="US")
-    iv = _iv(
-        OWNER,
-        company="Wikimedia",
+    iv = _iv(OWNER, company="Wikimedia")
+    iv.jobUrl = "https://job-boards.greenhouse.io/wikimedia/jobs/7919287"
+    entry = SimpleNamespace(
+        stage="intro",
+        scheduledAt=datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc),
+        interviewerName="Natalie Ross",
         caller=InterviewCaller(
             enabled=True,
             startsAt=datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc),
@@ -231,9 +189,9 @@ def test_caller_channel_text_with_and_without_time():
             methodValue="+1 555 0100",
         ),
     )
-    iv.jobUrl = "https://job-boards.greenhouse.io/wikimedia/jobs/7919287"
-    text = caller_channel_text(
+    text = caller_round_text(
         iv,
+        entry,
         account=account,
         owner=_user("A", "UA"),
         coworkers=[_user("B", "UB"), _user("Casey")],
@@ -249,9 +207,9 @@ def test_caller_channel_text_with_and_without_time():
     assert "*Caller assigned:* TBD" in text
     assert "*Coworkers:* <@UB> Casey" in text
 
-    iv.caller = InterviewCaller(enabled=True, timezone="America/New_York")
-    text = caller_channel_text(iv, account=account, owner=_user("A"), coworkers=[], kind="updated")
-    assert "*Interview time:* TBD" in text
+    entry.interviewerName = None
+    entry.caller = InterviewCaller(enabled=True, timezone="America/New_York")
+    text = caller_round_text(iv, entry, account=account, owner=_user("A"), coworkers=[])
+    assert "*Recruiter name:* —" in text
     assert "*Method:* TBD" in text
-    assert "*Caller details updated* by A" in text
     assert "*Coworkers:*" not in text

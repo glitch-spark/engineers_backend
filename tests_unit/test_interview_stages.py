@@ -13,9 +13,7 @@ from fastapi import HTTPException  # noqa: E402
 
 from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus  # noqa: E402
 from app.routers.interviews import (  # noqa: E402
-    StageHistoryItemIn,
     _reject_adjacent_duplicate,
-    _set_stage_history,
     _sync_top_from_tip,
     migrate_legacy_stage_fields,
 )
@@ -34,6 +32,8 @@ def _iv(**kw):
         transcript="",
         note="",
         stageHistory=[],
+        interviewerName=None,
+        caller=None,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -66,32 +66,6 @@ def test_migrate_does_not_overwrite_existing_tip_transcript():
     assert iv.transcript == ""
 
 
-def test_set_stage_history_merges_by_id_and_reports_removed():
-    a = InterviewStageEvent(id="a", stage="intro", at=AT, transcript="A", note="a")
-    b = InterviewStageEvent(id="b", stage="tech_round_1", at=AT, transcript="B")
-    c = InterviewStageEvent(id="c", stage="final", at=AT, note="C")
-    iv = _iv(stageHistory=[a, b, c])
-    removed = _set_stage_history(
-        iv,
-        [StageHistoryItemIn(id="a", stage="intro"), StageHistoryItemIn(id="c", stage="final", scheduledAt="2026-05-10")],
-        by=None,
-    )
-    assert removed == {"b"}
-    assert [e.id for e in iv.stageHistory] == ["a", "c"]
-    assert iv.stageHistory[0].transcript == "A"
-    assert iv.stageHistory[1].note == "C"
-    assert iv.stageHistory[1].scheduledAt.date().isoformat() == "2026-05-10"
-
-
-def test_set_stage_history_falls_back_to_stage_name():
-    a = InterviewStageEvent(id="a", stage="intro", at=AT, transcript="A")
-    iv = _iv(stageHistory=[a])
-    _set_stage_history(iv, [StageHistoryItemIn(stage="intro"), StageHistoryItemIn(stage="panel")], by=None)
-    assert iv.stageHistory[0].id == "a"
-    assert iv.stageHistory[0].transcript == "A"
-    assert iv.stageHistory[1].stage == "panel"
-
-
 def test_sync_top_from_tip_mirrors_stage_status_and_date():
     tip = InterviewStageEvent(
         stage="panel", at=AT, status=InterviewStatus.passed, scheduledAt=datetime(2026, 5, 3, 12, 0),
@@ -109,22 +83,6 @@ def test_sync_keeps_time_when_same_calendar_day():
     iv = _iv(stageHistory=[tip])
     _sync_top_from_tip(iv)
     assert iv.scheduledAt == datetime(2026, 4, 25, 14, 30)
-
-
-def test_create_history_keeps_prior_rounds():
-    iv = _iv()
-    _set_stage_history(
-        iv,
-        [
-            StageHistoryItemIn(stage="ai_interview", scheduledAt="2026-04-20"),
-            StageHistoryItemIn(stage="intro", scheduledAt="2026-04-22"),
-            StageHistoryItemIn(stage="tech_round_1", scheduledAt="2026-04-25"),
-        ],
-        by=None,
-    )
-    _sync_top_from_tip(iv)
-    assert [e.stage for e in iv.stageHistory] == ["ai_interview", "intro", "tech_round_1"]
-    assert iv.stage == InterviewStage.tech_round_1
 
 
 def test_reject_adjacent_duplicate():
