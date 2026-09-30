@@ -9,6 +9,7 @@ the same grouping `app.routers.metrics` uses).
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from typing import Annotated, Optional
 
@@ -48,13 +49,21 @@ async def _subject_id(user: UserExtra, user_id: Optional[str]):
     return oid
 
 
+_YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _parse_ymd(value: Optional[str], name: str) -> Optional[date]:
     if not value:
         return None
+    if not _YMD_RE.match(value):
+        raise HTTPException(status_code=422, detail=f"invalid {name}")
     try:
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
     except ValueError:
         raise HTTPException(status_code=422, detail=f"invalid {name}")
+    if not (2000 <= parsed.year <= 2100):
+        raise HTTPException(status_code=422, detail=f"invalid {name}")
+    return parsed
 
 
 def _today(value: Optional[str]) -> date:
@@ -99,9 +108,25 @@ async def dashboard_week(
     bids_total = self_sum + bidder_sum
     interviews_done = sum(p.interviewsDone for p in plans)
 
-    # This week's weekly plan (targets).
-    year, week_number, _key = app_week_key(_midnight(monday))
-    weekly_plan = await WeeklyPlan.find_one({"userId": sid, "year": year, "weekNumber": week_number})
+    # This week's weekly plan (targets): the plan whose startDate-endDate
+    # contains today, per spec. Primary lookup by startDate (the frontend
+    # stores year/weekNumber from the plan's *creation* date, which can
+    # disagree with the Monday it covers around year boundaries); fall back
+    # to the app_week_key(monday) year/weekNumber lookup for older plans
+    # that predate this rule.
+    monday_dt = _midnight(monday)
+    weekly_plan = await WeeklyPlan.find_one(
+        {
+            "userId": sid,
+            "startDate": {
+                "$gte": monday_dt - timedelta(hours=12),
+                "$lte": monday_dt + timedelta(hours=12),
+            },
+        }
+    )
+    if weekly_plan is None:
+        year, week_number, _key = app_week_key(monday_dt)
+        weekly_plan = await WeeklyPlan.find_one({"userId": sid, "year": year, "weekNumber": week_number})
     bids_target = _metric_target(weekly_plan, "bids")
     interviews_target = _metric_target(weekly_plan, "interviews")
 

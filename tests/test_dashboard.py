@@ -1,5 +1,6 @@
 from datetime import date, datetime
 
+import pytest
 from beanie import PydanticObjectId
 
 from app.alerts import app_week_key
@@ -33,6 +34,22 @@ async def _weekly_plan(user, monday: date, metrics):
         weekNumber=week_number,
         startDate=dt,
         endDate=dt,
+        metrics=metrics,
+    )
+    await plan.insert()
+    return plan
+
+
+async def _weekly_plan_raw(user, *, year, week_number, start_date, end_date, metrics):
+    """Like `_weekly_plan` but with explicit year/weekNumber/startDate/endDate,
+    so tests can construct the creation-date-vs-Monday mismatch that happens
+    around year boundaries (see test_week_plan_lookup_falls_back_across_year_boundary)."""
+    plan = WeeklyPlan(
+        userId=user.id,
+        year=year,
+        weekNumber=week_number,
+        startDate=start_date,
+        endDate=end_date,
         metrics=metrics,
     )
     await plan.insert()
@@ -177,11 +194,16 @@ async def test_week_user_id_param(client, staff_user, staff_user_2, admin_user, 
     assert (
         await client.get(f"/dashboard/week?userId={staff_user_2.id}", headers=auth_header(staff_user))
     ).status_code == 403
-    assert (
-        await client.get(
-            f"/dashboard/week?userId={staff_user_2.id}&today=2026-10-01", headers=auth_header(admin_user)
-        )
-    ).status_code == 200
+
+    # Seed a regular plan for staff_user_2 only — the admin's response should
+    # reflect staff_user_2's data, not staff_user's (nothing seeded for staff_user).
+    await _plan(staff_user_2, date(2026, 9, 28), self_=7)
+    r = await client.get(
+        f"/dashboard/week?userId={staff_user_2.id}&today=2026-10-01", headers=auth_header(admin_user)
+    )
+    assert r.status_code == 200
+    assert r.json()["bids"]["self"] == 7
+
     assert (
         await client.get(
             "/dashboard/week?userId=000000000000000000000000", headers=auth_header(admin_user)
@@ -196,3 +218,30 @@ async def test_week_bad_today_is_422(client, staff_user, auth_header):
     assert (
         await client.get("/dashboard/week?today=garbage", headers=auth_header(staff_user))
     ).status_code == 422
+
+
+@pytest.mark.parametrize("bad_today", ["20261001", "9999-12-31", "0001-01-01"])
+async def test_week_malformed_today_is_422_not_500(client, staff_user, auth_header, bad_today):
+    r = await client.get(f"/dashboard/week?today={bad_today}", headers=auth_header(staff_user))
+    assert r.status_code == 422
+
+
+async def test_week_plan_lookup_falls_back_across_year_boundary(client, staff_user, auth_header):
+    # Frontend stores year/weekNumber from the plan's *creation* date (Sunday-start
+    # week numbers), so a plan created Thu 2026-01-01 is stored (year=2026, weekNumber=1)
+    # even though its Monday (startDate) is 2025-12-29 — app_week_key(monday) alone
+    # would ask for (2025, 53) and miss it. The startDate window lookup must find it.
+    await _weekly_plan_raw(
+        staff_user,
+        year=2026,
+        week_number=1,
+        start_date=datetime(2025, 12, 29, 5, 0),
+        end_date=datetime(2026, 1, 4, 23, 59),
+        metrics=[{"key": "bids", "label": "Job applies", "target": 40}],
+    )
+
+    r = await client.get("/dashboard/week?today=2026-01-01", headers=auth_header(staff_user))
+    assert r.status_code == 200
+    b = r.json()
+    assert b["bids"]["target"] == 40
+    assert b["hasWeeklyPlan"] is True
