@@ -256,3 +256,45 @@ def test_question_updates_follow_remap_and_round_stage():
         3: {"stage": "tech_round_1"},
         4: {"stage": "tech_round_1"},
     }
+
+
+def test_plan_interview_returns_payload_and_question_updates():
+    from scripts.migrate_interview_statuses import plan_interview
+    raw = _iv([_entry("a", "intro", "completed"), _entry("b", "rejected", "scheduled")])
+    raw["_id"] = "iv1"
+    questions = [{"_id": 1, "interviewId": "iv1", "stageId": "b", "stage": "rejected"}]
+    payload, q_updates, res = plan_interview(raw, questions, now=NOW)
+    assert payload["status"] == "canceled"
+    assert q_updates == [(1, {"stageId": "a", "stage": "intro"})]
+    assert res.rules["rejected_to_canceled"] == 1
+
+
+def test_resync_moves_ends_at_with_scheduled_at():
+    from datetime import timedelta
+    raw = _iv(
+        [_entry("a", "intro", "completed", when=datetime(2026, 9, 1, 10)),
+         _entry("b", "rejected", "completed", when=datetime(2026, 9, 15, 10))],
+    )
+    raw["scheduledAt"] = datetime(2026, 9, 15, 10)
+    raw["endsAt"] = datetime(2026, 9, 15, 10, 45)
+    doc = resolve_interview(raw, now=NOW).doc
+    assert doc["scheduledAt"] == datetime(2026, 9, 1, 10)
+    assert doc["endsAt"] == datetime(2026, 9, 1, 10, 45)  # duration kept
+
+    raw["endsAt"] = datetime(2026, 9, 20)  # nonsense duration -> 1 hour
+    assert resolve_interview(raw, now=NOW).doc["endsAt"] == datetime(2026, 9, 1, 10) + timedelta(hours=1)
+
+
+def test_changed_fields_includes_ends_at():
+    from scripts.migrate_interview_statuses import changed_fields
+    raw = _iv([_entry("a", "intro", "completed")])
+    doc = copy.deepcopy(raw)
+    doc["endsAt"] = datetime(2026, 9, 1, 11)
+    assert set(changed_fields(raw, doc)) == {"endsAt"}
+
+
+def test_new_round_does_not_inherit_previous_outcome():
+    from app.routers.interviews import _carry_status
+    assert _carry_status(InterviewStatus.canceled, appended=True) == InterviewStatus.scheduled
+    assert _carry_status(InterviewStatus.rejected, appended=True) == InterviewStatus.scheduled
+    assert _carry_status(InterviewStatus.canceled, appended=False) == InterviewStatus.canceled

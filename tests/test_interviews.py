@@ -715,3 +715,45 @@ async def test_post_stage_rejected_returns_400(client, staff_user, auth_header):
         json={"stage": "rejected", "scheduledAt": "2026-05-01T10:00:00Z"},
     )
     assert r.status_code == 400
+
+
+async def test_saving_unmigrated_interview_relinks_questions(client, staff_user, auth_header):
+    from bson import ObjectId
+
+    from app.models import Interview, InterviewQuestion
+
+    acc = await _make_account(owner_id=staff_user.id)
+    when = datetime(2026, 4, 25, 14, 30)
+    oid = ObjectId()
+    await Interview.get_motor_collection().insert_one({
+        "_id": oid, "accountId": acc.id, "createdBy": staff_user.id, "scheduledAt": when,
+        "stage": "rejected", "status": "scheduled", "transcript": "", "note": "",
+        "stageHistory": [
+            {"id": "a", "stage": "intro", "status": "completed", "at": when, "scheduledAt": when},
+            {"id": "b", "stage": "rejected", "status": "scheduled", "at": when, "scheduledAt": when},
+        ],
+    })
+    await InterviewQuestion.get_motor_collection().insert_one(
+        {"interviewId": oid, "userId": staff_user.id, "stageId": "b", "stage": "rejected", "question": "Q?"},
+    )
+    r = await client.patch(f"/interviews/{oid}/stages/a", headers=auth_header(staff_user), json={"note": "n"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "canceled"
+    q = await InterviewQuestion.get_motor_collection().find_one({"interviewId": oid})
+    assert (q["stageId"], q["stage"]) == ("a", "intro")
+
+
+async def test_stage_move_from_canceled_starts_new_round_scheduled(client, staff_user, auth_header):
+    iv = await _create_intro(client, staff_user, auth_header)
+    h = auth_header(staff_user)
+    r = await client.put(f"/interviews/{iv['_id']}", headers=h, json={"status": "canceled"})
+    assert r.json()["status"] == "canceled"
+    r = await client.put(
+        f"/interviews/{iv['_id']}", headers=h,
+        json={"stage": "tech_round_1", "scheduledAt": "2026-05-02T10:00:00Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stage"] == "tech_round_1"
+    assert body["status"] == "scheduled"
+    assert body["stageHistory"][0]["status"] == "canceled"

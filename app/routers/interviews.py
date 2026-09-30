@@ -23,7 +23,7 @@ from app.models import (
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus
-from app.interview_normalize import normalize_stage, translate_legacy_write
+from app.interview_normalize import normalize_stage, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
     CallerError,
     CallerIn,
@@ -199,11 +199,38 @@ async def _apply_caller(iv: Interview, body: CallerIn, *, user: UserExtra) -> No
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
+def _carry_status(current: Optional[InterviewStatus], *, appended: bool) -> Optional[InterviewStatus]:
+    """Status for the tip after an update: a newly appended round starts Scheduled."""
+    return InterviewStatus.scheduled if appended else current
+
+
+async def _save_interview(iv: Interview) -> None:
+    """Save, then re-link questions owed by a document resolved on read.
+
+    An unmigrated interview loses its "rejected" round when it is saved
+    (the model resolves it on load); its extracted questions must follow to
+    the round before, or they are orphaned and the later migration can no
+    longer find them.
+    """
+    await iv.save()
+    if not iv.needs_question_sync:
+        return
+    remap = iv.pending_question_remap
+    coll = InterviewQuestion.get_motor_collection()
+    questions = await coll.find(
+        {"interviewId": iv.id, "$or": [{"stageId": {"$in": list(remap)}}, {"stage": "rejected"}]},
+        {"interviewId": 1, "stageId": 1, "stage": 1},
+    ).to_list(None)
+    for qid, payload in pending_question_updates(iv, questions):
+        await coll.update_one({"_id": qid}, {"$set": payload})
+    iv.clear_question_sync()
+
+
 async def _post_caller_channel(iv: Interview, *, kind: str) -> None:
     ts = await notify_caller_channel(iv, kind=kind)
     if ts and iv.caller is not None and iv.caller.slackChannelTs != ts:
         iv.caller.slackChannelTs = ts
-        await iv.save()
+        await _save_interview(iv)
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
@@ -585,7 +612,7 @@ async def get_interview(
     if not _can_view(iv, user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     if migrate_legacy_stage_fields(iv):
-        await iv.save()
+        await _save_interview(iv)
         tip = _tip(iv)
         if tip is not None:
             await InterviewQuestion.find(
@@ -742,6 +769,7 @@ async def update_interview(
     iv.scheduledAt = new_sched
     iv.endsAt = new_ends
     removed_stage_ids: set[str] = set()
+    rounds_before = len(iv.stageHistory)
     if body.stageHistory is not None:
         removed_stage_ids = _set_stage_history(iv, body.stageHistory, by=user.id)
 
@@ -782,6 +810,12 @@ async def update_interview(
     elif body.stageHistory is not None and not iv.stageHistory:
         iv.stage = None
 
+    # A round appended by a stage move starts Scheduled — it must not inherit
+    # the previous round's Canceled/Rejected (or the card falls straight back).
+    iv.status = _carry_status(
+        iv.status,
+        appended=body.stageHistory is None and len(iv.stageHistory) > rounds_before,
+    )
     if body.status is not None:
         if body.status == "":
             iv.status = None
@@ -821,7 +855,7 @@ async def update_interview(
     else:
         resync_caller_day(iv.caller, iv.scheduledAt)
 
-    await iv.save()
+    await _save_interview(iv)
 
     if removed_stage_ids:
         await InterviewQuestion.find(
@@ -889,7 +923,7 @@ async def add_interview_stage(
     iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
     resync_caller_day(iv.caller, iv.scheduledAt)
-    await iv.save()
+    await _save_interview(iv)
 
     await _after_save(
         iv,
@@ -939,7 +973,7 @@ async def update_interview_stage(
     if idx == len(iv.stageHistory) - 1:
         _sync_top_from_tip(iv)
         resync_caller_day(iv.caller, iv.scheduledAt)
-    await iv.save()
+    await _save_interview(iv)
 
     extract_ids: list[Optional[str]] = []
     if transcript_changed:
@@ -975,7 +1009,7 @@ async def delete_interview_stage(
     _reject_adjacent_duplicate(iv)
     _sync_top_from_tip(iv)
     resync_caller_day(iv.caller, iv.scheduledAt)
-    await iv.save()
+    await _save_interview(iv)
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
 
     await _after_save(

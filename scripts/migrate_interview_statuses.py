@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,9 +33,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
-from app.interview_normalize import normalize_stage, resolve_interview  # noqa: E402
+from app.interview_normalize import Resolution, question_updates, resolve_interview  # noqa: E402
 
-_FIELDS = ("stage", "status", "scheduledAt", "stageHistory")
+_FIELDS = ("stage", "status", "scheduledAt", "endsAt", "stageHistory")
 
 
 def changed_fields(raw: dict, doc: dict) -> dict:
@@ -43,82 +43,70 @@ def changed_fields(raw: dict, doc: dict) -> dict:
     return {k: doc.get(k) for k in _FIELDS if doc.get(k) != raw.get(k)}
 
 
-def question_updates(
-    questions: list[dict],
-    remap: dict[tuple, str],
-    stage_by_round: dict[tuple, str],
-) -> list[tuple]:
-    """(question _id, $set payload) for questions whose round link or stage changes.
-
-    `remap` and `stage_by_round` are keyed by (interviewId, roundId) so ids are
-    never matched across interviews. Questions without a known round only get
-    their legacy stage value mapped.
-    """
-    out = []
-    for q in questions:
-        iv_id, sid = q.get("interviewId"), q.get("stageId")
-        new_sid = remap.get((iv_id, sid), sid)
-        old_stage = q.get("stage")
-        new_stage = old_stage
-        # `stage` is an extraction-time snapshot: only rewrite it when the
-        # question moved rounds or holds "rejected" / a legacy stage key.
-        if new_sid != sid or old_stage == "rejected" or normalize_stage(old_stage) != old_stage:
-            new_stage = stage_by_round.get((iv_id, new_sid)) or normalize_stage(old_stage)
-        payload = {}
-        if new_sid != sid:
-            payload["stageId"] = new_sid
-        if new_stage != old_stage:
-            payload["stage"] = new_stage
-        if payload:
-            out.append((q["_id"], payload))
-    return out
+def plan_interview(raw: dict, questions: list[dict], *, now: datetime) -> tuple[dict, list[tuple], Resolution]:
+    """For one raw interview and its questions: the interview $set payload,
+    the question updates, and the resolution (rule counts, remap)."""
+    res = resolve_interview(raw, now=now)
+    iv_id = raw["_id"]
+    remap = {(iv_id, old): new for old, new in res.question_remap.items()}
+    stage_by_round = {
+        (iv_id, e["id"]): e.get("stage") for e in res.doc.get("stageHistory") or [] if e.get("id")
+    }
+    return changed_fields(raw, res.doc), question_updates(questions, remap, stage_by_round), res
 
 
 async def run(apply: bool) -> int:
     db = AsyncIOMotorClient(get_settings().MONGODB_URI).get_default_database()
     now = datetime.now(timezone.utc)
-    scanned = changed = 0
+    scanned = changed = remapped_rounds = 0
     rules: Counter = Counter()
     intro_ids: list = []
-    remap: dict[tuple, str] = {}
-    stage_by_round: dict[tuple, str] = {}
-
-    async for raw in db.interviews.find({}):
-        scanned += 1
-        res = resolve_interview(raw, now=now)
-        payload = changed_fields(raw, res.doc)
-        rules.update(res.rules)
-        for old, new in res.question_remap.items():
-            remap[(raw["_id"], old)] = new
-        for entry in res.doc.get("stageHistory") or []:
-            if entry.get("id"):
-                stage_by_round[(raw["_id"], entry["id"])] = entry.get("stage")
-        if res.rules.get("rejected_only_to_intro"):
-            intro_ids.append(raw["_id"])
-        if not payload:
-            continue
-        changed += 1
-        if apply:
-            await db.interviews.update_one({"_id": raw["_id"]}, {"$set": payload})
+    all_q_updates: list[tuple] = []
 
     questions = await db.interviewquestions.find(
         {}, {"interviewId": 1, "stageId": 1, "stage": 1},
     ).to_list(None)
-    q_updates = question_updates(questions, remap, stage_by_round)
+    by_interview: dict = defaultdict(list)
+    for q in questions:
+        by_interview[q.get("interviewId")].append(q)
+
+    async for raw in db.interviews.find({}):
+        scanned += 1
+        payload, q_updates, res = plan_interview(raw, by_interview.pop(raw["_id"], []), now=now)
+        rules.update(res.rules)
+        remapped_rounds += len(res.question_remap)
+        if res.rules.get("rejected_only_to_intro"):
+            intro_ids.append(raw["_id"])
+        all_q_updates += q_updates
+        if payload:
+            changed += 1
+        if apply:
+            # Questions first: once the interview is rewritten a re-run can no
+            # longer see the removed round, so its questions must already follow.
+            for qid, q_payload in q_updates:
+                await db.interviewquestions.update_one({"_id": qid}, {"$set": q_payload})
+            if payload:
+                await db.interviews.update_one({"_id": raw["_id"]}, {"$set": payload})
+
+    # Questions of deleted interviews: only map legacy stage values.
+    orphans = [q for qs in by_interview.values() for q in qs]
+    orphan_updates = question_updates(orphans, {}, {})
+    all_q_updates += orphan_updates
     if apply:
-        for qid, q_payload in q_updates:
+        for qid, q_payload in orphan_updates:
             await db.interviewquestions.update_one({"_id": qid}, {"$set": q_payload})
-    relinked = sum(1 for _, q in q_updates if "stageId" in q)
+
+    relinked = sum(1 for _, q in all_q_updates if "stageId" in q)
+    new_stage = {qid: p["stage"] for qid, p in all_q_updates if "stage" in p}
     stage_before = {q.get("stage") for q in questions} - {None}
+    stage_after = {new_stage.get(q["_id"], q.get("stage")) for q in questions} - {None}
 
     mode = "applied" if apply else "dry-run"
     print(f"mode={mode} scanned={scanned} changed={changed}")
     for name in sorted(rules):
         print(f"  {name}: {rules[name]}")
-    print(f"  removed rounds with questions re-pointed: {len(remap)}")
-    print(f"  questions updated: {len(q_updates)} (re-linked to previous round: {relinked})")
-    new_stage = {qid: p["stage"] for qid, p in q_updates if "stage" in p}
-    stage_after = {new_stage.get(q["_id"], q.get("stage")) for q in questions} - {None}
+    print(f"  removed rounds with questions re-pointed: {remapped_rounds}")
+    print(f"  questions updated: {len(all_q_updates)} (re-linked to previous round: {relinked})")
     print(f"  question stage values before: {sorted(stage_before)}")
     print(f"  question stage values after:  {sorted(stage_after)}")
     print(f"  rejected-only -> intro ids ({len(intro_ids)}): {', '.join(str(i) for i in intro_ids)}")

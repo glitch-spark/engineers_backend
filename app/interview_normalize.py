@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional
 
@@ -182,6 +182,52 @@ def resolve_interview(raw: dict, *, now: datetime) -> Resolution:
     cur, new = _utc_naive(doc.get("scheduledAt")), _utc_naive(tip_when)
     if new is not None and (cur is None or cur.date() != new.date()):
         doc["scheduledAt"] = tip_when
+        # endsAt belonged to the old start (often the removed rejected round):
+        # keep the duration when it is sane, else default to one hour.
+        ends = _utc_naive(doc.get("endsAt"))
+        if ends is not None:
+            duration = ends - cur if cur is not None else None
+            if duration is None or not (timedelta(0) < duration <= timedelta(days=1)):
+                duration = timedelta(hours=1)
+            doc["endsAt"] = tip_when + duration
     if (doc.get("stage"), doc.get("status"), doc.get("scheduledAt")) != before:
         rules["top_resynced"] += 1
     return res
+
+
+def question_updates(
+    questions: list[dict],
+    remap: dict[tuple, str],
+    stage_by_round: dict[tuple, str],
+) -> list[tuple]:
+    """(question _id, $set payload) for questions whose round link or stage changes.
+
+    `remap` and `stage_by_round` are keyed by (interviewId, roundId) so ids are
+    never matched across interviews. Questions without a known round only get
+    their legacy stage value mapped.
+    """
+    out = []
+    for q in questions:
+        iv_id, sid = q.get("interviewId"), q.get("stageId")
+        new_sid = remap.get((iv_id, sid), sid)
+        old_stage = q.get("stage")
+        new_stage = old_stage
+        # `stage` is an extraction-time snapshot: only rewrite it when the
+        # question moved rounds or holds "rejected" / a legacy stage key.
+        if new_sid != sid or old_stage == "rejected" or normalize_stage(old_stage) != old_stage:
+            new_stage = stage_by_round.get((iv_id, new_sid)) or normalize_stage(old_stage)
+        payload = {}
+        if new_sid != sid:
+            payload["stageId"] = new_sid
+        if new_stage != old_stage:
+            payload["stage"] = new_stage
+        if payload:
+            out.append((q["_id"], payload))
+    return out
+
+
+def pending_question_updates(iv: Any, questions: list[dict]) -> list[tuple]:
+    """Question updates owed by an interview resolved on read (see Interview.pending_question_remap)."""
+    remap = {(iv.id, old): new for old, new in (iv.pending_question_remap or {}).items()}
+    stage_by_round = {(iv.id, e.id): e.stage for e in (iv.stageHistory or []) if e.id}
+    return question_updates(questions, remap, stage_by_round)

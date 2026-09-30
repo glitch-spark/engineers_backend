@@ -6,7 +6,7 @@ from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pymongo import IndexModel
 
 from app.interview_normalize import normalize_status, resolve_interview
@@ -115,16 +115,38 @@ class Interview(TimestampedDocument):
     stageHistory: List[InterviewStageEvent] = []
     caller: Optional[InterviewCaller] = None
 
-    @model_validator(mode="before")
+    # Set when an unmigrated document was resolved on read: questions linked to
+    # removed "rejected" rounds must follow on save (routers.interviews._save_interview).
+    _question_sync: Optional[dict] = PrivateAttr(default=None)
+
+    @property
+    def pending_question_remap(self) -> dict:
+        return dict(self._question_sync or {})
+
+    @property
+    def needs_question_sync(self) -> bool:
+        return self._question_sync is not None
+
+    def clear_question_sync(self) -> None:
+        self._question_sync = None
+
+    @model_validator(mode="wrap")
     @classmethod
-    def _migrate_legacy_fields(cls, data):
+    def _migrate_legacy_fields(cls, data, handler):
+        res = None
         if isinstance(data, dict):
             # Old documents stored interviewer name under `interviewName`.
             if data.get("interviewerName") in (None, "") and data.get("interviewName"):
                 data["interviewerName"] = data["interviewName"]
             # Unmigrated documents: rejected stage entries / legacy values.
-            data = resolve_interview(data, now=datetime.now(dt_timezone.utc)).doc
-        return data
+            res = resolve_interview(data, now=datetime.now(dt_timezone.utc))
+            data = res.doc
+        iv = handler(data)
+        if res is not None and (
+            res.question_remap or res.rules.get("rejected_only_to_intro")
+        ):
+            iv._question_sync = dict(res.question_remap)
+        return iv
 
     class Settings:
         name = "interviews"
