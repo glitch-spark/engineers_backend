@@ -41,8 +41,20 @@ async def run_cron_ticks() -> int:
     return code
 
 
+def _setup_logging() -> None:
+    """INFO/WARNING to stdout, ERROR+ to stderr — Railway marks every stderr line as an error."""
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    out = logging.StreamHandler(sys.stdout)
+    out.addFilter(lambda record: record.levelno < logging.ERROR)
+    err = logging.StreamHandler(sys.stderr)
+    err.setLevel(logging.ERROR)
+    for handler in (out, err):
+        handler.setFormatter(fmt)
+    logging.basicConfig(level=logging.INFO, handlers=[out, err])
+
+
 async def _run() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _setup_logging()
     settings = get_settings()
     os.environ["MONGODB_URI"] = settings.MONGODB_URI
     await init_db()
