@@ -62,6 +62,9 @@ def bucket_keys(start: date, end: date, bucket: Bucket) -> list[date]:
             if d.weekday() != 6:
                 keys.append(d)
             d += timedelta(days=1)
+        if not keys:
+            # Range is Sunday-only (e.g. a single Sunday) — never drop it.
+            return [start]
         return keys
     if bucket == "week":
         first_monday = start - timedelta(days=start.weekday())
@@ -86,6 +89,8 @@ def bucket_keys(start: date, end: date, bucket: Bucket) -> list[date]:
 
 def bucket_for(d: date, bucket: Bucket, keys: list[date]) -> date:
     if bucket == "day":
+        if d in keys:
+            return d
         if d.weekday() == 6:
             prev_saturday = d - timedelta(days=1)
             if prev_saturday in keys:
@@ -148,10 +153,12 @@ def percentile(mine: int, scores: list[int]) -> dict | None:
     if n < 3:
         return None
     rank = 1 + sum(1 for s in scores if s > mine)
-    pct = math.ceil(rank / n * 100)
+    # Integer ceiling division avoids float error from `round-trip through /`
+    # (e.g. rank/n*100 landing a hair above an exact multiple of 100/n).
+    pct = -(-rank * 100 // n)
     if pct <= 50:
         return {"position": "top", "percent": pct}
-    return {"position": "bottom", "percent": math.ceil((n - rank + 1) / n * 100)}
+    return {"position": "bottom", "percent": -(-(n - rank + 1) * 100 // n)}
 
 
 def month_keys(today: date, n: int = 12) -> list[str]:

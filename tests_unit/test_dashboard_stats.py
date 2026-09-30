@@ -45,6 +45,12 @@ def test_range_starting_sunday_rolls_forward():
     assert bucket_for(date(2026, 10, 4), "day", keys) == date(2026, 10, 5)
 
 
+def test_sunday_only_day_range_is_not_dropped():
+    keys = bucket_keys(date(2026, 10, 4), date(2026, 10, 4), "day")
+    assert keys == [date(2026, 10, 4)]
+    assert bucket_for(date(2026, 10, 4), "day", keys) == date(2026, 10, 4)
+
+
 def test_week_bucket_puts_sunday_in_preceding_week():
     keys = bucket_keys(date(2026, 9, 1), date(2026, 11, 30), "week")
     assert bucket_for(date(2026, 10, 4), "week", keys) == date(2026, 9, 28)
@@ -90,6 +96,19 @@ def test_percentile_top_bottom_ties_and_small_team():
     assert percentile(20, [50, 40, 30, 20, 10]) == {"position": "bottom", "percent": 40}
     assert percentile(40, [40, 40, 10, 5]) == {"position": "top", "percent": 25}
     assert percentile(5, [5, 3]) is None
+
+
+def test_percentile_avoids_float_ceiling_error():
+    # N=25, rank 7 (6 scores strictly higher): 7/25*100 = 28.0 exactly, but
+    # float division can round up to 28.000000000000004 -> ceil 29.
+    scores = list(range(100, 100 - 25, -1))  # 100..76, strictly descending
+    mine = scores[6]  # 6 scores above mine -> rank 7
+    assert percentile(mine, scores) == {"position": "top", "percent": 28}
+
+    # N=100, rank 94 -> bottom (100-94+1)/100*100 = 7 exactly.
+    scores100 = list(range(200, 100, -1))  # 100 distinct scores, descending
+    mine100 = scores100[93]  # 93 scores above mine -> rank 94
+    assert percentile(mine100, scores100) == {"position": "bottom", "percent": 7}
 
 
 def test_month_keys_rolls_over_year():
