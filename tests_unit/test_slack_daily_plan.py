@@ -61,20 +61,13 @@ def test_regular_daily_plan_text_numbers_both_days():
     assert lines[0] == ":spiral_note_pad: *Daily plan* — <@U123>"
     assert lines[1:-1] == [
         "*9/27 (Sun)*",
-        "1. Bid",
-        "- Bid (hands-on) : 100",
-        "- Bid (by bidder) : 150",
-        "2. Interview",
-        "Done today : 2",
-        "New invitations : 3",
+        "1. Bid 250 (hands-on: 100 + bidder: 150)",
+        "2. Interview Done/New Invitation : 2/3",
         "3. Create Linkedin Profile",
         "4. Update &lt;resume&gt;",
         "*9/28 (Mon)*",
-        "1. Bid",
-        "- Bid (hands-on) : 90",
-        "- Bid (by bidder) : 160",
-        "2. Interview",
-        "Scheduled : 5",
+        "1. Bid 250 (hands-on: 90 + bidder: 160)",
+        "2. Interview Scheduled : 5",
         "3. Prep for Acme",
     ]
     assert "Open Report" in lines[-1]
@@ -94,7 +87,9 @@ def test_regular_daily_plan_text_without_items_or_counts():
         tomorrowItems=[],
     )
     text = daily_plan_text(plan, _owner())
-    assert "Scheduled : 0" in text
+    assert "1. Bid 0 (hands-on: 0 + bidder: 0)" in text
+    assert "2. Interview Done/New Invitation : 0/0" in text
+    assert "2. Interview Scheduled : 0" in text
     assert not any(line.startswith("3. ") for line in text.splitlines())
     assert "Ship" not in text  # the free-text note belongs to custom plans
 
