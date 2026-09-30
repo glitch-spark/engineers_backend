@@ -16,7 +16,18 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.alerts import app_week_key
-from app.dashboard_stats import app_tz, local_day_start_utc, pace, percentile, streak, week_window
+from app.dashboard_stats import (
+    app_tz,
+    bucket_for,
+    bucket_keys,
+    bucket_label,
+    local_day_start_utc,
+    pace,
+    percentile,
+    pick_bucket,
+    streak,
+    week_window,
+)
 from app.deps import get_current_user
 from app.interview_rounds import (
     BREAKDOWN_ORDER,
@@ -195,4 +206,57 @@ async def dashboard_week(
         "stages": stages,
         "streak": streak_value,
         "hasWeeklyPlan": weekly_plan is not None,
+    }
+
+
+_MAX_RANGE_DAYS = 1096
+
+
+@router.get("/activity")
+async def dashboard_activity(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None),
+    userId: Optional[str] = Query(None),
+) -> dict:
+    sid = await _subject_id(user, userId)
+    start = _parse_ymd(from_, "from")
+    end = _parse_ymd(to, "to")
+    if start is None or end is None or start > end or (end - start).days + 1 > _MAX_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail="invalid range")
+
+    bucket = pick_bucket(start, end)
+    keys = bucket_keys(start, end, bucket)
+    series = {
+        key: {
+            "key": key.isoformat(),
+            "label": bucket_label(key, bucket, start, end),
+            "self": 0,
+            "bidder": 0,
+            "interviews": 0,
+        }
+        for key in keys
+    }
+
+    plans = await _regular_plans(sid, start, end)
+    for p in plans:
+        row = series[bucket_for(p.date.date(), bucket, keys)]
+        row["self"] += p.bidsHandsOn
+        row["bidder"] += p.bidsByBidder
+        row["interviews"] += p.interviewsDone
+
+    series_list = [series[key] for key in keys]
+    totals = {
+        "self": sum(row["self"] for row in series_list),
+        "bidder": sum(row["bidder"] for row in series_list),
+        "bids": sum(row["self"] + row["bidder"] for row in series_list),
+        "interviews": sum(row["interviews"] for row in series_list),
+    }
+
+    return {
+        "bucket": bucket,
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "series": series_list,
+        "totals": totals,
     }

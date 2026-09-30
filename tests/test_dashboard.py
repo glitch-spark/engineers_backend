@@ -245,3 +245,54 @@ async def test_week_plan_lookup_falls_back_across_year_boundary(client, staff_us
     b = r.json()
     assert b["bids"]["target"] == 40
     assert b["hasWeeklyPlan"] is True
+
+
+async def test_activity_week_days_with_sunday_merged(client, staff_user, auth_header):
+    # plans Mon Sep 28 (2/1/0), Sat Oct 3 (1/0/1), Sun Oct 4 (1/1/0)
+    await _plan(staff_user, date(2026, 9, 28), self_=2, bidder=1, iv=0)
+    await _plan(staff_user, date(2026, 10, 3), self_=1, bidder=0, iv=1)
+    await _plan(staff_user, date(2026, 10, 4), self_=1, bidder=1, iv=0)
+
+    h = auth_header(staff_user)
+    r = await client.get("/dashboard/activity?from=2026-09-28&to=2026-10-04", headers=h)
+    assert r.status_code == 200
+    b = r.json()
+    assert b["bucket"] == "day" and len(b["series"]) == 6
+    assert b["series"][0] == {"key": "2026-09-28", "label": "Mon", "self": 2, "bidder": 1, "interviews": 0}
+    assert b["series"][5] == {"key": "2026-10-03", "label": "Sat", "self": 2, "bidder": 1, "interviews": 1}
+    assert b["totals"] == {"self": 4, "bidder": 2, "bids": 6, "interviews": 1}
+
+
+async def test_activity_year_is_monthly_and_zero_filled(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    r = await client.get("/dashboard/activity?from=2026-01-01&to=2026-12-31", headers=h)
+    assert r.status_code == 200
+    b = r.json()
+    assert b["bucket"] == "month" and len(b["series"]) == 12 and b["series"][0]["label"] == "Jan"
+
+
+async def test_activity_ignores_custom_plans_and_other_users(client, staff_user, staff_user_2, auth_header):
+    await _plan(staff_user, date(2026, 9, 28), self_=3, bidder=1, iv=1)
+    await _plan(staff_user, date(2026, 9, 29), self_=9, bidder=9, iv=9, plan_type="custom")
+    await _plan(staff_user_2, date(2026, 9, 28), self_=5, bidder=5, iv=5)
+
+    r = await client.get(
+        "/dashboard/activity?from=2026-09-28&to=2026-10-03", headers=auth_header(staff_user)
+    )
+    assert r.status_code == 200
+    b = r.json()
+    assert b["totals"] == {"self": 3, "bidder": 1, "bids": 4, "interviews": 1}
+
+
+@pytest.mark.parametrize(
+    "qs",
+    [
+        "from=2026-10-05&to=2026-10-01",
+        "from=2020-01-01&to=2026-01-01",
+        "from=2026-13-01&to=2026-12-01",
+        "to=2026-10-01",
+    ],
+)
+async def test_activity_bad_ranges_422(client, staff_user, auth_header, qs):
+    assert (await client.get(f"/dashboard/activity?{qs}", headers=auth_header(staff_user))).status_code == 422
+
