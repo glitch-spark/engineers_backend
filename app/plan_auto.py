@@ -105,7 +105,8 @@ def weekly_done(days: list, week_interviews: dict, overrides: WeeklyOverrides) -
     return done
 
 
-async def _weekly_plans(user_ids: list, monday: date) -> dict:
+async def weekly_plans_for(user_ids: list, monday: date) -> dict:
+    """{userId: WeeklyPlan} for the week starting `monday` (migrated or not)."""
     start = _midnight(monday)
     plans = await WeeklyPlan.find({
         "userId": {"$in": user_ids},
@@ -125,7 +126,7 @@ async def _weekly_plans(user_ids: list, monday: date) -> dict:
 async def week_snapshot(user_ids: list, monday: date) -> dict:
     """Everything the week views need, for each user, in a handful of queries."""
     sunday = monday + timedelta(days=6)
-    weekly = await _weekly_plans(user_ids, monday)
+    weekly = await weekly_plans_for(user_ids, monday)
     dailies = await DailyPlan.find({
         "userId": {"$in": user_ids},
         "date": {"$gte": _midnight(monday), "$lte": _midnight(sunday)},
@@ -160,4 +161,25 @@ async def week_snapshot(user_ids: list, monday: date) -> dict:
             "done": weekly_done(rows, week_interviews, overrides),
             "lastLogged": max(logged, default=None),
         }
+    return out
+
+
+async def effective_interviews_by_day(user_ids: list, start: date, end: date) -> dict:
+    """{userId: {date: interviews Done (self + caller)}} over [start, end].
+
+    Days with a plan use its overrides; other days use interview records.
+    """
+    auto = await interview_counts(user_ids, start, end)
+    plans = await DailyPlan.find({
+        "userId": {"$in": user_ids},
+        "date": {"$gte": _midnight(start), "$lte": _midnight(end)},
+    }).to_list()
+    out: dict = {
+        uid: {d: e["self"] + e["caller"] for d, e in auto.get(uid, {}).items()}
+        for uid in user_ids
+    }
+    for plan in plans:
+        day = plan.date.date()
+        done = effective_daily_done(plan, auto.get(plan.userId, {}).get(day, empty_day()), {})
+        out.setdefault(plan.userId, {})[day] = done.interviewsSelf + done.interviewsCaller
     return out

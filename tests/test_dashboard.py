@@ -7,20 +7,26 @@ from app.alerts import app_week_key
 from app.config import get_settings
 from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
 from app.models.interview import InterviewStageEvent
+from app.models.plan_common import Counts, DoneOverrides
 
 
 async def _plan(user, day: date, self_=0, bidder=0, iv=0, plan_type="regular"):
+    """A daily plan in the Goal vs Done shape. `plan_type="custom"` stands for
+    an entry that was never logged (goal only), which the dashboard ignores;
+    `iv` is stored as the day's interviews Done override."""
     dt = datetime(day.year, day.month, day.day)
     year, week_number, _ = app_week_key(dt)
+    logged = plan_type == "regular"
     plan = DailyPlan(
         userId=user.id,
         date=dt,
         year=year,
         weekNumber=week_number,
-        planType=plan_type,
-        bidsHandsOn=self_,
-        bidsByBidder=bidder,
-        interviewsDone=iv,
+        # A never-logged entry only has a goal: Done and overrides are saved when logging.
+        goal=Counts(bidsSelf=self_, bidsBidder=bidder, interviewsSelf=iv) if not logged else Counts(),
+        done=Counts(bidsSelf=self_, bidsBidder=bidder) if logged else Counts(),
+        doneOverrides=DoneOverrides(interviewsSelf=iv) if logged and iv else DoneOverrides(),
+        loggedAt=dt if logged else None,
     )
     await plan.insert()
     return plan
@@ -29,32 +35,26 @@ async def _plan(user, day: date, self_=0, bidder=0, iv=0, plan_type="regular"):
 async def _weekly_plan(user, monday: date, metrics):
     dt = datetime(monday.year, monday.month, monday.day)
     year, week_number, _ = app_week_key(dt)
-    plan = WeeklyPlan(
-        userId=user.id,
-        year=year,
-        weekNumber=week_number,
-        startDate=dt,
-        endDate=dt,
-        metrics=metrics,
+    return await _weekly_plan_raw(
+        user, year=year, week_number=week_number, start_date=dt, end_date=dt, metrics=metrics
     )
-    await plan.insert()
-    return plan
 
 
 async def _weekly_plan_raw(user, *, year, week_number, start_date, end_date, metrics):
-    """Like `_weekly_plan` but with explicit year/weekNumber/startDate/endDate,
-    so tests can construct the creation-date-vs-Monday mismatch that happens
-    around year boundaries (see test_week_plan_lookup_falls_back_across_year_boundary)."""
-    plan = WeeklyPlan(
-        userId=user.id,
-        year=year,
-        weekNumber=week_number,
-        startDate=start_date,
-        endDate=end_date,
-        metrics=metrics,
-    )
-    await plan.insert()
-    return plan
+    """A weekly plan stored in the pre Goal-vs-Done shape (metrics targets), so
+    these tests also cover the legacy fold: bids/interviews targets become
+    goal.bidsSelf / goal.interviewsSelf. Explicit year/weekNumber/startDate let
+    tests build the creation-date-vs-Monday mismatch around year boundaries."""
+    await WeeklyPlan.get_motor_collection().insert_one({
+        "userId": user.id,
+        "year": year,
+        "weekNumber": week_number,
+        "startDate": start_date,
+        "endDate": end_date,
+        "metrics": metrics,
+        "createdAt": start_date,
+        "updatedAt": start_date,
+    })
 
 
 async def test_week_requires_auth(client):
