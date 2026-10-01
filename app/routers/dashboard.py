@@ -123,7 +123,7 @@ async def dashboard_week(
     monday, saturday, sunday = week_window(day)
 
     # Actuals: logged daily plans over the counting window (Mon-Sun);
-    # interviews are each day's Done (records, or the day's override).
+    # interviews come from interview records.
     plans = await _logged_plans([sid], monday, sunday)
     self_sum = sum(p.done.bidsSelf for p in plans)
     bidder_sum = sum(p.done.bidsBidder for p in plans)
