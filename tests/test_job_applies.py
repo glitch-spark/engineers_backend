@@ -2,7 +2,7 @@
 fetch/extract functions, so no network or LLM is used."""
 import io
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 from beanie import PydanticObjectId
@@ -125,16 +125,6 @@ async def test_threshold_patch_changes_suggestions(client, staff_user, auth_head
     assert all(x["suggestions"] == [] for x in rows)
 
 
-async def test_mark_applied(client, staff_user, auth_header):
-    h = auth_header(staff_user)
-    acc = await make_account(staff_user)
-    run_id = (await create_run(client, h, acc)).json()["runId"]
-    await worker.run_worker(PydanticObjectId(run_id))
-    row = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"][0]
-    r = await client.patch(f"/job-applies/rows/{row['_id']}", headers=h, json={"applied": True})
-    assert r.status_code == 200 and r.json()["applied"] is True
-
-
 async def test_location_gate_excludes_profile(client, staff_user, auth_header):
     h = auth_header(staff_user)
     acc = await make_account(staff_user, country="BR")
@@ -244,7 +234,10 @@ async def test_applied_set_during_run_is_kept(client, staff_user, auth_header, m
 
     async def extract_and_mark(jd, *, user, run_date, llm=None):
         # The user ticks "applied" while the worker is mid-run.
-        await JobApplyRow.get_motor_collection().update_many({"runId": PydanticObjectId(run_id)}, {"$set": {"applied": True}})
+        await JobApplyRow.get_motor_collection().update_many(
+            {"runId": PydanticObjectId(run_id)},
+            {"$push": {"appliedResumes": {"accountId": "x", "resumeId": "y", "at": datetime.utcnow()}}},
+        )
         return await fake_extract(jd, user=user, run_date=run_date)
 
     monkeypatch.setattr(worker, "EXTRACT", extract_and_mark)
@@ -320,3 +313,96 @@ async def test_sheet_descriptions_are_cached_per_url_for_later_runs(client, staf
     await worker.run_worker(PydanticObjectId(second))
     row = await JobApplyRow.find_one(JobApplyRow.runId == PydanticObjectId(second))
     assert row.status == "scored" and row.jdSource == "sheet"
+
+
+
+async def _done_run(client, h, acc, data=SHEET):
+    run_id = (await create_run(client, h, acc, data=data)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    return run_id, {r["url"]: r for r in rows}
+
+
+async def _mark(client, h, row, *, applied=True, suggestion=0):
+    s = row["suggestions"][suggestion]
+    return await client.put(
+        f"/job-applies/rows/{row['_id']}/applied", headers=h,
+        json={"accountId": s["accountId"], "resumeId": s["resumeId"], "applied": applied},
+    )
+
+
+async def test_mark_resume_applied_writes_the_permanent_log(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplicationLog
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id, rows = await _done_run(client, h, acc)
+    remote = rows["https://jobs.example.com/remote"]
+    r = await _mark(client, h, remote)
+    assert r.status_code == 200 and [m["resumeId"] for m in r.json()["appliedResumes"]] == [remote["suggestions"][0]["resumeId"]]
+    assert (await _mark(client, h, remote)).status_code == 200  # idempotent
+    (log,) = await JobApplicationLog.find_all().to_list()
+    assert log.url == remote["url"] and log.profileName == "Backend" and log.filename == "strong.md" and str(log.runId) == run_id
+
+    rows_now = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    marked = next(x for x in rows_now if x["_id"] == remote["_id"])
+    assert marked["applied"] is True and len(marked["appliedResumes"]) == 1
+
+    r = await _mark(client, h, remote, applied=False)
+    assert r.status_code == 200 and r.json()["appliedResumes"] == []
+    assert await JobApplicationLog.find_all().count() == 0
+
+
+async def test_applied_filters_and_counters(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id, rows = await _done_run(client, h, acc)
+    await _mark(client, h, rows["https://jobs.example.com/remote"])
+
+    def urls(resp):
+        return {x["url"] for x in resp.json()["rows"]}
+
+    yes = await client.get(f"/job-applies/runs/{run_id}/rows?applied=yes", headers=h)
+    no = await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested&applied=no", headers=h)
+    assert urls(yes) == {"https://jobs.example.com/remote"}
+    assert urls(no) == {"https://boards.greenhouse.io/acme/jobs/9"}
+
+    since = (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z"
+    run = (await client.get(f"/job-applies/runs/{run_id}", params={"appliedSince": since}, headers=h)).json()
+    assert run["appliedInRun"] == 1 and run["appliedSince"] == 1
+    assert all("hasFile" in r for r in run["resumes"])
+
+
+async def test_later_runs_show_already_applied(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    _, rows = await _done_run(client, h, acc)
+    await _mark(client, h, rows["https://jobs.example.com/remote"])
+
+    run2, rows2 = await _done_run(client, h, acc)
+    prev = rows2["https://jobs.example.com/remote"]["previouslyApplied"]
+    assert len(prev) == 1 and prev[0]["profileName"] == "Backend" and prev[0]["filename"] == "strong.md"
+    no = (await client.get(f"/job-applies/runs/{run2}/rows?applied=no", headers=h)).json()["rows"]
+    assert "https://jobs.example.com/remote" not in {x["url"] for x in no}
+
+
+async def test_bulk_mark_top_suggestion(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id, rows = await _done_run(client, h, acc)
+    ids = [rows[u]["_id"] for u in ("https://jobs.example.com/remote", "https://jobs.example.com/hybrid")]
+    r = await client.post(f"/job-applies/runs/{run_id}/mark-top-applied", headers=h, json={"rowIds": ids})
+    assert r.status_code == 200 and r.json()["marked"] == 1  # the hybrid job has no suggestion
+    again = await client.post(f"/job-applies/runs/{run_id}/mark-top-applied", headers=h, json={"rowIds": ids})
+    assert again.json()["marked"] == 0
+
+
+async def test_mark_rejects_unknown_resume(client, staff_user, staff_user_2, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    _, rows = await _done_run(client, h, acc)
+    row = rows["https://jobs.example.com/remote"]
+    r = await client.put(f"/job-applies/rows/{row['_id']}/applied", headers=h,
+                         json={"accountId": str(acc.id), "resumeId": "nope", "applied": True})
+    assert r.status_code == 400
+    assert (await _mark(client, auth_header(staff_user_2), row)).status_code == 404

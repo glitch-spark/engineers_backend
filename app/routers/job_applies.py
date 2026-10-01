@@ -1,7 +1,7 @@
 """Job Applies: upload a sheet of job postings, score selected resumes, suggest one resume per profile."""
 import asyncio
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Annotated, Any, Optional
 
 import httpx
@@ -15,7 +15,15 @@ from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, UserExtra
 from app.job_apply.schema import GateResult, Location
-from app.models.job_apply import JobApplyRow, JobApplyRun, ProfileGates, RunCounts, RunSelection
+from app.models.job_apply import (
+    AppliedMark,
+    JobApplicationLog,
+    JobApplyRow,
+    JobApplyRun,
+    ProfileGates,
+    RunCounts,
+    RunSelection,
+)
 from app.routers._util import doc_to_dict, to_object_id
 
 router = APIRouter(prefix="/job-applies", tags=["job-applies"])
@@ -75,7 +83,7 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
                 h = health(r.markdown)
                 out["resumes"].append({
                     "accountId": str(acc.id), "resumeId": str(r.id), "filename": r.filename,
-                    "health": {"score": h.score, "issues": h.issues},
+                    "health": {"score": h.score, "issues": h.issues}, "hasFile": bool(r.s3Key),
                 })
     return out
 
@@ -112,12 +120,13 @@ class _RowListView(BaseModel):
     bestByProfile: list[_SuggestionView] = Field(default_factory=list)
     topScore: Optional[int] = None
     applied: bool = False
+    appliedResumes: list[AppliedMark] = Field(default_factory=list)
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
             "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
-            "applied": 1, "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
+            "applied": 1, "appliedResumes": 1, "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1,
             "bestByProfile.total": 1, "bestByProfile.band": 1, "bestByProfile.knockouts": 1,
         }
@@ -130,8 +139,21 @@ def _suggestion(s) -> dict:
     }
 
 
-def _row_summary(row: JobApplyRow, threshold: int, account_id: str = "") -> dict:
+def _applied_marks(row, suggestions: list[dict]) -> list[dict]:
+    marks = [m.model_dump(mode="json") for m in row.appliedResumes]
+    if not marks and row.applied and suggestions:  # legacy single tick = the top suggestion
+        top = suggestions[0]
+        marks = [{"accountId": top["accountId"], "resumeId": top["resumeId"], "at": None}]
+    return marks
+
+
+def _row_summary(row: JobApplyRow, threshold: int, account_id: str = "", previous: Optional[list] = None) -> dict:
     ex = row.extraction
+    suggestions = [
+        _suggestion(s) for s in row.bestByProfile
+        if s.total >= threshold and (not account_id or s.accountId == account_id)
+    ]
+    marks = _applied_marks(row, suggestions)
     return {
         "_id": str(row.id),
         "rowIndex": row.rowIndex,
@@ -149,11 +171,11 @@ def _row_summary(row: JobApplyRow, threshold: int, account_id: str = "") -> dict
         "gates": [g.model_dump() for g in row.gates],
         "profileGates": [pg.model_dump() for pg in row.profileGates],
         "topScore": row.topScore,
-        "suggestions": [
-            _suggestion(s) for s in row.bestByProfile
-            if s.total >= threshold and (not account_id or s.accountId == account_id)
-        ],
-        "applied": row.applied,
+        "suggestions": suggestions,
+        "appliedResumes": marks,
+        "applied": bool(marks),
+        # Applications to this URL recorded in other runs (permanent applied log).
+        "previouslyApplied": previous or [],
     }
 
 
@@ -243,9 +265,27 @@ async def list_runs(user: Annotated[UserExtra, Depends(get_current_user)]) -> di
     return {"runs": [await _run_out(r) for r in runs]}
 
 
+def _naive_utc(value: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="appliedSince must be an ISO date-time")
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
 @router.get("/runs/{run_id}")
-async def get_run(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    return await _run_out(await _owned_run(run_id, user), with_profiles=True)
+async def get_run(
+    run_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    appliedSince: Optional[str] = Query(None, description="ISO date-time (the viewer's local midnight) for 'applied today'"),
+) -> dict:
+    run = await _owned_run(run_id, user)
+    out = await _run_out(run, with_profiles=True)
+    log = JobApplicationLog.get_motor_collection()
+    out["appliedInRun"] = await log.count_documents({"runId": run.id})
+    if appliedSince:
+        out["appliedSince"] = await log.count_documents({"userId": run.userId, "appliedAt": {"$gte": _naive_utc(appliedSince)}})
+    return out
 
 
 class RunPatch(BaseModel):
@@ -319,6 +359,7 @@ async def list_rows(
     view: str = Query("all"),
     accountId: str = Query(""),
     minScore: Optional[int] = Query(None),
+    applied: str = Query("any", pattern="^(any|yes|no)$"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
 ) -> dict:
@@ -335,14 +376,39 @@ async def list_rows(
         q["topScore"] = {"$gte": minScore}
     if accountId:
         q["bestByProfile"] = {"$elemMatch": {"accountId": accountId, **({"total": {"$gte": floor}} if view == "suggested" else {})}}
+    if applied != "any":
+        # "Applied" = marked in this run, or the URL is in the permanent log from another run.
+        run_urls = await JobApplyRow.get_motor_collection().distinct("url", {"runId": run.id})
+        logged = await JobApplicationLog.get_motor_collection().distinct(
+            "url", {"userId": run.userId, "url": {"$in": run_urls}, "runId": {"$ne": run.id}}
+        )
+        cond = (
+            {"$or": [{"appliedResumes.0": {"$exists": True}}, {"applied": True}, {"url": {"$in": logged}}]}
+            if applied == "yes"
+            else {"appliedResumes.0": {"$exists": False}, "applied": {"$ne": True}, "url": {"$nin": logged}}
+        )
+        q = {"$and": [q, cond]}
 
     total = await JobApplyRow.find(q).count()
     rows = await (
         JobApplyRow.find(q).sort("+rowIndex").skip((page - 1) * limit).limit(limit).project(_RowListView).to_list()
     )
     pages = (total + limit - 1) // limit
+    previous: dict[str, list] = {}
+    page_urls = [r.url for r in rows if r.url]
+    if page_urls:
+        cursor = JobApplicationLog.get_motor_collection().find(
+            {"userId": run.userId, "url": {"$in": page_urls}, "runId": {"$ne": run.id}}
+        ).sort("appliedAt", -1)
+        async for entry in cursor:
+            previous.setdefault(entry["url"], []).append({
+                "appliedAt": entry["appliedAt"].isoformat() if entry.get("appliedAt") else None,
+                "profileName": entry.get("profileName", ""),
+                "filename": entry.get("filename", ""),
+                "accountId": entry.get("accountId"),
+            })
     return {
-        "rows": [_row_summary(r, run.threshold, accountId) for r in rows],
+        "rows": [_row_summary(r, run.threshold, accountId, previous.get(r.url)) for r in rows],
         "pagination": {"page": page, "limit": limit, "total": total, "totalPages": pages, "hasNext": page < pages, "hasPrev": page > 1},
     }
 
@@ -358,14 +424,72 @@ async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_us
     return out
 
 
-class RowPatch(BaseModel):
+# ---------- applied marks ----------
+
+
+async def _set_applied(row: JobApplyRow, account_id: str, resume_id: str, filename: str, applied: bool) -> None:
+    """Mark/unmark one resume on one job: the row's appliedResumes (for this run's table) and the permanent
+    applied log (for later runs). Idempotent both ways."""
+    now = datetime.utcnow()
+    rows = JobApplyRow.get_motor_collection()
+    log = JobApplicationLog.get_motor_collection()
+    key = {"userId": row.userId, "url": row.url, "resumeId": resume_id}
+    if applied:
+        await rows.update_one(
+            {"_id": row.id, "appliedResumes.resumeId": {"$ne": resume_id}},
+            {"$push": {"appliedResumes": {"accountId": account_id, "resumeId": resume_id, "at": now}},
+             "$set": {"applied": False, "updatedAt": now}},
+        )
+        acc = await Account.get(PydanticObjectId(account_id)) if PydanticObjectId.is_valid(account_id) else None
+        await log.update_one(
+            key,
+            {"$set": {**key, "company": row.company, "title": row.title, "accountId": account_id,
+                      "profileName": acc.name if acc else "", "filename": filename, "runId": row.runId,
+                      "rowId": row.id, "updatedAt": now},
+             "$setOnInsert": {"appliedAt": now, "createdAt": now}},
+            upsert=True,
+        )
+    else:
+        await rows.update_one(
+            {"_id": row.id},
+            {"$pull": {"appliedResumes": {"resumeId": resume_id}}, "$set": {"applied": False, "updatedAt": now}},
+        )
+        await log.delete_one(key)
+
+
+class AppliedBody(BaseModel):
+    accountId: str
+    resumeId: str
     applied: bool
 
 
-@router.patch("/rows/{row_id}")
-async def update_row(row_id: str, body: RowPatch, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+@router.put("/rows/{row_id}/applied")
+async def set_row_applied(row_id: str, body: AppliedBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     row = await _owned_row(row_id, user)
-    await JobApplyRow.get_motor_collection().update_one(
-        {"_id": row.id}, {"$set": {"applied": body.applied, "updatedAt": datetime.utcnow()}}
-    )
-    return {"_id": str(row.id), "applied": body.applied}
+    score = next((s for s in row.scores if s.accountId == body.accountId and s.resumeId == body.resumeId), None)
+    if score is None or not row.url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That resume wasn't scored for this job.")
+    await _set_applied(row, body.accountId, body.resumeId, score.filename, body.applied)
+    fresh = await JobApplyRow.get(row.id)
+    return {"_id": str(row.id), "appliedResumes": [m.model_dump(mode="json") for m in fresh.appliedResumes]}
+
+
+class BulkAppliedBody(BaseModel):
+    rowIds: list[str] = Field(max_length=500)
+
+
+@router.post("/runs/{run_id}/mark-top-applied")
+async def mark_top_applied(
+    run_id: str, body: BulkAppliedBody, user: Annotated[UserExtra, Depends(get_current_user)]
+) -> dict:
+    """Mark each selected job's top suggestion as applied (skips jobs with no suggestion or already marked)."""
+    run = await _owned_run(run_id, user)
+    ids = [to_object_id(i) for i in body.rowIds]
+    marked = 0
+    for row in await JobApplyRow.find({"_id": {"$in": ids}, "runId": run.id}).to_list():
+        tops = [s for s in row.bestByProfile if s.total >= run.threshold]
+        if not tops or row.appliedResumes or row.applied:
+            continue
+        await _set_applied(row, tops[0].accountId, tops[0].resumeId, tops[0].filename, True)
+        marked += 1
+    return {"marked": marked}
