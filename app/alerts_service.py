@@ -28,6 +28,7 @@ from app.alerts import (
 )
 from app.models import Notification, RecurringCharge, ResumeApplication, Transaction, UserExtra, WeeklyPlan
 from app.models.plan_common import monday_of
+from app.models.resume_application import BID_FILTER
 from app.plan_auto import weekly_plans_for
 from app.slack_bot import resolve_user_tz
 
@@ -256,7 +257,7 @@ async def _tick_daily_bids(users: list[UserExtra], *, now: datetime) -> int:
         start_naive = start.replace(tzinfo=None)
         end_naive = end.replace(tzinfo=None)
         count = await ResumeApplication.find(
-            {"userId": user.id, "createdAt": {"$gte": start_naive, "$lt": end_naive}}
+            {"userId": user.id, "createdAt": {"$gte": start_naive, "$lt": end_naive}, **BID_FILTER}
         ).count()
         if count < target:
             continue

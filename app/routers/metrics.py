@@ -28,6 +28,7 @@ from app.interview_rounds import (
     load_interviews_for_window as _load_interviews_for_window,
 )
 from app.models import Interview, ResumeApplication, Transaction, UserExtra
+from app.models.resume_application import BID_FILTER
 from app.plan_auto import week_snapshot
 from app.routers._util import parse_date
 
@@ -76,7 +77,7 @@ async def _income_sum(user_id, start: datetime, end: datetime) -> float:
 
 async def _bid_count(user_id, start: datetime, end: datetime) -> int:
     return await ResumeApplication.find(
-        {"userId": user_id, "createdAt": {"$gte": start, "$lte": end}}
+        {"userId": user_id, "createdAt": {"$gte": start, "$lte": end}, **BID_FILTER}
     ).count()
 
 
@@ -136,11 +137,14 @@ async def _bucketed_income(user_id, start, end, bucket: str) -> dict[str, float]
     return {d["_id"].isoformat(): float(d["total"]) for d in docs if d["_id"]}
 
 
-async def _bucketed_count(coll, user_field: str, user_id, start, end, ts_field: str, bucket: str) -> dict[str, int]:
+async def _bucketed_count(
+    coll, user_field: str, user_id, start, end, ts_field: str, bucket: str, extra: Optional[dict] = None
+) -> dict[str, int]:
     pipeline = [
         {"$match": {
             user_field: user_id,
             ts_field: {"$gte": start, "$lte": end},
+            **(extra or {}),
         }},
         {"$group": {
             "_id": {"$dateTrunc": {"date": f"${ts_field}", "unit": _BUCKET_UNIT[bucket], "timezone": "UTC"}},
@@ -182,7 +186,7 @@ def _bucket_starts(start: datetime, end: datetime, bucket: str) -> list[datetime
 async def _series(user_id, start: datetime, end: datetime, bucket: str) -> list[dict]:
     income_map = await _bucketed_income(user_id, start, end, bucket)
     bid_map = await _bucketed_count(
-        ResumeApplication, "userId", user_id, start, end, "createdAt", bucket
+        ResumeApplication, "userId", user_id, start, end, "createdAt", bucket, extra=BID_FILTER
     )
     iv_map = await _bucketed_count(
         Interview, "createdBy", user_id, start, end, "scheduledAt", bucket
@@ -289,6 +293,7 @@ async def _bids_by_user(user_ids, start, end) -> dict:
         {"$match": {
             "userId": {"$in": user_ids},
             "createdAt": {"$gte": start, "$lte": end},
+            **BID_FILTER,
         }},
         {"$group": {"_id": "$userId", "value": {"$sum": 1}}},
     ]
@@ -429,7 +434,7 @@ async def _trend_by_user(user_ids: list, weeks: int = 8) -> dict:
     start = monday - timedelta(weeks=weeks - 1)
 
     bid_pipe = [
-        {"$match": {"userId": {"$in": user_ids}, "createdAt": {"$gte": start}}},
+        {"$match": {"userId": {"$in": user_ids}, "createdAt": {"$gte": start}, **BID_FILTER}},
         {"$group": {
             "_id": {"u": "$userId", "y": {"$isoWeekYear": "$createdAt"}, "w": {"$isoWeek": "$createdAt"}},
             "n": {"$sum": 1},
@@ -695,7 +700,7 @@ async def dashboard_feed(
     uid = user.id
 
     # Recent bids
-    bids = await ResumeApplication.find({"userId": uid}).sort("-createdAt").limit(limit).to_list()
+    bids = await ResumeApplication.find({"userId": uid, **BID_FILTER}).sort("-createdAt").limit(limit).to_list()
     bid_events = [{
         "kind": "bid",
         "at": (b.createdAt or datetime.now(timezone.utc)).isoformat(),
