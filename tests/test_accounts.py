@@ -277,3 +277,19 @@ async def test_resume_filename_strips_control_chars(client, staff_user, auth_hea
     assert r.status_code == 201
     stored = r.json()["resumes"][0]["filename"]
     assert "\x00" not in stored and "\x07" not in stored
+
+
+async def test_archive_hides_profile_from_default_list(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    r = await client.post("/accounts", headers=h, json={"name": "Old profile"})
+    acc_id = r.json()["_id"]
+    r = await client.put(f"/accounts/{acc_id}", headers=h, json={"archived": True})
+    assert r.status_code == 200 and r.json()["archived"] is True and r.json()["archivedAt"]
+    assert [a["_id"] for a in (await client.get("/accounts", headers=h)).json()["accounts"]] == []
+    archived = (await client.get("/accounts?status=archived", headers=h)).json()["accounts"]
+    assert [a["_id"] for a in archived] == [acc_id]
+    assert len((await client.get("/accounts?status=all", headers=h)).json()["accounts"]) == 1
+    lookup = (await client.get("/accounts/lookup", headers=h)).json()["accounts"]
+    assert lookup[0]["archived"] is True
+    r = await client.put(f"/accounts/{acc_id}", headers=h, json={"archived": False})
+    assert r.json()["archived"] is False and r.json()["archivedAt"] is None
