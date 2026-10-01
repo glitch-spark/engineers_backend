@@ -10,6 +10,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
 from app.db import init_db
+from app import resume_queue
 from app.job_apply import worker as job_apply_worker
 from app.routers import (
     accounts,
@@ -46,9 +47,12 @@ async def lifespan(app: FastAPI):
     if job_apply_worker.worker_enabled():
         # Restarts Job Applies runs whose worker died (redeploy/crash); see app/job_apply/worker.py.
         sweep = asyncio.create_task(job_apply_worker.sweep_forever())
+    queue = asyncio.create_task(resume_queue.queue_forever()) if resume_queue.queue_enabled() else None
     yield
     if sweep:
         sweep.cancel()
+    if queue:
+        queue.cancel()
 
 
 def create_app() -> FastAPI:
