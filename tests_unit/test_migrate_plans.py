@@ -24,7 +24,7 @@ def test_migrate_regular_daily():
                  planInterviewsScheduled=2, tomorrowItems=["Prep panel"])
     to_set, to_unset, next_goal = migrate_daily(doc)
     assert to_set["done"] == {"bidsSelf": 5, "bidsBidder": 2}
-    assert to_set["doneOverrides"] == {"interviewsSelf": 1, "interviewsCaller": 0}
+    assert "doneOverrides" not in to_set  # interviews come from the Interviews page
     assert to_set["goalItems"] == [{"text": "Fix resume", "done": True}]
     assert to_set["loggedAt"] == CREATED
     assert "goal" not in to_set
@@ -35,7 +35,7 @@ def test_migrate_regular_daily():
     # Saturday's plan for tomorrow lands on Monday.
     assert next_goal == {
         "date": datetime(2026, 10, 5),
-        "goal": {"bidsSelf": 6, "bidsBidder": 3, "interviewsSelf": 2},
+        "goal": {"bidsSelf": 6, "bidsBidder": 3},  # no daily interview goal
         "goalItems": [{"text": "Prep panel", "done": False}],
     }
 
@@ -61,8 +61,7 @@ def test_migrate_weekly():
     assert to_set == {
         "weekStart": datetime(2026, 9, 28),
         "goal": {"bidsSelf": 40, "interviewsSelf": 5},
-        "planNotes": "Plan",
-        "recapNotes": "Recap",
+        "recapNotes": "Plan\n\nRecap",
     }
     assert sorted(to_unset) == ["content", "metrics", "nextInterviewTarget", "result", "status"]
 

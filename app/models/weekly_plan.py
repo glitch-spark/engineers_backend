@@ -6,7 +6,7 @@ from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItems, Counts, WeeklyOverrides, monday_of
+from app.models.plan_common import ChecklistItems, Counts, monday_of
 
 _LEGACY_KEYS = ("metrics", "nextInterviewTarget", "status", "content", "result")
 
@@ -36,8 +36,8 @@ def fold_legacy_weekly(data: Any) -> Any:
             elif key == "interviews":
                 goal["interviewsSelf"] = int(target or 0)
         data["goal"] = goal
-        data.setdefault("planNotes", data.get("content") or "")
-        data.setdefault("recapNotes", data.get("result") or "")
+        text = [part.strip() for part in (data.get("content") or "", data.get("result") or "") if part.strip()]
+        data.setdefault("recapNotes", "\n\n".join(text))
     for key in _LEGACY_KEYS:
         data.pop(key, None)
     return data
@@ -47,7 +47,7 @@ class WeeklyPlan(TimestampedDocument):
     """One person's Goal vs Done for a Monday-start week.
 
     Done is computed from the week's daily plans and interview records
-    (`app.plan_auto`); `doneOverrides` replaces any of it by hand.
+    (`app.plan_auto`).
     `startDate`/`endDate`/`year`/`weekNumber` are kept for older readers.
     """
 
@@ -59,9 +59,7 @@ class WeeklyPlan(TimestampedDocument):
     endDate: datetime
     goal: Counts = Field(default_factory=Counts)
     goalItems: ChecklistItems = []
-    planNotes: str = Field(default="", max_length=4000)
     recapNotes: str = Field(default="", max_length=4000)
-    doneOverrides: WeeklyOverrides = Field(default_factory=WeeklyOverrides)
 
     @model_validator(mode="before")
     @classmethod

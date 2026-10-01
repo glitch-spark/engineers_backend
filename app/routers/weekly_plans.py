@@ -1,7 +1,7 @@
 """Weekly plans: one Goal vs Done entry per person per Monday-start week.
 
 Done is computed from the week's daily plans and interview records
-(`app.plan_auto.week_snapshot`); the person can override any value.
+(`app.plan_auto.week_snapshot`).
 """
 
 from datetime import date, datetime, timedelta
@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from app.alerts import app_week_key
 from app.deps import get_current_user
 from app.models import UserExtra
-from app.models.plan_common import ChecklistItems, Counts, WeeklyOverrides
+from app.models.plan_common import ChecklistItems, Counts
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import week_snapshot
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
@@ -24,9 +24,7 @@ router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
 class WeekIn(BaseModel):
     goal: Counts = Field(default_factory=Counts)
     goalItems: ChecklistItems = []
-    planNotes: str = Field(default="", max_length=4000)
     recapNotes: str = Field(default="", max_length=4000)
-    doneOverrides: WeeklyOverrides = Field(default_factory=WeeklyOverrides)
 
 
 def _midnight(d: date) -> datetime:
@@ -55,11 +53,8 @@ def _week_out(uid, monday: date, snap: dict) -> dict:
         "userId": str(uid),
         "goal": (plan.goal if plan else Counts()).model_dump(),
         "goalItems": [i.model_dump() for i in (plan.goalItems if plan else [])],
-        "planNotes": plan.planNotes if plan else "",
         "recapNotes": plan.recapNotes if plan else "",
         "done": snap["done"].model_dump(),
-        "auto": snap["auto"].model_dump(),
-        "doneOverrides": (plan.doneOverrides if plan else WeeklyOverrides()).model_dump(),
         "stages": _sum_stages(snap["dayAuto"]),
         "days": [
             {
@@ -67,6 +62,8 @@ def _week_out(uid, monday: date, snap: dict) -> dict:
                 "logged": d in by_date and by_date[d].loggedAt is not None,
                 "goal": (by_date[d].goal if d in by_date else Counts()).model_dump(),
                 "done": snap["dayDone"].get(d, Counts()).model_dump(),
+                "itemsDone": sum(1 for i in by_date[d].goalItems if i.done) if d in by_date else 0,
+                "itemsTotal": len(by_date[d].goalItems) if d in by_date else 0,
             }
             for d in days
         ],
@@ -127,9 +124,7 @@ async def put_week(
         )
     plan.goal = body.goal
     plan.goalItems = body.goalItems
-    plan.planNotes = body.planNotes
     plan.recapNotes = body.recapNotes
-    plan.doneOverrides = body.doneOverrides
     if plan.id is None:
         await plan.insert()
     else:

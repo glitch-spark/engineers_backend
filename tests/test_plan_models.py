@@ -10,13 +10,7 @@ import pytest
 from beanie import PydanticObjectId
 
 from app.models.daily_plan import DailyPlan
-from app.models.plan_common import (
-    PROFILE_REGIONS,
-    REGIONS,
-    clean_region_dict,
-    monday_of,
-    next_working_day,
-)
+from app.models.plan_common import Counts, monday_of, next_working_day
 from app.models.weekly_plan import WeeklyPlan
 
 USER = PydanticObjectId()
@@ -45,27 +39,13 @@ def test_fold_legacy_daily_regular():
         planBidsHandsOn=6,
         tomorrowItems=["Call recruiter"],
     ))
-    assert plan.done.bidsSelf == 4
-    assert plan.done.bidsBidder == 2
-    # History stays exact: the old count was all of that day's interviews.
-    assert plan.doneOverrides.interviewsSelf == 1
-    assert plan.doneOverrides.interviewsCaller == 0
+    assert (plan.done.bidsSelf, plan.done.bidsBidder) == (4, 2)
+    # Interviews are never typed: the old count is dropped.
+    assert (plan.done.interviewsSelf, plan.done.interviewsCaller) == (0, 0)
     assert [(i.text, i.done) for i in plan.goalItems] == [("Fix resume", True)]
     assert plan.loggedAt == datetime(2026, 9, 30, 21, 0)
     assert plan.goal.bidsSelf == 0  # tomorrow's plan belongs to the next day (migration)
-    assert not hasattr(plan, "bidsHandsOn")
-
-
-def test_fold_legacy_regular_zero_interviews_is_exact_zero():
-    plan = DailyPlan.model_validate(_legacy_daily(planType="regular", bidsHandsOn=1))
-    assert plan.doneOverrides.interviewsSelf == 0
-    assert plan.doneOverrides.interviewsCaller == 0
-
-
-def test_fold_legacy_custom_plan_keeps_auto_interviews():
-    plan = DailyPlan.model_validate(_legacy_daily(today="Notes only"))
-    assert plan.doneOverrides.interviewsSelf is None
-    assert plan.doneOverrides.interviewsCaller is None
+    assert not hasattr(plan, "bidsHandsOn") and not hasattr(plan, "doneOverrides")
 
 
 def test_fold_legacy_daily_custom_text_to_notes():
@@ -97,42 +77,25 @@ def test_fold_legacy_weekly_metrics_and_text():
         "result": "Recap text",
     })
     assert plan.weekStart == datetime(2026, 9, 28)
-    assert plan.goal.bidsSelf == 40
-    assert plan.goal.interviewsSelf == 5
-    assert plan.planNotes == "Plan text"
-    assert plan.recapNotes == "Recap text"
-    assert not hasattr(plan, "metrics")
+    assert plan.goal.bidsSelf == 40 and plan.goal.interviewsSelf == 5
+    assert plan.recapNotes == "Plan text\n\nRecap text"
+    assert not hasattr(plan, "metrics") and not hasattr(plan, "planNotes")
 
 
 def test_new_shape_untouched():
     plan = DailyPlan.model_validate(_legacy_daily(
-        goal={"bidsSelf": 6, "linkedin": {"US": 2}},
+        goal={"bidsSelf": 6, "bidsBidder": 4},
         done={"bidsSelf": 5},
-        doneOverrides={"interviewsCaller": 0},
         notes="n",
         loggedAt=datetime(2026, 9, 30, 22, 0),
     ))
-    assert plan.goal.bidsSelf == 6
-    assert plan.goal.linkedin == {"US": 2}
-    assert plan.done.bidsSelf == 5
-    assert plan.doneOverrides.interviewsCaller == 0
+    assert plan.goal.bidsSelf == 6 and plan.done.bidsSelf == 5
     assert plan.loggedAt == datetime(2026, 9, 30, 22, 0)
 
 
-def test_regions():
-    assert REGIONS == ("US", "EU", "Latam", "Canada", "Asia")
-    assert PROFILE_REGIONS == REGIONS + ("Unassigned",)
-
-
-def test_clean_region_dict_rejects_unknown_and_negative_drops_zero():
-    assert clean_region_dict({"US": 2, "EU": 0}, REGIONS) == {"US": 2}
+def test_counts_reject_negative():
     with pytest.raises(ValueError):
-        clean_region_dict({"Mars": 1}, REGIONS)
-    with pytest.raises(ValueError):
-        clean_region_dict({"US": -1}, REGIONS)
-    with pytest.raises(ValueError):
-        clean_region_dict({"Unassigned": 1}, REGIONS)
-    assert clean_region_dict({"Unassigned": 1}, PROFILE_REGIONS) == {"Unassigned": 1}
+        Counts(bidsSelf=-1)
 
 
 def test_next_working_day_saturday_to_monday():

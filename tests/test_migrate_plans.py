@@ -53,13 +53,13 @@ async def test_apply_then_second_run_is_noop(staff_user):
 
     wed = await _daily_col().find_one({"date": datetime(2026, 9, 30)})
     assert "bidsHandsOn" not in wed and wed["done"] == {"bidsSelf": 5, "bidsBidder": 1}
-    assert wed["doneOverrides"] == {"interviewsSelf": 1, "interviewsCaller": 0}
+    assert "doneOverrides" not in wed and "interviewsDone" not in wed
     thu = await DailyPlan.find_one({"date": datetime(2026, 10, 1)})
     assert thu.goal.bidsSelf == 7 and [i.text for i in thu.goalItems] == ["Prep"]
     assert thu.loggedAt is None and thu.year == 2026
     week = await _weekly_col().find_one({})
     assert week["weekStart"] == datetime(2026, 9, 28) and week["goal"] == {"bidsSelf": 40}
-    assert "metrics" not in week and week["planNotes"] == "Plan"
+    assert "metrics" not in week and week["recapNotes"] == "Plan"
 
     again = await run(apply=True, database=_db())
     assert again["dailyMigrated"] == 0 and again["weeklyMigrated"] == 0
@@ -70,7 +70,7 @@ async def test_next_day_goal_not_overwritten(staff_user):
     await _seed(staff_user)
     await _daily_col().insert_one({
         "userId": staff_user.id, "date": datetime(2026, 10, 1), "year": 2026, "weekNumber": 40,
-        "goal": {"bidsSelf": 2}, "goalItems": [], "done": {}, "doneOverrides": {}, "notes": "",
+        "goal": {"bidsSelf": 2}, "goalItems": [], "done": {}, "notes": "",
         "loggedAt": None, "createdAt": datetime(2026, 10, 1), "updatedAt": datetime(2026, 10, 1),
     })
     counts = await run(apply=True, database=_db())

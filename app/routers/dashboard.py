@@ -38,7 +38,7 @@ from app.interview_rounds import (
     load_interviews_for_window,
 )
 from app.models import DailyPlan, Transaction, UserExtra
-from app.plan_auto import effective_interviews_by_day, weekly_plans_for
+from app.plan_auto import interviews_by_day, weekly_plans_for
 from app.routers._util import to_object_id
 from app.routers.transactions import _TOTALS_GROUP
 
@@ -176,7 +176,7 @@ async def dashboard_week(
     bids_scores = {uid: 0 for uid in population}
     for p in score_docs:
         bids_scores[p.userId] = bids_scores.get(p.userId, 0) + p.done.bidsSelf + p.done.bidsBidder
-    interviews = await effective_interviews_by_day(members, monday, sunday)
+    interviews = await interviews_by_day(members, monday, sunday)
     iv_scores = {uid: sum(interviews.get(uid, {}).values()) for uid in population}
     interviews_done = iv_scores[sid]
 
@@ -235,7 +235,7 @@ async def dashboard_activity(
         row = series[bucket_for(p.date.date(), bucket, keys)]
         row["self"] += p.done.bidsSelf
         row["bidder"] += p.done.bidsBidder
-    for day, count in (await effective_interviews_by_day([sid], start, end)).get(sid, {}).items():
+    for day, count in (await interviews_by_day([sid], start, end)).get(sid, {}).items():
         series[bucket_for(day, bucket, keys)]["interviews"] += count
 
     series_list = [series[key] for key in keys]

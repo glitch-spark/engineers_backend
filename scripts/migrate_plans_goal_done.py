@@ -9,16 +9,16 @@ works either way.
 
 Daily plans:
 - bids hands-on / by bidder -> done.bidsSelf / done.bidsBidder
-- interviews done -> doneOverrides.interviewsSelf (keeps history exact;
-  old data has no caller split); new invitations are dropped
+- typed interview counts are dropped (interviews now come from the
+  Interviews page)
 - today's items -> ticked goal items; free text -> notes; loggedAt = createdAt
-- the plan for tomorrow -> the next working day's goal (a goal-only entry is
+- the plan for tomorrow (bids and items) -> the next working day's goal (a goal-only entry is
   created when that day has none; an existing non-empty goal is never
   overwritten)
 
 Weekly plans:
 - weekStart from startDate; bids / interviews targets -> goal.bidsSelf /
-  goal.interviewsSelf; plan / recap text -> planNotes / recapNotes; other
+  goal.interviewsSelf; plan and recap text -> recapNotes; other
   metrics, actuals, status and nextInterviewTarget are dropped
 - several plans for the same user and week are reported, not merged
 """
@@ -44,7 +44,7 @@ from app.models.plan_common import next_working_day  # noqa: E402
 from app.models.weekly_plan import _LEGACY_KEYS as WEEKLY_LEGACY_KEYS  # noqa: E402
 from app.models.weekly_plan import fold_legacy_weekly  # noqa: E402
 
-_DAILY_FIELDS = ("done", "doneOverrides", "goalItems", "notes", "loggedAt")
+_DAILY_FIELDS = ("done", "goalItems", "notes", "loggedAt")
 
 
 def migrate_daily(doc: dict) -> tuple[dict, list, dict | None]:
@@ -62,7 +62,6 @@ def migrate_daily(doc: dict) -> tuple[dict, list, dict | None]:
         for key, old in (
             ("bidsSelf", "planBidsHandsOn"),
             ("bidsBidder", "planBidsByBidder"),
-            ("interviewsSelf", "planInterviewsScheduled"),
         )
         if doc.get(old)
     }
@@ -82,7 +81,7 @@ def migrate_weekly(doc: dict) -> tuple[dict, list]:
     folded = fold_legacy_weekly(doc)
     to_set = {"weekStart": folded["weekStart"]} if "weekStart" not in doc else {}
     if legacy and "goal" not in doc:
-        to_set.update(goal=folded["goal"], planNotes=folded["planNotes"], recapNotes=folded["recapNotes"])
+        to_set.update(goal=folded["goal"], recapNotes=folded["recapNotes"])
     return to_set, legacy
 
 
@@ -144,7 +143,7 @@ async def run(apply: bool, database=None) -> dict:
             await daily.insert_one({
                 "userId": doc["userId"], "date": next_goal["date"], "year": year, "weekNumber": week_number,
                 "goal": next_goal["goal"], "goalItems": next_goal["goalItems"],
-                "done": {}, "doneOverrides": {}, "notes": "", "loggedAt": None,
+                "done": {}, "notes": "", "loggedAt": None,
                 "createdAt": now, "updatedAt": now,
             })
         else:

@@ -7,13 +7,13 @@ from app.alerts import app_week_key
 from app.config import get_settings
 from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
 from app.models.interview import InterviewCaller
-from app.models.plan_common import Counts, DoneOverrides
+from app.models.plan_common import Counts
 
 
 async def _plan(user, day: date, self_=0, bidder=0, iv=0, plan_type="regular"):
-    """A daily plan in the Goal vs Done shape. `plan_type="custom"` stands for
-    an entry that was never logged (goal only), which the dashboard ignores;
-    `iv` is stored as the day's interviews Done override."""
+    """A daily plan. `plan_type="custom"` stands for a goal-only entry (never
+    followed up), which the dashboard ignores. Interviews are never typed: `iv`
+    creates that many interview rounds on the day (self, intro) for logged days."""
     dt = datetime(day.year, day.month, day.day)
     year, week_number, _ = app_week_key(dt)
     logged = plan_type == "regular"
@@ -22,13 +22,14 @@ async def _plan(user, day: date, self_=0, bidder=0, iv=0, plan_type="regular"):
         date=dt,
         year=year,
         weekNumber=week_number,
-        # A never-logged entry only has a goal: Done and overrides are saved when logging.
-        goal=Counts(bidsSelf=self_, bidsBidder=bidder, interviewsSelf=iv) if not logged else Counts(),
+        goal=Counts(bidsSelf=self_, bidsBidder=bidder) if not logged else Counts(),
         done=Counts(bidsSelf=self_, bidsBidder=bidder) if logged else Counts(),
-        doneOverrides=DoneOverrides(interviewsSelf=iv) if logged and iv else DoneOverrides(),
         loggedAt=dt if logged else None,
     )
     await plan.insert()
+    for n in range(iv if logged else 0):
+        await Interview(accountId=PydanticObjectId(), createdBy=user.id, scheduledAt=dt.replace(hour=12, minute=n),
+                        stage="intro", status="completed").insert()
     return plan
 
 
@@ -439,7 +440,7 @@ async def test_week_counts_unmigrated_legacy_daily_plans(client, staff_user, aut
 
     b = (await client.get("/dashboard/week?today=2026-09-30", headers=auth_header(staff_user))).json()
     assert b["bids"]["self"] == 5 and b["bids"]["bidder"] == 2
-    # The old count was the whole day: no automatic caller round on top.
+    # Interviews come from the Interviews page only (the old typed count is ignored).
     assert b["interviews"]["done"] == 1
     assert b["streak"] == 1
 

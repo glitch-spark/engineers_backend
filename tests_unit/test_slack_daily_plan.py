@@ -23,11 +23,10 @@ def _plan(**kw):
     base = dict(
         id="plan1",
         date=datetime(2026, 10, 1),
-        goal=Counts(bidsSelf=6, bidsBidder=4, interviewsSelf=1, interviewsCaller=1,
-                    profiles={"US": 2, "EU": 1}, linkedin={"US": 2}),
-        goalItems=[ChecklistItem(text="Fix resume", done=True), ChecklistItem(text="Call <recruiter>")],
-        done=Counts(bidsSelf=5, bidsBidder=4, linkedin={"US": 2}),
-        notes="Slow day & quiet",
+        goal=Counts(bidsSelf=150, bidsBidder=100),
+        goalItems=[ChecklistItem(text="Seek caller", done=True), ChecklistItem(text="Bidder <review>")],
+        done=Counts(bidsSelf=140, bidsBidder=100),
+        notes="Moved review & prep",
         slackChannel=None,
         slackTs=None,
     )
@@ -39,51 +38,29 @@ def _owner():
     return SimpleNamespace(name="Pedro", email="p@x.com", slackUserId="U123")
 
 
-def _done():
-    return Counts(bidsSelf=5, bidsBidder=4, interviewsSelf=1, interviewsCaller=0,
-                  profiles={"US": 2}, linkedin={"US": 2})
-
-
-def test_daily_plan_text_full():
-    tomorrow = _plan(
-        date=datetime(2026, 10, 2),
-        goal=Counts(bidsSelf=6, bidsBidder=4, interviewsSelf=1, interviewsCaller=1),
-        goalItems=[ChecklistItem(text="Prep panel")],
-    )
-    lines = daily_plan_text(_plan(), _owner(), tomorrow=tomorrow, done=_done()).splitlines()
+def test_daily_plan_text_follow_up():
+    done = Counts(bidsSelf=140, bidsBidder=100, interviewsSelf=2, interviewsCaller=1)
+    lines = daily_plan_text(_plan(), _owner(), done=done).splitlines()
     assert lines[:-1] == [
         ":spiral_note_pad: *Daily plan* — <@U123>",
         "*10/1 (Thu)*",
-        "Bids: self 5/6 · bidder 4/4",
-        "Interviews: self 1/1 · caller 0/1",
-        "Profiles 2/3 · LinkedIn 2/2",
-        "✓ Fix resume",
-        "○ Call &lt;recruiter&gt;",
-        "Slow day &amp; quiet",
-        "*Tomorrow 10/2 (Fri)*: Bids 10 · Interviews 2",
-        "○ Prep panel",
+        "Bids: self 140/150 · bidder 100/100",
+        "Interviews: self 2 · caller 1",
+        "✓ Seek caller",
+        "○ Bidder &lt;review&gt;",
+        "Moved review &amp; prep",
     ]
     assert lines[-1].endswith("/report?week=2026-09-28|Open Report>")
 
 
-def test_daily_plan_text_minimal_without_profiles_items_notes_or_tomorrow():
-    plan = _plan(goal=Counts(bidsSelf=3), goalItems=[], done=Counts(), notes="")
+def test_daily_plan_text_minimal():
+    plan = _plan(goal=Counts(), goalItems=[], done=Counts(), notes="")
     lines = daily_plan_text(plan, _owner(), done=Counts()).splitlines()
-    assert lines[1:-1] == [
-        "*10/1 (Thu)*",
-        "Bids: self 0/3 · bidder 0/0",
-        "Interviews: self 0/0 · caller 0/0",
-    ]
+    assert lines[1:-1] == ["*10/1 (Thu)*", "Bids: self 0/0 · bidder 0/0", "Interviews: self 0 · caller 0"]
 
 
 def test_daily_plan_text_defaults_done_to_stored_done():
-    text = daily_plan_text(_plan(), _owner())
-    assert "Bids: self 5/6 · bidder 4/4" in text
-
-
-def test_daily_plan_text_empty_tomorrow_is_omitted():
-    empty = _plan(date=datetime(2026, 10, 2), goal=Counts(), goalItems=[])
-    assert "Tomorrow" not in daily_plan_text(_plan(), _owner(), tomorrow=empty, done=_done())
+    assert "Bids: self 140/150 · bidder 100/100" in daily_plan_text(_plan(), _owner())
 
 
 @pytest.mark.asyncio

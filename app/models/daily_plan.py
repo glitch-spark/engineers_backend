@@ -6,7 +6,7 @@ from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItems, Counts, DoneOverrides
+from app.models.plan_common import ChecklistItems, Counts
 
 # Fields of the pre Goal-vs-Done shape. `planBids*` / `planInterviewsScheduled`
 # / `tomorrowItems` describe the NEXT day, so the fold drops them here and
@@ -41,20 +41,16 @@ def fold_legacy_daily(data: Any) -> Any:
     data = dict(data)
     bids_self = int(data.get("bidsHandsOn") or 0)
     bids_bidder = int(data.get("bidsByBidder") or 0)
-    interviews = int(data.get("interviewsDone") or 0)
     items = _legacy_today_items(data)
     text = "\n\n".join(
         part.strip() for part in (data.get("today") or "", data.get("tomorrow") or "") if part.strip()
     )
+    # Interviews are never typed any more: the old count is dropped.
     data["done"] = {"bidsSelf": bids_self, "bidsBidder": bids_bidder}
-    # A regular plan's count was all of that day's interviews: keep it exact
-    # (no automatic caller rounds on top). Free-text plans counted nothing.
-    regular = data.get("planType") == "regular"
-    data["doneOverrides"] = {"interviewsSelf": interviews, "interviewsCaller": 0} if regular else {}
     data["goalItems"] = [{"text": item[:200], "done": True} for item in items]
     if text and not data.get("notes"):
         data["notes"] = text
-    if bids_self or bids_bidder or interviews or items or text:
+    if bids_self or bids_bidder or data.get("interviewsDone") or items or text:
         data.setdefault("loggedAt", data.get("createdAt"))
     for key in _LEGACY_KEYS:
         data.pop(key, None)
@@ -64,12 +60,10 @@ def fold_legacy_daily(data: Any) -> Any:
 class DailyPlan(TimestampedDocument):
     """One person's Goal vs Done for a calendar day.
 
-    `goal` and `goalItems` are set the evening before (or that morning);
-    `done` holds what the person types (bids, LinkedIn) plus the profiles
-    snapshot taken when the day is logged. Interviews Done is automatic from
-    interview records unless `doneOverrides` says otherwise. `loggedAt` is
-    set the first time Done is saved — a goal-only entry for a future day
-    has none.
+    The goal (bids and goal lines) is set at the start of the day; the
+    follow-up records bids done, ticks goal lines and adds notes, and sets
+    `loggedAt` the first time. Interviews are never stored here: they come
+    from interview records (`app.plan_auto`).
 
     `year` and `weekNumber` use the calendar-year week of
     `app.alerts.app_week_key` like before.
@@ -82,7 +76,6 @@ class DailyPlan(TimestampedDocument):
     goal: Counts = Field(default_factory=Counts)
     goalItems: ChecklistItems = []
     done: Counts = Field(default_factory=Counts)
-    doneOverrides: DoneOverrides = Field(default_factory=DoneOverrides)
     notes: str = Field(default="", max_length=2000)
     loggedAt: Optional[datetime] = None
     # Bot post in SLACK_DAILY_PLAN_CHANNEL_ID, kept so edits update it in place.

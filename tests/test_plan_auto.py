@@ -4,8 +4,8 @@ from datetime import date, datetime
 
 from beanie import PydanticObjectId
 
-from app.models import Account, DailyPlan, Interview, WeeklyPlan
-from app.plan_auto import interview_counts, profiles_by_region, week_snapshot
+from app.models import DailyPlan, Interview, WeeklyPlan
+from app.plan_auto import interview_counts, week_snapshot
 
 
 async def test_interview_counts_by_day_self_and_caller(staff_user, staff_user_2):
@@ -42,16 +42,6 @@ async def test_interview_counts_by_day_self_and_caller(staff_user, staff_user_2)
     assert counts[staff_user_2.id][date(2026, 10, 1)]["self"] == 1
 
 
-async def test_profiles_by_region_unassigned(staff_user, staff_user_2):
-    for region in ("US", "US", None, "EU"):
-        await Account(name="p", region=region, createdBy=staff_user.id).insert()
-    await Account(name="other", region="Latam", createdBy=staff_user_2.id).insert()
-
-    out = await profiles_by_region([staff_user.id, staff_user_2.id])
-    assert out[staff_user.id] == {"US": 2, "EU": 1, "Unassigned": 1}
-    assert out[staff_user_2.id] == {"Latam": 1}
-
-
 async def test_week_snapshot_reads_legacy_weekly_without_weekStart(staff_user):
     await WeeklyPlan.get_motor_collection().insert_one({
         "userId": staff_user.id,
@@ -67,13 +57,12 @@ async def test_week_snapshot_reads_legacy_weekly_without_weekStart(staff_user):
     })
     await DailyPlan(
         userId=staff_user.id, date=datetime(2026, 9, 29), year=2026, weekNumber=40,
-        done={"bidsSelf": 6, "bidsBidder": 2, "linkedin": {"US": 2}}, loggedAt=datetime(2026, 9, 29, 20),
+        done={"bidsSelf": 6, "bidsBidder": 2}, loggedAt=datetime(2026, 9, 29, 20),
     ).insert()
 
     snap = (await week_snapshot([staff_user.id], date(2026, 9, 28)))[staff_user.id]
     assert snap["plan"] is not None and snap["plan"].goal.bidsSelf == 40
     assert snap["done"].bidsSelf == 6 and snap["done"].bidsBidder == 2
-    assert snap["done"].linkedin == {"US": 2}
     assert snap["lastLogged"] == date(2026, 9, 29)
 
 

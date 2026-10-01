@@ -53,6 +53,8 @@ async def team_report(
             "email": u.email,
             "goal": (plan.goal if plan else Counts()).model_dump(),
             "done": snap["done"].model_dump(),
+            "itemsDone": sum(1 for i in plan.goalItems if i.done) if plan else 0,
+            "itemsTotal": len(plan.goalItems) if plan else 0,
             "lastLoggedDate": last_logged[u.id].isoformat() if u.id in last_logged else None,
             "hasWeeklyPlan": plan is not None,
         })

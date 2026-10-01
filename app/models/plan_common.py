@@ -1,35 +1,17 @@
 """Goal vs Done building blocks shared by Daily and Weekly plans.
 
-Bids and interviews are flows (summed over a week); profiles and LinkedIn
-accounts are stock levels kept per region (a week shows its latest value).
+Plans track bids (self, bidder) and interviews (self, caller). Goals are
+typed; bids Done is typed per day; interviews Done always comes from the
+Interviews page (`app.plan_auto`).
 """
 
 from datetime import date, timedelta
-from typing import Annotated, Optional
+from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator
 
-REGIONS = ("US", "EU", "Latam", "Canada", "Asia")
-# Profiles without a region on the Profiles page count here.
-PROFILE_REGIONS = REGIONS + ("Unassigned",)
-
 MAX_ITEMS = 20
 MAX_ITEM_LENGTH = 200
-
-
-def clean_region_dict(value: Optional[dict], allowed: tuple) -> dict:
-    """Validate a region -> count map: known regions, ints >= 0, zeros dropped."""
-    out: dict[str, int] = {}
-    for region, count in (value or {}).items():
-        if region not in allowed:
-            raise ValueError(f"unknown region: {region}")
-        count = int(count)
-        if count < 0:
-            raise ValueError(f"{region} count must be 0 or more")
-        if count:
-            out[region] = count
-    return out
-
 
 Count = Annotated[int, Field(ge=0)]
 
@@ -39,65 +21,13 @@ class Counts(BaseModel):
     bidsBidder: Count = 0
     interviewsSelf: Count = 0
     interviewsCaller: Count = 0
-    profiles: dict[str, int] = {}
-    linkedin: dict[str, int] = {}
-
-    @field_validator("profiles")
-    @classmethod
-    def _profiles(cls, v: dict) -> dict:
-        return clean_region_dict(v, PROFILE_REGIONS)
-
-    @field_validator("linkedin")
-    @classmethod
-    def _linkedin(cls, v: dict) -> dict:
-        return clean_region_dict(v, REGIONS)
 
 
-class DoneIn(BaseModel):
-    """The Done values a user types; the rest of Done is automatic."""
+class BidsIn(BaseModel):
+    """Bids typed on a day (goal in the morning, Done at follow-up)."""
 
     bidsSelf: Count = 0
     bidsBidder: Count = 0
-    linkedin: dict[str, int] = {}
-
-    @field_validator("linkedin")
-    @classmethod
-    def _linkedin(cls, v: dict) -> dict:
-        return clean_region_dict(v, REGIONS)
-
-
-class DoneOverrides(BaseModel):
-    """Hand-typed replacements for automatic daily Done values (None = automatic)."""
-
-    interviewsSelf: Optional[Count] = None
-    interviewsCaller: Optional[Count] = None
-    profiles: Optional[dict[str, int]] = None
-
-    @field_validator("profiles")
-    @classmethod
-    def _profiles(cls, v: Optional[dict]) -> Optional[dict]:
-        return None if v is None else clean_region_dict(v, PROFILE_REGIONS)
-
-
-class WeeklyOverrides(BaseModel):
-    """Hand-typed replacements for any automatic weekly Done value (None = automatic)."""
-
-    bidsSelf: Optional[Count] = None
-    bidsBidder: Optional[Count] = None
-    interviewsSelf: Optional[Count] = None
-    interviewsCaller: Optional[Count] = None
-    profiles: Optional[dict[str, int]] = None
-    linkedin: Optional[dict[str, int]] = None
-
-    @field_validator("profiles")
-    @classmethod
-    def _profiles(cls, v: Optional[dict]) -> Optional[dict]:
-        return None if v is None else clean_region_dict(v, PROFILE_REGIONS)
-
-    @field_validator("linkedin")
-    @classmethod
-    def _linkedin(cls, v: Optional[dict]) -> Optional[dict]:
-        return None if v is None else clean_region_dict(v, REGIONS)
 
 
 class ChecklistItem(BaseModel):
