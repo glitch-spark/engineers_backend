@@ -1,3 +1,8 @@
+from datetime import datetime
+
+from app.models import Transaction
+
+
 async def test_transactions_list_no_token_returns_401(client):
     r = await client.get("/transactions")
     assert r.status_code == 401
@@ -77,14 +82,85 @@ async def test_staff_cannot_edit_others_transaction(client, staff_user, staff_us
     assert r.status_code == 403
 
 
-async def test_staff_sees_own_transactions_only(client, staff_user, staff_user_2, auth_header):
+async def test_staff_sees_all_transactions(client, staff_user, staff_user_2, auth_header):
     await client.post(
         "/transactions",
         headers=auth_header(staff_user),
-        json={"date": "2026-01-01", "amount": 1},
+        json={"date": "2026-01-01", "amount": 1, "payMethod": "coin"},
     )
     r = await client.get("/transactions", headers=auth_header(staff_user_2))
-    assert r.json()["pagination"]["total"] == 0
+    assert r.json()["pagination"]["total"] == 1
+
+
+async def test_staff_can_filter_by_owner(client, staff_user, staff_user_2, auth_header):
+    for owner in (staff_user, staff_user_2):
+        await client.post(
+            "/transactions",
+            headers=auth_header(owner),
+            json={"date": "2026-01-01", "amount": 1, "payMethod": "coin"},
+        )
+    r = await client.get(
+        f"/transactions?userId={staff_user.id}", headers=auth_header(staff_user_2),
+    )
+    body = r.json()
+    assert body["pagination"]["total"] == 1
+    assert body["transactions"][0]["ownerEmail"] == staff_user.email
+
+
+async def test_filter_by_payer_includes_legacy_rows(client, staff_user, admin_user, auth_header):
+    await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-01-01", "amount": -5, "payMethod": "coin", "payerId": str(admin_user.id)},
+    )
+    await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-01-02", "amount": -7, "payMethod": "coin"},
+    )
+    # Pre-payer row: no payerId stored, so the owner counts as the payer.
+    legacy = Transaction(userId=staff_user.id, date=datetime(2026, 1, 3), amount=-9, payMethod="coin")
+    await legacy.insert()
+
+    r = await client.get(
+        f"/transactions?payerId={staff_user.id}", headers=auth_header(staff_user),
+    )
+    body = r.json()
+    assert body["pagination"]["total"] == 2
+    assert sorted(t["amount"] for t in body["transactions"]) == [-9, -7]
+
+    r = await client.get(
+        f"/transactions?payerId={admin_user.id}", headers=auth_header(staff_user),
+    )
+    assert r.json()["pagination"]["total"] == 1
+
+
+async def test_totals_cover_all_pages_and_respect_filters(client, staff_user, auth_header):
+    for date, amount, method in (
+        ("2026-02-02", 20, "coin"),
+        ("2026-02-03", -5, "coin"),
+        ("2026-02-04", -10, "card"),
+        ("2026-03-01", -100, "coin"),
+    ):
+        body = {"date": date, "amount": amount, "payMethod": method}
+        if method == "card":
+            body["cardLast4"] = "1234"
+        await client.post("/transactions", headers=auth_header(staff_user), json=body)
+
+    r = await client.get(
+        "/transactions?from=2026-02-01&to=2026-02-28&limit=1", headers=auth_header(staff_user),
+    )
+    body = r.json()
+    assert len(body["transactions"]) == 1
+    assert body["totals"] == {"income": 20, "outcome": 15, "net": 5, "count": 3}
+
+    r = await client.get(
+        "/transactions?from=2026-02-01&to=2026-02-28&payMethod=coin", headers=auth_header(staff_user),
+    )
+    assert r.json()["totals"] == {"income": 20, "outcome": 5, "net": 15, "count": 2}
+
+    r = await client.get("/transactions?from=2030-01-01", headers=auth_header(staff_user))
+    assert r.json()["totals"] == {"income": 0, "outcome": 0, "net": 0, "count": 0}
 
 
 async def test_admin_sees_all_transactions(client, staff_user, admin_user, auth_header):
