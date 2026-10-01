@@ -80,3 +80,18 @@ def test_bad_file_type_raises():
         parse_sheet("j.pdf", b"%PDF")
     with pytest.raises(SheetError):
         parse_sheet("j.xlsx", b"not a zip")
+
+
+def test_hyperlink_formula_cells():
+    data = xlsx([["Job", "JD"], ['=HYPERLINK("https://x.com/a","Apply")', JD], ["=HYPERLINK(\"https://x.com/b\";\"Apply\")", JD]])
+    assert [r.url for r in parse_sheet("j.xlsx", data)] == ["https://x.com/a", "https://x.com/b"]
+
+
+def test_row_index_matches_sheet_rows_with_blank_rows():
+    rows = parse_sheet("j.xlsx", xlsx([["URL"], ["https://a.com/1"], [None], ["https://a.com/2"]]))
+    assert [r.rowIndex for r in rows] == [2, 4]
+
+
+def test_hash_routed_urls_stay_distinct():
+    rows = parse_sheet("j.xlsx", xlsx([["https://c.com/careers#/job/1"], ["https://c.com/careers#/job/2"], ["https://c.com/careers#/job/2"]]))
+    assert [r.url for r in rows] == ["https://c.com/careers#/job/1", "https://c.com/careers#/job/2"]

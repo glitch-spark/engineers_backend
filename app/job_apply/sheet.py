@@ -13,6 +13,7 @@ MIN_JD_AVG_CHARS = 200  # a column must average this much text to count as the J
 MIN_JD_CELL_CHARS = 100  # shorter cells are treated as "no JD" and the URL is fetched instead
 
 _URL = re.compile(r"^https?://\S+$", re.I)
+_HYPERLINK_FORMULA = re.compile(r'^=\s*HYPERLINK\(\s*"([^"]+)"(?:\s*[,;]\s*"([^"]*)")?', re.I)
 _DROP_PARAMS = re.compile(r"^(?:utm_[a-z]+|gh_src|source|src|ref|refid|trk|lever-source|lever-origin)$", re.I)
 
 
@@ -46,25 +47,35 @@ def normalize_url(url: str) -> str:
         p for p in parts.query.split("&") if p and not _DROP_PARAMS.match(p.split("=", 1)[0])
     )
     path = parts.path.rstrip("/")
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
+    # Keep hash routes (#/job/1, #!/job/1): single-page career sites put the job id there.
+    fragment = parts.fragment if parts.fragment.startswith(("/", "!")) else ""
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, fragment))
+
+
+def _xlsx_cell(value_cell, formula_cell) -> _Cell:
+    text = "" if value_cell.value is None else str(value_cell.value).strip()
+    link = value_cell.hyperlink.target if value_cell.hyperlink else None
+    formula = formula_cell.value if isinstance(formula_cell.value, str) else ""
+    if m := _HYPERLINK_FORMULA.match(formula):
+        link = link or m.group(1)
+        text = text or (m.group(2) or "")
+    return _Cell(text=text, link=link)
 
 
 def _read_xlsx(data: bytes) -> list[list[_Cell]]:
     from openpyxl import load_workbook
 
     try:
-        # read_only=False so hyperlink targets are available.
-        wb = load_workbook(io.BytesIO(data), read_only=False, data_only=True)
+        # read_only=False so hyperlink targets are available. The formula view finds =HYPERLINK("url", "text")
+        # cells, which have no hyperlink object and often no cached value.
+        values = load_workbook(io.BytesIO(data), read_only=False, data_only=True).active
+        formulas = load_workbook(io.BytesIO(data), read_only=False, data_only=False).active
     except Exception as exc:  # noqa: BLE001 — any openpyxl failure means an unreadable file
         raise SheetError("Could not read the spreadsheet. Upload an .xlsx or .csv file.") from exc
-    ws = wb.active
-    rows = []
-    for row in ws.iter_rows():
-        rows.append([
-            _Cell(text="" if c.value is None else str(c.value).strip(), link=c.hyperlink.target if c.hyperlink else None)
-            for c in row
-        ])
-    return rows
+    return [
+        [_xlsx_cell(v, f) for v, f in zip(vrow, frow)]
+        for vrow, frow in zip(values.iter_rows(), formulas.iter_rows())
+    ]
 
 
 def _read_csv(data: bytes) -> list[list[_Cell]]:
@@ -86,6 +97,8 @@ def parse_sheet(filename: str, data: bytes) -> list[SheetRow]:
     else:
         raise SheetError("Unsupported file type. Upload an .xlsx or .csv file.")
 
+    # Keep each row's 1-based sheet number so results point at the right row even after blank rows.
+    numbers = [i + 1 for i, r in enumerate(rows) if any(c.text or c.link for c in r)]
     rows = [r for r in rows if any(c.text or c.link for c in r)]
     if len(rows) > MAX_ROWS + 1:
         raise SheetError(f"Too many rows: {len(rows)} (max {MAX_ROWS}).")
@@ -108,7 +121,7 @@ def parse_sheet(filename: str, data: bytes) -> list[SheetRow]:
 
     has_header = col(url_col)[0].url is None
     body = rows[1:] if has_header else rows
-    start = 2 if has_header else 1
+    body_numbers = numbers[1:] if has_header else numbers
 
     jd_col, best_avg = None, 0.0
     for i in range(width):
@@ -130,7 +143,7 @@ def parse_sheet(filename: str, data: bytes) -> list[SheetRow]:
             continue
         seen.add(url)
         jd = r[jd_col].text if jd_col is not None and jd_col < len(r) else ""
-        out.append(SheetRow(rowIndex=start + offset, url=url, jdText=jd if len(jd) >= MIN_JD_CELL_CHARS else None))
+        out.append(SheetRow(rowIndex=body_numbers[offset], url=url, jdText=jd if len(jd) >= MIN_JD_CELL_CHARS else None))
     if len(out) > MAX_ROWS:
         raise SheetError(f"Too many rows: {len(out)} (max {MAX_ROWS}).")
     return out
