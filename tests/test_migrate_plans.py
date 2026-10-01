@@ -53,7 +53,7 @@ async def test_apply_then_second_run_is_noop(staff_user):
 
     wed = await _daily_col().find_one({"date": datetime(2026, 9, 30)})
     assert "bidsHandsOn" not in wed and wed["done"] == {"bidsSelf": 5, "bidsBidder": 1}
-    assert wed["doneOverrides"] == {"interviewsSelf": 1}
+    assert wed["doneOverrides"] == {"interviewsSelf": 1, "interviewsCaller": 0}
     thu = await DailyPlan.find_one({"date": datetime(2026, 10, 1)})
     assert thu.goal.bidsSelf == 7 and [i.text for i in thu.goalItems] == ["Prep"]
     assert thu.loggedAt is None and thu.year == 2026
@@ -88,3 +88,31 @@ async def test_weekly_duplicates_reported(staff_user):
     })
     counts = await run(apply=False, database=_db())
     assert counts["weeklyDuplicates"] == 1
+
+
+async def test_consecutive_legacy_days_keep_carried_items(staff_user):
+    common = {"userId": staff_user.id, "year": 2026, "weekNumber": 40, "planType": "regular",
+              "createdAt": datetime(2026, 9, 28, 21), "updatedAt": datetime(2026, 9, 28, 21)}
+    await _daily_col().insert_many([
+        {**common, "date": datetime(2026, 9, 28), "bidsHandsOn": 3, "todayItems": [],
+         "tomorrowItems": ["Prep panel"], "planBidsHandsOn": 5},
+        {**common, "date": datetime(2026, 9, 29), "bidsHandsOn": 4, "todayItems": ["Did outreach"],
+         "tomorrowItems": []},
+        {**common, "date": datetime(2026, 9, 30), "bidsHandsOn": 2, "todayItems": [],
+         "tomorrowItems": []},
+    ])
+    await _daily_col().update_one({"date": datetime(2026, 9, 29)}, {"$set": {"tomorrowItems": ["Call recruiter"]}})
+
+    await run(apply=True, database=_db())
+
+    tue = await _daily_col().find_one({"date": datetime(2026, 9, 29)})
+    assert tue["goalItems"] == [{"text": "Did outreach", "done": True}, {"text": "Prep panel", "done": False}]
+    assert tue["goal"] == {"bidsSelf": 5}
+    assert tue["done"] == {"bidsSelf": 4, "bidsBidder": 0}
+    wed = await _daily_col().find_one({"date": datetime(2026, 9, 30)})
+    assert wed["goalItems"] == [{"text": "Call recruiter", "done": False}]
+
+    again = await run(apply=True, database=_db())
+    assert again["dailyMigrated"] == 0
+    tue = await _daily_col().find_one({"date": datetime(2026, 9, 29)})
+    assert len(tue["goalItems"]) == 2

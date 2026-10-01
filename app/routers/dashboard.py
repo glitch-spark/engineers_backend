@@ -90,15 +90,21 @@ def _today(value: Optional[str]) -> date:
     return parsed if parsed is not None else datetime.now(app_tz()).date()
 
 
+# Logged plans, plus documents from before Goal vs Done (no `loggedAt` field
+# until scripts/migrate_plans_goal_done.py runs; the model folds them on read).
+_LOGGED_OR_LEGACY = {"$or": [{"loggedAt": {"$ne": None}}, {"loggedAt": {"$exists": False}}]}
+
+
 async def _logged_plans(user_ids: list, start: date, end: date) -> list[DailyPlan]:
     """Daily plans whose Done was logged (goal-only entries don't count)."""
-    return await DailyPlan.find(
+    plans = await DailyPlan.find(
         {
             "userId": {"$in": user_ids},
-            "loggedAt": {"$ne": None},
             "date": {"$gte": _midnight(start), "$lte": _midnight(end)},
+            **_LOGGED_OR_LEGACY,
         }
     ).to_list()
+    return [p for p in plans if p.loggedAt is not None]
 
 
 def _target(total: int) -> Optional[int]:
@@ -156,7 +162,7 @@ async def dashboard_week(
     population_start = day - timedelta(days=29)
     active_ids = await DailyPlan.get_motor_collection().distinct(
         "userId",
-        {"loggedAt": {"$ne": None}, "date": {"$gte": _midnight(population_start), "$lte": _midnight(day)}},
+        {"date": {"$gte": _midnight(population_start), "$lte": _midnight(day)}, **_LOGGED_OR_LEGACY},
     )
     eligible = await UserExtra.find(
         {"_id": {"$in": active_ids}, "role": {"$ne": "admin"}},

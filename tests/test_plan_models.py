@@ -47,17 +47,25 @@ def test_fold_legacy_daily_regular():
     ))
     assert plan.done.bidsSelf == 4
     assert plan.done.bidsBidder == 2
+    # History stays exact: the old count was all of that day's interviews.
     assert plan.doneOverrides.interviewsSelf == 1
-    assert plan.doneOverrides.interviewsCaller is None
+    assert plan.doneOverrides.interviewsCaller == 0
     assert [(i.text, i.done) for i in plan.goalItems] == [("Fix resume", True)]
     assert plan.loggedAt == datetime(2026, 9, 30, 21, 0)
     assert plan.goal.bidsSelf == 0  # tomorrow's plan belongs to the next day (migration)
     assert not hasattr(plan, "bidsHandsOn")
 
 
-def test_fold_legacy_daily_zero_interviews_leaves_auto():
+def test_fold_legacy_regular_zero_interviews_is_exact_zero():
     plan = DailyPlan.model_validate(_legacy_daily(planType="regular", bidsHandsOn=1))
+    assert plan.doneOverrides.interviewsSelf == 0
+    assert plan.doneOverrides.interviewsCaller == 0
+
+
+def test_fold_legacy_custom_plan_keeps_auto_interviews():
+    plan = DailyPlan.model_validate(_legacy_daily(today="Notes only"))
     assert plan.doneOverrides.interviewsSelf is None
+    assert plan.doneOverrides.interviewsCaller is None
 
 
 def test_fold_legacy_daily_custom_text_to_notes():

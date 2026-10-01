@@ -47,7 +47,10 @@ def fold_legacy_daily(data: Any) -> Any:
         part.strip() for part in (data.get("today") or "", data.get("tomorrow") or "") if part.strip()
     )
     data["done"] = {"bidsSelf": bids_self, "bidsBidder": bids_bidder}
-    data["doneOverrides"] = {"interviewsSelf": interviews} if interviews else {}
+    # A regular plan's count was all of that day's interviews: keep it exact
+    # (no automatic caller rounds on top). Free-text plans counted nothing.
+    regular = data.get("planType") == "regular"
+    data["doneOverrides"] = {"interviewsSelf": interviews, "interviewsCaller": 0} if regular else {}
     data["goalItems"] = [{"text": item[:200], "done": True} for item in items]
     if text and not data.get("notes"):
         data["notes"] = text

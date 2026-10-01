@@ -6,7 +6,7 @@ from beanie import PydanticObjectId
 from app.alerts import app_week_key
 from app.config import get_settings
 from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
-from app.models.interview import InterviewStageEvent
+from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.models.plan_common import Counts, DoneOverrides
 
 
@@ -425,3 +425,24 @@ async def test_net_monthly_naive_month_boundaries_regardless_of_app_timezone(
     b = r.json()
     assert b["months"][0]["period"] == "2025-10" and b["months"][0]["net"] == 100
     assert b["months"][-1]["period"] == "2026-09" and b["months"][-1]["net"] == 3000
+
+
+async def test_week_counts_unmigrated_legacy_daily_plans(client, staff_user, auth_header):
+    """Deployed before the migration runs: old-shape regular plans still count."""
+    await DailyPlan.get_motor_collection().insert_one({
+        "userId": staff_user.id, "date": datetime(2026, 9, 29), "year": 2026, "weekNumber": 40,
+        "planType": "regular", "bidsHandsOn": 5, "bidsByBidder": 2, "interviewsDone": 1,
+        "createdAt": datetime(2026, 9, 29, 21), "updatedAt": datetime(2026, 9, 29, 21),
+    })
+    await Interview(accountId=PydanticObjectId(), createdBy=staff_user.id, scheduledAt=datetime(2026, 9, 29, 15),
+                    stage="intro", status="scheduled",
+                    caller=InterviewCaller(enabled=True, startsAt=datetime(2026, 9, 29, 15))).insert()
+
+    b = (await client.get("/dashboard/week?today=2026-09-30", headers=auth_header(staff_user))).json()
+    assert b["bids"]["self"] == 5 and b["bids"]["bidder"] == 2
+    # The old count was the whole day: no automatic caller round on top.
+    assert b["interviews"]["done"] == 1
+    assert b["streak"] == 1
+
+    a = (await client.get("/dashboard/activity?from=2026-09-28&to=2026-10-04", headers=auth_header(staff_user))).json()
+    assert a["totals"]["self"] == 5 and a["totals"]["interviews"] == 1

@@ -27,6 +27,8 @@ from app.alerts import (
     period_key_for_due,
 )
 from app.models import Notification, RecurringCharge, ResumeApplication, Transaction, UserExtra, WeeklyPlan
+from app.models.plan_common import monday_of
+from app.plan_auto import weekly_plans_for
 from app.slack_bot import resolve_user_tz
 
 log = logging.getLogger(__name__)
@@ -243,18 +245,10 @@ async def _tick_daily_bids(users: list[UserExtra], *, now: datetime) -> int:
     created = 0
     for user in users:
         local = local_now(resolve_user_tz(user), now)
-        year, week, _ = app_week_key(local)
-        plan = await WeeklyPlan.find_one(
-            {"userId": user.id, "year": year, "weekNumber": week}
-        )
+        plan = (await weekly_plans_for([user.id], monday_of(local.date()))).get(user.id)
         if plan is None:
             continue
-        bids_target = 0
-        for metric in plan.metrics or []:
-            if getattr(metric, "key", None) == "bids":
-                bids_target = int(getattr(metric, "target", 0) or 0)
-                break
-        target = daily_bids_target(bids_target)
+        target = daily_bids_target(plan.goal.bidsSelf + plan.goal.bidsBidder)
         if target <= 0:
             continue
         start, end = local_day_bounds_utc(local)

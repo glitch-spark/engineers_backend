@@ -24,7 +24,7 @@ def test_migrate_regular_daily():
                  planInterviewsScheduled=2, tomorrowItems=["Prep panel"])
     to_set, to_unset, next_goal = migrate_daily(doc)
     assert to_set["done"] == {"bidsSelf": 5, "bidsBidder": 2}
-    assert to_set["doneOverrides"] == {"interviewsSelf": 1}
+    assert to_set["doneOverrides"] == {"interviewsSelf": 1, "interviewsCaller": 0}
     assert to_set["goalItems"] == [{"text": "Fix resume", "done": True}]
     assert to_set["loggedAt"] == CREATED
     assert "goal" not in to_set

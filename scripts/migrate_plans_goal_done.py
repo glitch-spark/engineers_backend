@@ -86,6 +86,12 @@ def migrate_weekly(doc: dict) -> tuple[dict, list]:
     return to_set, legacy
 
 
+def _merge_items(own: list, carried: list) -> list:
+    """This day's items first, then items carried from the day before (no duplicates, max 20)."""
+    seen = {item["text"] for item in own}
+    return (own + [item for item in carried if item.get("text") not in seen])[:20]
+
+
 def _goal_is_empty(doc: dict) -> bool:
     goal = doc.get("goal") or {}
     has_counts = any(isinstance(v, int) and v for v in goal.values()) or any(
@@ -118,6 +124,11 @@ async def run(apply: bool, database=None) -> dict:
         to_set, to_unset, next_goal = migrate_daily(doc)
         counts["dailyMigrated"] += 1
         if apply:
+            if "goalItems" in to_set:
+                # The previous day's plan for tomorrow may already have put
+                # items on this day (docs run in date order): keep them.
+                current = await daily.find_one({"_id": doc["_id"]}, {"goalItems": 1})
+                to_set["goalItems"] = _merge_items(to_set["goalItems"], (current or {}).get("goalItems") or [])
             await daily.update_one({"_id": doc["_id"]}, _update({**to_set, "updatedAt": now}, to_unset))
         if next_goal is None:
             continue

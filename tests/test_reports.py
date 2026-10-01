@@ -48,3 +48,18 @@ async def test_team_done_matches_week_endpoint(client, staff_user, admin_user, a
     row = next(r for r in team["users"] if r["userId"] == str(staff_user.id))
     assert row["done"] == week["done"]
     assert row["goal"] == week["goal"]
+
+
+async def test_team_last_logged_looks_before_this_week(client, staff_user, admin_user, auth_header):
+    # Logged last Saturday only: on Monday the team view must still show that date.
+    await client.put("/daily-plans/2026-09-26", headers=auth_header(staff_user),
+                     json={"goal": {}, "done": {"bidsSelf": 2}})
+    # A later goal-only (not logged) entry doesn't count.
+    await client.put("/daily-plans/2026-09-29", headers=auth_header(staff_user), json={"goal": {"bidsSelf": 3}})
+    # Logs after the viewed week are ignored.
+    await client.put("/daily-plans/2026-10-06", headers=auth_header(staff_user),
+                     json={"goal": {}, "done": {"bidsSelf": 1}})
+
+    team = (await client.get(f"/reports/team?weekStart={WEEK}", headers=auth_header(admin_user))).json()
+    row = next(r for r in team["users"] if r["userId"] == str(staff_user.id))
+    assert row["lastLoggedDate"] == "2026-09-26"
