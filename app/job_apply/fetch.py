@@ -2,12 +2,14 @@
 JobPosting, then its visible text, then a headless browser for script-rendered pages."""
 import asyncio
 import html as html_lib
+import ipaddress
 import json
 import re
+import socket
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Awaitable, Callable, Literal, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -25,6 +27,9 @@ _UNSUPPORTED = re.compile(r"(?:^|\.)(?:linkedin\.com|indeed\.[a-z.]+)$", re.I)
 _BLOCK_TAGS = ["p", "div", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article", "br", "dt", "dd", "table"]
 _DROP_TAGS = ["script", "style", "noscript", "nav", "header", "footer", "svg", "form", "iframe"]
 
+MAX_REDIRECTS = 5
+_ALLOWED_PORTS = {None, 80, 443}
+
 _browser_sem = asyncio.Semaphore(BROWSER_CONCURRENCY)
 
 
@@ -40,6 +45,55 @@ class FetchResult:
     title: str = ""
     company: str = ""
     location: str = ""
+
+
+# ---------- URL safety (user-supplied URLs are fetched from our servers) ----------
+
+
+async def _resolve(host: str) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return [info[4][0] for info in infos]
+
+
+def _public_ip(ip: str) -> bool:
+    addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    return addr.is_global and not addr.is_multicast
+
+
+async def check_url(url: str) -> None:
+    """Refuse anything but http(s) on the default ports to a public address, so a job sheet can't make
+    the server read internal services (localhost, private networks, cloud metadata)."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise FetchError("blocked URL: only http(s) links are fetched")
+    try:
+        port = parts.port
+    except ValueError:
+        raise FetchError("blocked URL: bad port")
+    if port not in _ALLOWED_PORTS:
+        raise FetchError("blocked URL: non-standard port")
+    host = parts.hostname
+    try:
+        ips = [str(ipaddress.ip_address(host))]
+    except ValueError:
+        try:
+            ips = await _resolve(host)
+        except OSError:
+            raise FetchError("could not resolve host")
+    if not ips or not all(_public_ip(ip) for ip in ips):
+        raise FetchError("blocked URL: private or reserved address")
+
+
+async def _get_page(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """GET with redirects followed by hand, so every hop is checked."""
+    for _ in range(MAX_REDIRECTS + 1):
+        await check_url(url)
+        resp = await client.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT, follow_redirects=False)
+        if resp.is_redirect and resp.headers.get("location"):
+            url = urljoin(url, resp.headers["location"])
+            continue
+        return resp
+    raise FetchError("too many redirects")
 
 
 # ---------- routing ----------
@@ -281,11 +335,22 @@ async def browser_html(url: str) -> str:
     """Render a script-heavy page with headless Chromium (at most BROWSER_CONCURRENCY at once)."""
     from playwright.async_api import async_playwright
 
+    await check_url(url)
+
+    async def guard(route) -> None:
+        try:
+            await check_url(route.request.url)
+        except FetchError:
+            await route.abort()
+            return
+        await route.continue_()
+
     async with _browser_sem:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch()
             try:
                 page = await browser.new_page(user_agent=UA)
+                await page.route("**/*", guard)  # every request the page makes, redirects included
                 await page.goto(url, wait_until="networkidle", timeout=30_000)
                 return await page.content()
             finally:
@@ -309,9 +374,10 @@ async def fetch_job(
         except Exception:  # noqa: BLE001 — any ATS API problem falls back to the page itself
             pass
 
+    await check_url(url)
     result: Optional[FetchResult] = None
     try:
-        resp = await client.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT, follow_redirects=True)
+        resp = await _get_page(client, url)
         if resp.status_code < 400:
             result = _from_page(resp.text, "html")
     except httpx.HTTPError:

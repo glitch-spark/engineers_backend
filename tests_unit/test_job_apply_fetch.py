@@ -5,7 +5,17 @@ from datetime import date
 import httpx
 import pytest
 
+from app.job_apply import fetch as fetch_mod
 from app.job_apply.fetch import FetchError, fetch_job, html_to_text, parse_jsonld, route
+
+@pytest.fixture(autouse=True)
+def fake_dns(monkeypatch):
+    """No real DNS in unit tests: 'internal.corp' resolves to a private IP, everything else to a public one."""
+    async def resolve(host):
+        return ["10.0.0.5"] if host == "internal.corp" else ["93.184.216.34"]
+
+    monkeypatch.setattr(fetch_mod, "_resolve", resolve)
+
 
 LONG = "<p>" + "You will build distributed systems in Python and Go. " * 12 + "</p>"
 
@@ -125,3 +135,39 @@ async def test_ats_failure_falls_back_to_generic():
 def test_html_to_text_keeps_line_structure():
     text = html_to_text("<h2>Requirements</h2><ul><li>Python</li><li>Go</li></ul>")
     assert text.splitlines() == ["Requirements", "- Python", "- Go"]
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1/admin",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://[::1]/x",
+    "https://internal.corp/jobs/1",
+    "http://careers.beta.io:8080/jobs/1",
+    "ftp://careers.beta.io/jobs/1",
+])
+async def test_blocks_internal_targets(url):
+    async with client({"": (200, f"<html><body>{LONG}</body></html>")}) as c:
+        with pytest.raises(FetchError, match="blocked"):
+            await fetch_job(url, client=c)
+
+
+async def test_blocks_redirect_to_private_address():
+    def handler(request):
+        if request.url.host == "careers.beta.io":
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        with pytest.raises(FetchError, match="blocked"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c)
+
+
+async def test_follows_public_redirects():
+    def handler(request):
+        if request.url.path == "/old":
+            return httpx.Response(301, headers={"location": "/new"})
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        res = await fetch_job("https://careers.beta.io/old", client=c)
+    assert "distributed systems" in res.text
