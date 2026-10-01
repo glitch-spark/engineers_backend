@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Literal, Optional
 
 from beanie import PydanticObjectId
+from beanie.odm.utils.encoder import Encoder
 from fastapi import HTTPException, status
 from pymongo import ReturnDocument
 
@@ -134,6 +135,27 @@ async def enqueue_generation(
 
 _running: set[asyncio.Task] = set()
 
+# Fields the queue (claim, heartbeat, applied marks) owns; the runner never writes them back.
+_QUEUE_OWNED = frozenset({"_id", "id", "createdAt", "leaseAt", "attempts", "countsAsBid", "source", "jobApplyRowId",
+                          "promptOverride"})
+
+
+class Superseded(Exception):
+    """The job was re-claimed by another worker; this runner must stop writing."""
+
+
+async def persist_job(job: ResumeApplication) -> None:
+    """Save a runner's progress: only the runner's own fields, the lease refreshed, and fenced to this claim
+    (`attempts` must still match) so a runner whose job was re-queued can't overwrite the new run."""
+    doc = Encoder(to_db=True).encode(job)
+    fields = {k: v for k, v in doc.items() if k not in _QUEUE_OWNED}
+    now = datetime.utcnow()
+    fields.update({"updatedAt": now, "leaseAt": now})
+    res = await _coll().update_one({"_id": job.id, "attempts": job.attempts}, {"$set": fields})
+    if res.matched_count == 0:
+        raise Superseded(str(job.id))
+
+
 # Only jobs written by this queue are claimed or recovered: records from before it (no `source`, never claimed)
 # that were stuck by old restarts must not be regenerated in bulk.
 _QUEUED = {"status": "queued", "source": {"$exists": True}}
@@ -148,16 +170,19 @@ def _coll():
 
 
 async def _claim_one() -> Optional[ResumeApplication]:
-    """Atomically take the oldest queued job (exactly one worker gets it)."""
+    """Atomically take the oldest queued job (exactly one worker gets it). Generator-page jobs go first, so a
+    person waiting on one isn't stuck behind a Job Applies batch."""
     now = datetime.utcnow()
-    doc = await _coll().find_one_and_update(
-        _QUEUED,
-        {"$set": {"status": "in_progress", "step": "generating_resume", "leaseAt": now, "startedAt": now, "updatedAt": now},
-         "$inc": {"attempts": 1}},
-        sort=[("createdAt", 1)],
-        return_document=ReturnDocument.AFTER,
-    )
-    return await ResumeApplication.get(doc["_id"]) if doc else None
+    update = {"$set": {"status": "in_progress", "step": "generating_resume", "leaseAt": now, "startedAt": now,
+                       "updatedAt": now},
+              "$inc": {"attempts": 1}}
+    for match in ({**_QUEUED, "source": "generator"}, _QUEUED):
+        doc = await _coll().find_one_and_update(
+            match, update, sort=[("createdAt", 1)], return_document=ReturnDocument.AFTER
+        )
+        if doc:
+            return await ResumeApplication.get(doc["_id"])
+    return None
 
 
 async def _requeue_stale(now: Optional[datetime] = None) -> int:
@@ -185,7 +210,10 @@ async def _requeue_stale(now: Optional[datetime] = None) -> int:
 async def _heartbeat(job_id) -> None:
     while True:
         await asyncio.sleep(HEARTBEAT_SECONDS)
-        await _coll().update_one({"_id": job_id, "status": "in_progress"}, {"$set": {"leaseAt": datetime.utcnow()}})
+        try:
+            await _coll().update_one({"_id": job_id, "status": "in_progress"}, {"$set": {"leaseAt": datetime.utcnow()}})
+        except Exception as exc:  # noqa: BLE001 — one failed beat must not end the lease (it would look stale)
+            log.warning("resume job %s heartbeat failed: %s", job_id, exc)
 
 
 async def _run(job: ResumeApplication) -> None:

@@ -146,3 +146,72 @@ async def test_job_list_includes_source(client, staff_user, auth_header):
     await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="A", source="job_applies")
     jobs = (await client.get("/resume/jobs", headers=auth_header(staff_user))).json()["jobs"]
     assert jobs[0]["source"] == "job_applies"
+
+
+async def test_runner_writes_refresh_lease_and_keep_queue_fields(staff_user):
+    await _queued(staff_user, 1)
+    claimed = await resume_queue._claim_one()
+    coll = ResumeApplication.get_motor_collection()
+    later = datetime.utcnow() + timedelta(minutes=4)
+    await coll.update_one({"_id": claimed.id}, {"$set": {"leaseAt": later, "countsAsBid": True}})  # heartbeat / applied
+    claimed.step = "uploading"
+    await resume_queue.persist_job(claimed)
+    doc = await coll.find_one({"_id": claimed.id})
+    assert doc["step"] == "uploading" and doc["countsAsBid"] is True and doc["attempts"] == 1
+    assert doc["leaseAt"] >= datetime.utcnow() - timedelta(seconds=5)  # not wound back to the claim time
+    assert await resume_queue._requeue_stale() == 0
+
+
+async def test_superseded_runner_does_not_overwrite(staff_user, monkeypatch):
+    """If the job was re-claimed (attempts moved on), the old runner's writes are dropped."""
+    from app.resume_service import GeneratedResume
+    from app.routers import resume as resume_router
+
+    acc = await make_account(staff_user)
+    await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="Acme")
+    claimed = await resume_queue._claim_one()
+    coll = ResumeApplication.get_motor_collection()
+
+    async def fake_generate(*a, **k):
+        await coll.update_one({"_id": claimed.id}, {"$set": {"attempts": 2}})  # another worker re-claimed it
+        return GeneratedResume(pdf_bytes=b"%PDF", s3_key="k", plain_text="x")
+
+    monkeypatch.setattr(resume_router, "generate_resume", fake_generate)
+    await resume_router.run_job_doc(claimed)
+    doc = await coll.find_one({"_id": claimed.id})
+    assert doc["status"] == "in_progress" and doc.get("s3Key") is None  # the stale runner wrote nothing
+
+
+async def test_generator_jobs_are_claimed_before_job_applies_batches(staff_user):
+    acc = await make_account(staff_user)
+    batch = await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="Batch", source="job_applies")
+    await ResumeApplication.get_motor_collection().update_one(
+        {"_id": batch.id}, {"$set": {"createdAt": datetime.utcnow() - timedelta(hours=1)}}
+    )
+    gen = await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="Now")
+    assert (await resume_queue._claim_one()).id == gen.id
+    assert (await resume_queue._claim_one()).id == batch.id
+
+
+async def test_heartbeat_survives_a_failed_write(staff_user, monkeypatch):
+    await _queued(staff_user, 1)
+    claimed = await resume_queue._claim_one()
+    monkeypatch.setattr(resume_queue, "HEARTBEAT_SECONDS", 0.01)
+    real = resume_queue._coll
+    calls = {"n": 0}
+
+    class Flaky:
+        def __init__(self, inner):
+            self.inner = inner
+
+        async def update_one(self, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("network blip")
+            return await self.inner.update_one(*a, **k)
+
+    monkeypatch.setattr(resume_queue, "_coll", lambda: Flaky(real()))
+    hb = asyncio.create_task(resume_queue._heartbeat(claimed.id))
+    await asyncio.sleep(0.1)
+    assert not hb.done() and calls["n"] >= 2
+    hb.cancel()

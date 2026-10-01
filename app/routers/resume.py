@@ -128,7 +128,7 @@ async def _run_job(
         job.status = "in_progress"
         job.step = "generating_resume"
         job.startedAt = datetime.now(timezone.utc)
-        await job.save()
+        await resume_queue.persist_job(job)
 
         result = await generate_resume(
             account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id)
@@ -152,7 +152,7 @@ async def _run_job(
             job.s3Url = None    # legacy public URL — downloads use presigned URLs
         else:
             job.pdfData = base64.b64encode(result.pdf_bytes).decode("ascii")
-        await job.save()
+        await resume_queue.persist_job(job)
         log.info(
             "job %s pdf persisted: %d bytes (s3_key=%s)",
             job.id, len(result.pdf_bytes), result.s3_key or "<inline>",
@@ -161,7 +161,7 @@ async def _run_job(
         # ---- step 3: screening (optional) ----
         if questions:
             job.step = "generating_answers"
-            await job.save()
+            await resume_queue.persist_job(job)
 
             screening_result = await _run_screening(
                 account=account,
@@ -202,13 +202,15 @@ async def _run_job(
         job.step = "done"
         job.completedAt = datetime.now(timezone.utc)
         job.executionMs = int((time.monotonic() - started) * 1000)
-        await job.save()
+        await resume_queue.persist_job(job)
 
         # Pipeline is now driven entirely by email sync — completed resume
         # generations no longer auto-create Application rows. Users land in
         # the Pipeline board only when Gmail surfaces a confirmation,
         # recruiter reach-out, or interview email tied to a real company.
 
+    except resume_queue.Superseded:
+        log.info("resume job %s was re-queued elsewhere; this run stops", job_id)
     except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
         log.exception("resume job %s failed", job_id)
         await _mark_failed(job, str(exc), started)
@@ -234,7 +236,9 @@ async def _mark_failed(job: ResumeApplication, message: str, started: float) -> 
     job.completedAt = datetime.now(timezone.utc)
     job.executionMs = int((time.monotonic() - started) * 1000)
     try:
-        await job.save()
+        await resume_queue.persist_job(job)
+    except resume_queue.Superseded:
+        pass
     except Exception:  # noqa: BLE001
         log.exception("could not persist failure for job %s", job.id)
 
