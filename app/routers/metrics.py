@@ -20,6 +20,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.deps import get_current_user
+from app.interview_normalize import interview_status_value
 from app.interview_rounds import (
     BREAKDOWN_ORDER as _BREAKDOWN_ORDER,
     _as_aware,
@@ -768,11 +769,11 @@ async def dashboard_feed(
         sched = _as_aware(iv.scheduledAt)
         if sched and sched <= now:
             iv_events.append({
-                "kind": "interview_done" if iv.status and str(iv.status) in ("completed", "passed", "failed") else "interview_past",
+                "kind": "interview_done" if interview_status_value(iv.status) in ("completed", "passed", "rejected") else "interview_past",
                 "at": sched.isoformat(),
                 "company": iv.companyName,
                 "stage": iv.stage.value if iv.stage else None,
-                "status": str(iv.status) if iv.status else None,
+                "status": interview_status_value(iv.status),
                 "interviewId": str(iv.id),
             })
 

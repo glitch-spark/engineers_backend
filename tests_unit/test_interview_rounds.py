@@ -38,8 +38,9 @@ def test_excluded_stages_not_counted():
     assert count_interview_rounds(iv, START, END)[0] == 0
 
 
-def test_scheduled_rejected_is_canceled():
-    iv = _iv("rejected", "scheduled", datetime(2026, 9, 30))
+def test_canceled_round_counts_as_canceled():
+    # Canceled is a round status now (the old stage-rejected + scheduled trick is migrated away).
+    iv = _iv("intro", "canceled", datetime(2026, 9, 30))
     assert count_interview_rounds(iv, START, END)[:2] == (0, 1)
 
 

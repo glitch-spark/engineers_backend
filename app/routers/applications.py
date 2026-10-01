@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from app.deps import get_current_user
+from app.interview_normalize import interview_status_value
 from app.models import Application, EmailMessage, Interview, ResumeApplication, UserExtra
 from app.models.application import KanbanStage, STAGE_ORDER, StageEvent
 from app.routers._util import doc_to_dict, populate_owner, to_object_id
@@ -120,6 +121,11 @@ def _advance_stage(app: Application, new_stage: str, *, source: str, by: Optiona
     return True
 
 
+def pipeline_outcome_for_status(status: Any) -> Optional[str]:
+    """Application outcome implied by an interview round status (rejected only)."""
+    return "rejected" if interview_status_value(status) == "rejected" else None
+
+
 async def attach_interview_to_app(
     *,
     user_id: PydanticObjectId,
@@ -144,12 +150,8 @@ async def attach_interview_to_app(
         if _advance_stage(app, interview.stage.value if hasattr(interview.stage, "value") else str(interview.stage), source="interview-link", by=user_id):
             changed = True
 
-    # Terminal status mapping → outcome.
-    status_str = str(interview.status) if interview.status else ""
-    if status_str in ("passed",):
-        # passed != offer; only flips outcome to offer on explicit Final-pass
-        pass
-    elif status_str in ("failed", "no_show"):
+    # Terminal status mapping → outcome (passed never implies an offer).
+    if pipeline_outcome_for_status(interview.status) == "rejected":
         if app.outcome == "active":
             app.outcome = "rejected"
             _advance_stage(app, KanbanStage.rejected.value, source="interview-link", by=user_id)

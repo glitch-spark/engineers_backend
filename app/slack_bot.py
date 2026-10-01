@@ -23,6 +23,9 @@ from zoneinfo import ZoneInfo
 import httpx
 from beanie import PydanticObjectId
 
+from app.interview_caller import caller_change_lines, round_caller_snapshot
+from app.interview_normalize import interview_status_value
+
 from app.config import get_settings
 from app.know_your_why import know_your_why_for_date
 from app.models import Account, Interview, UserExtra
@@ -313,11 +316,10 @@ async def _linked_users() -> list[UserExtra]:
 
 
 _SKIP_STATUSES = {
-    InterviewStatus.canceled,
     InterviewStatus.completed,
     InterviewStatus.passed,
-    InterviewStatus.failed,
-    InterviewStatus.no_show,
+    InterviewStatus.rejected,
+    InterviewStatus.canceled,
 }
 
 
@@ -338,37 +340,6 @@ def _enum_key(value: Any) -> Optional[str]:
     raw = getattr(value, "value", value)
     text = str(raw).strip()
     return text or None
-
-
-def _naive_dt(value: Optional[datetime]) -> Optional[datetime]:
-    if value is None:
-        return None
-    if value.tzinfo is not None:
-        return value.replace(tzinfo=None)
-    return value
-
-
-def interview_update_is_noteworthy(
-    *,
-    prev_scheduled_at: Optional[datetime],
-    new_scheduled_at: Optional[datetime],
-    prev_stage: Any,
-    new_stage: Any,
-    prev_status: Any,
-    new_status: Any,
-    prev_company: Optional[str],
-    new_company: Optional[str],
-) -> bool:
-    """True when schedule, stage, status, or company changed (not note/transcript)."""
-    if _naive_dt(prev_scheduled_at) != _naive_dt(new_scheduled_at):
-        return True
-    if _enum_key(prev_stage) != _enum_key(new_stage):
-        return True
-    if _enum_key(prev_status) != _enum_key(new_status):
-        return True
-    if (prev_company or "").strip() != (new_company or "").strip():
-        return True
-    return False
 
 
 async def notify_interview_dm(
@@ -443,35 +414,31 @@ def _mention(user: Optional[UserExtra]) -> str:
     return (user.name or user.email or "someone").strip()
 
 
-def caller_channel_text(
+def caller_round_text(
     interview: Interview,
+    entry: Any,
     *,
     account: Optional[Account],
     owner: Optional[UserExtra],
     coworkers: list[UserExtra],
-    kind: str = "created",
 ) -> str:
-    caller = interview.caller
+    """The #caller parent post for one round that needs a caller."""
+    caller = entry.caller
     tz = zoneinfo_for_slack(getattr(caller, "timezone", None))
     company = (interview.companyName or "").strip() or "—"
     job_url = (interview.jobUrl or "").strip()
-    recruiter = (interview.interviewerName or "").strip() or "—"
+    recruiter = (getattr(entry, "interviewerName", None) or "").strip() or "—"
     flag = _country_flag(account.country if account else None)
     if flag and recruiter != "—":
         recruiter = f"{recruiter} {flag}"
-    headline = (
-        f":telephone_receiver: *Caller needed* — posted by {_mention(owner)}"
-        if kind == "created"
-        else f":pencil2: *Caller details updated* by {_mention(owner)}"
-    )
     lines = [
-        headline,
+        f":telephone_receiver: *Caller needed* — posted by {_mention(owner)}",
         f"*Profile:* {_profile_label(account) or '—'}",
         f"*Company name:* {company}",
         f"*JD Link:* {job_url or '—'}",
         f"*Recruiter name:* {recruiter}",
-        f"*Stage:* {_stage_label(interview.stage)}",
-        f"*Interview time:* {fmt_caller_time(getattr(caller, 'startsAt', None), tz)}",
+        f"*Stage:* {_stage_label(entry.stage)}",
+        f"*Interview time:* {fmt_caller_time(getattr(entry, 'scheduledAt', None), tz)}",
         f"*Method:* {_method_text(caller)}",
         f"*Caller assigned:* {(getattr(caller, 'callerName', '') or '').strip() or 'TBD'}",
     ]
@@ -480,47 +447,79 @@ def caller_channel_text(
     return "\n".join(lines)
 
 
-async def notify_caller_channel(interview: Interview, *, kind: str = "created") -> Optional[str]:
-    """Post the caller request to the private caller channel. Never raises.
+def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
+    if key == "stage":
+        return _stage_label(value)
+    if key == "status":
+        return str(value).capitalize()
+    if key == "method":
+        return _METHOD_LABELS.get(value or "", value or "TBD")
+    if key == "coworkers":
+        return " ".join(mentions.get(str(i), "someone") for i in value) or "—"
+    return str(value)
 
-    Updates reply in the original message's thread. Returns the parent
-    message ts so the caller can persist it.
+
+async def notify_round_caller(
+    interview: Interview,
+    entry: Any,
+    kind: str,
+    *,
+    prev: Optional[dict] = None,
+) -> Optional[str]:
+    """Post a round's #caller message. Never raises.
+
+    created → new parent post (returns its ts); updated → thread reply with
+    one `Field: old → new` line per change; canceled → thread reply. Without
+    a parent post, updated falls back to created and canceled is skipped.
     """
     try:
-        caller = interview.caller
+        caller = getattr(entry, "caller", None)
         channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
-        if caller is None or not caller.enabled or not channel or not slack_bot_configured():
+        if caller is None or not channel or not slack_bot_configured():
             return None
-        account = await Account.get(interview.accountId) if interview.accountId else None
+        parent = (caller.slackChannelTs or "").strip() or None
+        tz = zoneinfo_for_slack(getattr(caller, "timezone", None))
         owner = await UserExtra.get(interview.createdBy)
+        if kind == "canceled":
+            if not parent:
+                return None
+            when = fmt_caller_time(getattr(entry, "scheduledAt", None), tz)
+            text = f":no_entry: *Canceled* — {_stage_label(entry.stage)} · {when}"
+            await _slack_api("chat.postMessage", {
+                "channel": channel, "text": text, "thread_ts": parent,
+                "unfurl_links": False, "unfurl_media": False,
+            })
+            return parent
+        if kind == "updated" and parent and prev is not None:
+            new = round_caller_snapshot(entry)
+            ids = {str(i) for i in (prev.get("coworkers") or ())} | {str(i) for i in (new or {}).get("coworkers") or ()}
+            users = await UserExtra.find({"_id": {"$in": [PydanticObjectId(i) for i in ids]}}).to_list() if ids else []
+            mentions = {str(u.id): _mention(u) for u in users}
+            lines = caller_change_lines(
+                prev, new or {},
+                fmt_time=lambda d: fmt_caller_time(d, tz),
+                label=lambda k, v: _snapshot_label(k, v, mentions),
+            )
+            if not lines:
+                return parent
+            text = "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
+            await _slack_api("chat.postMessage", {
+                "channel": channel, "text": text, "thread_ts": parent,
+                "unfurl_links": False, "unfurl_media": False,
+            })
+            return parent
+        account = await Account.get(interview.accountId) if interview.accountId else None
         coworkers = (
             await UserExtra.find({"_id": {"$in": list(caller.coworkerIds)}}).to_list()
-            if caller.coworkerIds
-            else []
+            if caller.coworkerIds else []
         )
-        parent_ts = (caller.slackChannelTs or "").strip() or None
-        effective_kind = kind if parent_ts else "created"
-        text = caller_channel_text(
-            interview,
-            account=account,
-            owner=owner,
-            coworkers=coworkers,
-            kind=effective_kind,
-        )
-        payload: dict[str, Any] = {
-            "channel": channel,
-            "text": text,
-            "unfurl_links": False,
-            "unfurl_media": False,
-        }
-        if effective_kind != "created":
-            payload["thread_ts"] = parent_ts
-        res = await _slack_api("chat.postMessage", payload)
-        if effective_kind != "created":
-            return parent_ts
+        text = caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers)
+        res = await _slack_api("chat.postMessage", {
+            "channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False,
+        })
         return res.get("ts") or None
     except Exception as exc:
-        log.warning("slack_bot caller channel post failed kind=%s: %s", kind, exc)
+        log.warning("slack_bot round caller post failed kind=%s: %s", kind, exc)
         return None
 
 
@@ -801,10 +800,14 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     interviews = await Interview.find(
         {
             "$or": [
-                {"createdBy": user.id},
-                {"caller.enabled": True, "caller.coworkerIds": user.id},
+                {"createdBy": user.id, "scheduledAt": {"$gte": start_n, "$lt": end_n}},
+                # Callers live on rounds: match the coworker's round on this day.
+                {"stageHistory": {"$elemMatch": {
+                    "caller.enabled": True,
+                    "caller.coworkerIds": user.id,
+                    "scheduledAt": {"$gte": start_n, "$lt": end_n},
+                }}},
             ],
-            "scheduledAt": {"$gte": start_n, "$lt": end_n},
         }
     ).sort([("scheduledAt", 1)]).to_list()
     interviews = [iv for iv in interviews if iv.status not in _SKIP_STATUSES]
@@ -850,10 +853,160 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
     return 0, "dm_failed"
 
 
+# ---------- 6:00 AM ET #caller reminder --------------------------------------
+
+CALLER_DIGEST_TZ = ZoneInfo("America/New_York")
+CALLER_DIGEST_SENTINEL = PydanticObjectId("000000000000000000000000")
+_CALLER_DIGEST_HOURS = (6, 12)  # first tick at/after 06:00 ET, catch up until noon
+
+
+def _aware_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def caller_digest_due(now: datetime) -> Optional[date]:
+    """ET date to post for, when `now` falls in the 06:00–12:00 ET window."""
+    local = _aware_utc(now).astimezone(CALLER_DIGEST_TZ)
+    start, end = _CALLER_DIGEST_HOURS
+    return local.date() if start <= local.hour < end else None
+
+
+def _et_day_bounds_utc(day: date) -> tuple[datetime, datetime]:
+    """Naive-UTC [start, end) of an ET calendar day (Mongo stores naive UTC)."""
+    start = datetime.combine(day, datetime.min.time(), tzinfo=CALLER_DIGEST_TZ)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=CALLER_DIGEST_TZ)
+    return (
+        start.astimezone(timezone.utc).replace(tzinfo=None),
+        end.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def select_caller_rounds(interviews: list, day: date) -> list[tuple[Any, Any]]:
+    """(interview, round) for scheduled rounds with a caller on ET date `day`, by start time."""
+    rows = []
+    for iv in interviews:
+        for entry in getattr(iv, "stageHistory", None) or []:
+            caller = getattr(entry, "caller", None)
+            when = getattr(entry, "scheduledAt", None)
+            if caller is None or not caller.enabled or when is None:
+                continue
+            if interview_status_value(entry.status) != "scheduled":
+                continue
+            if _aware_utc(when).astimezone(CALLER_DIGEST_TZ).date() != day:
+                continue
+            rows.append((iv, entry))
+    rows.sort(key=lambda row: _aware_utc(row[1].scheduledAt))
+    return rows
+
+
+def caller_digest_text(rows: list[tuple[Any, Any]], *, profiles: dict[str, str], owners: dict[str, str]) -> str:
+    if not rows:
+        return ":telephone_receiver: *No caller interviews today.*"
+    lines = [f":telephone_receiver: *Caller interviews today — {len(rows)}*"]
+    for iv, entry in rows:
+        caller = entry.caller
+        company = (iv.companyName or "").strip() or "—"
+        job_url = (getattr(iv, "jobUrl", None) or "").strip()
+        parts = [
+            f"*{fmt_caller_time(entry.scheduledAt, CALLER_DIGEST_TZ, with_day=False)}*",
+            profiles.get(str(iv.accountId)) or "—",
+            _mrkdwn_link(job_url, company) if job_url else company,
+            _stage_label(entry.stage),
+            _method_text(caller),
+            f"caller {(caller.callerName or '').strip() or 'TBD'}",
+            owners.get(str(iv.createdBy), "someone"),
+        ]
+        lines.append("• " + " · ".join(parts))
+    return "\n".join(lines)
+
+
+async def _digest_load(start: datetime, end: datetime) -> list:
+    return await Interview.find(
+        {"stageHistory": {"$elemMatch": {"caller.enabled": True, "scheduledAt": {"$gte": start, "$lt": end}}}}
+    ).to_list()
+
+
+async def _digest_claim(key: str) -> bool:
+    try:
+        await SlackAlertLog(
+            userId=CALLER_DIGEST_SENTINEL, kind=key, sentAt=datetime.now(timezone.utc),
+        ).insert()
+        return True
+    except Exception:  # duplicate (userId, kind) → another tick already claimed today
+        return False
+
+
+async def _digest_release(key: str) -> None:
+    await SlackAlertLog.find(
+        SlackAlertLog.userId == CALLER_DIGEST_SENTINEL, SlackAlertLog.kind == key,
+    ).delete()
+
+
+async def _digest_post(text: str) -> bool:
+    channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
+    try:
+        await _slack_api("chat.postMessage", {
+            "channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False,
+        })
+        return True
+    except Exception as exc:
+        log.warning("slack_bot caller digest post failed: %s", exc)
+        return False
+
+
+async def _digest_labels(rows: list[tuple[Any, Any]]) -> tuple[dict[str, str], dict[str, str]]:
+    interviews = [iv for iv, _ in rows]
+    profiles = await _profile_labels(interviews) if interviews else {}
+    owner_ids = {iv.createdBy for iv in interviews}
+    users = await UserExtra.find({"_id": {"$in": list(owner_ids)}}).to_list() if owner_ids else []
+    return profiles, {str(u.id): _mention(u) for u in users}
+
+
+def _digest_configured() -> bool:
+    return slack_bot_configured() and bool((get_settings().SLACK_CALLER_CHANNEL_ID or "").strip())
+
+
+async def run_caller_channel_digest(
+    now: datetime,
+    *,
+    load=_digest_load,
+    claim=_digest_claim,
+    release=_digest_release,
+    post=_digest_post,
+    labels=_digest_labels,
+    configured=_digest_configured,
+) -> str:
+    """Post today's caller rounds to #caller once per ET day (claim first, release on failure)."""
+    if not configured():
+        return "not_configured"
+    day = caller_digest_due(now)
+    if day is None:
+        return "not_due"
+    key = f"caller-digest:{day.isoformat()}"
+    if not await claim(key):
+        return "already_sent"
+    ok = False
+    try:
+        rows = select_caller_rounds(await load(*_et_day_bounds_utc(day)), day)
+        profiles, owners = await labels(rows)
+        ok = await post(caller_digest_text(rows, profiles=profiles, owners=owners))
+    except Exception as exc:
+        log.warning("slack_bot caller digest failed: %s", exc)
+    if not ok:
+        await release(key)
+        return "post_failed"
+    return "posted"
+
+
 async def run_alert_tick() -> dict[str, int]:
-    """Cron entrypoint: daily digest for every linked user."""
+    """Cron entrypoint: #caller reminder, then the daily digest for every linked user."""
+    try:
+        caller_digest = await run_caller_channel_digest(datetime.now(timezone.utc))
+    except Exception as exc:  # never block the per-user digest
+        log.exception("slack_bot caller digest crashed: %s", exc)
+        caller_digest = "error"
     if not slack_bot_configured():
-        return {"users": 0, "digest": 0, "skipped": 1}
+        return {"users": 0, "digest": 0, "skipped": 1, "caller_digest": caller_digest}
     users = await _linked_users()
     digest_total = 0
     skips = {
@@ -874,4 +1027,4 @@ async def run_alert_tick() -> dict[str, int]:
                 logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
         except Exception as exc:
             log.exception("slack_bot tick failed for user=%s: %s", user.id, exc)
-    return {"users": len(users), "digest": digest_total, "skipped": 0, **skips}
+    return {"users": len(users), "digest": digest_total, "skipped": 0, "caller_digest": caller_digest, **skips}

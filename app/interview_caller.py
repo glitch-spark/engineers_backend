@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
-from typing import Any, List, Optional
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+from typing import Any, Callable, List, Optional
 
 from beanie import PydanticObjectId
 from pydantic import BaseModel
 
+from app.interview_normalize import normalize_stage, normalize_status
 from app.models.interview import InterviewCaller
 from app.slack_timezones import normalize_slack_timezone, validate_timezone
 
@@ -18,10 +18,7 @@ CALLER_METHODS = ("video", "phone_hushed", "phone_slynumber")
 class CallerIn(BaseModel):
     enabled: bool = False
     callerName: Optional[str] = None
-    # Local wall-clock start "HH:MM" in `timezone`; empty means TBD.
-    time: Optional[str] = None
-    # Calendar day "YYYY-MM-DD" as picked in the form; falls back to scheduledAt.
-    date: Optional[str] = None
+    # Display time zone for Slack; the caller joins at the round's start.
     timezone: Optional[str] = None
     method: Optional[str] = None
     methodValue: Optional[str] = None
@@ -32,53 +29,29 @@ class CallerError(ValueError):
     pass
 
 
-def parse_hhmm(value: Optional[str]) -> Optional[time]:
-    raw = (value or "").strip()
-    if not raw:
+def is_coworker(caller: Optional[InterviewCaller], user_id: Any) -> bool:
+    if caller is None or not caller.enabled:
+        return False
+    return any(str(i) == str(user_id) for i in caller.coworkerIds)
+
+
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
         return None
-    try:
-        parsed = datetime.strptime(raw[:5], "%H:%M")
-    except ValueError as exc:
-        raise CallerError("invalid caller time; use HH:MM") from exc
-    return parsed.time()
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def parse_day(value: Optional[str]) -> Optional[date]:
-    raw = (value or "").strip()
-    if not raw:
-        return None
-    try:
-        return date.fromisoformat(raw[:10])
-    except ValueError as exc:
-        raise CallerError("invalid caller date; use YYYY-MM-DD") from exc
-
-
-def local_start_utc(day: date, at: time, tz_name: str) -> datetime:
-    """Wall-clock `day at` in `tz_name`, converted to aware UTC."""
-    local = datetime.combine(day, at, tzinfo=ZoneInfo(tz_name))
-    return local.astimezone(timezone.utc)
-
-
-def interview_day(scheduled_at: datetime, tz_name: str) -> date:
-    """Calendar day of scheduledAt (naive UTC, often T12:00) as seen in `tz_name`."""
-    aware = scheduled_at if scheduled_at.tzinfo else scheduled_at.replace(tzinfo=timezone.utc)
-    return aware.astimezone(ZoneInfo(tz_name)).date()
-
-
-def build_caller(
+def build_round_caller(
     body: CallerIn,
     *,
-    scheduled_at: datetime,
+    starts_at: datetime,
     owner_id: PydanticObjectId,
     valid_coworker_ids: set[str],
     default_tz: Optional[str],
     previous: Optional[InterviewCaller] = None,
 ) -> InterviewCaller:
-    """Validate the payload and return the caller subdocument to store.
-
-    `valid_coworker_ids` are ids of existing active users; unknown ids are
-    rejected and the owner is dropped from their own coworker list.
-    """
+    """Caller subdocument for a round. The caller joins at the round's start,
+    so there is no separate caller time; `timezone` only drives Slack display."""
     if not body.enabled:
         if previous is None:
             return InterviewCaller(enabled=False)
@@ -108,14 +81,10 @@ def build_caller(
         seen.add(key)
         ids.append(PydanticObjectId(key))
 
-    day = parse_day(body.date) or interview_day(scheduled_at, tz_name)
-    at = parse_hhmm(body.time)
-    starts_at = local_start_utc(day, at, tz_name) if at else None
-
     return InterviewCaller(
         enabled=True,
         callerName=(body.callerName or "").strip() or "TBD",
-        startsAt=starts_at,
+        startsAt=_as_utc(starts_at),
         timezone=tz_name,
         method=method,
         methodValue=(body.methodValue or "").strip(),
@@ -124,32 +93,66 @@ def build_caller(
     )
 
 
-def resync_caller_day(caller: Optional[InterviewCaller], scheduled_at: Optional[datetime]) -> None:
-    """Keep the caller's local start time when the interview date moves."""
-    if caller is None or caller.startsAt is None or scheduled_at is None:
-        return
-    tz = ZoneInfo(normalize_slack_timezone(caller.timezone))
-    local = caller.startsAt.astimezone(tz)
-    day = interview_day(scheduled_at, tz.key)
-    if local.date() != day:
-        caller.startsAt = local_start_utc(day, local.time().replace(tzinfo=None), tz.key)
+# Order of lines in a thread reply; keys of round_caller_snapshot.
+_CHANGE_FIELDS = (
+    ("time", "Time"),
+    ("stage", "Stage"),
+    ("status", "Status"),
+    ("method", "Method"),
+    ("link", "Link"),
+    ("caller", "Caller assigned"),
+    ("coworkers", "Coworkers"),
+)
 
 
-def caller_snapshot(caller: Optional[InterviewCaller]) -> Optional[tuple[Any, ...]]:
-    """Fields whose change is worth a Slack thread reply."""
+def round_caller_snapshot(entry: Any) -> Optional[dict]:
+    """What #caller cares about for one round; None when no caller is requested."""
+    caller = getattr(entry, "caller", None)
     if caller is None or not caller.enabled:
         return None
-    return (
-        caller.callerName,
-        caller.startsAt,
-        caller.timezone,
-        caller.method,
-        caller.methodValue,
-        tuple(sorted(str(i) for i in caller.coworkerIds)),
-    )
+    return {
+        "time": _as_utc(getattr(entry, "scheduledAt", None)),
+        "stage": normalize_stage(getattr(entry, "stage", None)),
+        "status": normalize_status(getattr(entry, "status", None)),
+        "method": caller.method,
+        "link": (caller.methodValue or "").strip(),
+        "caller": (caller.callerName or "").strip() or "TBD",
+        "coworkers": tuple(sorted(str(i) for i in caller.coworkerIds)),
+    }
 
 
-def is_coworker(caller: Optional[InterviewCaller], user_id: Any) -> bool:
-    if caller is None or not caller.enabled:
-        return False
-    return any(str(i) == str(user_id) for i in caller.coworkerIds)
+def caller_post_kind(
+    prev: Optional[dict], new: Optional[dict], *, round_deleted: bool = False,
+) -> Optional[str]:
+    """created / updated / canceled / None for a round's #caller thread."""
+    if prev is None:
+        if new is None or round_deleted or new.get("status") == "canceled":
+            return None
+        return "created"
+    # Only a still-scheduled call can be canceled: deleting an old interview or
+    # dropping the caller from a finished/canceled round posts nothing.
+    ending = round_deleted or new is None or new.get("status") == "canceled"
+    if ending:
+        return "canceled" if prev.get("status") == "scheduled" else None
+    return "updated" if new != prev else None
+
+
+def caller_change_lines(
+    prev: dict,
+    new: dict,
+    *,
+    fmt_time: Callable[[datetime], str],
+    label: Callable[[str, Any], str],
+) -> list[str]:
+    """`Field: old → new` for each field that changed, in a fixed order."""
+    lines = []
+    for key, title in _CHANGE_FIELDS:
+        old, cur = prev.get(key), new.get(key)
+        if old == cur:
+            continue
+        if key == "time":
+            render = lambda v: fmt_time(v) if v is not None else "TBD"  # noqa: E731
+        else:
+            render = lambda v, k=key: label(k, v) if v not in (None, "", ()) else "—"  # noqa: E731
+        lines.append(f"{title}: {render(old)} → {render(cur)}")
+    return lines
