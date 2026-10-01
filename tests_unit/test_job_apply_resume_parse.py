@@ -83,3 +83,29 @@ def test_health_badge():
     h = health("Just a few words")
     assert set(h.issues) == {"too_little_text", "no_email", "no_phone", "missing_headings"}
     assert h.score == 100 - 20 - 20 - 8 - 8
+
+
+def test_scrum_master_is_not_a_degree():
+    assert parse_resume("Certified Scrum Master leading two teams", RUN).degree_level is None
+    assert parse_resume("EDUCATION Certified Scrum Master; Bachelor of Science", RUN).degree_level == 2
+    assert parse_resume("Owned Master Data Management", RUN).degree_level is None
+    assert parse_resume("Master's in Computer Science", RUN).degree_level == 3
+
+
+TITLE_FLAT = (
+    "--- Page 1 --- Jane Doe Software Engineer jane@x.com Experience Acme Software Engineer Jan 2018 – Present "
+    "Built APIs in Go. Beta Developer 2016 - 2018 PHP sites. Education State University B.S. Computer Science "
+    "2010 - 2014 Skills Go, PHP"
+)
+
+
+def test_title_case_headings_in_flat_pdf_text():
+    r = parse_resume(TITLE_FLAT, RUN)
+    assert len(r.roles) == 2
+    assert abs(experience_years(r.roles, RUN) - 10.75) < 0.1
+    assert r.degree_level == 2 and "PHP" in r.skills
+
+
+def test_prose_experience_is_not_a_heading():
+    r = parse_resume("Jane Doe. 5 years of Experience Building APIs. SKILLS Go", RUN)
+    assert "Building APIs" in r.headline

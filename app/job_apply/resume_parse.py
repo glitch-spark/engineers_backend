@@ -34,6 +34,11 @@ _LINE_HEADINGS = [
     (g, re.compile(rf"^[ \t]*(?:#{{1,6}}[ \t]*|\*\*|__)?(?:{_alts(ws)})[ \t]*:?[ \t]*(?:\*\*|__)?[ \t]*$", re.I | re.M))
     for g, ws in _GROUPS.items()
 ]
+# Title-Case headings ("Experience", "Technical Skills") inside flat PDF text; filtered by context in _headings.
+_TITLE_HEADINGS = [
+    (g, re.compile(rf"(?<![A-Za-z])(?:{_alts([' '.join(x.capitalize() for x in w.split()) for w in ws])})(?![A-Za-z])"))
+    for g, ws in _GROUPS.items()
+]
 _CAPS_HEADINGS = [
     (g, re.compile(rf"(?<![A-Za-z])(?:{_alts([w.upper() for w in ws])})(?![A-Za-z])"))
     for g, ws in _GROUPS.items()
@@ -54,7 +59,7 @@ _RANGE = re.compile(
 _STATED_YEARS = re.compile(r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)(?:\s+of)?(?:\s+[\w-]+){0,3}?\s+experience", re.I)
 _DEGREE_LONG = [
     (4, re.compile(r"\b(?:ph\.?\s?d|doctorate|doctor of)\b", re.I)),
-    (3, re.compile(r"\bmaster(?:'?s)?\b", re.I)),
+    (3, re.compile(r"\bmaster(?:'?s)?\s+(?:of|in|degree)\b|\bmaster'?s\b|\bmasters\b", re.I)),
     (2, re.compile(r"\bbachelor(?:'?s)?\b|\bundergraduate degree\b", re.I)),
     (1, re.compile(r"\bassociate(?:'?s)? degree\b|\bdiploma\b", re.I)),
 ]
@@ -65,6 +70,9 @@ _DEGREE_ABBR = [
     (2, re.compile(rf"(?<![A-Za-z])(?:B\.?S\.?c?|B\.?A\.|BA|B\.?Eng|B\.?Tech|BCA|B\.?E\.|B\.?Com){_NB}")),
     (1, re.compile(rf"(?<![A-Za-z])(?:A\.?A\.?S?|A\.?S\.)" + _NB)),
 ]
+
+# Phrases with "master" that aren't degrees.
+_NOT_DEGREE = re.compile(r"\bscrum\s+master\b|\bmaster\s+data\b|\bmaster\s+(?:class|plan|branch|node|list|key)\b", re.I)
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _PHONE = re.compile(r"\+?\(?\d[\d\s().-]{8,}\d")
@@ -122,11 +130,26 @@ def parse_date_ranges(text: str, run_date: date) -> list[tuple[date, Optional[da
     return out
 
 
+def _title_heading_ok(text: str, start: int, end: int) -> bool:
+    """A Title-Case keyword in running text is a heading unless it reads as prose ("5 years of Experience")."""
+    before = text[:start].rstrip()
+    prev_word = before.split()[-1] if before.split() else ""
+    if before.endswith((",", "&", "/", "-")) or re.fullmatch(r"[a-z]+", prev_word):
+        return False
+    nxt = text[end:].lstrip(" :")[:1]
+    return not nxt.islower()
+
+
 def _headings(text: str) -> list[tuple[int, int, str]]:
     found: list[tuple[int, int, str]] = []
     for group, rx in _LINE_HEADINGS + _CAPS_HEADINGS:
         for m in rx.finditer(text):
             found.append((m.start(), m.end(), group))
+    if text.count("\n") < 5:  # flat PDF text: no line structure to lean on
+        for group, rx in _TITLE_HEADINGS:
+            for m in rx.finditer(text):
+                if _title_heading_ok(text, m.start(), m.end()):
+                    found.append((m.start(), m.end(), group))
     found.sort(key=lambda h: (h[0], -(h[1] - h[0])))
     merged: list[tuple[int, int, str]] = []
     for h in found:
@@ -177,7 +200,20 @@ def _drop_trailing_header(body: str) -> str:
     return body[: cut + 1] if cut != -1 else body
 
 
+def _complement(length: int, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """[0, length) minus `spans`: with no Experience heading, search for roles outside education/projects."""
+    out, pos = [], 0
+    for a, b in sorted(spans):
+        if a > pos:
+            out.append((pos, a))
+        pos = max(pos, b)
+    if pos < length:
+        out.append((pos, length))
+    return out or [(0, length)]
+
+
 def _degree(text: str, education: str) -> Optional[int]:
+    text, education = _NOT_DEGREE.sub(" ", text), _NOT_DEGREE.sub(" ", education)
     levels = [lvl for lvl, rx in _DEGREE_LONG if rx.search(education or text)]
     if education:
         levels += [lvl for lvl, rx in _DEGREE_ABBR if rx.search(education)]
@@ -195,7 +231,9 @@ def parse_resume(markdown: str, run_date: date) -> ParsedResume:
     head_end = heads[0][0] if heads else len(text)
     headline = re.sub(r"[#*_]+", " ", text[:head_end])
     headline = re.sub(r"\s+", " ", headline).strip()[:200]
-    exp_spans = regions.get("experience") or [(0, len(text))]
+    exp_spans = regions.get("experience") or _complement(
+        len(text), regions.get("education", []) + regions.get("other", [])
+    )
     education = joined("education")
     stated = _STATED_YEARS.search(text)
     return ParsedResume(
