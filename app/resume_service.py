@@ -14,6 +14,7 @@ Identical regenerations skip the LLM call via a content-hash cache
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -557,7 +558,9 @@ def generate_presigned_get(s3_key: str, expires: int = 900, download_filename: O
     )
 
 
-def _maybe_upload_to_s3(pdf_bytes: bytes, profile_name: str, company: str) -> tuple[Optional[str], Optional[str]]:
+def _maybe_upload_to_s3(
+    pdf_bytes: bytes, profile_name: str, company: str, job_id: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
     settings = get_settings()
     bucket = settings.AWS_S3_BUCKET
     region = settings.AWS_REGION
@@ -566,7 +569,9 @@ def _maybe_upload_to_s3(pdf_bytes: bytes, profile_name: str, company: str) -> tu
 
     s3 = _s3_client()
     date_segment = datetime.now(timezone.utc).strftime("%Y_%m_%d")
-    key = f"{date_segment}/{_safe_segment(profile_name)}/{_safe_segment(company)}/Resume.pdf"
+    # The job id keeps two generations for the same profile/company/day from overwriting each other.
+    job_segment = f"{_safe_segment(job_id)}/" if job_id else ""
+    key = f"{date_segment}/{_safe_segment(profile_name)}/{_safe_segment(company)}/{job_segment}Resume.pdf"
     s3.put_object(
         Bucket=bucket,
         Key=key,
@@ -597,12 +602,24 @@ class GeneratedResume:
     llm_fallback_reason: Optional[str] = None
 
 
+_render_sem: Optional[asyncio.Semaphore] = None
+
+
+def _render_slots() -> asyncio.Semaphore:
+    """At most RESUME_RENDER_CONCURRENCY Chromium renders at once (each launches its own browser)."""
+    global _render_sem
+    if _render_sem is None:
+        _render_sem = asyncio.Semaphore(max(1, get_settings().RESUME_RENDER_CONCURRENCY))
+    return _render_sem
+
+
 async def generate_resume(
     account: Account,
     job_description: str,
     company: str,
     prompt_body: Optional[str] = None,
     owner: Optional[UserExtra] = None,
+    job_id: Optional[str] = None,
 ) -> GeneratedResume:
     """Run the full pipeline: LLM rewrites style-stripped body text (or a
     content-hash cache hit reuses a prior output, skipping the call), the body
@@ -632,12 +649,13 @@ async def generate_resume(
     out_html = _finalize_resume_html(template, raw)
     _validate_llm_html(out_html)
 
-    pdf_bytes = await _html_to_pdf(
-        out_html,
-        page_format=account.pageFormat or "A4",
-        margin_pt=_resolve_margin_pt(account),
-    )
-    s3_key, _region = _maybe_upload_to_s3(pdf_bytes, account.name, company)
+    async with _render_slots():
+        pdf_bytes = await _html_to_pdf(
+            out_html,
+            page_format=account.pageFormat or "A4",
+            margin_pt=_resolve_margin_pt(account),
+        )
+    s3_key, _region = await asyncio.to_thread(_maybe_upload_to_s3, pdf_bytes, account.name, company, job_id)
     plain_text = re.sub(
         r"\n{3,}", "\n\n",
         BeautifulSoup(out_html, "html.parser").get_text("\n").strip(),

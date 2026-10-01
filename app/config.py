@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # the top; the tail is benefits/EEO/legal boilerplate. Trimming cuts
     # input tokens with negligible quality loss. ~12000 chars ≈ 3K tokens.
     RESUME_JD_MAX_CHARS: int = 12000
+    # Generation queue (app/resume_queue.py): resumes generating at once, PDF renders (Chromium) at once,
+    # and generations a user may queue per day (both the Generator page and Job Applies).
+    RESUME_LLM_CONCURRENCY: int = 3
+    RESUME_RENDER_CONCURRENCY: int = 2
+    RESUME_DAILY_CAP: int = 300
     # Reasoning effort for non-resume gpt-5* calls (interview rollup,
     # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for

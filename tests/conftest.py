@@ -26,6 +26,7 @@ os.environ.setdefault("APP_BASE_URL", "http://test.localhost")
 os.environ.setdefault("APP_TIMEZONE", "UTC")
 os.environ.setdefault("JWT_EXPIRES_MIN", "60")
 os.environ["JOB_APPLY_WORKER_DISABLED"] = "1"  # tests drive app.job_apply.worker.run_worker directly
+os.environ["RESUME_QUEUE_DISABLED"] = "1"  # tests drive app.resume_queue directly
 
 from typing import AsyncIterator  # noqa: E402
 
@@ -46,6 +47,7 @@ from app.models import (  # noqa: E402
     JobPostingCache,
     Notification,
     RecurringCharge,
+    ResumeApplication,
     Transaction,
     UserExtra,
     WeeklyPlan,
@@ -76,7 +78,7 @@ async def client(app) -> AsyncIterator[AsyncClient]:
 async def db_clean(app) -> AsyncIterator[None]:
     for model in (
         UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge,
-        JobApplyRun, JobApplyRow, JobExtractionCache, JobPostingCache, JobApplicationLog,
+        JobApplyRun, JobApplyRow, JobExtractionCache, JobPostingCache, JobApplicationLog, ResumeApplication,
     ):
         await model.delete_all()
     yield

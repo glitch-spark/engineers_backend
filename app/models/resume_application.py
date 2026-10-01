@@ -19,6 +19,11 @@ JobStep = Literal[
 ]
 
 
+# Bid counting: tailored resumes from Job Applies count only once the job is marked applied with them.
+# Absent/None (old records, Generator page) counts.
+BID_FILTER: dict = {"countsAsBid": {"$ne": False}}
+
+
 class ScreeningPair(BaseModel):
     question: str
     answer: str
@@ -81,9 +86,19 @@ class ResumeApplication(TimestampedDocument):
     # so a failed-job retry can honor the original opt-in.
     generateCoverLetter: bool = False
 
+    # ---- generation queue (app/resume_queue.py) ----
+    source: Literal["generator", "job_applies"] = "generator"
+    countsAsBid: Optional[bool] = None  # False = Job Applies tailoring not yet applied with (not a bid)
+    leaseAt: Optional[datetime] = None  # worker heartbeat while generating
+    attempts: int = 0  # times the worker claimed this job; 3 interrupted attempts → failed
+    promptOverride: Optional[str] = None  # one-off prompt, kept for retries and restarts
+    jobApplyRowId: Optional[PydanticObjectId] = None
+
     class Settings:
         name = "resumeapplications"
         indexes = [
             IndexModel([("userId", 1), ("createdAt", -1)], name="user_recent"),
             IndexModel([("accountId", 1), ("createdAt", -1)], name="account_recent"),
+            IndexModel([("status", 1), ("createdAt", 1)], name="queue"),
+            IndexModel([("jobApplyRowId", 1)], name="job_apply_row"),
         ]
