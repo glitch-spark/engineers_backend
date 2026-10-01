@@ -444,6 +444,11 @@ async def delete_run(run_id: str, user: Annotated[UserExtra, Depends(get_current
     run = await _owned_run(run_id, user)
     if run.status in ACTIVE:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cancel the run before deleting it.")
+    # Tailored resumes still waiting in the queue would cost money for a run that's gone; finished ones stay
+    # on the Generated page.
+    tailored_ids = [i for i in await JobApplyRow.get_motor_collection().distinct("tailoredJobId", {"runId": run.id}) if i]
+    if tailored_ids:
+        await ResumeApplication.get_motor_collection().delete_many({"_id": {"$in": tailored_ids}, "status": "queued"})
     await JobApplyRow.find({"runId": run.id}).delete()
     await run.delete()
     return {"ok": True}
@@ -702,15 +707,21 @@ async def _tailor_row(
         source="job_applies",
         job_apply_row_id=row.id,
     )
-    # Replace the previous tailored job: drop it if it never started and no applied mark uses it.
-    if row.tailoredJobId:
-        used = any(m.tailoredJobId == str(row.tailoredJobId) for m in row.appliedResumes)
-        if not used:
-            await ResumeApplication.get_motor_collection().delete_one({"_id": row.tailoredJobId, "status": "queued"})
-    await JobApplyRow.get_motor_collection().update_one(
-        {"_id": row.id},
+    jobs = ResumeApplication.get_motor_collection()
+    # Compare-and-set: only link the new job if the row still points where we read it. A concurrent tailor
+    # (double click, `t` twice) that got there first wins; ours is dropped so nothing is left orphaned.
+    linked = await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id, "tailoredJobId": row.tailoredJobId},
         {"$set": {"tailoredJobId": job.id, "tailoredAccountId": account_id, "updatedAt": datetime.utcnow()}},
     )
+    if not linked.modified_count:
+        await jobs.delete_one({"_id": job.id})
+        fresh = await JobApplyRow.get(row.id)
+        current = await ResumeApplication.get(fresh.tailoredJobId) if fresh and fresh.tailoredJobId else None
+        return current or job
+    # Replace the previous tailored job: drop it if it never started and no applied mark uses it.
+    if row.tailoredJobId and not any(m.tailoredJobId == str(row.tailoredJobId) for m in row.appliedResumes):
+        await jobs.delete_one({"_id": row.tailoredJobId, "status": "queued"})
     return job
 
 
@@ -743,7 +754,7 @@ async def tailor_all(run_id: str, body: TailorBody, user: Annotated[UserExtra, D
     ).sort("+rowIndex").to_list()
     existing = await _tailored_docs([r.tailoredJobId for r in rows])
     remaining = await resume_queue.remaining_today(owner)
-    queued = skipped = 0
+    queued = skipped = other = 0
     for row in rows:
         current = existing.get(str(row.tailoredJobId))
         if current and current.get("status") != "failed":
@@ -757,11 +768,12 @@ async def tailor_all(run_id: str, body: TailorBody, user: Annotated[UserExtra, D
         try:
             await _tailor_row(row, run, owner, tops[0].accountId, body.coverLetter)
         except HTTPException as exc:
-            if exc.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
-                raise
-            skipped += 1
-            remaining = 0
+            if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+                skipped += 1
+                remaining = 0
+            else:  # e.g. the profile has no HTML template, or the description is too long: skip this job
+                other += 1
             continue
         queued += 1
         remaining -= 1
-    return {"queued": queued, "skippedCap": skipped}
+    return {"queued": queued, "skippedCap": skipped, "skipped": other}

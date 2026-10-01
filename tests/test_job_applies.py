@@ -499,7 +499,7 @@ async def test_tailor_all_respects_cap(client, staff_user, auth_header, monkeypa
     h = auth_header(staff_user)
     run_id, _, _, _ = await _two_profile_run(client, h, staff_user)
     r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
-    assert r.status_code == 200 and r.json() == {"queued": 1, "skippedCap": 1}
+    assert r.status_code == 200 and r.json() == {"queued": 1, "skippedCap": 1, "skipped": 0}
     run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
     assert run["tailoring"] == {"queued": 1, "inProgress": 0, "ready": 0, "failed": 0}
 
@@ -598,3 +598,45 @@ async def test_log_backfill_filekey(client, staff_user, auth_header):
     h = auth_header(staff_user)
     _, rows = await _done_run(client, h, await make_account(staff_user))
     assert rows["https://jobs.example.com/remote"]["previouslyApplied"][0]["profileName"] == "Old"
+
+
+async def test_concurrent_tailor_keeps_one_job(client, staff_user, auth_header):
+    """Two requests that both read the row before either writes must not leave an orphaned queued job."""
+    from app.models import ResumeApplication, UserExtra
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+    from app.routers.job_applies import _tailor_row
+
+    h = auth_header(staff_user)
+    run_id, rows, strong, _ = await _two_profile_run(client, h, staff_user)
+    row_id = PydanticObjectId(rows["https://jobs.example.com/remote"]["_id"])
+    stale_a, stale_b = await JobApplyRow.get(row_id), await JobApplyRow.get(row_id)
+    run = await JobApplyRun.get(PydanticObjectId(run_id))
+    owner = await UserExtra.get(staff_user.id)
+    await _tailor_row(stale_a, run, owner, None, False)
+    await _tailor_row(stale_b, run, owner, None, False)
+    jobs = await ResumeApplication.find({"jobApplyRowId": row_id}).to_list()
+    fresh = await JobApplyRow.get(row_id)
+    assert len(jobs) == 1 and fresh.tailoredJobId == jobs[0].id
+
+
+async def test_tailor_all_skips_rows_it_cannot_tailor(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id, _, strong, _ = await _two_profile_run(client, h, staff_user)
+    strong.styleTemplate = None  # the best profile has no HTML template
+    await strong.save()
+    r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["queued"] == 0 and r.json()["skipped"] == 2
+
+
+async def test_deleting_a_run_drops_its_queued_tailored_jobs(client, staff_user, auth_header):
+    from app.models import ResumeApplication
+
+    h = auth_header(staff_user)
+    run_id, rows, _, _ = await _two_profile_run(client, h, staff_user)
+    await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
+    ready = await _tailored_ready(client, h, rows["https://boards.greenhouse.io/acme/jobs/9"])  # completed one stays
+    assert await ResumeApplication.find({"source": "job_applies", "status": "queued"}).count() == 1
+    assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 200
+    assert await ResumeApplication.find({"source": "job_applies", "status": "queued"}).count() == 0
+    assert await ResumeApplication.get(ready["jobId"]) is not None
