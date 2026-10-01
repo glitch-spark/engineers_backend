@@ -17,17 +17,16 @@ NY = ZoneInfo("America/New_York")
 
 
 def _iv(stage, scheduled_at, history=(), status="scheduled", caller=None):
-    return SimpleNamespace(
-        stage=stage,
-        status=status,
-        scheduledAt=scheduled_at,
-        stageHistory=[SimpleNamespace(stage=s, scheduledAt=dt) for s, dt in history],
-        caller=caller,
-    )
+    """history: (stage, scheduledAt) or (stage, scheduledAt, status, caller) tuples."""
+    events = []
+    for h in history:
+        h = tuple(h) + (None, None)[len(h) - 2:] if len(h) < 4 else tuple(h)
+        events.append(SimpleNamespace(stage=h[0], scheduledAt=h[1], status=h[2], caller=h[3]))
+    return SimpleNamespace(stage=stage, status=status, scheduledAt=scheduled_at, stageHistory=events, caller=caller)
 
 
-def _caller(starts_at, enabled=True):
-    return SimpleNamespace(enabled=enabled, startsAt=starts_at)
+def _caller(enabled=True):
+    return SimpleNamespace(enabled=enabled, startsAt=None)
 
 
 def _day(interviews_self=0, interviews_caller=0, stages=None):
@@ -42,19 +41,33 @@ def _plan(done=None, overrides=None, logged=True):
     )
 
 
-def test_split_rounds_caller_same_local_day_only():
+def test_split_rounds_caller_is_per_round():
+    # Intro taken alone; the tech round had a caller (stored on that round).
     iv = _iv(
-        "tech_round_1",
-        datetime(2026, 10, 1, 15),
-        history=[("intro", datetime(2026, 9, 29, 14))],
-        caller=_caller(datetime(2026, 10, 1, 14, 50, tzinfo=timezone.utc)),
+        "final",
+        datetime(2026, 10, 2, 15),
+        history=[
+            ("intro", datetime(2026, 9, 29, 14), "completed", None),
+            ("tech_round_1", datetime(2026, 10, 1, 15), "completed", _caller()),
+        ],
     )
     rounds = split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC)
-    assert rounds == [(date(2026, 9, 29), "intro", False), (date(2026, 10, 1), "tech", True)]
+    assert rounds == [
+        (date(2026, 9, 29), "intro", False),
+        (date(2026, 10, 1), "tech", True),
+        (date(2026, 10, 2), "final", False),
+    ]
+
+
+def test_split_rounds_latest_round_uses_interview_caller():
+    iv = _iv("intro", datetime(2026, 10, 1, 15), caller=_caller())
+    assert split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC) == [
+        (date(2026, 10, 1), "intro", True)
+    ]
 
 
 def test_split_rounds_disabled_caller_is_self():
-    iv = _iv("intro", datetime(2026, 10, 1, 15), caller=_caller(datetime(2026, 10, 1, 15), enabled=False))
+    iv = _iv("intro", datetime(2026, 10, 1, 15), caller=_caller(enabled=False))
     assert split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC) == [
         (date(2026, 10, 1), "intro", False)
     ]
@@ -67,12 +80,15 @@ def test_split_rounds_ny_saturday_late_round_is_saturday():
     ]
 
 
-def test_split_rounds_skips_excluded_and_canceled():
-    excluded = _iv("home_assessment", datetime(2026, 10, 1), history=[("ai_interview", datetime(2026, 9, 30))])
-    canceled = _iv("rejected", datetime(2026, 10, 1))
+def test_split_rounds_skips_excluded_and_canceled_rounds():
     window = (datetime(2026, 9, 28), datetime(2026, 10, 5), UTC)
+    excluded = _iv("home_assessment", datetime(2026, 10, 1), history=[("ai_interview", datetime(2026, 9, 30))])
     assert split_rounds_by_day(excluded, *window) == []
+    canceled = _iv("intro", datetime(2026, 10, 1), status="canceled")
     assert split_rounds_by_day(canceled, *window) == []
+    # A rejected round still happened, so it counts (same as the dashboard tiles).
+    rejected = _iv("panel", datetime(2026, 10, 1), status="rejected")
+    assert split_rounds_by_day(rejected, *window) == [(date(2026, 10, 1), "panel", False)]
 
 
 def test_effective_daily_done_override_beats_auto():

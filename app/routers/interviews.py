@@ -22,17 +22,18 @@ from app.models import (
     UserExtra,
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
-from app.models.interview import InterviewStage, InterviewStageEvent, InterviewStatus
+from app.models.interview import InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus
+from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
     CallerError,
     CallerIn,
-    build_caller,
-    caller_snapshot,
+    build_round_caller,
+    caller_post_kind,
     is_coworker,
-    resync_caller_day,
+    round_caller_snapshot,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack_bot import notify_caller_channel
+from app.slack_bot import notify_round_caller
 
 log = logging.getLogger(__name__)
 
@@ -58,17 +59,8 @@ def _stage_value(stage: Any) -> Optional[str]:
 
 
 def _normalize_stage(stage: Optional[str]) -> Optional[str]:
-    """Map legacy/generic tech keys to a concrete Tech sub-stage."""
-    stage = _stage_value(stage)
-    if not stage:
-        return stage
-    if stage in ("tech", "tech1"):
-        return InterviewStage.tech_round_1.value
-    if stage == "tech2":
-        return InterviewStage.tech_round_2.value
-    if stage == "hiring_manager":
-        return InterviewStage.cultural.value
-    return stage
+    """Map legacy stage keys (tech, tech1, hiring_manager, …) to current values."""
+    return normalize_stage(_stage_value(stage))
 
 
 def _coerce_write_stage(stage: str) -> str:
@@ -126,65 +118,78 @@ def _append_stage_history(
     )
 
 
-class StageHistoryItemIn(BaseModel):
-    id: Optional[str] = None
+class RoundIn(BaseModel):
+    """One interview round (stage + when + outcome + per-round details)."""
+
     stage: str
-    scheduledAt: Optional[str] = None  # ISO or YYYY-MM-DD
+    scheduledAt: str
+    endsAt: Optional[str] = None
+    status: Optional[str] = "scheduled"
+    interviewerName: Optional[str] = None
+    note: Optional[str] = ""
+    transcript: Optional[str] = ""
+    caller: Optional[CallerIn] = None
 
 
 class InterviewCreate(BaseModel):
     accountId: str
-    scheduledAt: str
-    endsAt: str
-    stage: Optional[str] = None
-    status: Optional[str] = None
     companyName: Optional[str] = None
-    interviewerName: Optional[str] = None
     appliedPosition: Optional[str] = None
     jobUrl: Optional[str] = None
     mainTechStack: Optional[str] = None
+    round: Optional[RoundIn] = None
+    # Legacy flat shape (older clients): mapped into `round` when it is absent.
+    scheduledAt: Optional[str] = None
+    endsAt: Optional[str] = None
+    stage: Optional[str] = None
+    status: Optional[str] = None
+    interviewerName: Optional[str] = None
     transcript: Optional[str] = ""
     note: Optional[str] = ""
-    # Same ordered path the edit form sends — otherwise prior rounds are dropped.
-    stageHistory: Optional[List[StageHistoryItemIn]] = None
     caller: Optional[CallerIn] = None
 
 
-class StageCreate(BaseModel):
-    stage: str
-    scheduledAt: Optional[str] = None
-    status: Optional[str] = None
-    transcript: Optional[str] = None
-    note: Optional[str] = None
+class StageCreate(RoundIn):
+    # Add next round: optionally mark the previous (scheduled/completed) round passed.
+    markPreviousPassed: bool = False
 
 
 class StagePatch(BaseModel):
     stage: Optional[str] = None
     scheduledAt: Optional[str] = None
-    status: Optional[str] = None
-    transcript: Optional[str] = None
-    note: Optional[str] = None
-
-
-class InterviewUpdate(BaseModel):
-    accountId: Optional[str] = None
-    scheduledAt: Optional[str] = None
     endsAt: Optional[str] = None
-    stage: Optional[str] = None
     status: Optional[str] = None
-    companyName: Optional[str] = None
     interviewerName: Optional[str] = None
-    appliedPosition: Optional[str] = None
-    jobUrl: Optional[str] = None
-    mainTechStack: Optional[str] = None
     transcript: Optional[str] = None
     note: Optional[str] = None
-    # Ordered stage entries — replaces history so mistaken board moves can be fixed.
-    stageHistory: Optional[List[StageHistoryItemIn]] = None
     caller: Optional[CallerIn] = None
 
 
-async def _apply_caller(iv: Interview, body: CallerIn, *, user: UserExtra) -> None:
+class InterviewUpdate(BaseModel):
+    """Application-level fields. Rounds are edited through /{id}/stages."""
+
+    accountId: Optional[str] = None
+    companyName: Optional[str] = None
+    appliedPosition: Optional[str] = None
+    jobUrl: Optional[str] = None
+    mainTechStack: Optional[str] = None
+    # Legacy board/quick-status path (stale tabs and the Canceled column).
+    stage: Optional[str] = None
+    status: Optional[str] = None
+    scheduledAt: Optional[str] = None
+    endsAt: Optional[str] = None
+    # Whole-history rewrites are no longer accepted (they silently deleted rounds).
+    stageHistory: Optional[Any] = None
+
+
+async def _round_caller(
+    body: CallerIn,
+    *,
+    starts_at: datetime,
+    owner_id: Any,
+    user: UserExtra,
+    previous: Optional[InterviewCaller],
+) -> InterviewCaller:
     raw_ids = [str(i).strip() for i in (body.coworkerIds or []) if str(i).strip()]
     valid: set[str] = set()
     if body.enabled and raw_ids:
@@ -193,32 +198,105 @@ async def _apply_caller(iv: Interview, body: CallerIn, *, user: UserExtra) -> No
             {"_id": {"$in": oids}, "isActive": {"$ne": False}}
         ).to_list()
         valid = {str(u.id) for u in rows}
-    owner = user if str(user.id) == str(iv.createdBy) else await UserExtra.get(iv.createdBy)
+    owner = user if str(user.id) == str(owner_id) else await UserExtra.get(owner_id)
     try:
-        iv.caller = build_caller(
+        return build_round_caller(
             body,
-            scheduled_at=iv.scheduledAt,
-            owner_id=iv.createdBy,
+            starts_at=starts_at,
+            owner_id=owner_id,
             valid_coworker_ids=valid,
             default_tz=owner.slackTimezone if owner else None,
-            previous=iv.caller,
+            previous=previous,
         )
     except CallerError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
-async def _post_caller_channel(iv: Interview, *, kind: str) -> None:
-    ts = await notify_caller_channel(iv, kind=kind)
-    if ts and iv.caller is not None and iv.caller.slackChannelTs != ts:
-        iv.caller.slackChannelTs = ts
-        await iv.save()
+def mark_previous_passed(history: list[InterviewStageEvent]) -> bool:
+    """Before appending a round: a still-open previous round becomes passed."""
+    if not history:
+        return False
+    tip = history[-1]
+    if tip.status in (InterviewStatus.scheduled, InterviewStatus.completed):
+        tip.status = InterviewStatus.passed
+        return True
+    return False
+
+
+def round_ends_at(start: datetime, ends: Optional[datetime]) -> datetime:
+    """Round end: `ends` when it is after `start`, else start + 1 hour."""
+    if ends is not None and _utc_naive(ends) > _utc_naive(start):
+        return ends
+    return start + timedelta(hours=1)
+
+
+def _carry_status(current: Optional[InterviewStatus], *, appended: bool) -> Optional[InterviewStatus]:
+    """Status for the tip after an update: a newly appended round starts Scheduled."""
+    return InterviewStatus.scheduled if appended else current
+
+
+async def _save_interview(iv: Interview) -> None:
+    """Save, then re-link questions owed by a document resolved on read.
+
+    An unmigrated interview loses its "rejected" round when it is saved
+    (the model resolves it on load); its extracted questions must follow to
+    the round before, or they are orphaned and the later migration can no
+    longer find them.
+    """
+    await iv.save()
+    if not iv.needs_question_sync:
+        return
+    remap = iv.pending_question_remap
+    coll = InterviewQuestion.get_motor_collection()
+    questions = await coll.find(
+        {"interviewId": iv.id, "$or": [{"stageId": {"$in": list(remap)}}, {"stage": "rejected"}]},
+        {"interviewId": 1, "stageId": 1, "stage": 1},
+    ).to_list(None)
+    for qid, payload in pending_question_updates(iv, questions):
+        await coll.update_one({"_id": qid}, {"$set": payload})
+    iv.clear_question_sync()
+
+
+def _round_snapshots(iv: Interview) -> dict[str, Optional[dict]]:
+    return {e.id: round_caller_snapshot(e) for e in iv.stageHistory if e.id}
+
+
+async def _sync_caller_posts(
+    iv: Interview,
+    before: dict[str, Optional[dict]],
+    *,
+    deleted: Iterable[str] = (),
+) -> None:
+    """Post #caller create/update/cancel messages for rounds whose caller
+    details changed since `before` (snapshots taken before the write)."""
+    gone = set(deleted)
+    entries = {e.id: e for e in iv.stageHistory if e.id}
+    ts_changed = False
+    for rid in dict.fromkeys([*before, *entries]):
+        entry = entries.get(rid)
+        if entry is None:
+            continue
+        removed = rid in gone
+        new = None if removed else round_caller_snapshot(entry)
+        kind = caller_post_kind(before.get(rid), new, round_deleted=removed)
+        if kind is None:
+            continue
+        ts = await notify_round_caller(iv, entry, kind, prev=before.get(rid))
+        if ts and entry.caller is not None and entry.caller.slackChannelTs != ts:
+            entry.caller.slackChannelTs = ts
+            ts_changed = True
+    if ts_changed and not gone:
+        _sync_top_from_tip(iv)
+        await _save_interview(iv)
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
+    """Admin, owner, or a coworker on any round's caller request."""
     return (
         user.role == "admin"
         or str(iv.createdBy) == str(user.id)
         or is_coworker(iv.caller, user.id)
+        or any(is_coworker(getattr(e, "caller", None), user.id) for e in (iv.stageHistory or []))
     )
 
 
@@ -231,57 +309,6 @@ def _parse_datetime(s: str) -> Optional[datetime]:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def _set_stage_history(
-    iv: Interview,
-    items: list[StageHistoryItemIn],
-    *,
-    by: Any,
-) -> set[str]:
-    """Replace stageHistory from an ordered list (edit-form fixups).
-
-    Entries are matched to existing ones by id (then by stage) so each round's
-    status, transcript and note survive. Returns ids of entries that were dropped.
-    """
-    by_id = {e.id: e for e in iv.stageHistory}
-    by_stage: dict[str, list[InterviewStageEvent]] = {}
-    for e in iv.stageHistory:
-        by_stage.setdefault(_normalize_stage(e.stage) or e.stage, []).append(e)
-    used: set[str] = set()
-
-    cleaned: list[InterviewStageEvent] = []
-    now = datetime.now(timezone.utc)
-    for item in items:
-        s = _normalize_stage((item.stage or "").strip())
-        if not s:
-            continue
-        if s not in STAGES:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"invalid stage in history: {s}")
-        sched = _parse_datetime(item.scheduledAt) if item.scheduledAt else None
-        if cleaned and cleaned[-1].stage == s:
-            # Prefer a newer scheduledAt when consolidating duplicates.
-            if sched is not None:
-                cleaned[-1].scheduledAt = sched
-            continue
-        prev = by_id.get(item.id) if item.id else None
-        if prev is not None and prev.id in used:
-            prev = None
-        if prev is None:
-            prev = next((e for e in by_stage.get(s, []) if e.id not in used), None)
-        if prev is not None:
-            used.add(prev.id)
-            cleaned.append(
-                prev.model_copy(
-                    update={"stage": s, "scheduledAt": sched if sched is not None else prev.scheduledAt}
-                )
-            )
-        else:
-            cleaned.append(
-                InterviewStageEvent(stage=s, at=now, by=by, source="edit", scheduledAt=sched)
-            )
-    iv.stageHistory = cleaned
-    return set(by_id) - used
 
 
 def _utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
@@ -350,12 +377,20 @@ def _sync_top_from_tip(iv: Interview) -> None:
     if tip.scheduledAt is not None:
         cur = _utc_naive(iv.scheduledAt)
         new = _utc_naive(tip.scheduledAt)
-        if cur is None or cur.date() != new.date():
+        # Timed rounds (they have an end) set the exact start; legacy date-only
+        # rounds only move the interview's date and keep its time.
+        if tip.endsAt is not None or cur is None or cur.date() != new.date():
             iv.scheduledAt = tip.scheduledAt
+    if tip.endsAt is not None:
+        iv.endsAt = tip.endsAt
     start = _utc_naive(iv.scheduledAt)
     ends = _utc_naive(iv.endsAt)
     if start is not None and (ends is None or ends <= start):
         iv.endsAt = start + timedelta(hours=1)
+    # Interviewer and caller live on rounds; the interview-level fields mirror
+    # the latest round for one release (DM digest, _can_view read them).
+    iv.interviewerName = tip.interviewerName
+    iv.caller = tip.caller
 
 
 def _reject_adjacent_duplicate(iv: Interview) -> None:
@@ -380,14 +415,9 @@ async def _after_save(
     iv: Interview,
     *,
     user: UserExtra,
-    prev_caller: Optional[tuple] = None,
     extract_stage_ids: Iterable[Optional[str]] = (),
 ) -> None:
     """Pipeline re-sync and transcript extraction after an update."""
-    new_caller = caller_snapshot(iv.caller)
-    if new_caller is not None and new_caller != prev_caller:
-        await _post_caller_channel(iv, kind="created" if prev_caller is None else "updated")
-
     try:
         from app.routers.applications import attach_interview_to_app
         await attach_interview_to_app(user_id=user.id, interview=iv)
@@ -471,18 +501,6 @@ def _stage_filter_values(stage: str) -> list[str]:
     raw = (stage or "").strip()
     if not raw:
         return []
-    # Board-level Tech → any tech sub-stage (incl. legacy).
-    if raw == "tech":
-        return [
-            InterviewStage.tech.value,
-            InterviewStage.tech_round_1.value,
-            InterviewStage.tech_round_2.value,
-            InterviewStage.live_coding.value,
-            InterviewStage.system_design.value,
-            InterviewStage.home_assessment.value,
-            "tech1",
-            "tech2",
-        ]
     normalized = _normalize_stage(raw) or raw
     if normalized not in STAGES and raw not in STAGES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid stage")
@@ -496,6 +514,79 @@ def _stage_filter_values(stage: str) -> list[str]:
     return list(vals)
 
 
+def range_match(from_dt: Optional[datetime], to_dt: Optional[datetime]) -> dict:
+    """Interviews with any round dated in range (or a dated interview with no rounds)."""
+    rng: dict = {}
+    if from_dt is not None:
+        rng["$gte"] = from_dt
+    if to_dt is not None:
+        rng["$lte"] = to_dt
+    if not rng:
+        return {}
+    return {"$or": [
+        {"stageHistory": {"$elemMatch": {"scheduledAt": rng}}},
+        {"stageHistory": {"$size": 0}, "scheduledAt": rng},
+    ]}
+
+
+def _as_naive_utc(value: Any) -> Optional[datetime]:
+    if isinstance(value, str):
+        value = _parse_datetime(value)
+    if not isinstance(value, datetime):
+        return None
+    return _utc_naive(value)
+
+
+def _iso_utc(value: Any) -> Optional[str]:
+    dt = _as_naive_utc(value)
+    return dt.isoformat() + "Z" if dt is not None else None
+
+
+def flatten_rounds(
+    interviews: list[dict],
+    *,
+    from_dt: datetime,
+    to_dt: datetime,
+    stage: str = "",
+    status: str = "",
+) -> list[dict]:
+    """Calendar rows: one per round dated in [from_dt, to_dt), filtered on the round itself."""
+    lo, hi = _utc_naive(from_dt), _utc_naive(to_dt)
+    want_stage = _normalize_stage(stage) if stage else None
+    rows = []
+    for iv in interviews:
+        account = iv.get("accountId") if isinstance(iv.get("accountId"), dict) else {}
+        owner = iv.get("createdBy")
+        owner_id = str(owner.get("_id")) if isinstance(owner, dict) else str(owner or "")
+        for e in iv.get("stageHistory") or []:
+            start = _as_naive_utc(e.get("scheduledAt"))
+            if start is None or not (lo <= start < hi):
+                continue
+            if want_stage and _normalize_stage(e.get("stage")) != want_stage:
+                continue
+            if status and normalize_status(e.get("status")) != status:
+                continue
+            caller = e.get("caller") or {}
+            rows.append({
+                "interviewId": str(iv.get("_id")),
+                "roundId": e.get("id"),
+                "stage": _normalize_stage(e.get("stage")),
+                "status": normalize_status(e.get("status")),
+                "scheduledAt": _iso_utc(start),
+                "endsAt": _iso_utc(e.get("endsAt")),
+                "companyName": iv.get("companyName"),
+                "profileLabel": (account.get("name") or account.get("email") or "").strip() or None,
+                "ownerId": owner_id,
+                "ownerName": iv.get("ownerName") or iv.get("ownerEmail"),
+                "hasCaller": bool(caller.get("enabled")),
+            })
+    rows.sort(key=lambda r: r["scheduledAt"])
+    return rows
+
+
+_SORT_FIELDS = {"latest": "scheduledAt", "company": "companyName", "stage": "stage", "status": "status"}
+
+
 @router.get("")
 async def list_interviews(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -507,50 +598,16 @@ async def list_interviews(
     stage: str = Query(""),
     status_: str = Query("", alias="status"),
     creatorId: str = Query(""),
-    sort: str = Query("desc"),
+    sort: str = Query("latest"),
+    dir: str = Query("desc"),
 ) -> dict:
     # Every authenticated user can list/filter all interviews. Pass creatorId
     # to narrow to one owner; omit it to see everyone.
-    query: dict[str, Any] = {}
+    query: dict[str, Any] = range_match(parse_date(from_), parse_date(to, end_of_day=True))
 
-    date_filter: dict = {}
-    f_dt = parse_date(from_)
-    t_dt = parse_date(to, end_of_day=True)
-    if f_dt:
-        date_filter["$gte"] = f_dt
-    if t_dt:
-        date_filter["$lte"] = t_dt
-
-    stage_vals = _stage_filter_values(stage) if stage else []
-
-    if date_filter and stage_vals:
-        # Stage filter = “has this stage badge with a date in range”, not “current pan”.
-        query["$or"] = [
-            {
-                "stageHistory": {
-                    "$elemMatch": {
-                        "stage": {"$in": stage_vals},
-                        "scheduledAt": date_filter,
-                    }
-                }
-            },
-            {
-                "stage": {"$in": stage_vals},
-                "scheduledAt": date_filter,
-            },
-        ]
-    elif date_filter:
-        # Include cards whose current schedule OR any stage-round date falls in range.
-        query["$or"] = [
-            {"scheduledAt": date_filter},
-            {"stageHistory.scheduledAt": date_filter},
-        ]
-    elif stage_vals:
-        query["$or"] = [
-            {"stage": {"$in": stage_vals}},
-            {"stageHistory.stage": {"$in": stage_vals}},
-        ]
-
+    # Stage and status describe the latest round (mirrored on the interview).
+    if stage:
+        query["stage"] = {"$in": _stage_filter_values(stage)}
     if accountId:
         query["accountId"] = to_object_id(accountId)
     if status_:
@@ -560,10 +617,17 @@ async def list_interviews(
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
 
-    direction = 1 if sort == "asc" else -1
+    # Legacy clients send sort=asc|desc (by date).
+    if sort in ("asc", "desc"):
+        sort, dir = "latest", sort
+    field = _SORT_FIELDS.get(sort, "scheduledAt")
+    direction = 1 if dir == "asc" else -1
     skip = (page - 1) * limit
     total = await Interview.find(query).count()
-    rows = await Interview.find(query).sort([("scheduledAt", direction)]).skip(skip).limit(limit).to_list()
+    # Case-insensitive ordering ("acme" next to "Acme", not after "Zeta").
+    rows = await Interview.find(query, collation={"locale": "en", "strength": 2}).sort(
+        [(field, direction), ("_id", direction)]
+    ).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
     rows_out = await _populate_coworkers(await _populate_account(rows_with_owner))
 
@@ -581,6 +645,38 @@ async def list_interviews(
     }
 
 
+@router.get("/rounds")
+async def list_interview_rounds(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+    accountId: str = Query(""),
+    stage: str = Query(""),
+    status_: str = Query("", alias="status"),
+    creatorId: str = Query(""),
+) -> dict:
+    """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list."""
+    f_dt, t_dt = parse_date(from_), parse_date(to)
+    if f_dt is None or t_dt is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from and to are required")
+    if not (timedelta(0) < _utc_naive(t_dt) - _utc_naive(f_dt) <= timedelta(days=45)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="range must be 1 to 45 days")
+    if status_ and status_ not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": f_dt, "$lt": t_dt}}}}
+    if accountId:
+        query["accountId"] = to_object_id(accountId)
+    if creatorId:
+        query["createdBy"] = to_object_id(creatorId)
+    rows = await Interview.find(query).to_list()
+    out = await _populate_coworkers(await _populate_account(await populate_owner(rows, field="createdBy")))
+    rounds = flatten_rounds(out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_)
+    # The interviews behind the rounds, so a click can open the side panel
+    # (GET /{id} is limited to owner/admin/coworker; this feed is not).
+    shown = {r["interviewId"] for r in rounds}
+    return {"rounds": rounds, "interviews": {str(i["_id"]): i for i in out if str(i["_id"]) in shown}}
+
+
 @router.get("/{iv_id}")
 async def get_interview(
     iv_id: str,
@@ -593,7 +689,7 @@ async def get_interview(
     if not _can_view(iv, user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     if migrate_legacy_stage_fields(iv):
-        await iv.save()
+        await _save_interview(iv)
         tip = _tip(iv)
         if tip is not None:
             await InterviewQuestion.find(
@@ -602,82 +698,110 @@ async def get_interview(
     return await _interview_out(iv)
 
 
+async def _build_round(
+    rnd: RoundIn,
+    *,
+    owner_id: Any,
+    user: UserExtra,
+    source: str,
+) -> InterviewStageEvent:
+    """Validate a RoundIn and return the stage entry to store."""
+    stage_raw, status_raw = translate_legacy_write(rnd.stage, rnd.status)
+    stage_val = _coerce_write_stage(stage_raw or InterviewStage.intro.value)
+    status_val = (status_raw or "").strip() or InterviewStatus.scheduled.value
+    if status_val not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    start = _parse_datetime(rnd.scheduledAt)
+    if start is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
+    ends = None
+    if rnd.endsAt:
+        ends = _parse_datetime(rnd.endsAt)
+        if ends is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
+    entry = InterviewStageEvent(
+        id=uuid4().hex,
+        stage=stage_val,
+        at=datetime.now(timezone.utc),
+        by=user.id,
+        source=source,
+        scheduledAt=start,
+        endsAt=round_ends_at(start, ends),
+        status=InterviewStatus(status_val),
+        interviewerName=(rnd.interviewerName or "").strip() or None,
+        note=rnd.note or "",
+        transcript=rnd.transcript or "",
+    )
+    if rnd.caller is not None:
+        entry.caller = await _round_caller(
+            rnd.caller, starts_at=start, owner_id=owner_id, user=user, previous=None,
+        )
+    return entry
+
+
+def _legacy_round(body: InterviewCreate) -> RoundIn:
+    """Older clients post the first round as flat interview fields."""
+    return RoundIn(
+        stage=body.stage or InterviewStage.intro.value,
+        scheduledAt=body.scheduledAt or "",
+        endsAt=body.endsAt,
+        status=body.status or InterviewStatus.scheduled.value,
+        interviewerName=body.interviewerName,
+        note=body.note or "",
+        transcript=body.transcript or "",
+        caller=body.caller,
+    )
+
+
+async def _account_for_write(account_id: str, user: UserExtra) -> Any:
+    account_oid = to_object_id(account_id)
+    account = await Account.get(account_oid)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid accountId")
+    if user.role != "admin" and str(account.createdBy) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="cannot use an account you do not own")
+    return account_oid
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_interview(
     body: InterviewCreate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    stage_val = _coerce_write_stage(body.stage) if body.stage else None
-    status_val = (body.status or "").strip() or None
-    if status_val is not None and status_val not in STATUSES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
-    sched = _parse_datetime(body.scheduledAt)
-    if sched is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
-    ends = _parse_datetime(body.endsAt)
-    if ends is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
-    if ends <= sched:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="endsAt must be after scheduledAt")
+    company = (body.companyName or "").strip()
+    if not company:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="companyName is required")
+    account_oid = await _account_for_write(body.accountId, user)
+    entry = await _build_round(
+        body.round or _legacy_round(body), owner_id=user.id, user=user, source="create",
+    )
 
-    account_oid = to_object_id(body.accountId)
-    account = await Account.get(account_oid)
-    if account is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid accountId")
-
-    is_admin = user.role == "admin"
-    if not is_admin and str(account.createdBy) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="cannot use an account you do not own")
-
+    # History is appended after construction: the model's read-time resolver
+    # only understands raw dicts.
     iv = Interview(
         accountId=account_oid,
         createdBy=user.id,
-        scheduledAt=sched,
-        endsAt=ends,
-        stage=InterviewStage(stage_val) if stage_val else None,
-        status=InterviewStatus(status_val) if status_val else None,
-        companyName=body.companyName or None,
-        interviewerName=body.interviewerName or None,
-        appliedPosition=body.appliedPosition or None,
-        jobUrl=body.jobUrl or None,
-        mainTechStack=body.mainTechStack or None,
+        scheduledAt=entry.scheduledAt,
+        endsAt=entry.endsAt,
+        companyName=company,
+        appliedPosition=(body.appliedPosition or "").strip() or None,
+        jobUrl=(body.jobUrl or "").strip() or None,
+        mainTechStack=(body.mainTechStack or "").strip() or None,
         stageHistory=[],
     )
-    if body.stageHistory:
-        _set_stage_history(iv, body.stageHistory, by=user.id)
-    if stage_val:
-        last = _normalize_stage(iv.stageHistory[-1].stage) if iv.stageHistory else None
-        if last != stage_val:
-            _append_stage_history(iv, stage_val, by=user.id, source="create")
+    iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
-    if status_val:
-        iv.status = InterviewStatus(status_val)
-    tip = _tip(iv)
-    if tip is not None:
-        tip.status = iv.status
-        tip.transcript = body.transcript or ""
-        tip.note = body.note or ""
-    else:
-        iv.transcript = body.transcript or ""
-        iv.note = body.note or ""
-    if body.caller is not None and body.caller.enabled:
-        await _apply_caller(iv, body.caller, user=user)
     await iv.insert()
 
-    if (body.transcript or "").strip():
-        asyncio.create_task(extract_and_score(iv, tip.id if tip else None))
-
-    # Auto-link to pipeline (idempotent + best-effort).
+    if entry.transcript.strip():
+        asyncio.create_task(extract_and_score(iv, entry.id))
     try:
         from app.routers.applications import attach_interview_to_app
         await attach_interview_to_app(user_id=user.id, interview=iv)
     except Exception as exc:  # noqa: BLE001
         log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
-
-    if caller_snapshot(iv.caller) is not None:
-        await _post_caller_channel(iv, kind="created")
-
-    return doc_to_dict(iv)
+    await _sync_caller_posts(iv, {})
+    return await _interview_out(iv)
 
 
 @router.put("/{iv_id}")
@@ -686,161 +810,88 @@ async def update_interview(
     body: InterviewUpdate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
+    if body.stageHistory is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="edit rounds with /interviews/{id}/stages",
+        )
     oid = to_object_id(iv_id)
     iv = await Interview.get(oid)
     if iv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-
     is_admin = user.role == "admin"
-    is_owner = str(iv.createdBy) == str(user.id)
-    if not is_admin and not is_owner:
+    if not is_admin and str(iv.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
+    before = _round_snapshots(iv)
     prev_sched = iv.scheduledAt
-    prev_caller = caller_snapshot(iv.caller)
     migrated = migrate_legacy_stage_fields(iv)
 
-    if body.accountId is not None:
-        new_account_oid = to_object_id(body.accountId)
-        account = await Account.get(new_account_oid)
-        if account is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid accountId")
-        if not is_admin and str(account.createdBy) != str(user.id):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="cannot use an account you do not own")
-        iv.accountId = new_account_oid
+    # Stale clients still send stage "rejected": set the current round's
+    # status instead, without a new round or a date change.
+    legacy_rejected = normalize_stage(body.stage) == "rejected"
+    body.stage, body.status = translate_legacy_write(body.stage, body.status)
+    if legacy_rejected:
+        body.scheduledAt = None
+        body.endsAt = None
 
+    if body.accountId is not None:
+        iv.accountId = await _account_for_write(body.accountId, user)
+    if body.companyName is not None:
+        company = body.companyName.strip()
+        if not company:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="companyName is required")
+        iv.companyName = company
+    if body.appliedPosition is not None:
+        iv.appliedPosition = body.appliedPosition.strip() or None
+    if body.jobUrl is not None:
+        iv.jobUrl = body.jobUrl.strip() or None
+    if body.mainTechStack is not None:
+        iv.mainTechStack = body.mainTechStack.strip() or None
+
+    # Legacy stage move (board drag from a stale tab): append / re-date a round.
     new_sched = iv.scheduledAt
-    new_ends = iv.endsAt
     if body.scheduledAt is not None:
         sched = _parse_datetime(body.scheduledAt)
         if sched is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
         new_sched = sched
-    if body.endsAt is not None:
-        ends = _parse_datetime(body.endsAt)
-        if ends is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
-        new_ends = ends
-    # Edit UI no longer edits times; if endsAt is missing/equal/before start, keep a 1h window.
-    if new_sched is not None and (new_ends is None or new_ends <= new_sched):
-        new_ends = new_sched + timedelta(hours=1)
-
-    # Before changing the interview date, stamp the current tip with the prior schedule
-    # so earlier rounds keep their date when the next round is scheduled.
-    if (
-        body.scheduledAt is not None
-        and body.stageHistory is None
-        and iv.stageHistory
-        and prev_sched is not None
-    ):
-        tip = iv.stageHistory[-1]
-        if tip.scheduledAt is None:
+        tip = _tip(iv)
+        if tip is not None and tip.scheduledAt is None and prev_sched is not None:
             tip.scheduledAt = prev_sched
-            iv.stageHistory[-1] = tip
-
     iv.scheduledAt = new_sched
-    iv.endsAt = new_ends
-    removed_stage_ids: set[str] = set()
-    if body.stageHistory is not None:
-        removed_stage_ids = _set_stage_history(iv, body.stageHistory, by=user.id)
-
-    if body.stage is not None:
-        if body.stage == "":
-            iv.stage = None
-        else:
-            stage_val = _coerce_write_stage(body.stage)
-            prev = _stage_value(iv.stage)
-            iv.stage = InterviewStage(stage_val)
-            if body.stageHistory is None:
-                # Board drag / partial update — append movement.
-                if stage_val != _normalize_stage(prev):
-                    _append_stage_history(
-                        iv,
-                        stage_val,
-                        by=user.id,
-                        source="manual",
-                        previous=prev,
-                        previous_scheduled_at=prev_sched,
-                    )
-                elif body.scheduledAt is not None:
-                    # Same stage, date-only change (e.g. Tech → same Tech sub-stage).
-                    _append_stage_history(
-                        iv, stage_val, by=user.id, source="manual", previous=prev,
-                    )
-            else:
-                # Edit form sent an explicit history — keep current stage as the tip.
-                last = iv.stageHistory[-1].stage if iv.stageHistory else None
-                if _normalize_stage(last) != stage_val:
-                    _append_stage_history(
-                        iv, stage_val, by=user.id, source="edit", previous=last,
-                    )
-    elif body.stageHistory is not None and iv.stageHistory:
-        # History-only edit: current stage follows the last remaining entry.
-        tip = _normalize_stage(iv.stageHistory[-1].stage)
-        iv.stage = InterviewStage(tip) if tip in STAGES else None
-    elif body.stageHistory is not None and not iv.stageHistory:
-        iv.stage = None
-
+    rounds_before = len(iv.stageHistory)
+    if body.stage:
+        stage_val = _coerce_write_stage(body.stage)
+        prev = _stage_value(iv.stage)
+        if stage_val != _normalize_stage(prev) or body.scheduledAt is not None:
+            _append_stage_history(
+                iv, stage_val, by=user.id, source="manual",
+                previous=prev, previous_scheduled_at=prev_sched,
+            )
+    iv.status = _carry_status(iv.status, appended=len(iv.stageHistory) > rounds_before)
     if body.status is not None:
         if body.status == "":
             iv.status = None
+        elif body.status not in STATUSES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
         else:
-            if body.status not in STATUSES:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
             iv.status = InterviewStatus(body.status)
-    if body.companyName is not None:
-        iv.companyName = body.companyName or None
-    if body.interviewerName is not None:
-        iv.interviewerName = body.interviewerName or None
-    if body.appliedPosition is not None:
-        iv.appliedPosition = body.appliedPosition or None
-    if body.jobUrl is not None:
-        iv.jobUrl = body.jobUrl or None
-    if body.mainTechStack is not None:
-        iv.mainTechStack = body.mainTechStack or None
-
-    # The modal/panel edit the current round: transcript, note and status land on the tip.
     tip = _tip(iv)
-    target_transcript = tip.transcript if tip is not None else (iv.transcript or "")
-    transcript_changed = body.transcript is not None and body.transcript != (target_transcript or "")
     if tip is not None:
         tip.status = iv.status
-        if body.transcript is not None:
-            tip.transcript = body.transcript
-        if body.note is not None:
-            tip.note = body.note
-    else:
-        if body.transcript is not None:
-            iv.transcript = body.transcript
-        if body.note is not None:
-            iv.note = body.note
+        if tip.caller is not None and tip.caller.enabled and tip.scheduledAt is not None:
+            tip.caller.startsAt = tip.scheduledAt
+    _sync_top_from_tip(iv)
+    await _save_interview(iv)
 
-    if body.caller is not None:
-        await _apply_caller(iv, body.caller, user=user)
-    else:
-        resync_caller_day(iv.caller, iv.scheduledAt)
-
-    await iv.save()
-
-    if removed_stage_ids:
-        await InterviewQuestion.find(
-            {"interviewId": iv.id, "stageId": {"$in": list(removed_stage_ids)}}
-        ).delete()
     if migrated and tip is not None:
         await InterviewQuestion.find(
             {"interviewId": iv.id, "stageId": None}
         ).update({"$set": {"stageId": tip.id}})
-
-    extract_ids: list[Optional[str]] = []
-    if transcript_changed and (body.transcript or "").strip():
-        extract_ids.append(tip.id if tip is not None else None)
-    await _after_save(
-        iv,
-        user=user,
-        prev_caller=prev_caller,
-        extract_stage_ids=extract_ids,
-    )
-    return doc_to_dict(iv)
+    await _sync_caller_posts(iv, before)
+    await _after_save(iv, user=user)
+    return await _interview_out(iv)
 
 
 @router.post("/{iv_id}/stages", status_code=status.HTTP_201_CREATED)
@@ -850,46 +901,28 @@ async def add_interview_stage(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     iv = await _load_editable(iv_id, user)
-    prev_caller = caller_snapshot(iv.caller)
+    before = _round_snapshots(iv)
     migrate_legacy_stage_fields(iv)
-
-    stage_val = _coerce_write_stage(body.stage)
-    if body.status and body.status not in STATUSES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
-    sched = None
-    if body.scheduledAt:
-        sched = _parse_datetime(body.scheduledAt)
-        if sched is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
-
-    entry = InterviewStageEvent(
-        id=uuid4().hex,
-        stage=stage_val,
-        at=datetime.now(timezone.utc),
-        by=user.id,
-        source="stage",
-        scheduledAt=sched or datetime.now(timezone.utc),
-        status=InterviewStatus(body.status) if body.status else None,
-        transcript=body.transcript or "",
-        note=body.note or "",
-    )
-    prev_tip = iv.stageHistory[-1] if iv.stageHistory else None
-    if prev_tip is not None and _normalize_stage(prev_tip.stage) == stage_val:
+    if normalize_stage(body.stage) == "rejected":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{stage_val} cannot directly follow itself",
+            detail="rejected is a status; set status on the current round",
         )
+    entry = await _build_round(body, owner_id=iv.createdBy, user=user, source="stage")
+    prev_tip = _tip(iv)
+    if prev_tip is not None and _normalize_stage(prev_tip.stage) == entry.stage:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{entry.stage} cannot directly follow itself",
+        )
+    if body.markPreviousPassed:
+        mark_previous_passed(iv.stageHistory)
     iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
-    resync_caller_day(iv.caller, iv.scheduledAt)
-    await iv.save()
+    await _save_interview(iv)
 
-    await _after_save(
-        iv,
-        user=user,
-        prev_caller=prev_caller,
-        extract_stage_ids=[entry.id] if entry.transcript.strip() else [],
-    )
+    await _sync_caller_posts(iv, before)
+    await _after_save(iv, user=user, extract_stage_ids=[entry.id] if entry.transcript.strip() else [])
     return await _interview_out(iv)
 
 
@@ -901,18 +934,30 @@ async def update_interview_stage(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     iv = await _load_editable(iv_id, user)
-    prev_caller = caller_snapshot(iv.caller)
+    before = _round_snapshots(iv)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
     entry = iv.stageHistory[idx]
 
-    if body.stage is not None:
+    body.stage, body.status = translate_legacy_write(body.stage, body.status)
+    if body.stage:
         entry.stage = _coerce_write_stage(body.stage)
     if body.scheduledAt is not None:
         sched = _parse_datetime(body.scheduledAt)
         if sched is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
+        old_start, old_end = entry.scheduledAt, entry.endsAt
         entry.scheduledAt = sched
+        # Rescheduling keeps the round's duration unless a new end is sent.
+        if body.endsAt is None and old_start is not None and old_end is not None:
+            entry.endsAt = round_ends_at(sched, sched + (_utc_naive(old_end) - _utc_naive(old_start)))
+        if entry.caller is not None and entry.caller.enabled:
+            entry.caller.startsAt = sched
+    if body.endsAt is not None:
+        ends = _parse_datetime(body.endsAt) if body.endsAt else None
+        if body.endsAt and ends is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
+        entry.endsAt = round_ends_at(entry.scheduledAt, ends)
     if body.status is not None:
         if body.status == "":
             entry.status = None
@@ -920,18 +965,23 @@ async def update_interview_stage(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
         else:
             entry.status = InterviewStatus(body.status)
+    if body.interviewerName is not None:
+        entry.interviewerName = body.interviewerName.strip() or None
     transcript_changed = body.transcript is not None and body.transcript != entry.transcript
     if body.transcript is not None:
         entry.transcript = body.transcript
     if body.note is not None:
         entry.note = body.note
+    if body.caller is not None:
+        entry.caller = await _round_caller(
+            body.caller, starts_at=entry.scheduledAt, owner_id=iv.createdBy,
+            user=user, previous=entry.caller,
+        )
     iv.stageHistory[idx] = entry
 
     _reject_adjacent_duplicate(iv)
-    if idx == len(iv.stageHistory) - 1:
-        _sync_top_from_tip(iv)
-        resync_caller_day(iv.caller, iv.scheduledAt)
-    await iv.save()
+    _sync_top_from_tip(iv)
+    await _save_interview(iv)
 
     extract_ids: list[Optional[str]] = []
     if transcript_changed:
@@ -939,12 +989,8 @@ async def update_interview_stage(
             extract_ids.append(entry.id)
         else:
             await InterviewQuestion.find({"interviewId": iv.id, "stageId": entry.id}).delete()
-    await _after_save(
-        iv,
-        user=user,
-        prev_caller=prev_caller,
-        extract_stage_ids=extract_ids,
-    )
+    await _sync_caller_posts(iv, before)
+    await _after_save(iv, user=user, extract_stage_ids=extract_ids)
     return await _interview_out(iv)
 
 
@@ -955,26 +1001,22 @@ async def delete_interview_stage(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     iv = await _load_editable(iv_id, user)
-    prev_caller = caller_snapshot(iv.caller)
+    before = _round_snapshots(iv)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
     if len(iv.stageHistory) <= 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="An interview needs at least one stage",
+            detail="An interview needs at least one round",
         )
+    # Cancel the round's #caller thread while the round still exists.
+    await _sync_caller_posts(iv, before, deleted={stage_id})
     iv.stageHistory.pop(idx)
     _reject_adjacent_duplicate(iv)
     _sync_top_from_tip(iv)
-    resync_caller_day(iv.caller, iv.scheduledAt)
-    await iv.save()
+    await _save_interview(iv)
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
-
-    await _after_save(
-        iv,
-        user=user,
-        prev_caller=prev_caller,
-    )
+    await _after_save(iv, user=user)
     return await _interview_out(iv)
 
 
@@ -993,6 +1035,8 @@ async def delete_interview(
     if not is_admin and not is_owner:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
+    before = _round_snapshots(iv)
+    await _sync_caller_posts(iv, before, deleted=set(before))
     await iv.delete()
     await InterviewQuestion.find({"interviewId": iv.id}).delete()
     return {"ok": True}

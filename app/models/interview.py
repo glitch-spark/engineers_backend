@@ -6,45 +6,34 @@ from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pymongo import IndexModel
 
+from app.interview_normalize import normalize_status, resolve_interview
 from app.models.base import TimestampedDocument
 
 
 class InterviewStage(str, Enum):
     intro = "intro"
-    tech = "tech"  # legacy / generic; prefer tech sub-stages below
     tech_round_1 = "tech_round_1"
     tech_round_2 = "tech_round_2"
     live_coding = "live_coding"
     system_design = "system_design"
     home_assessment = "home_assessment"
-    panel = "panel"
     cultural = "cultural"
+    panel = "panel"
     final = "final"
-    rejected = "rejected"
     ai_interview = "ai_interview"
 
 
-# Legacy stage strings still present in old documents; mapped on read so the
-# document loads against the trimmed enum. Writes must use the new values.
-_LEGACY_STAGE_MAP = {
-    "tech1": InterviewStage.tech_round_1,
-    "tech2": InterviewStage.tech_round_2,
-    "hiring_manager": InterviewStage.final,
-    "offer": InterviewStage.final,
-    "others": InterviewStage.intro,
-}
-
-
 class InterviewStatus(str, Enum):
+    """Per-round status. Rejected/canceled are statuses, never stages; legacy
+    values (failed, no_show, rescheduled) are mapped by normalize_status."""
+
     scheduled = "scheduled"
     completed = "completed"
     passed = "passed"
-    failed = "failed"
-    no_show = "no_show"
-    rescheduled = "rescheduled"
+    rejected = "rejected"
     canceled = "canceled"
 
 
@@ -53,29 +42,6 @@ def stage_event_id(stage: str, at: Any, scheduled_at: Any = None) -> str:
     same entry keeps the same id across reads until it is persisted."""
     seed = f"{stage}|{at}|{scheduled_at}"
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
-
-
-class InterviewStageEvent(BaseModel):
-    id: str = Field(default_factory=lambda: uuid4().hex)
-    stage: str
-    at: datetime
-    by: Optional[PydanticObjectId] = None
-    source: Optional[str] = None  # 'create' | 'manual' | 'board' | 'edit' | 'seed'
-    # Interview scheduled date for this round (when they sat this stage).
-    scheduledAt: Optional[datetime] = None
-    status: Optional[InterviewStatus] = None
-    transcript: str = ""
-    note: str = ""
-
-    @model_validator(mode="before")
-    @classmethod
-    def _backfill_id(cls, data):
-        if isinstance(data, dict) and not data.get("id"):
-            data = dict(data)
-            data["id"] = stage_event_id(
-                str(data.get("stage") or ""), data.get("at"), data.get("scheduledAt"),
-            )
-        return data
 
 
 CallerMethod = Literal["video", "phone_hushed", "phone_slynumber"]
@@ -103,6 +69,39 @@ class InterviewCaller(BaseModel):
         return v
 
 
+class InterviewStageEvent(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    stage: str
+    at: datetime
+    by: Optional[PydanticObjectId] = None
+    source: Optional[str] = None  # 'create' | 'manual' | 'board' | 'edit' | 'seed'
+    # Interview scheduled date for this round (when they sat this stage).
+    scheduledAt: Optional[datetime] = None
+    status: Optional[InterviewStatus] = None
+    transcript: str = ""
+    note: str = ""
+    # Per-round details (phase 2). The interview-level interviewerName/caller
+    # mirror the latest round's for one release.
+    interviewerName: Optional[str] = None
+    endsAt: Optional[datetime] = None
+    caller: Optional[InterviewCaller] = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _legacy_status(cls, v):
+        return normalize_status(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_id(cls, data):
+        if isinstance(data, dict) and not data.get("id"):
+            data = dict(data)
+            data["id"] = stage_event_id(
+                str(data.get("stage") or ""), data.get("at"), data.get("scheduledAt"),
+            )
+        return data
+
+
 class Interview(TimestampedDocument):
     accountId: PydanticObjectId
     resumeId: Optional[PydanticObjectId] = None  # legacy; no longer surfaced in UI
@@ -121,21 +120,38 @@ class Interview(TimestampedDocument):
     stageHistory: List[InterviewStageEvent] = []
     caller: Optional[InterviewCaller] = None
 
-    @field_validator("stage", mode="before")
-    @classmethod
-    def _coerce_legacy_stage(cls, v):
-        if isinstance(v, str) and v in _LEGACY_STAGE_MAP:
-            return _LEGACY_STAGE_MAP[v]
-        return v
+    # Set when an unmigrated document was resolved on read: questions linked to
+    # removed "rejected" rounds must follow on save (routers.interviews._save_interview).
+    _question_sync: Optional[dict] = PrivateAttr(default=None)
 
-    @model_validator(mode="before")
+    @property
+    def pending_question_remap(self) -> dict:
+        return dict(self._question_sync or {})
+
+    @property
+    def needs_question_sync(self) -> bool:
+        return self._question_sync is not None
+
+    def clear_question_sync(self) -> None:
+        self._question_sync = None
+
+    @model_validator(mode="wrap")
     @classmethod
-    def _migrate_legacy_fields(cls, data):
-        # Old documents stored interviewer name under `interviewName`.
+    def _migrate_legacy_fields(cls, data, handler):
+        res = None
         if isinstance(data, dict):
+            # Old documents stored interviewer name under `interviewName`.
             if data.get("interviewerName") in (None, "") and data.get("interviewName"):
                 data["interviewerName"] = data["interviewName"]
-        return data
+            # Unmigrated documents: rejected stage entries / legacy values.
+            res = resolve_interview(data, now=datetime.now(dt_timezone.utc))
+            data = res.doc
+        iv = handler(data)
+        if res is not None and (
+            res.question_remap or res.rules.get("rejected_only_to_intro")
+        ):
+            iv._question_sync = dict(res.question_remap)
+        return iv
 
     class Settings:
         name = "interviews"
@@ -146,4 +162,5 @@ class Interview(TimestampedDocument):
             IndexModel([("stage", 1)]),
             IndexModel([("status", 1)]),
             IndexModel([("caller.coworkerIds", 1)]),
+            IndexModel([("stageHistory.caller.coworkerIds", 1)]),
         ]

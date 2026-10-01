@@ -5,7 +5,6 @@ from datetime import date, datetime
 from beanie import PydanticObjectId
 
 from app.models import Account, DailyPlan, Interview, WeeklyPlan
-from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.plan_auto import interview_counts, profiles_by_region, week_snapshot
 
 
@@ -17,10 +16,13 @@ async def test_interview_counts_by_day_self_and_caller(staff_user, staff_user_2)
         scheduledAt=datetime(2026, 10, 1, 15),
         stage="tech_round_1",
         status="scheduled",
+        # Rounds carry their own caller: the intro was taken alone, the tech round with a caller.
         stageHistory=[
-            InterviewStageEvent(stage="intro", at=datetime(2026, 9, 29, 9), scheduledAt=datetime(2026, 9, 29, 9)),
+            {"stage": "intro", "at": datetime(2026, 9, 29, 9), "scheduledAt": datetime(2026, 9, 29, 9),
+             "status": "completed"},
+            {"stage": "tech_round_1", "at": datetime(2026, 10, 1, 15), "scheduledAt": datetime(2026, 10, 1, 15),
+             "status": "scheduled", "caller": {"enabled": True, "startsAt": datetime(2026, 10, 1, 15)}},
         ],
-        caller=InterviewCaller(enabled=True, startsAt=datetime(2026, 10, 1, 15)),
     ).insert()
     await Interview(
         accountId=account_id,

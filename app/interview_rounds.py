@@ -15,7 +15,6 @@ from app.models import Interview
 # Rounds excluded from interview KPIs / leaderboard (matches Interviews board).
 _ROUND_COUNT_EXCLUDED = frozenset({
     "ai_interview",
-    "rejected",
     "home_assessment",
 })
 
@@ -93,57 +92,62 @@ def _dt_in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool
     return _as_aware(start) <= d <= _as_aware(end)  # type: ignore[operator]
 
 
-def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime]]]:
-    """Trail of (stage, scheduledAt) — history keeps its own dates; tip uses iv.scheduledAt."""
-    trail: list[tuple[str, Optional[datetime]]] = []
+def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str, Any]]:
+    """Trail of (stage, scheduledAt, status, caller) — history keeps its own dates,
+    statuses and callers; the tip falls back to the interview-level values."""
+    trail: list[tuple[str, Optional[datetime], str, Any]] = []
 
-    def push(stage_raw: Any, dt: Optional[datetime]) -> None:
+    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any, caller: Any) -> None:
         stage = _norm_stage(stage_raw)
         if not stage:
             return
+        status = _norm_status(status_raw)
         if trail and trail[-1][0] == stage:
-            if dt is not None:
-                trail[-1] = (stage, dt)
+            _, prev_dt, prev_status, prev_caller = trail[-1]
+            trail[-1] = (
+                stage,
+                dt if dt is not None else prev_dt,
+                status or prev_status,
+                caller if caller is not None else prev_caller,
+            )
             return
-        trail.append((stage, dt))
+        trail.append((stage, dt, status, caller))
 
     for h in (iv.stageHistory or []):
-        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None))
-    push(iv.stage, iv.scheduledAt)
+        push(
+            getattr(h, "stage", None),
+            getattr(h, "scheduledAt", None),
+            getattr(h, "status", None),
+            getattr(h, "caller", None),
+        )
+    push(iv.stage, iv.scheduledAt, iv.status, getattr(iv, "caller", None))
     return trail
 
 
 def count_interview_rounds(
     iv: Interview, start: datetime, end: datetime,
 ) -> tuple[int, int, dict[str, int]]:
-    """Return (countable_rounds, canceled, breakdown_counts).
+    """Return (countable_rounds, canceled, breakdown_counts) for rounds dated in range.
 
-    Canceled = status scheduled + current stage rejected (not done / canceled).
-    Countable rounds exclude AI Interview, Home Assessment, Rejected badges.
+    A round with status canceled counts toward `canceled`, never as held.
+    Countable rounds exclude AI Interview and Home Assessment.
     """
-    status = _norm_status(iv.status)
-    stage = _norm_stage(iv.stage)
-    rounds = _dated_rounds(iv)
     breakdown = empty_breakdown()
-
-    if status == "scheduled" and stage == "rejected":
-        touches = _dt_in_range(iv.scheduledAt, start, end) or any(
-            _dt_in_range(dt, start, end) for _, dt in rounds
-        )
-        return (0, 1 if touches else 0, breakdown)
-
-    n = 0
-    for s, dt in rounds:
-        if s in _ROUND_COUNT_EXCLUDED:
-            continue
+    n = canceled = 0
+    for s, dt, round_status, _caller in _dated_rounds(iv):
         if not _dt_in_range(dt, start, end):
+            continue
+        if round_status == "canceled":
+            canceled += 1
+            continue
+        if s in _ROUND_COUNT_EXCLUDED:
             continue
         group = _breakdown_group(s)
         if not group:
             continue
         breakdown[group] = breakdown.get(group, 0) + 1
         n += 1
-    return n, 0, breakdown
+    return n, canceled, breakdown
 
 
 async def load_interviews_for_window(user_ids: list, start: datetime, end: datetime) -> list[Interview]:
@@ -160,31 +164,20 @@ async def load_interviews_for_window(user_ids: list, start: datetime, end: datet
     ).to_list()
 
 
-def _is_canceled(iv: Interview) -> bool:
-    return _norm_status(iv.status) == "scheduled" and _norm_stage(iv.stage) == "rejected"
-
-
 def split_rounds_by_day(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
-    """(local date, breakdown group, is_caller) for each countable round in the window.
+    """(local date, breakdown group, is_caller) for each round held in the window.
 
-    Same exclusions as `count_interview_rounds`. A round counts as a caller
-    round when the interview's caller is enabled and the call starts on the
-    round's local date; otherwise it was taken by the owner (self).
+    Same rules as `count_interview_rounds` (canceled rounds, AI interviews and
+    home assessments don't count). A round is a caller round when it has an
+    enabled caller; otherwise the owner took it (self).
     """
-    if _is_canceled(iv):
-        return []
-    caller = getattr(iv, "caller", None)
-    caller_day = None
-    if caller is not None and caller.enabled and caller.startsAt is not None:
-        caller_day = _as_aware(caller.startsAt).astimezone(tz).date()
-
     out = []
-    for stage, dt in _dated_rounds(iv):
-        if stage in _ROUND_COUNT_EXCLUDED or not _dt_in_range(dt, start, end):
+    for stage, dt, round_status, caller in _dated_rounds(iv):
+        if not _dt_in_range(dt, start, end) or round_status == "canceled" or stage in _ROUND_COUNT_EXCLUDED:
             continue
         group = _breakdown_group(stage)
         if not group:
             continue
         day = _as_aware(dt).astimezone(tz).date()
-        out.append((day, group, caller_day == day))
+        out.append((day, group, bool(caller is not None and getattr(caller, "enabled", False))))
     return out

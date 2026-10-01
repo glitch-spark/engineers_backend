@@ -6,7 +6,7 @@ from beanie import PydanticObjectId
 from app.alerts import app_week_key
 from app.config import get_settings
 from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
-from app.models.interview import InterviewCaller, InterviewStageEvent
+from app.models.interview import InterviewCaller
 from app.models.plan_common import Counts, DoneOverrides
 
 
@@ -123,7 +123,7 @@ async def test_week_plan_without_core_metrics_has_no_target(client, staff_user, 
 
 async def test_week_stage_tiles_and_canceled(client, staff_user, auth_header):
     # interviews createdBy staff: intro Mon + tech_round_1 Wed (stageHistory), final Sat 23:30 UTC,
-    # rejected+scheduled Tue, ai_interview Thu, intro on next Mon Oct 5 (outside)
+    # canceled round Tue, ai_interview Thu, intro on next Mon Oct 5 (outside)
     account_id = PydanticObjectId()
 
     def _iv(**kw):
@@ -134,16 +134,15 @@ async def test_week_stage_tiles_and_canceled(client, staff_user, auth_header):
         stage="tech_round_1",
         status="scheduled",
         stageHistory=[
-            InterviewStageEvent(
-                stage="intro", at=datetime(2026, 9, 28, 9), scheduledAt=datetime(2026, 9, 28, 9)
-            ),
-            InterviewStageEvent(
-                stage="tech_round_1", at=datetime(2026, 9, 30, 10), scheduledAt=datetime(2026, 9, 30, 10)
-            ),
+            {"stage": "intro", "at": datetime(2026, 9, 28, 9), "scheduledAt": datetime(2026, 9, 28, 9),
+             "status": "completed"},
+            {"stage": "tech_round_1", "at": datetime(2026, 9, 30, 10), "scheduledAt": datetime(2026, 9, 30, 10),
+             "status": "scheduled"},
         ],
     ).insert()
     await _iv(scheduledAt=datetime(2026, 10, 3, 23, 30), stage="final", status="scheduled").insert()
-    await _iv(scheduledAt=datetime(2026, 9, 29, 12), stage="rejected", status="scheduled").insert()
+    # Canceled is a round status now (no "rejected" stage).
+    await _iv(scheduledAt=datetime(2026, 9, 29, 12), stage="intro", status="canceled").insert()
     await _iv(scheduledAt=datetime(2026, 10, 1, 9), stage="ai_interview", status="scheduled").insert()
     await _iv(scheduledAt=datetime(2026, 10, 5, 9), stage="intro", status="scheduled").insert()
 
