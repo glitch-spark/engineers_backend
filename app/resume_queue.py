@@ -57,6 +57,25 @@ def build_filename(profile_name: str, company: str) -> str:
     return f"{_safe_segment(profile_name)}/Resume ({_safe_segment(company)}).pdf"
 
 
+def _daily_cap() -> int:
+    return get_settings().RESUME_DAILY_CAP
+
+
+async def daily_count(user: UserExtra) -> int:
+    """Generations this user queued today (their local day, same as the daily-pace alert), both pages."""
+    from app.alerts import local_day_bounds_utc, local_now
+    from app.slack_bot import resolve_user_tz
+
+    start, end = local_day_bounds_utc(local_now(resolve_user_tz(user)))
+    return await ResumeApplication.find(
+        {"userId": user.id, "createdAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)}}
+    ).count()
+
+
+async def remaining_today(user: UserExtra) -> int:
+    return max(0, _daily_cap() - await daily_count(user))
+
+
 async def enqueue_generation(
     *,
     user: UserExtra,
@@ -79,6 +98,12 @@ async def enqueue_generation(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
+        )
+    cap = _daily_cap()
+    if await daily_count(user) >= cap:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Daily limit of {cap} tailored resumes reached. It resets at midnight.",
         )
     company = (company or "").strip() or "Company"
     profile_name = account.name or "profile"

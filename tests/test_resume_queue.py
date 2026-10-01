@@ -116,3 +116,26 @@ async def test_old_records_are_left_alone(staff_user):
     assert await resume_queue._claim_one() is None
     assert await resume_queue._requeue_stale() == 0
     assert await coll.count_documents({"status": "in_progress"}) == 1
+
+
+async def test_cap_blocks_single_enqueue(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(resume_queue, "_daily_cap", lambda: 2)
+    await _queued(staff_user, 2)
+    acc = await make_account(staff_user)
+    r = await client.post("/resume/generate", headers=auth_header(staff_user),
+                          json={"accountId": str(acc.id), "company": "Acme", "jobDescription": JD})
+    assert r.status_code == 429 and "Daily limit of 2" in r.json()["error"]
+    assert await resume_queue.remaining_today(staff_user) == 0
+
+
+async def test_cap_counts_both_sources(staff_user, monkeypatch):
+    monkeypatch.setattr(resume_queue, "_daily_cap", lambda: 2)
+    acc = await make_account(staff_user)
+    await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="A")
+    await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="B", source="job_applies")
+    with pytest.raises(Exception) as exc:
+        await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="C")
+    assert getattr(exc.value, "status_code", None) == 429
+    # Yesterday's generations don't count.
+    await ResumeApplication.get_motor_collection().update_many({}, {"$set": {"createdAt": datetime.utcnow() - timedelta(days=2)}})
+    assert await resume_queue.remaining_today(staff_user) == 2
