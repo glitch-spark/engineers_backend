@@ -130,8 +130,8 @@ def route(url: str) -> tuple[str, dict]:
 # ---------- HTML helpers ----------
 
 
-def html_to_text(markup: str) -> str:
-    soup = BeautifulSoup(markup or "", "html.parser")
+def html_to_text(markup: "str | BeautifulSoup") -> str:
+    soup = markup if isinstance(markup, BeautifulSoup) else BeautifulSoup(markup or "", "html.parser")
     for tag in soup(_DROP_TAGS):
         tag.decompose()
     for br in soup.find_all("br"):
@@ -162,8 +162,8 @@ def _find_posting(obj: Any) -> Optional[dict]:
     return None
 
 
-def parse_jsonld(markup: str) -> Optional[dict]:
-    soup = BeautifulSoup(markup or "", "html.parser")
+def parse_jsonld(markup: "str | BeautifulSoup") -> Optional[dict]:
+    soup = markup if isinstance(markup, BeautifulSoup) else BeautifulSoup(markup or "", "html.parser")
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or script.get_text() or "")
@@ -312,7 +312,9 @@ _ATS = {
 
 
 def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
-    ld = parse_jsonld(markup)
+    """CPU-bound (HTML parsing): callers run it in a thread. The page is parsed once."""
+    soup = BeautifulSoup(markup or "", "html.parser")
+    ld = parse_jsonld(soup)
     if ld:
         body = html_to_text(html_lib.unescape(ld.get("description") or ""))
         org = ld.get("hiringOrganization")
@@ -328,7 +330,7 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
         posted = _date(ld.get("datePosted"))
     else:
         posted = None
-    return FetchResult(text=html_to_text(markup), source=source, postedDate=posted)
+    return FetchResult(text=html_to_text(soup), source=source, postedDate=posted)
 
 
 async def browser_html(url: str) -> str:
@@ -379,13 +381,13 @@ async def fetch_job(
     try:
         resp = await _get_page(client, url)
         if resp.status_code < 400:
-            result = _from_page(resp.text, "html")
+            result = await asyncio.to_thread(_from_page, resp.text, "html")
     except httpx.HTTPError:
         result = None
 
     if browser is not None and (result is None or len(result.text) < THIN_PAGE):
         try:
-            rendered = _from_page(await browser(url), "browser")
+            rendered = await asyncio.to_thread(_from_page, await browser(url), "browser")
             if result is None or len(rendered.text) > len(result.text):
                 result = rendered
         except Exception:  # noqa: BLE001 — browser failure leaves the plain-HTML result

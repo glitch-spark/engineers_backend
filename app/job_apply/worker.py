@@ -270,7 +270,8 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
     resumes, profiles, notes = await _load_resumes(run)
     if notes:
         await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$addToSet": {"notes": {"$each": notes}}})
-    idf = build_idf([substantive_text(r.jdText) or r.jdText for r in rows if r.extraction and r.jdText])
+    jds = [r.jdText for r in rows if r.extraction and r.jdText]
+    idf = await asyncio.to_thread(lambda: build_idf([substantive_text(jd) or jd for jd in jds]))
     run_date = run.runDate.date()
     for row in todo:
         await check.tick()

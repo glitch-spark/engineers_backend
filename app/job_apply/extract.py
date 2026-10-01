@@ -1,4 +1,5 @@
 """Job description → JobExtraction: one LLM call per job, with a rule-based fallback (spec §3.2)."""
+import asyncio
 import hashlib
 import logging
 import re
@@ -419,4 +420,4 @@ async def extract_job(
         return ex, "llm"
     except Exception as exc:  # noqa: BLE001 — any LLM failure falls back to rules
         log.warning("job extraction via LLM failed, using rules: %s", exc)
-        return rules_extract(jd, run_date), "rules"
+        return await asyncio.to_thread(rules_extract, jd, run_date), "rules"

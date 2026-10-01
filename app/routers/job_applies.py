@@ -1,6 +1,7 @@
 """Job Applies: upload a sheet of job postings, score selected resumes, suggest one resume per profile."""
+import asyncio
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Optional
 
 from beanie import PydanticObjectId
@@ -12,7 +13,8 @@ from app.job_apply import worker
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, UserExtra
-from app.models.job_apply import JobApplyRow, JobApplyRun, RunCounts, RunSelection
+from app.job_apply.schema import GateResult, Location
+from app.models.job_apply import JobApplyRow, JobApplyRun, ProfileGates, RunCounts, RunSelection
 from app.routers._util import doc_to_dict, to_object_id
 
 router = APIRouter(prefix="/job-applies", tags=["job-applies"])
@@ -75,6 +77,49 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
                     "health": {"score": h.score, "issues": h.issues},
                 })
     return out
+
+
+class _SuggestionView(BaseModel):
+    accountId: str
+    resumeId: str
+    filename: str
+    total: int
+    band: str
+    knockouts: list[str] = Field(default_factory=list)
+
+
+class _ExtractionView(BaseModel):
+    workMode: str = "unknown"
+    allowedLocations: list[Location] = Field(default_factory=list)
+    timezoneNote: Optional[str] = None
+
+
+class _RowListView(BaseModel):
+    id: PydanticObjectId = Field(alias="_id")
+    rowIndex: int
+    url: Optional[str] = None
+    title: str = ""
+    company: str = ""
+    status: str
+    statusReason: Optional[str] = None
+    jdSource: Optional[str] = None
+    postedDate: Optional[date] = None
+    extraction: Optional[_ExtractionView] = None
+    extractionSource: Optional[str] = None
+    gates: list[GateResult] = Field(default_factory=list)
+    profileGates: list[ProfileGates] = Field(default_factory=list)
+    bestByProfile: list[_SuggestionView] = Field(default_factory=list)
+    topScore: Optional[int] = None
+    applied: bool = False
+
+    class Settings:
+        projection = {
+            "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
+            "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
+            "applied": 1, "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
+            "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1,
+            "bestByProfile.total": 1, "bestByProfile.band": 1, "bestByProfile.knockouts": 1,
+        }
 
 
 def _suggestion(s) -> dict:
@@ -153,7 +198,7 @@ async def create_run(
     sel = await _parse_selection(selection, user)
     data = await file.read(MAX_BYTES + 1)
     try:
-        rows = parse_sheet(file.filename or "", data)
+        rows = await asyncio.to_thread(parse_sheet, file.filename or "", data)
     except SheetError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if not rows:
@@ -280,7 +325,9 @@ async def list_rows(
         q["bestByProfile"] = {"$elemMatch": {"accountId": accountId, **({"total": {"$gte": floor}} if view == "suggested" else {})}}
 
     total = await JobApplyRow.find(q).count()
-    rows = await JobApplyRow.find(q).sort("+rowIndex").skip((page - 1) * limit).limit(limit).to_list()
+    rows = await (
+        JobApplyRow.find(q).sort("+rowIndex").skip((page - 1) * limit).limit(limit).project(_RowListView).to_list()
+    )
     pages = (total + limit - 1) // limit
     return {
         "rows": [_row_summary(r, run.threshold, accountId) for r in rows],
