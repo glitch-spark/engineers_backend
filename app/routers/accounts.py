@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 
 from beanie import PydanticObjectId
@@ -101,6 +102,23 @@ class AccountUpdate(BaseModel):
     screeningPrompt: Optional[str] = None
     coverLetterPrompt: Optional[str] = None
     showInGenerate: Optional[bool] = None
+    archived: Optional[bool] = None
+
+
+def archive_status_query(status_: str) -> dict:
+    """Mongo filter for the Profiles status filter (default: active).
+
+    Profiles saved before archiving existed have no `archived` field, so
+    "active" matches anything that isn't explicitly archived.
+    """
+    key = (status_ or "active").strip().lower()
+    if key == "active":
+        return {"archived": {"$ne": True}}
+    if key == "archived":
+        return {"archived": True}
+    if key == "all":
+        return {}
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="status must be active, archived or all")
 
 
 ALLOWED_REGIONS = frozenset({"Latam", "EU", "Canada", "US", "Asia"})
@@ -156,6 +174,7 @@ async def lookup_accounts(
                 "hasPrompt": bool((a.resumePromptBody or "").strip()),
                 "createdBy": str(a.createdBy),
                 "showInGenerate": a.showInGenerate,
+                "archived": a.archived,
             }
             for a in rows
         ]
@@ -169,9 +188,10 @@ async def list_accounts(
     limit: int = Query(10),
     search: str = Query(""),
     userId: str = Query(""),
+    status_: str = Query("active", alias="status"),
 ) -> dict:
     is_admin = user.role == "admin"
-    query: dict[str, Any] = {}
+    query: dict[str, Any] = archive_status_query(status_)
     if is_admin:
         if userId:
             query["createdBy"] = to_object_id(userId)
@@ -280,6 +300,9 @@ async def update_account(
         acc.coverLetterPrompt = body.coverLetterPrompt
     if body.showInGenerate is not None:
         acc.showInGenerate = body.showInGenerate
+    if body.archived is not None and body.archived != acc.archived:
+        acc.archived = body.archived
+        acc.archivedAt = datetime.now(timezone.utc) if body.archived else None
 
     await acc.save()
     return doc_to_dict(acc)

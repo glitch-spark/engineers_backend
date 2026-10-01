@@ -241,17 +241,17 @@ async def list_transactions(
     from_: str = Query("", alias="from"),
     to: str = Query(""),
     userId: str = Query(""),
+    payerId: str = Query(""),
     search: str = Query(""),
     fromSearch: str = Query(""),
     toSearch: str = Query(""),
     userSearch: str = Query(""),
     payMethod: str = Query(""),
 ) -> dict:
-    is_admin = user.role == "admin"
+    # Every signed-in role sees every transaction; edit/delete/approve stay
+    # restricted to owner, payer, or admin in the mutating routes below.
     query: dict[str, Any] = {}
-    if not is_admin:
-        # Owner of the request OR assigned as payer.
-        query["$or"] = [{"userId": user.id}, {"payerId": user.id}]
+    extra: list[dict] = []
 
     date_filter: dict = {}
     f_dt = parse_date(from_)
@@ -263,26 +263,29 @@ async def list_transactions(
     if date_filter:
         query["date"] = date_filter
 
-    if is_admin and userId:
+    if userId:
         query["userId"] = to_object_id(userId)
+
+    if payerId:
+        payer_oid = to_object_id(payerId)
+        # Pre-payer rows have no payerId — the owner counts as the payer.
+        extra.append({"$or": [
+            {"payerId": payer_oid},
+            {"payerId": None, "userId": payer_oid},
+        ]})
 
     if payMethod == "crypto":
         payMethod = "coin"  # legacy alias from older clients
     if payMethod in ("coin", "card"):
         query["payMethod"] = payMethod
 
-    extra: list[dict] = []
     if search:
-        search_or = [
+        extra.append({"$or": [
             {"description": ci_regex(search)},
             {"notes": ci_regex(search)},
             {"userId.name": ci_regex(search)},
             {"userId.email": ci_regex(search)},
-        ]
-        if "$or" in query:
-            extra.append({"$or": search_or})
-        else:
-            query["$or"] = search_or
+        ]})
 
     if fromSearch:
         extra.append({"$expr": {"$regexMatch": {
@@ -341,6 +344,11 @@ async def list_transactions(
     user_totals = _format_totals(owner_rows, people, "userId")
     payer_totals = _format_totals(payer_rows, people, "payerId")
     total_outcome = sum(p["outcome"] for p in payer_totals)
+    # Every matching row across all pages — the payer groups partition them.
+    totals = {
+        key: sum(p[key] for p in payer_totals)
+        for key in ("income", "outcome", "net", "count")
+    }
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -348,6 +356,7 @@ async def list_transactions(
         "userTotals": user_totals,
         "payerTotals": payer_totals,
         "totalOutcome": total_outcome,
+        "totals": totals,
         "pagination": {
             "page": page,
             "limit": limit,
