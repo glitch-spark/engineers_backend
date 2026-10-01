@@ -35,7 +35,9 @@ def _sanitize_filename(raw: str) -> str:
     return _FILENAME_BAD.sub("_", raw or "").strip()
 
 
-def _validate_and_normalize_resumes(items: List[ResumeIn]) -> List[Resume]:
+def _validate_and_normalize_resumes(items: List[ResumeIn], existing: Optional[List[Resume]] = None) -> List[Resume]:
+    """`existing` is the profile's current list: resumes that keep their id keep their upload date."""
+    uploaded = {str(r.id): r.uploadedAt for r in existing or []}
     if len(items) > MAX_RESUMES_PER_ACCOUNT:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -52,7 +54,8 @@ def _validate_and_normalize_resumes(items: List[ResumeIn]) -> List[Resume]:
                 detail=f"resume markdown exceeds {MAX_RESUME_MARKDOWN_BYTES} bytes",
             )
         rid = PydanticObjectId(item.id) if item.id else PydanticObjectId()
-        out.append(Resume(id=rid, filename=fn, markdown=item.markdown))
+        when = uploaded.get(str(rid))
+        out.append(Resume(id=rid, filename=fn, markdown=item.markdown, **({"uploadedAt": when} if when else {})))
     return out
 
 
@@ -282,7 +285,7 @@ async def update_account(
     if body.region is not None:
         acc.region = _normalize_region(body.region)
     if body.resumes is not None:
-        acc.resumes = _validate_and_normalize_resumes(body.resumes)
+        acc.resumes = _validate_and_normalize_resumes(body.resumes, acc.resumes)
     if body.resumePromptBody is not None:
         acc.resumePromptBody = body.resumePromptBody
     if body.styleTemplate is not None:

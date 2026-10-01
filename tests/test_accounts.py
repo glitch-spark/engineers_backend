@@ -293,3 +293,17 @@ async def test_archive_hides_profile_from_default_list(client, staff_user, auth_
     assert lookup[0]["archived"] is True
     r = await client.put(f"/accounts/{acc_id}", headers=h, json={"archived": False})
     assert r.json()["archived"] is False and r.json()["archivedAt"] is None
+
+
+async def test_resume_upload_dates_survive_later_saves(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc_id = (await client.post("/accounts", headers=h, json={"name": "Backend"})).json()["_id"]
+    r = await client.put(f"/accounts/{acc_id}", headers=h, json={"resumes": [{"filename": "a.pdf", "markdown": "A text"}]})
+    first = r.json()["resumes"][0]
+    r = await client.put(
+        f"/accounts/{acc_id}", headers=h,
+        json={"resumes": [{"id": first["id"], "filename": "a.pdf", "markdown": "A text"}, {"filename": "b.pdf", "markdown": "B"}]},
+    )
+    resumes = {x["filename"]: x for x in r.json()["resumes"]}
+    assert resumes["a.pdf"]["id"] == first["id"]
+    assert resumes["a.pdf"]["uploadedAt"] == first["uploadedAt"]
