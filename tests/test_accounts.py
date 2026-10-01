@@ -1,3 +1,5 @@
+import pytest
+
 async def test_accounts_list_no_token_returns_401(client):
     r = await client.get("/accounts")
     assert r.status_code == 401
@@ -307,3 +309,75 @@ async def test_resume_upload_dates_survive_later_saves(client, staff_user, auth_
     resumes = {x["filename"]: x for x in r.json()["resumes"]}
     assert resumes["a.pdf"]["id"] == first["id"]
     assert resumes["a.pdf"]["uploadedAt"] == first["uploadedAt"]
+
+
+@pytest.fixture
+def fake_s3(monkeypatch):
+    from app import resume_files
+
+    calls = {"put": [], "delete": [], "enabled": True}
+
+    async def put(key, data, content_type):
+        if not calls["enabled"]:
+            return False
+        calls["put"].append((key, len(data), content_type))
+        return True
+
+    async def delete(keys):
+        calls["delete"].extend(keys)
+
+    monkeypatch.setattr(resume_files, "put_resume_file", put)
+    monkeypatch.setattr(resume_files, "delete_resume_files", delete)
+    monkeypatch.setattr(resume_files, "presigned_url", lambda key, filename: f"https://s3.example/{key}?dl={filename}")
+    return calls
+
+
+async def _upload(client, h, acc_id, name="jane.pdf", body=b"%PDF-1.7 fake", text="Jane Doe resume text"):
+    return await client.post(
+        f"/accounts/{acc_id}/resumes", headers=h,
+        files={"file": (name, body, "application/pdf")}, data={"markdown": text},
+    )
+
+
+async def test_upload_resume_stores_original_in_s3(client, staff_user, auth_header, fake_s3):
+    h = auth_header(staff_user)
+    acc_id = (await client.post("/accounts", headers=h, json={"name": "Backend"})).json()["_id"]
+    r = await _upload(client, h, acc_id)
+    assert r.status_code == 200, r.text
+    (res,) = r.json()["resumes"]
+    assert res["s3Key"] == f"profiles/{acc_id}/resumes/{res['id']}.pdf" and res["fileSize"] == 13 and res["markdown"] == "Jane Doe resume text"
+    assert fake_s3["put"] == [(res["s3Key"], 13, "application/pdf")]
+
+    # Same filename replaces the text and file but keeps the resume id.
+    r = await _upload(client, h, acc_id, name="JANE.pdf", text="New text")
+    (again,) = r.json()["resumes"]
+    assert again["id"] == res["id"] and again["markdown"] == "New text" and fake_s3["delete"] == []
+
+    r = await client.get(f"/accounts/{acc_id}/resumes/{res['id']}/file", headers=h)
+    assert r.status_code == 200 and r.json()["url"].startswith(f"https://s3.example/{res['s3Key']}")
+
+    # Removing it from the profile deletes the S3 file; so does deleting the profile.
+    await _upload(client, h, acc_id, name="other.pdf")
+    other = next(x for x in (await client.get(f"/accounts/{acc_id}", headers=h)).json()["resumes"] if x["filename"] == "other.pdf")
+    r = await client.put(f"/accounts/{acc_id}", headers=h, json={"resumes": [{"id": other["id"], "filename": "other.pdf", "markdown": "x"}]})
+    assert r.status_code == 200 and fake_s3["delete"] == [res["s3Key"]]
+    assert r.json()["resumes"][0]["s3Key"] == other["s3Key"]  # kept across a plain list save
+    assert (await client.delete(f"/accounts/{acc_id}", headers=h)).status_code == 200
+    assert fake_s3["delete"] == [res["s3Key"], other["s3Key"]]
+
+
+async def test_upload_resume_without_s3_keeps_text_only(client, staff_user, auth_header, fake_s3):
+    fake_s3["enabled"] = False
+    h = auth_header(staff_user)
+    acc_id = (await client.post("/accounts", headers=h, json={"name": "Backend"})).json()["_id"]
+    (res,) = (await _upload(client, h, acc_id)).json()["resumes"]
+    assert res["s3Key"] is None and res["markdown"]
+    assert (await client.get(f"/accounts/{acc_id}/resumes/{res['id']}/file", headers=h)).status_code == 404
+
+
+async def test_upload_resume_validation(client, staff_user, staff_user_2, auth_header, fake_s3):
+    h = auth_header(staff_user)
+    acc_id = (await client.post("/accounts", headers=h, json={"name": "Backend"})).json()["_id"]
+    assert (await _upload(client, h, acc_id, name="cv.docx")).status_code == 400
+    assert (await _upload(client, h, acc_id, text="")).status_code == 400
+    assert (await _upload(client, auth_header(staff_user_2), acc_id)).status_code == 404

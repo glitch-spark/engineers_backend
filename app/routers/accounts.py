@@ -1,11 +1,13 @@
+import os
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel
 
+from app import resume_files
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.models.account import Resume
@@ -37,7 +39,7 @@ def _sanitize_filename(raw: str) -> str:
 
 def _validate_and_normalize_resumes(items: List[ResumeIn], existing: Optional[List[Resume]] = None) -> List[Resume]:
     """`existing` is the profile's current list: resumes that keep their id keep their upload date."""
-    uploaded = {str(r.id): r.uploadedAt for r in existing or []}
+    previous = {str(r.id): r for r in existing or []}
     if len(items) > MAX_RESUMES_PER_ACCOUNT:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -54,8 +56,12 @@ def _validate_and_normalize_resumes(items: List[ResumeIn], existing: Optional[Li
                 detail=f"resume markdown exceeds {MAX_RESUME_MARKDOWN_BYTES} bytes",
             )
         rid = PydanticObjectId(item.id) if item.id else PydanticObjectId()
-        when = uploaded.get(str(rid))
-        out.append(Resume(id=rid, filename=fn, markdown=item.markdown, **({"uploadedAt": when} if when else {})))
+        prev = previous.get(str(rid))
+        kept = (
+            {"uploadedAt": prev.uploadedAt, "s3Key": prev.s3Key, "fileSize": prev.fileSize, "fileType": prev.fileType}
+            if prev else {}
+        )
+        out.append(Resume(id=rid, filename=fn, markdown=item.markdown, **kept))
     return out
 
 
@@ -73,6 +79,7 @@ def _strip_markdown_from_account(payload: dict) -> dict:
                     "filename": r.get("filename"),
                     "uploadedAt": r.get("uploadedAt"),
                     "sizeBytes": len((r.get("markdown") or "").encode("utf-8")),
+                    "hasFile": bool(r.get("s3Key")),
                 })
         payload["resumes"] = slim
     return payload
@@ -284,8 +291,12 @@ async def update_account(
         acc.country = _normalize_country(body.country)
     if body.region is not None:
         acc.region = _normalize_region(body.region)
+    removed_files: list[str] = []
     if body.resumes is not None:
-        acc.resumes = _validate_and_normalize_resumes(body.resumes, acc.resumes)
+        before = list(acc.resumes)
+        acc.resumes = _validate_and_normalize_resumes(body.resumes, before)
+        kept_ids = {str(r.id) for r in acc.resumes}
+        removed_files = [r.s3Key for r in before if r.s3Key and str(r.id) not in kept_ids]
     if body.resumePromptBody is not None:
         acc.resumePromptBody = body.resumePromptBody
     if body.styleTemplate is not None:
@@ -308,7 +319,71 @@ async def update_account(
         acc.archivedAt = datetime.now(timezone.utc) if body.archived else None
 
     await acc.save()
+    await resume_files.delete_resume_files(removed_files)
     return doc_to_dict(acc)
+
+
+@router.post("/{account_id}/resumes")
+async def upload_resume(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    file: UploadFile = File(...),
+    markdown: str = Form(...),
+) -> dict:
+    """Add (or replace, by filename) one resume: the browser-extracted text goes in MongoDB, the original
+    file in S3 when configured. Returns the full account like PUT."""
+    acc = await Account.get(to_object_id(account_id))
+    if acc is None or str(acc.createdBy) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    fn = _sanitize_filename(file.filename or "")
+    ext = os.path.splitext(fn)[1].lower()
+    if not fn or len(fn) > MAX_FILENAME_LEN or ext not in resume_files.ALLOWED_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Upload a .pdf, .txt or .md resume.")
+    if not markdown.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No text could be read from this resume.")
+    if len(markdown.encode("utf-8")) > MAX_RESUME_MARKDOWN_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"resume markdown exceeds {MAX_RESUME_MARKDOWN_BYTES} bytes"
+        )
+    data = await file.read(resume_files.MAX_FILE_BYTES + 1)
+    if len(data) > resume_files.MAX_FILE_BYTES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is larger than 10 MB.")
+
+    current = next((r for r in acc.resumes if r.filename.lower() == fn.lower()), None)
+    if current is None and len(acc.resumes) >= MAX_RESUMES_PER_ACCOUNT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"too many resumes (max {MAX_RESUMES_PER_ACCOUNT})"
+        )
+    rid = current.id if current else PydanticObjectId()
+    key = resume_files.resume_key(str(acc.id), str(rid), ext)
+    content_type = resume_files.ALLOWED_TYPES[ext]
+    stored = await resume_files.put_resume_file(key, data, content_type)
+    resume = Resume(
+        id=rid, filename=fn, markdown=markdown,
+        s3Key=key if stored else None, fileSize=len(data), fileType=content_type,
+    )
+    stale = current.s3Key if current and current.s3Key and current.s3Key != resume.s3Key else None
+    acc.resumes = [resume if r.id == rid else r for r in acc.resumes] if current else [*acc.resumes, resume]
+    await acc.save()
+    if stale:
+        await resume_files.delete_resume_files([stale])
+    return doc_to_dict(acc)
+
+
+@router.get("/{account_id}/resumes/{resume_id}/file")
+async def resume_file_url(
+    account_id: str,
+    resume_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Short-lived download link for a resume's original file. Owner-or-admin, like GET /accounts/{id}."""
+    acc = await Account.get(to_object_id(account_id))
+    if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    resume = next((r for r in acc.resumes if str(r.id) == resume_id), None)
+    if resume is None or not resume.s3Key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="The original file isn't stored for this resume.")
+    return {"url": resume_files.presigned_url(resume.s3Key, resume.filename)}
 
 
 @router.delete("/{account_id}")
@@ -320,5 +395,7 @@ async def delete_account(
     acc = await Account.get(oid)
     if acc is None or str(acc.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    files = [r.s3Key for r in acc.resumes if r.s3Key]
     await acc.delete()
+    await resume_files.delete_resume_files(files)
     return {"ok": True}
