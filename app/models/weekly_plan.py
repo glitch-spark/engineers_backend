@@ -1,11 +1,12 @@
-from datetime import datetime
-from typing import List, Literal, Optional
+from datetime import datetime, timedelta
+from typing import Any, List, Literal, Optional
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
+from app.models.plan_common import ChecklistItem, Counts, WeeklyOverrides, check_items, monday_of
 
 WeeklyPlanStatus = Literal["planned", "reviewed"]
 
@@ -19,6 +20,8 @@ CORE_METRICS: list[dict] = [
     {"key": "outreach", "label": "Founder outreaches"},
 ]
 
+
+_LEGACY_KEYS = ("metrics", "nextInterviewTarget", "status", "content", "result")
 
 MetricUnit = Literal["count", "hours"]
 
@@ -34,29 +37,73 @@ class WeeklyMetric(BaseModel):
     unit: MetricUnit = "count"
 
 
+def fold_legacy_weekly(data: Any) -> Any:
+    """Read a pre Goal-vs-Done weekly plan as the new shape (until migrated)."""
+    if not isinstance(data, dict):
+        return data
+    legacy = any(key in data for key in _LEGACY_KEYS)
+    if not legacy and "weekStart" in data:
+        return data
+    data = dict(data)
+    if "weekStart" not in data and data.get("startDate") is not None:
+        start = data["startDate"]
+        if isinstance(start, str):
+            start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        # Plans stored the browser's local Monday midnight (e.g. 04:00Z).
+        day = monday_of((start.replace(tzinfo=None) + timedelta(hours=12)).date())
+        data["weekStart"] = datetime(day.year, day.month, day.day)
+    if legacy and "goal" not in data:
+        goal: dict[str, int] = {}
+        for metric in data.get("metrics") or []:
+            key = metric.get("key") if isinstance(metric, dict) else getattr(metric, "key", None)
+            target = metric.get("target") if isinstance(metric, dict) else getattr(metric, "target", 0)
+            if key == "bids":
+                goal["bidsSelf"] = int(target or 0)
+            elif key == "interviews":
+                goal["interviewsSelf"] = int(target or 0)
+        data["goal"] = goal
+        data.setdefault("planNotes", data.get("content") or "")
+        data.setdefault("recapNotes", data.get("result") or "")
+    for key in _LEGACY_KEYS:
+        data.pop(key, None)
+    return data
+
+
 class WeeklyPlan(TimestampedDocument):
+    """One person's Goal vs Done for a Monday-start week.
+
+    Done is computed from the week's daily plans and interview records
+    (`app.plan_auto`); `doneOverrides` replaces any of it by hand.
+    `startDate`/`endDate`/`year`/`weekNumber` are kept for older readers.
+    """
+
     userId: PydanticObjectId
+    weekStart: datetime
     weekNumber: int
     year: int
     startDate: datetime
     endDate: datetime
+    goal: Counts = Field(default_factory=Counts)
+    goalItems: List[ChecklistItem] = []
+    planNotes: str = Field(default="", max_length=4000)
+    recapNotes: str = Field(default="", max_length=4000)
+    doneOverrides: WeeklyOverrides = Field(default_factory=WeeklyOverrides)
 
-    # Structured progress metrics (target set at week start, actual at week
-    # end). Empty on legacy rows — UI renders gracefully.
-    metrics: List[WeeklyMetric] = []
-    # Forward-looking interview goal for NEXT week, set during the
-    # end-of-week review. Used to pre-seed next week's interviews target.
-    nextInterviewTarget: Optional[int] = None
-    status: WeeklyPlanStatus = "planned"
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_legacy(cls, data: Any) -> Any:
+        return fold_legacy_weekly(data)
 
-    # Free-text notes. `content` = start-of-week plan, `result` =
-    # end-of-week recap. Kept as-is for back-compat (no migration).
-    content: str = ""
-    result: str = ""
+    @field_validator("goalItems")
+    @classmethod
+    def _items(cls, v: list) -> list:
+        return check_items(v)
 
     class Settings:
         name = "weeklyplans"
         indexes = [
+            # Not unique: older data may hold duplicates; saves upsert by (userId, weekStart).
+            IndexModel([("userId", 1), ("weekStart", 1)]),
             IndexModel([("userId", 1), ("year", 1), ("weekNumber", 1)]),
             IndexModel([("year", 1), ("weekNumber", 1)]),
         ]
