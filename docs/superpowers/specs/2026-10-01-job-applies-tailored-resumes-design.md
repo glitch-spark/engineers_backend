@@ -61,6 +61,8 @@ answers in batches (still available per job on the Generated page).
 source: Literal["generator", "job_applies"] = "generator"
 countsAsBid: Optional[bool] = None   # None/absent = counts (old records, Generator page); False = not yet a bid
 leaseAt: Optional[datetime] = None   # worker heartbeat while generating
+attempts: int = 0                    # claims so far; 3 → failed
+promptOverride: Optional[str] = None # one-off prompt, kept for retries and restarts
 jobApplyRowId: Optional[PydanticObjectId] = None
 ```
 
@@ -118,7 +120,7 @@ resets at midnight."* Batch behaviour is in §5.
 - The aggregations in `metrics.py` and `alerts_service._tick_daily_bids` add `{"countsAsBid": {"$ne": False}}` to
   their `ResumeApplication` match. Old documents have no field, so they still count.
 - Job Applies generations are created with `countsAsBid=False`.
-- Marking a job applied with its tailored resume sets `countsAsBid=True` and `bidAt=now` on that document.
+- Marking a job applied with its tailored resume sets `countsAsBid=True` on that document.
   Unmarking sets it back to `False`.
 - The bid is counted on the tailored document's `createdAt`, as today, so the date doesn't move.
 
