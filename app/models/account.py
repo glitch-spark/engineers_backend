@@ -57,6 +57,10 @@ class Account(TimestampedDocument):
 
     # When false, hidden from the Resume Generator profile picker.
     showInGenerate: bool = True
+    # Archived profiles are hidden from pickers for new work (interviews,
+    # resumes) but keep showing on existing records. Absent = active.
+    archived: bool = False
+    archivedAt: Optional[datetime] = None
 
     class Settings:
         name = "accounts"
