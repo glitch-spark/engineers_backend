@@ -158,3 +158,33 @@ async def load_interviews_for_window(user_ids: list, start: datetime, end: datet
             ],
         }
     ).to_list()
+
+
+def _is_canceled(iv: Interview) -> bool:
+    return _norm_status(iv.status) == "scheduled" and _norm_stage(iv.stage) == "rejected"
+
+
+def split_rounds_by_day(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
+    """(local date, breakdown group, is_caller) for each countable round in the window.
+
+    Same exclusions as `count_interview_rounds`. A round counts as a caller
+    round when the interview's caller is enabled and the call starts on the
+    round's local date; otherwise it was taken by the owner (self).
+    """
+    if _is_canceled(iv):
+        return []
+    caller = getattr(iv, "caller", None)
+    caller_day = None
+    if caller is not None and caller.enabled and caller.startsAt is not None:
+        caller_day = _as_aware(caller.startsAt).astimezone(tz).date()
+
+    out = []
+    for stage, dt in _dated_rounds(iv):
+        if stage in _ROUND_COUNT_EXCLUDED or not _dt_in_range(dt, start, end):
+            continue
+        group = _breakdown_group(stage)
+        if not group:
+            continue
+        day = _as_aware(dt).astimezone(tz).date()
+        out.append((day, group, caller_day == day))
+    return out

@@ -101,6 +101,9 @@ class WeeklyPlan(TimestampedDocument):
 
     class Settings:
         name = "weeklyplans"
+        # Fetch whole documents: by default Beanie projects to the declared
+        # fields, which would hide the legacy keys the fold reads.
+        projection = None
         indexes = [
             # Not unique: older data may hold duplicates; saves upsert by (userId, weekStart).
             IndexModel([("userId", 1), ("weekStart", 1)]),

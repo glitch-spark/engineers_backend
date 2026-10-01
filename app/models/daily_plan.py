@@ -98,6 +98,9 @@ class DailyPlan(TimestampedDocument):
 
     class Settings:
         name = "dailyplans"
+        # Fetch whole documents: by default Beanie projects to the declared
+        # fields, which would hide the legacy keys the fold reads.
+        projection = None
         indexes = [
             IndexModel([("userId", 1), ("date", 1)], unique=True),
             IndexModel([("year", 1), ("weekNumber", 1)]),
