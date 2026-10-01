@@ -24,7 +24,7 @@ from app.job_apply.schema import GateResult, JobExtraction
 from app.job_apply.scoring import build_idf
 from app.job_apply.sections import substantive_text
 from app.models.account import Account
-from app.models.job_apply import JobApplyRow, JobApplyRun, JobExtractionCache, JobPostingCache, ProfileGates
+from app.models.job_apply import CACHE_DAYS, JobApplyRow, JobApplyRun, JobExtractionCache, JobPostingCache, ProfileGates
 from app.models.user_extra import UserExtra
 
 log = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ HEARTBEAT_SECONDS = 30
 STALE_AFTER = timedelta(minutes=2)
 SWEEP_SECONDS = 120
 CHECK_EVERY = 25
-POSTING_TTL = timedelta(days=7)
+POSTING_TTL = timedelta(days=CACHE_DAYS)
 
 Stage = Literal["fetch", "extract", "score"]
 
@@ -142,6 +142,18 @@ async def _rows(run_id: PydanticObjectId) -> list[JobApplyRow]:
     return await JobApplyRow.find(JobApplyRow.runId == run_id).sort("+rowIndex").to_list()
 
 
+async def _cache_description(url: str, text: str) -> None:
+    """Remember a description that came in a sheet, so a later link-only row for the URL needs no fetch."""
+    now = datetime.utcnow()
+    await JobPostingCache.get_motor_collection().update_one(
+        {"url": url},
+        {"$set": {"url": url, "text": text, "source": "sheet", "postedDate": None, "title": "", "company": "",
+                  "fetchedAt": now, "updatedAt": now},
+         "$setOnInsert": {"createdAt": now}},
+        upsert=True,
+    )
+
+
 # ---------- stages ----------
 
 
@@ -226,6 +238,8 @@ async def _extract_stage(run: JobApplyRun, rows: list[JobApplyRow], user: Option
         async with sem:
             await check.tick()
             try:
+                if row.jdSource == "sheet" and row.url:
+                    await _cache_description(row.url, row.jdText)
                 await _extract_one(row, run, user)
                 await _save_fields(row, _EXTRACT_FIELDS)
                 await _inc(run.id, extracted=1, excluded=1 if row.status == "excluded" else 0)

@@ -1,4 +1,8 @@
-"""Job Applies: one run per uploaded sheet, one row per job (spec §4.1)."""
+"""Job Applies storage.
+
+Runs are short-lived daily worklists (deleted RUN_RETENTION_DAYS after upload). What lasts: job descriptions
+cached per URL and LLM readings cached per description (CACHE_DAYS), and the permanent applied log.
+"""
 from datetime import date, datetime, timedelta
 from typing import List, Literal, Optional
 
@@ -12,13 +16,16 @@ from app.models.base import TimestampedDocument
 RunStatus = Literal["queued", "running", "done", "failed", "cancelled"]
 RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed"]
 
-POSTING_CACHE_TTL_SECONDS = 7 * 24 * 3600
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
-RETENTION_DAYS = 60
+RUN_RETENTION_DAYS = 3
+# Job description per URL and LLM reading per description. Matches the default max posting age: anything older
+# is excluded as stale anyway.
+CACHE_DAYS = 30
+CACHE_TTL_SECONDS = CACHE_DAYS * 24 * 3600
 
 
 def _expires_at() -> datetime:
-    return datetime.utcnow() + timedelta(days=RETENTION_DAYS)
+    return datetime.utcnow() + timedelta(days=RUN_RETENTION_DAYS)
 
 
 class RunSelection(BaseModel):
@@ -66,6 +73,14 @@ class ProfileGates(BaseModel):
     gates: List[GateResult] = Field(default_factory=list)
 
 
+class AppliedMark(BaseModel):
+    """One resume the user applied with for this job."""
+
+    accountId: str
+    resumeId: str
+    at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class JobApplyRow(TimestampedDocument):
     runId: PydanticObjectId
     userId: PydanticObjectId
@@ -87,7 +102,8 @@ class JobApplyRow(TimestampedDocument):
     bestByProfile: List[ResumeScore] = Field(default_factory=list)
     topScore: Optional[int] = None
     scoredAt: Optional[datetime] = None
-    applied: bool = False
+    applied: bool = False  # legacy single tick (before per-resume marks); read as "top suggestion applied"
+    appliedResumes: List[AppliedMark] = Field(default_factory=list)
     expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:
@@ -108,11 +124,15 @@ class JobExtractionCache(TimestampedDocument):
 
     class Settings:
         name = "job_extraction_cache"
-        indexes = [IndexModel([("key", ASCENDING)], unique=True, name="key")]
+        indexes = [
+            IndexModel([("key", ASCENDING)], unique=True, name="key"),
+            IndexModel([("createdAt", ASCENDING)], expireAfterSeconds=CACHE_TTL_SECONDS, name="ttl_30d"),
+        ]
 
 
 class JobPostingCache(TimestampedDocument):
-    """Fetched posting text keyed by normalised URL; expires after 7 days."""
+    """Job description per normalised URL, from a fetch or from a sheet; expires CACHE_DAYS after it was stored.
+    A later sheet with only the link reuses it with no fetch."""
 
     url: str
     text: str
@@ -126,5 +146,31 @@ class JobPostingCache(TimestampedDocument):
         name = "job_posting_cache"
         indexes = [
             IndexModel([("url", ASCENDING)], unique=True, name="url"),
-            IndexModel([("fetchedAt", ASCENDING)], expireAfterSeconds=POSTING_CACHE_TTL_SECONDS, name="ttl"),
+            # Replaces the old 7-day "ttl" index (dropped at startup, see app/db.py STALE_INDEXES).
+            IndexModel([("fetchedAt", ASCENDING)], expireAfterSeconds=CACHE_TTL_SECONDS, name="ttl_30d"),
+        ]
+
+
+class JobApplicationLog(TimestampedDocument):
+    """Permanent record of each job applied to, per resume. Outlives the run; later runs read it to flag
+    'Already applied' by URL."""
+
+    userId: PydanticObjectId
+    url: str  # normalised, same form as JobApplyRow.url
+    company: str = ""
+    title: str = ""
+    accountId: str
+    profileName: str = ""
+    resumeId: str
+    filename: str = ""
+    runId: Optional[PydanticObjectId] = None
+    rowId: Optional[PydanticObjectId] = None
+    appliedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "job_application_log"
+        indexes = [
+            IndexModel([("userId", ASCENDING), ("url", ASCENDING), ("resumeId", ASCENDING)], unique=True, name="user_url_resume"),
+            IndexModel([("userId", ASCENDING), ("appliedAt", DESCENDING)], name="user_recent"),
+            IndexModel([("runId", ASCENDING)], name="run"),
         ]

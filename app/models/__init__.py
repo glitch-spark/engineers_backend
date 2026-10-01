@@ -10,7 +10,7 @@ from app.models.interview import Interview
 from app.models.interview_chat_log import InterviewChatLog
 from app.models.interview_prep import InterviewPrompt, InterviewTemplateAnswer
 from app.models.interview_question import InterviewQuestion
-from app.models.job_apply import JobApplyRow, JobApplyRun, JobExtractionCache, JobPostingCache
+from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, JobExtractionCache, JobPostingCache
 from app.models.resume_application import ResumeApplication
 from app.models.resume_cache import ResumeLLMCache
 from app.models.notification import Notification
@@ -37,6 +37,7 @@ __all__ = [
     "InterviewPrompt",
     "InterviewQuestion",
     "InterviewTemplateAnswer",
+    "JobApplicationLog",
     "JobApplyRow",
     "JobApplyRun",
     "JobExtractionCache",

@@ -23,6 +23,8 @@ STALE_INDEXES: dict[str, list[str]] = {
         "uniq_user_profile_company",
         "uniq_user_account_company",
     ],
+    # 7-day TTL replaced by "ttl_30d" (a TTL's duration can't change in place).
+    "job_posting_cache": ["ttl"],
 }
 
 from app.models import (
@@ -40,6 +42,7 @@ from app.models import (
     InterviewPrompt,
     InterviewQuestion,
     InterviewTemplateAnswer,
+    JobApplicationLog,
     JobApplyRow,
     JobApplyRun,
     JobExtractionCache,
@@ -85,6 +88,7 @@ DOCUMENT_MODELS = [
     JobApplyRow,
     JobExtractionCache,
     JobPostingCache,
+    JobApplicationLog,
 ]
 
 

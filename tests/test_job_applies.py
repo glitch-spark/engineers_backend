@@ -303,3 +303,20 @@ async def test_google_sheet_link_errors(client, staff_user, auth_header, monkeyp
     assert r.status_code == 400 and "Anyone with the link" in r.json()["error"]
     r = await client.post("/job-applies/runs", headers=h, data={"selection": sel})
     assert r.status_code == 400 and "Google Sheets link" in r.json()["error"]
+
+
+async def test_sheet_descriptions_are_cached_per_url_for_later_runs(client, staff_user, auth_header, monkeypatch):
+    from app.models.job_apply import JobApplyRow, JobPostingCache
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    first = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(first))
+    cached = await JobPostingCache.find_one(JobPostingCache.url == "https://jobs.example.com/remote")
+    assert cached is not None and cached.source == "sheet" and "Python" in cached.text
+
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)  # a link-only row must not be fetched again
+    second = (await create_run(client, h, acc, data=sheet([["URL"], ["https://jobs.example.com/remote"]]))).json()["runId"]
+    await worker.run_worker(PydanticObjectId(second))
+    row = await JobApplyRow.find_one(JobApplyRow.runId == PydanticObjectId(second))
+    assert row.status == "scored" and row.jdSource == "sheet"
