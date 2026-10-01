@@ -93,3 +93,42 @@ def count_mentions(text: str, variants: Iterable[str]) -> int:
 
 def any_variant_regex(variants: Iterable[str]) -> "re.Pattern[str]":
     return _alternation(tuple(variants))
+
+
+# Seniority ladder shared by extraction and title scoring (spec §3.5).
+SENIORITY_LEVEL = {"intern": 0, "junior": 1, "mid": 2, "senior": 3, "staff": 4, "principal": 5, "director": 6}
+_SENIORITY_WORDS: list[tuple[str, str]] = [
+    (r"intern(?:ship)?|trainee", "intern"),
+    (r"junior|jr\.?|entry[- ]level|associate|graduate", "junior"),
+    (r"mid[- ]level|intermediate|mid", "mid"),
+    (r"senior|sr\.?", "senior"),
+    (r"staff|lead|tech lead", "staff"),
+    (r"principal|architect|distinguished", "principal"),
+    (r"director|head of|vp|vice president|chief|cto", "director"),
+]
+_SENIORITY_RES = [(re.compile(rf"(?<![A-Za-z])(?:{p})(?![A-Za-z])", re.I), lvl) for p, lvl in _SENIORITY_WORDS]
+_ROMAN = re.compile(r"(?<![A-Za-z])(I{1,3}|IV)\s*$")
+_ROMAN_LEVEL = {"I": "junior", "II": "mid", "III": "senior", "IV": "staff"}
+
+
+def seniority_word(title: str) -> str | None:
+    """Seniority named in a job or role title, or None when the title names none."""
+    t = (title or "").strip()
+    found = [lvl for rx, lvl in _SENIORITY_RES if rx.search(t)]
+    if found:
+        return max(found, key=SENIORITY_LEVEL.__getitem__)
+    m = _ROMAN.search(re.sub(r"\(.*?\)", "", t).strip())
+    return _ROMAN_LEVEL[m.group(1)] if m else None
+
+
+_CORE_STRIP = re.compile(
+    r"\(.*?\)|\[.*?\]|(?<![A-Za-z])(?:intern|junior|jr\.?|senior|sr\.?|lead|staff|principal|associate|mid[- ]level|entry[- ]level|i{1,3}|iv)(?![A-Za-z])",
+    re.I,
+)
+
+
+def core_title(title: str) -> str:
+    """'Senior Data Analyst (m/f/d)' → 'data analyst'."""
+    t = _CORE_STRIP.sub(" ", title or "")
+    t = re.sub(r"[^A-Za-z0-9+#./ -]+", " ", t)
+    return normalize(t)

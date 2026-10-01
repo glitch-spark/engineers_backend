@@ -55,3 +55,22 @@ def test_responsibility_line_override():
     assert line_kind("Must have 3 years of React", "core") == "required"
     assert line_kind("Ship features weekly", "core") == "core"
     assert line_kind("Experience with Go is a bonus", "required") == "preferred"
+
+
+def test_seniority_word():
+    from app.job_apply.text import seniority_word
+
+    assert seniority_word("Senior Data Analyst") == "senior"
+    assert seniority_word("Sr. Engineer") == "senior"
+    assert seniority_word("Staff Software Engineer") == "staff"
+    assert seniority_word("Software Engineer II") == "mid"
+    assert seniority_word("Software Engineer") is None
+    assert seniority_word("Head of Data") == "director"
+
+
+def test_core_title():
+    from app.job_apply.text import core_title
+
+    assert core_title("Senior Data Analyst (m/f/d)") == "data analyst"
+    assert core_title("Sr. Software Engineer II") == "software engineer"
+    assert core_title("Lead Front-End Developer") == "front-end developer"
