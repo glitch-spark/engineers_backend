@@ -251,3 +251,14 @@ async def test_applied_set_during_run_is_kept(client, staff_user, auth_header, m
     await worker.run_worker(PydanticObjectId(run_id))
     rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
     assert rows and all(r["applied"] for r in rows)
+
+
+async def test_run_detail_includes_resume_health(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    by_name = {r["filename"]: r for r in run["resumes"]}
+    assert set(by_name) == {"strong.md", "weak.md"}
+    assert by_name["weak.md"]["accountId"] == str(acc.id)
+    assert "no_email" in by_name["weak.md"]["health"]["issues"] and by_name["weak.md"]["health"]["score"] < 100

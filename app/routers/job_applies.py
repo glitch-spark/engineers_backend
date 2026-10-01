@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
 from app.job_apply import worker
+from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, UserExtra
 from app.models.job_apply import JobApplyRow, JobApplyRun, RunCounts, RunSelection
@@ -60,6 +61,19 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
             }
             for i in ids
         ]
+        # Parseability is a per-resume health badge, not part of the score (spec §3.1).
+        out["resumes"] = []
+        for sel in run.selection:
+            acc = accounts.get(sel.accountId)
+            wanted = {str(x) for x in sel.resumeIds}
+            for r in acc.resumes if acc else []:
+                if wanted and str(r.id) not in wanted:
+                    continue
+                h = health(r.markdown)
+                out["resumes"].append({
+                    "accountId": str(acc.id), "resumeId": str(r.id), "filename": r.filename,
+                    "health": {"score": h.score, "issues": h.issues},
+                })
     return out
 
 
