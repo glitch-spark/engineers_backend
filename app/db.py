@@ -25,6 +25,8 @@ STALE_INDEXES: dict[str, list[str]] = {
     ],
     # 7-day TTL replaced by "ttl_30d" (a TTL's duration can't change in place).
     "job_posting_cache": ["ttl"],
+    # Unique key moved from resumeId to fileKey (uploaded or tailored file).
+    "job_application_log": ["user_url_resume"],
 }
 
 from app.models import (
@@ -113,6 +115,16 @@ async def _migrate_legacy_resume_apps(database) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("legacy resumeapplications migration failed: %s", exc)
+
+
+async def _migrate_log_filekey(database) -> None:
+    """Applied-log entries from before tailored resumes have no fileKey; it equals their resumeId."""
+    coll = database["job_application_log"]
+    try:
+        async for doc in coll.find({"fileKey": {"$exists": False}}, {"resumeId": 1}):
+            await coll.update_one({"_id": doc["_id"]}, {"$set": {"fileKey": str(doc.get("resumeId"))}})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("applied-log fileKey back-fill failed: %s", exc)
 
 
 async def _drop_stale_indexes(database) -> None:
@@ -217,6 +229,7 @@ async def init_db():
     client = AsyncIOMotorClient(uri)
     _client = client
     database = client.get_default_database()
+    await _migrate_log_filekey(database)
     await _drop_stale_indexes(database)
     await _migrate_legacy_resume_apps(database)
     await _migrate_default_leaderboard_optin(database)

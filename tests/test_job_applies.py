@@ -514,3 +514,87 @@ async def test_rows_show_tailored_status_and_other_resumes(client, staff_user, a
     assert remote["tailored"]["status"] == "queued" and remote["tailored"]["hasPdf"] is False
     assert [o["filename"] for o in remote["otherResumes"]] == ["weak.md"]  # scored but below the threshold
     assert listed["https://jobs.example.com/hybrid"]["tailored"] is None
+
+
+async def _tailored_ready(client, h, row):
+    from app.models import ResumeApplication
+
+    t = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})).json()["tailored"]
+    await ResumeApplication.get_motor_collection().update_one(
+        {"_id": PydanticObjectId(t["jobId"])}, {"$set": {"status": "completed", "step": "done", "pdfData": "JVBERg=="}}
+    )
+    return t
+
+
+async def test_mark_tailored_requires_completed_pdf(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    _, rows, strong, _ = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    t = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})).json()["tailored"]
+    url = f"/job-applies/rows/{row['_id']}/applied"
+    body = {"accountId": t["accountId"], "tailoredJobId": t["jobId"], "applied": True}
+    r = await client.put(url, headers=h, json=body)
+    assert r.status_code == 400 and "isn't ready" in r.json()["error"]
+    both = await client.put(url, headers=h, json={**body, "resumeId": row["suggestions"][0]["resumeId"]})
+    assert both.status_code == 400
+    neither = await client.put(url, headers=h, json={"accountId": t["accountId"], "applied": True})
+    assert neither.status_code == 400
+
+
+async def test_mark_tailored_counts_bid_and_unmark_removes_it(client, staff_user, auth_header):
+    from app.models import ResumeApplication
+    from app.models.job_apply import JobApplicationLog
+
+    h = auth_header(staff_user)
+    _, rows, _, _ = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    t = await _tailored_ready(client, h, row)
+    url = f"/job-applies/rows/{row['_id']}/applied"
+    r = await client.put(url, headers=h, json={"accountId": t["accountId"], "tailoredJobId": t["jobId"], "applied": True})
+    assert r.status_code == 200 and r.json()["appliedResumes"][0]["tailoredJobId"] == t["jobId"]
+    assert (await ResumeApplication.get(t["jobId"])).countsAsBid is True
+    (log,) = await JobApplicationLog.find_all().to_list()
+    assert log.fileKey == f"tailored:{t['jobId']}" and log.tailoredJobId == t["jobId"] and log.resumeId is None
+
+    await client.put(url, headers=h, json={"accountId": t["accountId"], "tailoredJobId": t["jobId"], "applied": False})
+    assert (await ResumeApplication.get(t["jobId"])).countsAsBid is False
+    assert await JobApplicationLog.find_all().count() == 0
+
+
+async def test_mark_other_uploaded_resume(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    _, rows, _, weak = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    other = row["otherResumes"][0]
+    r = await client.put(f"/job-applies/rows/{row['_id']}/applied", headers=h,
+                         json={"accountId": other["accountId"], "resumeId": other["resumeId"], "applied": True})
+    assert r.status_code == 200 and r.json()["appliedResumes"][0]["resumeId"] == other["resumeId"]
+
+
+async def test_mark_top_prefers_ready_tailored(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id, rows, _, _ = await _two_profile_run(client, h, staff_user)
+    t = await _tailored_ready(client, h, rows["https://jobs.example.com/remote"])
+    marks = (await client.post(f"/job-applies/runs/{run_id}/mark-top-applied", headers=h, json={"all": True})).json()["marks"]
+    by_row = {m["rowId"]: m for m in marks}
+    assert by_row[rows["https://jobs.example.com/remote"]["_id"]]["tailoredJobId"] == t["jobId"]
+    gh = by_row[rows["https://boards.greenhouse.io/acme/jobs/9"]["_id"]]
+    assert gh.get("resumeId") and not gh.get("tailoredJobId")
+    undo = await client.post(f"/job-applies/runs/{run_id}/unmark-applied", headers=h, json={"marks": marks})
+    assert undo.json()["unmarked"] == 2
+
+
+async def test_log_backfill_filekey(client, staff_user, auth_header):
+    from app.db import _migrate_log_filekey
+    from app.models.job_apply import JobApplicationLog
+
+    coll = JobApplicationLog.get_motor_collection()
+    await coll.insert_one({"userId": staff_user.id, "url": "https://jobs.example.com/remote", "accountId": "a",
+                           "resumeId": "r1", "profileName": "Old", "filename": "old.pdf",
+                           "appliedAt": datetime.utcnow(), "createdAt": datetime.utcnow(), "updatedAt": datetime.utcnow()})
+    await _migrate_log_filekey(coll.database)
+    doc = await coll.find_one({"resumeId": "r1"})
+    assert doc["fileKey"] == "r1"
+    h = auth_header(staff_user)
+    _, rows = await _done_run(client, h, await make_account(staff_user))
+    assert rows["https://jobs.example.com/remote"]["previouslyApplied"][0]["profileName"] == "Old"

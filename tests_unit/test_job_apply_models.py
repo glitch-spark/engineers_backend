@@ -38,7 +38,7 @@ def test_description_and_extraction_caches_last_30_days():
     assert list(extraction["key"]) == ["createdAt"] and extraction["expireAfterSeconds"] == 30 * 24 * 3600
 
 
-def test_applied_log_is_permanent_and_unique_per_resume():
+def test_applied_log_is_permanent_and_unique_per_file():
     assert _ttl(JobApplicationLog) == []
     unique = [ix.document for ix in JobApplicationLog.Settings.indexes if ix.document.get("unique")]
-    assert [list(ix["key"]) for ix in unique] == [["userId", "url", "resumeId"]]
+    assert [list(ix["key"]) for ix in unique] == [["userId", "url", "fileKey"]]  # resumeId or tailored:<jobId>

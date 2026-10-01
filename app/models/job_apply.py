@@ -74,11 +74,18 @@ class ProfileGates(BaseModel):
 
 
 class AppliedMark(BaseModel):
-    """One resume the user applied with for this job."""
+    """One file the user applied with for this job: an uploaded resume (resumeId) or the job's tailored resume
+    (tailoredJobId, a ResumeApplication id). Exactly one is set."""
 
     accountId: str
-    resumeId: str
+    resumeId: Optional[str] = None
+    tailoredJobId: Optional[str] = None
     at: datetime = Field(default_factory=datetime.utcnow)
+
+
+def file_key(resume_id: Optional[str] = None, tailored_job_id: Optional[str] = None) -> str:
+    """Identity of the file applied with, as stored in the permanent applied log."""
+    return f"tailored:{tailored_job_id}" if tailored_job_id else str(resume_id)
 
 
 class JobApplyRow(TimestampedDocument):
@@ -164,7 +171,9 @@ class JobApplicationLog(TimestampedDocument):
     title: str = ""
     accountId: str
     profileName: str = ""
-    resumeId: str
+    fileKey: str  # file_key(resumeId, tailoredJobId)
+    resumeId: Optional[str] = None
+    tailoredJobId: Optional[str] = None
     filename: str = ""
     runId: Optional[PydanticObjectId] = None
     rowId: Optional[PydanticObjectId] = None
@@ -173,7 +182,8 @@ class JobApplicationLog(TimestampedDocument):
     class Settings:
         name = "job_application_log"
         indexes = [
-            IndexModel([("userId", ASCENDING), ("url", ASCENDING), ("resumeId", ASCENDING)], unique=True, name="user_url_resume"),
+            # Replaces "user_url_resume" (dropped at startup, app/db.py STALE_INDEXES; fileKey back-filled first).
+            IndexModel([("userId", ASCENDING), ("url", ASCENDING), ("fileKey", ASCENDING)], unique=True, name="user_url_file"),
             IndexModel([("userId", ASCENDING), ("appliedAt", DESCENDING)], name="user_recent"),
             IndexModel([("runId", ASCENDING)], name="run"),
         ]

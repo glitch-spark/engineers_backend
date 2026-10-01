@@ -18,6 +18,7 @@ from app.models import Account, ResumeApplication, UserExtra
 from app.job_apply.schema import GateResult, Location
 from app.models.job_apply import (
     AppliedMark,
+    file_key,
     JobApplicationLog,
     JobApplyRow,
     JobApplyRun,
@@ -508,49 +509,83 @@ async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_us
 # ---------- applied marks ----------
 
 
-async def _set_applied(row: JobApplyRow, account_id: str, resume_id: str, filename: str, applied: bool) -> None:
-    """Mark/unmark one resume on one job: the row's appliedResumes (for this run's table) and the permanent
-    applied log (for later runs). Idempotent both ways."""
+async def _set_applied(
+    row: JobApplyRow,
+    account_id: str,
+    filename: str,
+    applied: bool,
+    *,
+    resume_id: Optional[str] = None,
+    tailored_job_id: Optional[str] = None,
+) -> None:
+    """Mark/unmark one file (uploaded resume or the tailored one) on one job: the row's appliedResumes (this
+    run's table), the permanent applied log (later runs), and, for a tailored resume, whether it counts as a bid.
+    Idempotent both ways."""
     now = datetime.utcnow()
     rows = JobApplyRow.get_motor_collection()
     log = JobApplicationLog.get_motor_collection()
-    key = {"userId": row.userId, "url": row.url, "resumeId": resume_id}
+    fkey = file_key(resume_id, tailored_job_id)
+    key = {"userId": row.userId, "url": row.url, "fileKey": fkey}
+    field, value = ("tailoredJobId", tailored_job_id) if tailored_job_id else ("resumeId", resume_id)
     if applied:
         await rows.update_one(
-            {"_id": row.id, "appliedResumes.resumeId": {"$ne": resume_id}},
-            {"$push": {"appliedResumes": {"accountId": account_id, "resumeId": resume_id, "at": now}},
+            {"_id": row.id, f"appliedResumes.{field}": {"$ne": value}},
+            {"$push": {"appliedResumes": {"accountId": account_id, "resumeId": resume_id,
+                                          "tailoredJobId": tailored_job_id, "at": now}},
              "$set": {"applied": False, "updatedAt": now}},
         )
         acc = await Account.get(PydanticObjectId(account_id)) if PydanticObjectId.is_valid(account_id) else None
         await log.update_one(
             key,
             {"$set": {**key, "company": row.company, "title": row.title, "accountId": account_id,
-                      "profileName": acc.name if acc else "", "filename": filename, "runId": row.runId,
-                      "rowId": row.id, "updatedAt": now},
+                      "profileName": acc.name if acc else "", "resumeId": resume_id, "tailoredJobId": tailored_job_id,
+                      "filename": filename, "runId": row.runId, "rowId": row.id, "updatedAt": now},
              "$setOnInsert": {"appliedAt": now, "createdAt": now}},
             upsert=True,
         )
     else:
         await rows.update_one(
             {"_id": row.id},
-            {"$pull": {"appliedResumes": {"resumeId": resume_id}}, "$set": {"applied": False, "updatedAt": now}},
+            {"$pull": {"appliedResumes": {field: value}}, "$set": {"applied": False, "updatedAt": now}},
         )
         await log.delete_one(key)
+    if tailored_job_id and PydanticObjectId.is_valid(tailored_job_id):
+        # A tailored resume becomes a bid when it's actually used to apply (spec §4).
+        await ResumeApplication.get_motor_collection().update_one(
+            {"_id": PydanticObjectId(tailored_job_id)}, {"$set": {"countsAsBid": bool(applied), "updatedAt": now}}
+        )
 
 
 class AppliedBody(BaseModel):
     accountId: str
-    resumeId: str
+    resumeId: Optional[str] = None  # an uploaded resume scored for this job
+    tailoredJobId: Optional[str] = None  # or this job's tailored resume
     applied: bool
 
 
 @router.put("/rows/{row_id}/applied")
 async def set_row_applied(row_id: str, body: AppliedBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     row = await _owned_row(row_id, user)
-    score = next((s for s in row.scores if s.accountId == body.accountId and s.resumeId == body.resumeId), None)
-    if score is None or not row.url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That resume wasn't scored for this job.")
-    await _set_applied(row, body.accountId, body.resumeId, score.filename, body.applied)
+    if bool(body.resumeId) == bool(body.tailoredJobId):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Give either resumeId or tailoredJobId.")
+    if not row.url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This job has no URL.")
+    if body.tailoredJobId:
+        job = await ResumeApplication.get_motor_collection().find_one(
+            {"_id": to_object_id(body.tailoredJobId)}, {"status": 1, "pdfFilename": 1, "accountId": 1}
+        )
+        if job is None or str(row.tailoredJobId) != body.tailoredJobId:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That isn't this job's tailored resume.")
+        if body.applied and job.get("status") != "completed":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The tailored resume isn't ready yet.")
+        filename = job.get("pdfFilename") or "Tailored resume"
+        await _set_applied(row, str(job.get("accountId") or body.accountId), filename, body.applied,
+                           tailored_job_id=body.tailoredJobId)
+    else:
+        score = next((s for s in row.scores if s.accountId == body.accountId and s.resumeId == body.resumeId), None)
+        if score is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That resume wasn't scored for this job.")
+        await _set_applied(row, body.accountId, score.filename, body.applied, resume_id=body.resumeId)
     fresh = await JobApplyRow.get(row.id)
     return {"_id": str(row.id), "appliedResumes": [m.model_dump(mode="json") for m in fresh.appliedResumes]}
 
@@ -576,14 +611,25 @@ async def mark_top_applied(
         q = {"_id": {"$in": [to_object_id(i) for i in body.rowIds]}, "runId": run.id}
         q = {"$and": [q, await _rows_query(run, applied="no")]}
     marks = []
-    for row in await JobApplyRow.find(q).to_list():
+    rows = await JobApplyRow.find(q).to_list()
+    tailored = await _tailored_docs([r.tailoredJobId for r in rows])
+    for row in rows:
+        if row.appliedResumes or row.applied:
+            continue
+        ready = tailored.get(str(row.tailoredJobId))
+        if ready and ready.get("status") == "completed" and (not body.accountId or row.tailoredAccountId == body.accountId):
+            tid = str(row.tailoredJobId)
+            await _set_applied(row, row.tailoredAccountId or "", ready.get("pdfFilename") or "Tailored resume", True,
+                               tailored_job_id=tid)
+            marks.append({"rowId": str(row.id), "accountId": row.tailoredAccountId or "", "tailoredJobId": tid})
+            continue
         tops = [
             s for s in row.bestByProfile
             if s.total >= run.threshold and (not body.accountId or s.accountId == body.accountId)
         ]
-        if not tops or row.appliedResumes or row.applied:
+        if not tops:
             continue
-        await _set_applied(row, tops[0].accountId, tops[0].resumeId, tops[0].filename, True)
+        await _set_applied(row, tops[0].accountId, tops[0].filename, True, resume_id=tops[0].resumeId)
         marks.append({"rowId": str(row.id), "accountId": tops[0].accountId, "resumeId": tops[0].resumeId})
     return {"marked": len(marks), "marks": marks}
 
@@ -591,7 +637,8 @@ async def mark_top_applied(
 class MarkRef(BaseModel):
     rowId: str
     accountId: str
-    resumeId: str
+    resumeId: Optional[str] = None
+    tailoredJobId: Optional[str] = None
 
 
 class UnmarkBody(BaseModel):
@@ -609,8 +656,13 @@ async def unmark_applied(run_id: str, body: UnmarkBody, user: Annotated[UserExtr
     done = 0
     for m in body.marks:
         row = rows.get(m.rowId)
-        if row and any(a.resumeId == m.resumeId for a in row.appliedResumes):
-            await _set_applied(row, m.accountId, m.resumeId, "", False)
+        if not row:
+            continue
+        if m.tailoredJobId and any(a.tailoredJobId == m.tailoredJobId for a in row.appliedResumes):
+            await _set_applied(row, m.accountId, "", False, tailored_job_id=m.tailoredJobId)
+            done += 1
+        elif m.resumeId and any(a.resumeId == m.resumeId for a in row.appliedResumes):
+            await _set_applied(row, m.accountId, "", False, resume_id=m.resumeId)
             done += 1
     return {"unmarked": done}
 
@@ -652,7 +704,7 @@ async def _tailor_row(
     )
     # Replace the previous tailored job: drop it if it never started and no applied mark uses it.
     if row.tailoredJobId:
-        used = any(getattr(m, "tailoredJobId", None) == str(row.tailoredJobId) for m in row.appliedResumes)
+        used = any(m.tailoredJobId == str(row.tailoredJobId) for m in row.appliedResumes)
         if not used:
             await ResumeApplication.get_motor_collection().delete_one({"_id": row.tailoredJobId, "status": "queued"})
     await JobApplyRow.get_motor_collection().update_one(
