@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     # rest of the app still boots without these. EMAIL_TOKEN_KEY is a 32-byte
     # urlsafe-base64 Fernet key — generate one with
     #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Service account for writing Job Applies exports into a Google Sheet shared with its email as Editor:
+    # the key file's JSON (or a path to it). Unset = export disabled with a setup message.
+    GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = None
     GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
     GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None
     GOOGLE_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/gmail/oauth-callback"

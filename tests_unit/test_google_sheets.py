@@ -1,0 +1,76 @@
+"""Google Sheets client for the export: service-account auth and tab/rows calls (httpx.MockTransport)."""
+import json
+import os
+
+os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
+os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+
+from app import google_sheets  # noqa: E402
+
+SID = "1AbC_dEf-1234567890"
+
+
+@pytest.fixture
+def service_account(monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+    info = {"client_email": "exporter@proj.iam.gserviceaccount.com", "private_key": pem,
+            "token_uri": "https://oauth2.googleapis.com/token"}
+    monkeypatch.setattr(google_sheets, "_service_account_raw", lambda: json.dumps(info))
+    google_sheets._token_cache.clear()
+    return info
+
+
+def mock(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_not_configured(monkeypatch):
+    monkeypatch.setattr(google_sheets, "_service_account_raw", lambda: None)
+    async with mock(lambda r: httpx.Response(500)) as c:
+        with pytest.raises(google_sheets.SheetsError, match="isn't set up"):
+            await google_sheets.sheet_info(c, SID)
+
+
+async def test_ensure_tab_creates_header_once(service_account):
+    calls = []
+
+    def handler(req):
+        calls.append((req.method, req.url.path, req.content.decode() if req.content else ""))
+        if req.url.host == "oauth2.googleapis.com":
+            assert b"jwt-bearer" in req.content
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        assert req.headers["authorization"] == "Bearer tok"
+        if req.method == "GET":
+            return httpx.Response(200, json={"properties": {"title": "Applies"},
+                                             "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}]})
+        if req.url.path.endswith(":batchUpdate"):
+            return httpx.Response(200, json={"replies": [{"addSheet": {"properties": {"sheetId": 77, "title": "2026-10-02"}}}]})
+        return httpx.Response(200, json={})
+
+    async with mock(handler) as c:
+        info = await google_sheets.sheet_info(c, SID)
+        assert info == {"title": "Applies", "tabs": {"Sheet1": 0}}
+        assert await google_sheets.ensure_tab(c, SID, "2026-10-02", ["Date", "Applied"], info) is True
+        assert await google_sheets.ensure_tab(c, SID, "Sheet1", ["Date"], info) is False
+        await google_sheets.append_rows(c, SID, "2026-10-02", [["2026-10-02", False]])
+    paths = [p for _, p, _ in calls]
+    assert any(p.endswith(":batchUpdate") for p in paths)
+    assert any("values/" in p and p.endswith(":append") for p in paths)
+    assert sum(1 for p in paths if p.endswith("/token")) == 1  # token cached
+
+
+async def test_not_shared_gives_share_hint(service_account):
+    def handler(req):
+        if req.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        return httpx.Response(403, json={"error": {"message": "The caller does not have permission"}})
+
+    async with mock(handler) as c:
+        with pytest.raises(google_sheets.SheetsError, match="exporter@proj.iam.gserviceaccount.com"):
+            await google_sheets.sheet_info(c, SID)

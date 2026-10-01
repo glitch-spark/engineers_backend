@@ -115,6 +115,8 @@ class JobApplyRow(TimestampedDocument):
     appliedResumes: List[AppliedMark] = Field(default_factory=list)
     # Tailored resumes for this job, one per profile: accountId → ResumeApplication id (generation queue).
     tailored: Dict[str, PydanticObjectId] = Field(default_factory=dict)
+    # Profiles whose row for this job was exported to the Google Sheet: accountId → when.
+    exported: Dict[str, datetime] = Field(default_factory=dict)
     expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:

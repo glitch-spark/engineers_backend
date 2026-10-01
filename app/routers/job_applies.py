@@ -10,8 +10,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
-from app import resume_queue
-from app.job_apply import gsheet, worker
+from app import google_sheets, resume_files, resume_queue
+from app.job_apply import file_links, gsheet, worker
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
@@ -141,13 +141,14 @@ class _RowListView(BaseModel):
     appliedResumes: list[AppliedMark] = Field(default_factory=list)
     scores: list[_ScoreBrief] = Field(default_factory=list)
     tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
+    exported: dict[str, datetime] = Field(default_factory=dict)
     tailorOnly: list[str] = Field(default_factory=list)
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
             "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
-            "applied": 1, "appliedResumes": 1, "tailored": 1, "tailorOnly": 1,
+            "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
             "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1,
@@ -246,6 +247,8 @@ def _row_summary(
         "tailorOnly": row.tailorOnly,
         # Every profile this job is open to (passes its location / work-authorization checks).
         "openProfiles": _open_profiles(row),
+        # Profiles whose row for this job is already in the Google Sheet.
+        "exportedProfiles": list(row.exported),
     }
 
 
@@ -836,3 +839,140 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
             queued += 1
             remaining -= 1
     return {"queued": queued, "skippedCap": skipped, "skipped": other}
+
+
+# ---------- export to Google Sheets ----------
+
+EXPORT_HEADER = ["Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied"]
+
+
+class ExportBody(BaseModel):
+    sheetUrl: str = ""  # empty = the link saved from the last export
+    dryRun: bool = False  # count and check access only
+
+
+def _today_label(user: UserExtra) -> str:
+    from app.alerts import local_now
+    from app.slack_bot import resolve_user_tz
+
+    return local_now(resolve_user_tz(user)).date().isoformat()
+
+
+@router.post("/runs/{run_id}/export-sheet")
+async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Append one row per job × profile still to apply to (with that profile's tailored resume if ready, else its
+    matching uploaded resume) to today's tab of the shared Google Sheet. Rows already exported are skipped."""
+    run = await _owned_run(run_id, user)
+    url = body.sheetUrl.strip() or (user.jobApplySheetUrl or "")
+    if not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the Google Sheet link to export to.")
+    try:
+        sheet_id, _ = gsheet.parse_gsheet_url(url)
+    except SheetError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    rows = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).sort("+rowIndex").to_list()
+    tailored = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
+    accounts = {str(a.id): a for a in await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()}
+    resumes = {str(r.id): r for a in accounts.values() for r in a.resumes}
+    today = _today_label(user)
+
+    out: list[list] = []
+    marks: list[tuple] = []
+    pending = needs = already = no_file = 0
+    for row in rows:
+        matching = {s.accountId: s for s in row.bestByProfile if s.total >= run.threshold}
+        for acc in _open_profiles(row):
+            if acc in row.exported:
+                already += 1
+                continue
+            t = tailored.get(str(row.tailored.get(acc)))
+            s = matching.get(acc)
+            if t and t.get("status") == "completed":
+                link, kind = file_links.file_url("tailored", str(t["_id"])), "Tailored"
+            elif t and t.get("status") in ("queued", "in_progress"):
+                pending += 1
+                continue
+            elif s:
+                resume = resumes.get(s.resumeId)
+                if not resume or not resume.s3Key:
+                    no_file += 1  # the original PDF isn't stored, so there's nothing to link to
+                    continue
+                link, kind = file_links.file_url("resume", s.resumeId, account_id=acc), f"Uploaded · {s.filename}"
+            else:
+                needs += 1  # nothing to apply with yet: tailor it first
+                continue
+            out.append([
+                today, accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url,
+                f'=HYPERLINK("{link}","Download")', kind, s.total if s else "",
+                row.postedDate.isoformat() if row.postedDate else "", False,
+            ])
+            marks.append((row.id, acc))
+
+    async with httpx.AsyncClient() as http:
+        try:
+            info = await google_sheets.sheet_info(http, sheet_id)
+            if not body.dryRun and out:
+                await google_sheets.ensure_tab(http, sheet_id, today, EXPORT_HEADER, info)
+                await google_sheets.append_rows(http, sheet_id, today, out)
+        except google_sheets.SheetsError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    now = datetime.utcnow()
+    if not body.dryRun:
+        coll = JobApplyRow.get_motor_collection()
+        for row_id, acc in marks:
+            await coll.update_one({"_id": row_id}, {"$set": {f"exported.{acc}": now, "updatedAt": now}})
+    if url != user.jobApplySheetUrl:
+        await UserExtra.get_motor_collection().update_one({"_id": user.id}, {"$set": {"jobApplySheetUrl": url}})
+    return {
+        "ready": len(out),
+        "added": 0 if body.dryRun else len(out),
+        "pending": pending,
+        "needsResume": needs,
+        "alreadyExported": already,
+        "noFile": no_file,
+        "sheetTitle": info["title"],
+        "tab": today,
+        "sheetUrl": url,
+        "serviceAccount": google_sheets.service_account_email(),
+    }
+
+
+def _pdf_name(*parts: str) -> str:
+    import re
+
+    return re.sub(r"[^\w .()-]+", "_", " - ".join(p for p in parts if p)).strip() or "Resume"
+
+
+@router.get("/files/{token}")
+async def resume_file(token: str):
+    """A resume PDF from an exported sheet's link. No login: the signed, expiring link is the permission."""
+    import base64
+
+    from fastapi.responses import RedirectResponse, Response
+
+    try:
+        ref = file_links.read_token(token)
+    except file_links.BadLink:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This link is invalid or has expired.")
+    if ref["kind"] == "tailored":
+        doc = await ResumeApplication.get_motor_collection().find_one(
+            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1, "profileName": 1}
+        )
+        if doc is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume no longer exists.")
+        filename = _pdf_name(f"Resume ({doc.get('companyName') or 'job'})", doc.get("profileName") or "") + ".pdf"
+        if doc.get("s3Key"):
+            return RedirectResponse(resume_files.presigned_url(doc["s3Key"], filename))
+        if doc.get("pdfData"):
+            return Response(
+                base64.b64decode(doc["pdfData"]), media_type="application/pdf",
+                headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
+    acc = await Account.get(to_object_id(ref["accountId"] or ""))
+    resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
+    if resume is None or not resume.s3Key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+    return RedirectResponse(resume_files.presigned_url(resume.s3Key, resume.filename))
