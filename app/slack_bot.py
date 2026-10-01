@@ -538,59 +538,57 @@ def _plan_day_label(day: datetime, offset: int = 0, sep: str = "") -> str:
     return f"{d.month}/{d.day}{sep}({d.strftime('%a')})"
 
 
-def _regular_day_lines(
-    day: str, hands_on: int, by_bidder: int, interview: str, items: list[str]
-) -> list[str]:
-    """One day of a regular plan: one line each for Bid and Interview, then the items."""
-    hands_on, by_bidder = hands_on or 0, by_bidder or 0
+def _region_total(counts: dict) -> int:
+    return sum((counts or {}).values())
+
+
+def daily_plan_text(
+    plan: Any,
+    owner: Optional[UserExtra],
+    tomorrow: Any = None,
+    done: Any = None,
+) -> str:
+    """Goal → Done for the day, then tomorrow's goal.
+
+    `done` is the day's effective Done (automatic interviews/profiles with
+    overrides applied); it defaults to what the plan stores.
+    """
+    goal = plan.goal
+    done = done if done is not None else plan.done
     lines = [
-        f"*{day}*",
-        f"1. Bid {hands_on + by_bidder} (hands-on: {hands_on} + bidder: {by_bidder})",
-        f"2. Interview {interview}",
+        f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
+        f"*{_plan_day_label(plan.date, sep=' ')}*",
+        f"Bids: self {done.bidsSelf}/{goal.bidsSelf} · bidder {done.bidsBidder}/{goal.bidsBidder}",
+        f"Interviews: self {done.interviewsSelf}/{goal.interviewsSelf}"
+        f" · caller {done.interviewsCaller}/{goal.interviewsCaller}",
     ]
-    for n, item in enumerate(items or [], start=3):
-        lines.append(f"{n}. {_slack_escape(item)}")
-    return lines
-
-
-def daily_plan_text(plan: Any, owner: Optional[UserExtra]) -> str:
-    if getattr(plan, "planType", "custom") == "regular":
-        return "\n".join(
-            [
-                f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
-                *_regular_day_lines(
-                    _plan_day_label(plan.date, sep=" "),
-                    plan.bidsHandsOn,
-                    plan.bidsByBidder,
-                    f"Done/New Invitation : {plan.interviewsDone or 0}/{plan.interviewsNew or 0}",
-                    plan.todayItems,
-                ),
-                *_regular_day_lines(
-                    _plan_day_label(plan.date, 1, sep=" "),
-                    plan.planBidsHandsOn,
-                    plan.planBidsByBidder,
-                    f"Scheduled : {plan.planInterviewsScheduled or 0}",
-                    plan.tomorrowItems,
-                ),
-                f"<{_frontend_link('/report')}|Open Report>",
-            ]
-        )
-    today = (plan.today or "").strip()
-    tomorrow = (plan.tomorrow or "").strip()
-    return "\n".join(
-        [
-            f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
-            f"*{_plan_day_label(plan.date)}*",
-            _slack_escape(today) if today else "—",
-            f"*{_plan_day_label(plan.date, 1)}*",
-            _slack_escape(tomorrow) if tomorrow else "—",
-            f"<{_frontend_link('/report')}|Open Report>",
-        ]
+    stock = (
+        _region_total(done.profiles), _region_total(goal.profiles),
+        _region_total(done.linkedin), _region_total(goal.linkedin),
     )
+    if any(stock):
+        lines.append(f"Profiles {stock[0]}/{stock[1]} · LinkedIn {stock[2]}/{stock[3]}")
+    for item in plan.goalItems or []:
+        lines.append(f"{'✓' if item.done else '○'} {_slack_escape(item.text)}")
+    notes = (plan.notes or "").strip()
+    if notes:
+        lines.append(_slack_escape(notes))
+    if tomorrow is not None:
+        t_goal = tomorrow.goal
+        bids = t_goal.bidsSelf + t_goal.bidsBidder
+        interviews = t_goal.interviewsSelf + t_goal.interviewsCaller
+        if bids or interviews or tomorrow.goalItems:
+            lines.append(
+                f"*Tomorrow {_plan_day_label(tomorrow.date, sep=' ')}*: Bids {bids} · Interviews {interviews}"
+            )
+            lines.extend(f"○ {_slack_escape(item.text)}" for item in tomorrow.goalItems or [])
+    monday = (plan.date - timedelta(days=plan.date.weekday())).date().isoformat()
+    lines.append(f"<{_frontend_link(f'/report?week={monday}')}|Open Report>")
+    return "\n".join(lines)
 
 
 async def sync_daily_plan_message(
-    plan: Any, owner: Optional[UserExtra]
+    plan: Any, owner: Optional[UserExtra], tomorrow: Any = None, done: Any = None
 ) -> Optional[tuple[str, str]]:
     """Post the plan to SLACK_DAILY_PLAN_CHANNEL_ID, or edit the existing post
     in place. Never raises. Returns the live post's (channel, ts), or None when
@@ -599,7 +597,7 @@ async def sync_daily_plan_message(
     try:
         if not slack_bot_configured():
             return None
-        text = daily_plan_text(plan, owner)
+        text = daily_plan_text(plan, owner, tomorrow=tomorrow, done=done)
         channel = (plan.slackChannel or "").strip()
         ts = (plan.slackTs or "").strip()
         if channel and ts:

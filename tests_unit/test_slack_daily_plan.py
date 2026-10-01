@@ -1,4 +1,4 @@
-"""Unit tests for the daily plan Slack post (post, edit in place, delete)."""
+"""Unit tests for the daily plan Slack post (text, post, edit in place, delete)."""
 
 import os
 from datetime import datetime
@@ -11,6 +11,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.config import get_settings
+from app.models.plan_common import ChecklistItem, Counts
 from app.slack_bot import (
     daily_plan_text,
     delete_daily_plan_message,
@@ -21,9 +22,12 @@ from app.slack_bot import (
 def _plan(**kw):
     base = dict(
         id="plan1",
-        date=datetime(2026, 9, 27),
-        today="Ship <filter> & tests",
-        tomorrow="",
+        date=datetime(2026, 10, 1),
+        goal=Counts(bidsSelf=6, bidsBidder=4, interviewsSelf=1, interviewsCaller=1,
+                    profiles={"US": 2, "EU": 1}, linkedin={"US": 2}),
+        goalItems=[ChecklistItem(text="Fix resume", done=True), ChecklistItem(text="Call <recruiter>")],
+        done=Counts(bidsSelf=5, bidsBidder=4, linkedin={"US": 2}),
+        notes="Slow day & quiet",
         slackChannel=None,
         slackTs=None,
     )
@@ -35,63 +39,51 @@ def _owner():
     return SimpleNamespace(name="Pedro", email="p@x.com", slackUserId="U123")
 
 
-def test_daily_plan_text_labels_mention_and_escapes():
-    text = daily_plan_text(_plan(), _owner())
-    assert "<@U123>" in text
-    assert "*9/27(Sun)*" in text
-    assert "*9/28(Mon)*" in text
-    assert "Ship &lt;filter&gt; &amp; tests" in text
-    assert "\n—\n" in text  # empty tomorrow
+def _done():
+    return Counts(bidsSelf=5, bidsBidder=4, interviewsSelf=1, interviewsCaller=0,
+                  profiles={"US": 2}, linkedin={"US": 2})
 
 
-def test_regular_daily_plan_text_numbers_both_days():
-    plan = _plan(
-        planType="regular",
-        bidsHandsOn=100,
-        bidsByBidder=150,
-        interviewsDone=2,
-        interviewsNew=3,
-        todayItems=["Create Linkedin Profile", "Update <resume>"],
-        planBidsHandsOn=90,
-        planBidsByBidder=160,
-        planInterviewsScheduled=5,
-        tomorrowItems=["Prep for Acme"],
+def test_daily_plan_text_full():
+    tomorrow = _plan(
+        date=datetime(2026, 10, 2),
+        goal=Counts(bidsSelf=6, bidsBidder=4, interviewsSelf=1, interviewsCaller=1),
+        goalItems=[ChecklistItem(text="Prep panel")],
     )
-    lines = daily_plan_text(plan, _owner()).splitlines()
-    assert lines[0] == ":spiral_note_pad: *Daily plan* — <@U123>"
-    assert lines[1:-1] == [
-        "*9/27 (Sun)*",
-        "1. Bid 250 (hands-on: 100 + bidder: 150)",
-        "2. Interview Done/New Invitation : 2/3",
-        "3. Create Linkedin Profile",
-        "4. Update &lt;resume&gt;",
-        "*9/28 (Mon)*",
-        "1. Bid 250 (hands-on: 90 + bidder: 160)",
-        "2. Interview Scheduled : 5",
-        "3. Prep for Acme",
+    lines = daily_plan_text(_plan(), _owner(), tomorrow=tomorrow, done=_done()).splitlines()
+    assert lines[:-1] == [
+        ":spiral_note_pad: *Daily plan* — <@U123>",
+        "*10/1 (Thu)*",
+        "Bids: self 5/6 · bidder 4/4",
+        "Interviews: self 1/1 · caller 0/1",
+        "Profiles 2/3 · LinkedIn 2/2",
+        "✓ Fix resume",
+        "○ Call &lt;recruiter&gt;",
+        "Slow day &amp; quiet",
+        "*Tomorrow 10/2 (Fri)*: Bids 10 · Interviews 2",
+        "○ Prep panel",
     ]
-    assert "Open Report" in lines[-1]
+    assert lines[-1].endswith("/report?week=2026-09-28|Open Report>")
 
 
-def test_regular_daily_plan_text_without_items_or_counts():
-    plan = _plan(
-        planType="regular",
-        bidsHandsOn=0,
-        bidsByBidder=0,
-        interviewsDone=0,
-        interviewsNew=0,
-        todayItems=[],
-        planBidsHandsOn=0,
-        planBidsByBidder=0,
-        planInterviewsScheduled=0,
-        tomorrowItems=[],
-    )
-    text = daily_plan_text(plan, _owner())
-    assert "1. Bid 0 (hands-on: 0 + bidder: 0)" in text
-    assert "2. Interview Done/New Invitation : 0/0" in text
-    assert "2. Interview Scheduled : 0" in text
-    assert not any(line.startswith("3. ") for line in text.splitlines())
-    assert "Ship" not in text  # the free-text note belongs to custom plans
+def test_daily_plan_text_minimal_without_profiles_items_notes_or_tomorrow():
+    plan = _plan(goal=Counts(bidsSelf=3), goalItems=[], done=Counts(), notes="")
+    lines = daily_plan_text(plan, _owner(), done=Counts()).splitlines()
+    assert lines[1:-1] == [
+        "*10/1 (Thu)*",
+        "Bids: self 0/3 · bidder 0/0",
+        "Interviews: self 0/0 · caller 0/0",
+    ]
+
+
+def test_daily_plan_text_defaults_done_to_stored_done():
+    text = daily_plan_text(_plan(), _owner())
+    assert "Bids: self 5/6 · bidder 4/4" in text
+
+
+def test_daily_plan_text_empty_tomorrow_is_omitted():
+    empty = _plan(date=datetime(2026, 10, 2), goal=Counts(), goalItems=[])
+    assert "Tomorrow" not in daily_plan_text(_plan(), _owner(), tomorrow=empty, done=_done())
 
 
 @pytest.mark.asyncio

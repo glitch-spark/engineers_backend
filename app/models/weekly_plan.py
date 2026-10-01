@@ -2,11 +2,11 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Optional
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItem, Counts, WeeklyOverrides, check_items, monday_of
+from app.models.plan_common import ChecklistItems, Counts, WeeklyOverrides, monday_of
 
 WeeklyPlanStatus = Literal["planned", "reviewed"]
 
@@ -84,7 +84,7 @@ class WeeklyPlan(TimestampedDocument):
     startDate: datetime
     endDate: datetime
     goal: Counts = Field(default_factory=Counts)
-    goalItems: List[ChecklistItem] = []
+    goalItems: ChecklistItems = []
     planNotes: str = Field(default="", max_length=4000)
     recapNotes: str = Field(default="", max_length=4000)
     doneOverrides: WeeklyOverrides = Field(default_factory=WeeklyOverrides)
@@ -93,11 +93,6 @@ class WeeklyPlan(TimestampedDocument):
     @classmethod
     def _fold_legacy(cls, data: Any) -> Any:
         return fold_legacy_weekly(data)
-
-    @field_validator("goalItems")
-    @classmethod
-    def _items(cls, v: list) -> list:
-        return check_items(v)
 
     class Settings:
         name = "weeklyplans"

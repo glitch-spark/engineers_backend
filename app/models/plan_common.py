@@ -7,7 +7,7 @@ accounts are stock levels kept per region (a week shows its latest value).
 from datetime import date, timedelta
 from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 REGIONS = ("US", "EU", "Latam", "Canada", "Asia")
 # Profiles without a region on the Profiles page count here.
@@ -119,6 +119,9 @@ def check_items(items: list) -> list:
     if len(items) > MAX_ITEMS:
         raise ValueError(f"at most {MAX_ITEMS} checklist items")
     return items
+
+
+ChecklistItems = Annotated[list[ChecklistItem], AfterValidator(check_items)]
 
 
 def next_working_day(d: date) -> date:

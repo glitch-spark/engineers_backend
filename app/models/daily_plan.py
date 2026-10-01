@@ -2,11 +2,11 @@ from datetime import datetime
 from typing import Any, Optional
 
 from beanie import PydanticObjectId
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItem, Counts, DoneOverrides, check_items
+from app.models.plan_common import ChecklistItems, Counts, DoneOverrides
 
 # Fields of the pre Goal-vs-Done shape. `planBids*` / `planInterviewsScheduled`
 # / `tomorrowItems` describe the NEXT day, so the fold drops them here and
@@ -77,7 +77,7 @@ class DailyPlan(TimestampedDocument):
     year: int
     weekNumber: int
     goal: Counts = Field(default_factory=Counts)
-    goalItems: list[ChecklistItem] = []
+    goalItems: ChecklistItems = []
     done: Counts = Field(default_factory=Counts)
     doneOverrides: DoneOverrides = Field(default_factory=DoneOverrides)
     notes: str = Field(default="", max_length=2000)
@@ -90,11 +90,6 @@ class DailyPlan(TimestampedDocument):
     @classmethod
     def _fold_legacy(cls, data: Any) -> Any:
         return fold_legacy_daily(data)
-
-    @field_validator("goalItems")
-    @classmethod
-    def _items(cls, v: list) -> list:
-        return check_items(v)
 
     class Settings:
         name = "dailyplans"
