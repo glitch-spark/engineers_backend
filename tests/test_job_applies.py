@@ -486,10 +486,11 @@ async def test_retailor_replaces_queued_job(client, staff_user, auth_header):
     _, rows, strong, weak = await _two_profile_run(client, h, staff_user)
     row = rows["https://jobs.example.com/remote"]
     first = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})).json()["tailored"]
-    second = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"accountId": str(weak.id)})).json()["tailored"]
-    assert await ResumeApplication.get(first["jobId"]) is None  # still queued and unused -> replaced
+    again = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})).json()["tailored"]
+    weak_job = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"accountId": str(weak.id)})).json()["tailored"]
+    assert await ResumeApplication.get(first["jobId"]) is None  # same profile, still queued and unused -> replaced
     fresh = await JobApplyRow.get(PydanticObjectId(row["_id"]))
-    assert str(fresh.tailoredJobId) == second["jobId"] and fresh.tailoredAccountId == str(weak.id)
+    assert {k: str(v) for k, v in fresh.tailored.items()} == {str(strong.id): again["jobId"], str(weak.id): weak_job["jobId"]}
 
 
 async def test_tailor_all_respects_cap(client, staff_user, auth_header, monkeypatch):
@@ -499,7 +500,7 @@ async def test_tailor_all_respects_cap(client, staff_user, auth_header, monkeypa
     h = auth_header(staff_user)
     run_id, _, _, _ = await _two_profile_run(client, h, staff_user)
     r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
-    assert r.status_code == 200 and r.json() == {"queued": 1, "skippedCap": 1, "skipped": 0}
+    assert r.status_code == 200 and r.json() == {"queued": 1, "skippedCap": 3, "skipped": 0}
     run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
     assert run["tailoring"] == {"queued": 1, "inProgress": 0, "ready": 0, "failed": 0}
 
@@ -511,9 +512,10 @@ async def test_rows_show_tailored_status_and_other_resumes(client, staff_user, a
     await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})
     listed = {x["url"]: x for x in (await client.get(f"/job-applies/runs/{run_id}/rows?view=all", headers=h)).json()["rows"]}
     remote = listed["https://jobs.example.com/remote"]
-    assert remote["tailored"]["status"] == "queued" and remote["tailored"]["hasPdf"] is False
-    assert [o["filename"] for o in remote["otherResumes"]] == ["weak.md"]  # scored but below the threshold
-    assert listed["https://jobs.example.com/hybrid"]["tailored"] is None
+    (t,) = remote["tailored"]
+    assert t["status"] == "queued" and t["hasPdf"] is False and t["accountId"] == str(strong.id)
+    assert set(remote["openProfiles"]) == {str(strong.id), str(weak.id)}
+    assert listed["https://jobs.example.com/hybrid"]["tailored"] == []
 
 
 async def _tailored_ready(client, h, row):
@@ -565,7 +567,9 @@ async def test_mark_other_uploaded_resume(client, staff_user, auth_header):
     h = auth_header(staff_user)
     _, rows, _, weak = await _two_profile_run(client, h, staff_user)
     row = rows["https://jobs.example.com/remote"]
-    other = row["otherResumes"][0]
+    detail = (await client.get(f"/job-applies/rows/{row['_id']}", headers=h)).json()
+    shown = {x["resumeId"] for x in row["suggestions"]}
+    other = next(x for x in detail["scores"] if x["resumeId"] not in shown)  # scored, below the threshold
     r = await client.put(f"/job-applies/rows/{row['_id']}/applied", headers=h,
                          json={"accountId": other["accountId"], "resumeId": other["resumeId"], "applied": True})
     assert r.status_code == 200 and r.json()["appliedResumes"][0]["resumeId"] == other["resumeId"]
@@ -616,7 +620,7 @@ async def test_concurrent_tailor_keeps_one_job(client, staff_user, auth_header):
     await _tailor_row(stale_b, run, owner, None, False)
     jobs = await ResumeApplication.find({"jobApplyRowId": row_id}).to_list()
     fresh = await JobApplyRow.get(row_id)
-    assert len(jobs) == 1 and fresh.tailoredJobId == jobs[0].id
+    assert len(jobs) == 1 and fresh.tailored[str(strong.id)] == jobs[0].id
 
 
 async def test_tailor_all_skips_rows_it_cannot_tailor(client, staff_user, auth_header):
@@ -626,7 +630,7 @@ async def test_tailor_all_skips_rows_it_cannot_tailor(client, staff_user, auth_h
     await strong.save()
     r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
     assert r.status_code == 200, r.text
-    assert r.json()["queued"] == 0 and r.json()["skipped"] == 2
+    assert r.json()["queued"] == 2 and r.json()["skipped"] == 2  # weak has a template; strong doesn't
 
 
 async def test_deleting_a_run_drops_its_queued_tailored_jobs(client, staff_user, auth_header):
@@ -636,7 +640,7 @@ async def test_deleting_a_run_drops_its_queued_tailored_jobs(client, staff_user,
     run_id, rows, _, _ = await _two_profile_run(client, h, staff_user)
     await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
     ready = await _tailored_ready(client, h, rows["https://boards.greenhouse.io/acme/jobs/9"])  # completed one stays
-    assert await ResumeApplication.find({"source": "job_applies", "status": "queued"}).count() == 1
+    assert await ResumeApplication.find({"source": "job_applies", "status": "queued"}).count() == 3
     assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 200
     assert await ResumeApplication.find({"source": "job_applies", "status": "queued"}).count() == 0
     assert await ResumeApplication.get(ready["jobId"]) is not None
@@ -673,7 +677,7 @@ async def test_tailor_only_profile_run(client, staff_user, auth_header):
 
     r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
     assert r.json()["queued"] == 2
-    t = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"][0]["tailored"]
+    (t,) = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"][0]["tailored"]
     assert t["accountId"] == str(acc.id)
 
 
@@ -731,3 +735,54 @@ async def test_excluded_count_includes_profiles_blocked_by_location(client, staf
     run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
     excluded = (await client.get(f"/job-applies/runs/{run_id}/rows?view=excluded", headers=h)).json()["rows"]
     assert run["excludedCount"] == len(excluded) == 3
+
+
+
+async def test_each_profile_gets_its_own_tailored_resume(client, staff_user, auth_header):
+    """Tharun (no resumes, tailor only) and a profile with a resume can both be tailored for one job."""
+    h = auth_header(staff_user)
+    tharun = await _tailor_only_account(staff_user)
+    eric = await make_account(staff_user, resumes=(("eric.md", STRONG),), name="Eric")
+    run_id = (await _run_with(client, h, [tharun, eric])).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    row = next(x for x in (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+               if x["url"] == "https://jobs.example.com/remote")
+    assert set(row["openProfiles"]) == {str(tharun.id), str(eric.id)}
+    for acc in (tharun, eric):
+        r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"accountId": str(acc.id)})
+        assert r.status_code == 200 and r.json()["tailored"]["accountId"] == str(acc.id)
+    again = next(x for x in (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"] if x["_id"] == row["_id"])
+    assert {t["accountId"] for t in again["tailored"]} == {str(tharun.id), str(eric.id)}
+
+
+async def test_tailor_all_for_chosen_profiles_with_dry_run(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    tharun = await _tailor_only_account(staff_user)
+    eric = await make_account(staff_user, resumes=(("eric.md", STRONG),), name="Eric")
+    run_id = (await _run_with(client, h, [tharun, eric])).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    preview = (await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h,
+                                 json={"accountIds": [str(tharun.id)], "dryRun": True})).json()
+    assert preview == {"queued": 2, "skippedCap": 0, "skipped": 0}
+    from app.models import ResumeApplication
+    assert await ResumeApplication.find({"source": "job_applies"}).count() == 0  # dry run queues nothing
+    r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={"accountIds": [str(tharun.id)]})
+    assert r.json()["queued"] == 2
+    jobs = await ResumeApplication.find({"source": "job_applies"}).to_list()
+    assert {str(j.accountId) for j in jobs} == {str(tharun.id)}
+
+
+async def test_legacy_single_tailored_link_is_migrated(client, staff_user, auth_header):
+    from app.db import _migrate_tailored_map
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id, rows = await _done_run(client, h, acc)
+    row_id = PydanticObjectId(rows["https://jobs.example.com/remote"]["_id"])
+    legacy = PydanticObjectId()
+    coll = JobApplyRow.get_motor_collection()
+    await coll.update_one({"_id": row_id}, {"$set": {"tailoredJobId": legacy, "tailoredAccountId": str(acc.id)}})
+    await _migrate_tailored_map(coll.database)
+    doc = await coll.find_one({"_id": row_id})
+    assert doc["tailored"] == {str(acc.id): legacy} and "tailoredJobId" not in doc

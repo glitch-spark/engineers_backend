@@ -117,6 +117,19 @@ async def _migrate_legacy_resume_apps(database) -> None:
         log.warning("legacy resumeapplications migration failed: %s", exc)
 
 
+async def _migrate_tailored_map(database) -> None:
+    """Job Applies rows linked one tailored resume (tailoredJobId/tailoredAccountId); now it's one per profile."""
+    coll = database["job_apply_rows"]
+    try:
+        async for doc in coll.find({"tailoredJobId": {"$exists": True}}, {"tailoredJobId": 1, "tailoredAccountId": 1}):
+            update: dict = {"$unset": {"tailoredJobId": "", "tailoredAccountId": ""}}
+            if doc.get("tailoredJobId") and doc.get("tailoredAccountId"):
+                update["$set"] = {f"tailored.{doc['tailoredAccountId']}": doc["tailoredJobId"]}
+            await coll.update_one({"_id": doc["_id"]}, update)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("tailored-map migration failed: %s", exc)
+
+
 async def _migrate_log_filekey(database) -> None:
     """Applied-log entries from before tailored resumes have no fileKey; it equals their resumeId."""
     coll = database["job_application_log"]
@@ -230,6 +243,7 @@ async def init_db():
     _client = client
     database = client.get_default_database()
     await _migrate_log_filekey(database)
+    await _migrate_tailored_map(database)
     await _drop_stale_indexes(database)
     await _migrate_legacy_resume_apps(database)
     await _migrate_default_leaderboard_optin(database)

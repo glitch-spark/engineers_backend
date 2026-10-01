@@ -4,7 +4,7 @@ Runs are short-lived daily worklists (deleted RUN_RETENTION_DAYS after upload). 
 cached per URL and LLM readings cached per description (CACHE_DAYS), and the permanent applied log.
 """
 from datetime import date, datetime, timedelta
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from beanie import PydanticObjectId
 from pydantic import BaseModel, Field
@@ -113,9 +113,8 @@ class JobApplyRow(TimestampedDocument):
     scoredAt: Optional[datetime] = None
     applied: bool = False  # legacy single tick (before per-resume marks); read as "top suggestion applied"
     appliedResumes: List[AppliedMark] = Field(default_factory=list)
-    # Tailored resume for this job (a ResumeApplication from the generation queue) and the profile it used.
-    tailoredJobId: Optional[PydanticObjectId] = None
-    tailoredAccountId: Optional[str] = None
+    # Tailored resumes for this job, one per profile: accountId → ResumeApplication id (generation queue).
+    tailored: Dict[str, PydanticObjectId] = Field(default_factory=dict)
     expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:
