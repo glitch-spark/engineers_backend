@@ -179,3 +179,15 @@ def test_score_row_one_per_profile_and_blocking():
 
     blocked = score_row(EX, JD, job_blocked=True, resumes=resumes, profiles=profiles, idf=idf, run_date=RUN)
     assert blocked.best_by_profile == [] and blocked.top_score is None and len(blocked.scores) == 3
+
+
+def test_score_row_keeps_term_detail_only_for_each_profiles_best():
+    resumes = [_ri("P1", "a", STRONG), _ri("P1", "b", WEAK), _ri("P2", "c", STRONG), _ri("P2", "d", WEAK)]
+    profiles = {"P1": ProfileInfo("P1", "One", "US", "US"), "P2": ProfileInfo("P2", "Two", "BR", "Latam")}
+    idf = build_idf([JD])
+    for blocked_job in (False, True):
+        res = score_row(EX, JD, job_blocked=blocked_job, resumes=resumes, profiles=profiles, idf=idf, run_date=RUN)
+        with_terms = {s.resumeId for s in res.scores if s.terms}
+        assert with_terms == {"a", "c"}  # best per profile, even when the job or profile is excluded
+        assert all(s.components and s.total is not None for s in res.scores)
+        assert all(s.terms == [] for s in res.best_by_profile)  # summary copy carries no term detail

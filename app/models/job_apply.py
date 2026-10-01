@@ -1,5 +1,5 @@
 """Job Applies: one run per uploaded sheet, one row per job (spec §4.1)."""
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Literal, Optional
 
 from beanie import PydanticObjectId
@@ -13,6 +13,12 @@ RunStatus = Literal["queued", "running", "done", "failed", "cancelled"]
 RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed"]
 
 POSTING_CACHE_TTL_SECONDS = 7 * 24 * 3600
+# Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
+RETENTION_DAYS = 60
+
+
+def _expires_at() -> datetime:
+    return datetime.utcnow() + timedelta(days=RETENTION_DAYS)
 
 
 class RunSelection(BaseModel):
@@ -44,12 +50,14 @@ class JobApplyRun(TimestampedDocument):
     finishedAt: Optional[datetime] = None
     error: Optional[str] = None
     notes: List[str] = Field(default_factory=list)
+    expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:
         name = "job_apply_runs"
         indexes = [
             IndexModel([("userId", ASCENDING), ("createdAt", DESCENDING)], name="user_recent"),
             IndexModel([("status", ASCENDING)], name="status"),
+            IndexModel([("expiresAt", ASCENDING)], expireAfterSeconds=0, name="ttl"),
         ]
 
 
@@ -80,6 +88,7 @@ class JobApplyRow(TimestampedDocument):
     topScore: Optional[int] = None
     scoredAt: Optional[datetime] = None
     applied: bool = False
+    expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:
         name = "job_apply_rows"
@@ -87,6 +96,7 @@ class JobApplyRow(TimestampedDocument):
             IndexModel([("runId", ASCENDING), ("rowIndex", ASCENDING)], name="run_row"),
             IndexModel([("runId", ASCENDING), ("status", ASCENDING)], name="run_status"),
             IndexModel([("runId", ASCENDING), ("topScore", DESCENDING)], name="run_top"),
+            IndexModel([("expiresAt", ASCENDING)], expireAfterSeconds=0, name="ttl"),
         ]
 
 

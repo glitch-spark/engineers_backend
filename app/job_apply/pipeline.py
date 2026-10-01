@@ -59,14 +59,19 @@ def score_row(
         info = profiles.get(acc)
         gates[acc] = profile_gates(ex, country=info.country if info else None, region=info.region if info else None)
 
+    top_by_profile = {acc: pick_best([s for s in scores if s.accountId == acc]) for acc in order}
+
+    # Storage: term-by-term detail (the bulk of a row) is kept only for each profile's best resume,
+    # also on excluded rows so "why" stays inspectable. Others keep components and knockouts.
+    keep_terms = {s.resumeId for s in top_by_profile.values() if s is not None}
+    scores = [s if s.resumeId in keep_terms else s.model_copy(update={"terms": []}) for s in scores]
+
     best: list[ResumeScore] = []
     if not job_blocked:
         for acc in order:
-            if blocked(gates[acc]):
-                continue
-            top = pick_best([s for s in scores if s.accountId == acc])
-            if top is not None:
-                best.append(top)
+            top = top_by_profile[acc]
+            if top is not None and not blocked(gates[acc]):
+                best.append(top.model_copy(update={"terms": []}))  # summary copy; detail lives in `scores`
     best.sort(key=lambda s: s.total, reverse=True)
     return RowResult(
         profile_gates=[{"accountId": acc, "gates": gates[acc]} for acc in order],
