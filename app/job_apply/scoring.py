@@ -218,7 +218,8 @@ def _vector(text: str, idf: Idf) -> dict[str, float]:
     return {t: (1 + math.log(c)) * idf.idf.get(t, idf.default) for t, c in counts.items()}
 
 
-def relevance(resume_text: str, jd_text: str, idf: Idf, k: float = K) -> tuple[float, float]:
+def relevance(resume_text: str, jd_text: str, idf: Idf, k: Optional[float] = None) -> tuple[float, float]:
+    k = K if k is None else k  # read at call time so calibration can tune the module constant
     a, b = _vector(resume_text, idf), _vector(jd_text, idf)
     if not a or not b:
         return 0.0, 0.0
