@@ -184,20 +184,25 @@ class RunPatch(BaseModel):
 @router.patch("/runs/{run_id}")
 async def update_run(run_id: str, body: RunPatch, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     run = await _owned_run(run_id, user)
+    # Targeted $set: a full save() would overwrite counts/status the worker is updating meanwhile.
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": run.id}, {"$set": {"threshold": body.threshold, "updatedAt": datetime.utcnow()}}
+    )
     run.threshold = body.threshold
-    await run.save()
     return await _run_out(run, with_profiles=True)
 
 
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     run = await _owned_run(run_id, user)
-    if run.status not in ACTIVE:
+    now = datetime.utcnow()
+    res = await JobApplyRun.get_motor_collection().update_one(
+        {"_id": run.id, "status": {"$in": list(ACTIVE)}},
+        {"$set": {"status": "cancelled", "finishedAt": now, "updatedAt": now}},
+    )
+    if not res.modified_count:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only a queued or running run can be cancelled.")
-    run.status = "cancelled"
-    run.finishedAt = datetime.utcnow()
-    await run.save()
-    return await _run_out(run)
+    return await _run_out(await JobApplyRun.get(run.id))
 
 
 @router.post("/runs/{run_id}/retry-failed")
@@ -287,6 +292,7 @@ class RowPatch(BaseModel):
 @router.patch("/rows/{row_id}")
 async def update_row(row_id: str, body: RowPatch, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     row = await _owned_row(row_id, user)
-    row.applied = body.applied
-    await row.save()
-    return {"_id": str(row.id), "applied": row.applied}
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id}, {"$set": {"applied": body.applied, "updatedAt": datetime.utcnow()}}
+    )
+    return {"_id": str(row.id), "applied": body.applied}

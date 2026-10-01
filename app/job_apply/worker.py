@@ -13,6 +13,7 @@ from typing import Literal, Optional
 
 import httpx
 from beanie import PydanticObjectId
+from beanie.odm.utils.encoder import Encoder
 
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
@@ -89,16 +90,51 @@ async def _status(run_id: PydanticObjectId) -> Optional[str]:
     return doc.get("status") if doc else None
 
 
+_FETCH_FIELDS = ("jdText", "jdSource", "fetchedPostedDate", "title", "company", "status", "statusReason")
+_EXTRACT_FIELDS = ("extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason")
+_SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "scoredAt", "status")
+
+
+async def _save_fields(row: JobApplyRow, fields: tuple[str, ...]) -> None:
+    """$set only what a stage changed. Never `applied` (the user may tick it mid-run) and never an upsert
+    (a run deleted after Cancel must stay deleted)."""
+    doc = Encoder(to_db=True).encode({f: getattr(row, f) for f in fields})
+    doc["updatedAt"] = datetime.utcnow()
+    await JobApplyRow.get_motor_collection().update_one({"_id": row.id}, {"$set": doc})
+
+
+async def _gather_cancellable(coros) -> None:
+    """gather(), except that when one task fails (e.g. _Cancelled) the others are cancelled, not left running."""
+    tasks = [asyncio.create_task(c) for c in coros]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def _ensure_running(run_id: PydanticObjectId) -> None:
+    if await _status(run_id) == "cancelled":
+        raise _Cancelled()
+
+
 class _Checker:
     """Re-reads the run status every CHECK_EVERY processed rows; raises _Cancelled when cancelled."""
 
     def __init__(self, run_id: PydanticObjectId):
         self.run_id = run_id
         self.n = 0
+        self.cancelled = False
 
     async def tick(self) -> None:
+        # Sticky: once any task sees the cancel, every other task stops at its next tick.
+        if self.cancelled:
+            raise _Cancelled()
         self.n += 1
         if self.n % CHECK_EVERY == 0 and await _status(self.run_id) == "cancelled":
+            self.cancelled = True
             raise _Cancelled()
 
 
@@ -144,16 +180,16 @@ async def _fetch_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
                 await check.tick()
                 try:
                     await _fetch_one(row, client)
-                    await row.save()
+                    await _save_fields(row, _FETCH_FIELDS)
                     await _inc(run.id, fetched=1)
                 except _Cancelled:
                     raise
                 except Exception as exc:  # noqa: BLE001 — a row failure never fails the run
                     row.status, row.statusReason = "fetch_failed", str(exc)[:300] or exc.__class__.__name__
-                    await row.save()
+                    await _save_fields(row, _FETCH_FIELDS)
                     await _inc(run.id, failed=1)
 
-        await asyncio.gather(*(one(r) for r in todo))
+        await _gather_cancellable(one(r) for r in todo)
 
 
 async def _extract_one(row: JobApplyRow, run: JobApplyRun, user: Optional[UserExtra]) -> None:
@@ -191,17 +227,17 @@ async def _extract_stage(run: JobApplyRun, rows: list[JobApplyRow], user: Option
             await check.tick()
             try:
                 await _extract_one(row, run, user)
-                await row.save()
+                await _save_fields(row, _EXTRACT_FIELDS)
                 await _inc(run.id, extracted=1, excluded=1 if row.status == "excluded" else 0)
             except _Cancelled:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("job extraction failed for row %s", row.id)
                 row.status, row.statusReason = "llm_failed", str(exc)[:300] or exc.__class__.__name__
-                await row.save()
+                await _save_fields(row, _EXTRACT_FIELDS)
                 await _inc(run.id, failed=1)
 
-    await asyncio.gather(*(one(r) for r in todo))
+    await _gather_cancellable(one(r) for r in todo)
 
 
 async def _load_resumes(run: JobApplyRun) -> tuple[list[ResumeInput], dict[str, ProfileInfo], list[str]]:
@@ -251,7 +287,7 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
         row.scoredAt = datetime.utcnow()
         if row.status == "extracted":
             row.status = "scored"
-        await row.save()
+        await _save_fields(row, _SCORE_FIELDS)
         await _inc(run.id, scored=1)
 
 
@@ -279,8 +315,11 @@ async def run_worker(run_id: PydanticObjectId) -> None:
         user = await UserExtra.get(run.userId)
         check = _Checker(run_id)
         rows = await _rows(run_id)
+        await _ensure_running(run_id)
         await _fetch_stage(run, rows, check)
+        await _ensure_running(run_id)
         await _extract_stage(run, rows, user, check)
+        await _ensure_running(run_id)
         await _score_stage(run, rows, check)
         if await _status(run_id) != "cancelled":
             await _set_run(run_id, status="done", finishedAt=datetime.utcnow())

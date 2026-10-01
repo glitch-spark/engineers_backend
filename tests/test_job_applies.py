@@ -205,3 +205,49 @@ async def test_runs_list_and_delete(client, staff_user, staff_user_2, auth_heade
     assert (await client.get(f"/job-applies/runs/{run_id}", headers=auth_header(staff_user_2))).status_code == 404
     assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 200
     assert (await client.get(f"/job-applies/runs/{run_id}", headers=h)).status_code == 404
+
+
+async def test_cancel_mid_run_stops_work_and_delete_sticks(client, staff_user, auth_header, monkeypatch):
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    data = sheet([["URL"]] + [[f"https://jobs.example.com/{i}"] for i in range(60)])
+    run_id = (await create_run(client, h, acc, data=data)).json()["runId"]
+    calls = []
+
+    async def cancelling_fetch(url, *, client, browser=None):
+        calls.append(url)
+        if len(calls) == 1:
+            await JobApplyRun.get_motor_collection().update_one(
+                {"_id": PydanticObjectId(run_id)}, {"$set": {"status": "cancelled"}}
+            )
+        return await fake_fetch(url, client=client)
+
+    monkeypatch.setattr(worker, "FETCH", cancelling_fetch)
+    monkeypatch.setattr(worker, "CHECK_EVERY", 5)
+    await worker.run_worker(PydanticObjectId(run_id))
+
+    assert len(calls) <= 5 + worker.FETCH_CONCURRENCY
+    assert await JobApplyRow.find({"runId": PydanticObjectId(run_id), "status": {"$in": ["extracted", "scored"]}}).count() == 0
+    assert (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["status"] == "cancelled"
+    assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 200
+    assert await JobApplyRow.find({"runId": PydanticObjectId(run_id)}).count() == 0
+
+
+async def test_applied_set_during_run_is_kept(client, staff_user, auth_header, monkeypatch):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+
+    async def extract_and_mark(jd, *, user, run_date, llm=None):
+        # The user ticks "applied" while the worker is mid-run.
+        await JobApplyRow.get_motor_collection().update_many({"runId": PydanticObjectId(run_id)}, {"$set": {"applied": True}})
+        return await fake_extract(jd, user=user, run_date=run_date)
+
+    monkeypatch.setattr(worker, "EXTRACT", extract_and_mark)
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    assert rows and all(r["applied"] for r in rows)
