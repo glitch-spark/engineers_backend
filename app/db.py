@@ -40,6 +40,10 @@ from app.models import (
     InterviewPrompt,
     InterviewQuestion,
     InterviewTemplateAnswer,
+    JobApplyRow,
+    JobApplyRun,
+    JobExtractionCache,
+    JobPostingCache,
     Notification,
     RecurringCharge,
     ResumeApplication,
@@ -77,6 +81,10 @@ DOCUMENT_MODELS = [
     SlackAlertLog,
     Notification,
     RecurringCharge,
+    JobApplyRun,
+    JobApplyRow,
+    JobExtractionCache,
+    JobPostingCache,
 ]
 
 
