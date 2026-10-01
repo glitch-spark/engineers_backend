@@ -104,6 +104,9 @@ class JobApplyRow(TimestampedDocument):
     scoredAt: Optional[datetime] = None
     applied: bool = False  # legacy single tick (before per-resume marks); read as "top suggestion applied"
     appliedResumes: List[AppliedMark] = Field(default_factory=list)
+    # Tailored resume for this job (a ResumeApplication from the generation queue) and the profile it used.
+    tailoredJobId: Optional[PydanticObjectId] = None
+    tailoredAccountId: Optional[str] = None
     expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:

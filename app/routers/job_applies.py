@@ -10,10 +10,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
+from app import resume_queue
 from app.job_apply import gsheet, worker
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
-from app.models import Account, UserExtra
+from app.models import Account, ResumeApplication, UserExtra
 from app.job_apply.schema import GateResult, Location
 from app.models.job_apply import (
     AppliedMark,
@@ -103,6 +104,13 @@ class _ExtractionView(BaseModel):
     timezoneNote: Optional[str] = None
 
 
+class _ScoreBrief(BaseModel):
+    accountId: str
+    resumeId: str
+    filename: str
+    total: int
+
+
 class _RowListView(BaseModel):
     id: PydanticObjectId = Field(alias="_id")
     rowIndex: int
@@ -121,12 +129,17 @@ class _RowListView(BaseModel):
     topScore: Optional[int] = None
     applied: bool = False
     appliedResumes: list[AppliedMark] = Field(default_factory=list)
+    scores: list[_ScoreBrief] = Field(default_factory=list)
+    tailoredJobId: Optional[PydanticObjectId] = None
+    tailoredAccountId: Optional[str] = None
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
             "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
-            "applied": 1, "appliedResumes": 1, "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
+            "applied": 1, "appliedResumes": 1, "tailoredJobId": 1, "tailoredAccountId": 1,
+            "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
+            "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1,
             "bestByProfile.total": 1, "bestByProfile.band": 1, "bestByProfile.knockouts": 1,
         }
@@ -147,7 +160,38 @@ def _applied_marks(row, suggestions: list[dict]) -> list[dict]:
     return marks
 
 
-def _row_summary(row: JobApplyRow, threshold: int, account_id: str = "", previous: Optional[list] = None) -> dict:
+_TAILORED_PROJECTION = {"pdfData": 0, "jobDescription": 0, "plainText": 0, "coverLetterText": 0, "screeningPairs": 0}
+
+
+def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
+    if not doc:
+        return None
+    return {
+        "jobId": str(doc["_id"]),
+        "accountId": str(doc.get("accountId") or ""),
+        "status": doc.get("status"),
+        "step": doc.get("step"),
+        # A completed generation always has its PDF (in S3 or inline).
+        "hasPdf": doc.get("status") == "completed",
+        "error": doc.get("errorMessage"),
+    }
+
+
+async def _tailored_docs(ids: list) -> dict[str, dict]:
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    cursor = ResumeApplication.get_motor_collection().find({"_id": {"$in": ids}}, _TAILORED_PROJECTION)
+    return {str(d["_id"]): d async for d in cursor}
+
+
+def _row_summary(
+    row: JobApplyRow,
+    threshold: int,
+    account_id: str = "",
+    previous: Optional[list] = None,
+    tailored: Optional[dict] = None,
+) -> dict:
     ex = row.extraction
     suggestions = [
         _suggestion(s) for s in row.bestByProfile
@@ -176,6 +220,17 @@ def _row_summary(row: JobApplyRow, threshold: int, account_id: str = "", previou
         "applied": bool(marks),
         # Applications to this URL recorded in other runs (permanent applied log).
         "previouslyApplied": previous or [],
+        "tailored": _tailored_out(tailored),
+        # Every other scored resume (below the threshold or filtered out), for "Other resume…".
+        "otherResumes": sorted(
+            (
+                {"accountId": s.accountId, "resumeId": s.resumeId, "filename": s.filename, "total": s.total}
+                for s in row.scores
+                if s.resumeId not in {x["resumeId"] for x in suggestions}
+            ),
+            key=lambda o: o["total"],
+            reverse=True,
+        ),
     }
 
 
@@ -315,6 +370,18 @@ async def get_run(
     log = JobApplicationLog.get_motor_collection()
     out["appliedInRun"] = await log.count_documents({"runId": run.id})
     out["toApply"] = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).count()
+    tailored_ids = [
+        i for i in await JobApplyRow.get_motor_collection().distinct("tailoredJobId", {"runId": run.id}) if i
+    ]
+    jobs = ResumeApplication.get_motor_collection()
+    by_status = {
+        s: await jobs.count_documents({"_id": {"$in": tailored_ids}, "status": s})
+        for s in ("queued", "in_progress", "completed", "failed")
+    } if tailored_ids else dict.fromkeys(("queued", "in_progress", "completed", "failed"), 0)
+    out["tailoring"] = {
+        "queued": by_status["queued"], "inProgress": by_status["in_progress"],
+        "ready": by_status["completed"], "failed": by_status["failed"],
+    }
     if appliedSince:
         out["appliedSince"] = await log.count_documents({"userId": run.userId, "appliedAt": {"$gte": _naive_utc(appliedSince)}})
     return out
@@ -416,8 +483,12 @@ async def list_rows(
                 "filename": entry.get("filename", ""),
                 "accountId": entry.get("accountId"),
             })
+    tailored = await _tailored_docs([r.tailoredJobId for r in rows])
     return {
-        "rows": [_row_summary(r, run.threshold, accountId, previous.get(r.url)) for r in rows],
+        "rows": [
+            _row_summary(r, run.threshold, accountId, previous.get(r.url), tailored.get(str(r.tailoredJobId)))
+            for r in rows
+        ],
         "pagination": {"page": page, "limit": limit, "total": total, "totalPages": pages, "hasNext": page < pages, "hasPrev": page > 1},
     }
 
@@ -426,7 +497,8 @@ async def list_rows(
 async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     row = await _owned_row(row_id, user)
     run = await JobApplyRun.get(row.runId)
-    out = _row_summary(row, run.threshold if run else 75)
+    tailored = await _tailored_docs([row.tailoredJobId])
+    out = _row_summary(row, run.threshold if run else 75, tailored=tailored.get(str(row.tailoredJobId)))
     out["scores"] = [s.model_dump(mode="json") for s in sorted(row.scores, key=lambda s: s.total, reverse=True)]
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None
     out["jdText"] = row.jdText
@@ -541,3 +613,103 @@ async def unmark_applied(run_id: str, body: UnmarkBody, user: Annotated[UserExtr
             await _set_applied(row, m.accountId, m.resumeId, "", False)
             done += 1
     return {"unmarked": done}
+
+
+# ---------- tailored resumes ----------
+
+
+def _host(url: Optional[str]) -> str:
+    from urllib.parse import urlsplit
+
+    return (urlsplit(url or "").hostname or "").removeprefix("www.")
+
+
+def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
+    """The profile whose resume scored best on this job (even below the threshold); else the run's first."""
+    if row.scores:
+        return max(row.scores, key=lambda s: s.total).accountId
+    return str(run.selection[0].accountId)
+
+
+async def _tailor_row(
+    row: JobApplyRow, run: JobApplyRun, owner: UserExtra, account_id: Optional[str], cover_letter: bool
+) -> ResumeApplication:
+    account_id = account_id or _best_profile(row, run)
+    if account_id not in {str(s.accountId) for s in run.selection}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick one of this run's profiles.")
+    account = await Account.get(PydanticObjectId(account_id))
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
+    job = await resume_queue.enqueue_generation(
+        user=owner,
+        account=account,
+        jd=row.jdText or "",
+        company=row.company or _host(row.url) or row.title,
+        job_url=row.url,
+        cover_letter=cover_letter,
+        source="job_applies",
+        job_apply_row_id=row.id,
+    )
+    # Replace the previous tailored job: drop it if it never started and no applied mark uses it.
+    if row.tailoredJobId:
+        used = any(getattr(m, "tailoredJobId", None) == str(row.tailoredJobId) for m in row.appliedResumes)
+        if not used:
+            await ResumeApplication.get_motor_collection().delete_one({"_id": row.tailoredJobId, "status": "queued"})
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id},
+        {"$set": {"tailoredJobId": job.id, "tailoredAccountId": account_id, "updatedAt": datetime.utcnow()}},
+    )
+    return job
+
+
+class TailorBody(BaseModel):
+    accountId: Optional[str] = None
+    coverLetter: bool = False
+
+
+@router.post("/rows/{row_id}/tailor")
+async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Queue a tailored resume for this job (profile's HTML template + this job's description)."""
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    owner = await UserExtra.get(row.userId)
+    if run is None or owner is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    job = await _tailor_row(row, run, owner, body.accountId, body.coverLetter)
+    doc = await ResumeApplication.get_motor_collection().find_one({"_id": job.id}, _TAILORED_PROJECTION)
+    return {"tailored": _tailored_out(doc)}
+
+
+@router.post("/runs/{run_id}/tailor-all")
+async def tailor_all(run_id: str, body: TailorBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Queue tailored resumes for every job still to apply to that has none yet (or only a failed one), up to the
+    daily cap. Uses the profile filter, else each job's top suggestion's profile."""
+    run = await _owned_run(run_id, user)
+    owner = await UserExtra.get(run.userId)
+    rows = await JobApplyRow.find(
+        await _rows_query(run, view="suggested", account_id=body.accountId or "", applied="no")
+    ).sort("+rowIndex").to_list()
+    existing = await _tailored_docs([r.tailoredJobId for r in rows])
+    remaining = await resume_queue.remaining_today(owner)
+    queued = skipped = 0
+    for row in rows:
+        current = existing.get(str(row.tailoredJobId))
+        if current and current.get("status") != "failed":
+            continue
+        if remaining <= 0:
+            skipped += 1
+            continue
+        tops = [s for s in row.bestByProfile if s.total >= run.threshold and (not body.accountId or s.accountId == body.accountId)]
+        if not tops:
+            continue
+        try:
+            await _tailor_row(row, run, owner, tops[0].accountId, body.coverLetter)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+                raise
+            skipped += 1
+            remaining = 0
+            continue
+        queued += 1
+        remaining -= 1
+    return {"queued": queued, "skippedCap": skipped}

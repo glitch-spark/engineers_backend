@@ -64,10 +64,11 @@ SHEET = sheet([
 ])
 
 
-async def make_account(owner, *, country="US", resumes=(("strong.md", STRONG), ("weak.md", WEAK))) -> Account:
+async def make_account(owner, *, country="US", resumes=(("strong.md", STRONG), ("weak.md", WEAK)), name="Backend") -> Account:
     acc = Account(
-        name="Backend", country=country, region="US" if country == "US" else "Latam", createdBy=owner.id,
+        name=name, country=country, region="US" if country == "US" else "Latam", createdBy=owner.id,
         resumes=[Resume(filename=f, markdown=m) for f, m in resumes],
+        styleTemplate="<html><body><h1>Jane</h1><p>Engineer</p></body></html>",
     )
     await acc.insert()
     return acc
@@ -437,3 +438,79 @@ async def test_mark_all_skips_jobs_applied_in_earlier_runs(client, staff_user, a
     assert (await client.get(f"/job-applies/runs/{run2}", headers=h)).json()["toApply"] == 1
     r = await client.post(f"/job-applies/runs/{run2}/mark-top-applied", headers=h, json={"all": True})
     assert r.json()["marked"] == 1
+
+
+
+async def _two_profile_run(client, h, owner):
+    strong = await make_account(owner, resumes=(("strong.md", STRONG),), name="Strong")
+    weak = await make_account(owner, resumes=(("weak.md", WEAK),), name="Weak")
+    sel = [{"accountId": str(a.id), "resumeIds": []} for a in (weak, strong)]
+    r = await client.post("/job-applies/runs", headers=h,
+                          files={"file": ("jobs.xlsx", SHEET, "application/octet-stream")},
+                          data={"selection": json.dumps(sel), "threshold": "60"})
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows?view=all", headers=h)).json()["rows"]
+    return run_id, {x["url"]: x for x in rows}, strong, weak
+
+
+async def test_tailor_defaults_to_best_profile(client, staff_user, auth_header):
+    from app.models import ResumeApplication
+
+    h = auth_header(staff_user)
+    run_id, rows, strong, _ = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})
+    assert r.status_code == 200, r.text
+    t = r.json()["tailored"]
+    assert t["accountId"] == str(strong.id) and t["status"] == "queued"
+    job = await ResumeApplication.get(t["jobId"])
+    assert job.source == "job_applies" and job.countsAsBid is False and str(job.jobApplyRowId) == row["_id"]
+    assert job.jobUrl == row["url"] and "Python" in job.jobDescription
+
+
+async def test_tailor_rejects_profile_outside_run(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    _, rows, _, _ = await _two_profile_run(client, h, staff_user)
+    outsider = await make_account(staff_user, name="Other")
+    row = rows["https://jobs.example.com/remote"]
+    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"accountId": str(outsider.id)})
+    assert r.status_code == 400
+
+
+async def test_retailor_replaces_queued_job(client, staff_user, auth_header):
+    from app.models import ResumeApplication
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    _, rows, strong, weak = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    first = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})).json()["tailored"]
+    second = (await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"accountId": str(weak.id)})).json()["tailored"]
+    assert await ResumeApplication.get(first["jobId"]) is None  # still queued and unused -> replaced
+    fresh = await JobApplyRow.get(PydanticObjectId(row["_id"]))
+    assert str(fresh.tailoredJobId) == second["jobId"] and fresh.tailoredAccountId == str(weak.id)
+
+
+async def test_tailor_all_respects_cap(client, staff_user, auth_header, monkeypatch):
+    from app import resume_queue
+
+    monkeypatch.setattr(resume_queue, "_daily_cap", lambda: 1)
+    h = auth_header(staff_user)
+    run_id, _, _, _ = await _two_profile_run(client, h, staff_user)
+    r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
+    assert r.status_code == 200 and r.json() == {"queued": 1, "skippedCap": 1}
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["tailoring"] == {"queued": 1, "inProgress": 0, "ready": 0, "failed": 0}
+
+
+async def test_rows_show_tailored_status_and_other_resumes(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id, rows, strong, weak = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={})
+    listed = {x["url"]: x for x in (await client.get(f"/job-applies/runs/{run_id}/rows?view=all", headers=h)).json()["rows"]}
+    remote = listed["https://jobs.example.com/remote"]
+    assert remote["tailored"]["status"] == "queued" and remote["tailored"]["hasPdf"] is False
+    assert [o["filename"] for o in remote["otherResumes"]] == ["weak.md"]  # scored but below the threshold
+    assert listed["https://jobs.example.com/hybrid"]["tailored"] is None
