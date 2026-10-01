@@ -1,0 +1,207 @@
+"""Job Applies API lifecycle against a real test database. The worker is driven directly with fake
+fetch/extract functions, so no network or LLM is used."""
+import io
+import json
+from datetime import date
+
+import pytest
+from beanie import PydanticObjectId
+from openpyxl import Workbook
+
+from app.job_apply import worker
+from app.job_apply.fetch import FetchError, FetchResult
+from app.job_apply.schema import JobExtraction, Location, MinYears, Term
+from app.models import Account
+from app.models.account import Resume
+
+REMOTE_JD = "Senior Python Engineer\nRequirements\n- 3+ years Python\n- Kafka\nFully remote within the US. " * 3
+HYBRID_JD = "Python Engineer\nRequirements\n- Python\nThis is a hybrid role, 3 days in office. " * 3
+STRONG = "Senior Python Engineer EXPERIENCE Acme Senior Python Engineer Jan 2019 - Present Python Kafka services."
+WEAK = "Designer EXPERIENCE Studio Designer Jan 2024 - Present Figma."
+
+
+async def fake_extract(jd, *, user, run_date, llm=None):
+    hybrid = "hybrid" in jd
+    return JobExtraction(
+        title="Python Engineer" if hybrid else "Senior Python Engineer",
+        seniority=None if hybrid else "senior",
+        terms=[Term(term="Python", tier="required"), Term(term="Kafka", tier="required")],
+        minYears=MinYears(value=3, required=True),
+        workMode="hybrid" if hybrid else "remote",
+        allowedLocations=[Location(kind="country", value="US")],
+        postedDate=date(2026, 9, 25),
+    ), "llm"
+
+
+async def fake_fetch(url, *, client, browser=None):
+    return FetchResult(text=REMOTE_JD, source="ats_api", postedDate=date(2026, 9, 28), title="Fetched Role")
+
+
+async def failing_fetch(url, *, client, browser=None):
+    raise FetchError("no job text on the page")
+
+
+@pytest.fixture(autouse=True)
+def fakes(monkeypatch):
+    monkeypatch.setattr(worker, "EXTRACT", fake_extract)
+    monkeypatch.setattr(worker, "FETCH", fake_fetch)
+
+
+def sheet(rows) -> bytes:
+    wb = Workbook()
+    for r in rows:
+        wb.active.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+SHEET = sheet([
+    ["URL", "Description"],
+    ["https://jobs.example.com/remote", REMOTE_JD],
+    ["https://jobs.example.com/hybrid", HYBRID_JD],
+    ["https://boards.greenhouse.io/acme/jobs/9", None],
+])
+
+
+async def make_account(owner, *, country="US", resumes=(("strong.md", STRONG), ("weak.md", WEAK))) -> Account:
+    acc = Account(
+        name="Backend", country=country, region="US" if country == "US" else "Latam", createdBy=owner.id,
+        resumes=[Resume(filename=f, markdown=m) for f, m in resumes],
+    )
+    await acc.insert()
+    return acc
+
+
+async def create_run(client, headers, acc, *, data=SHEET, threshold=60, resume_ids=None):
+    selection = [{"accountId": str(acc.id), "resumeIds": resume_ids or []}]
+    return await client.post(
+        "/job-applies/runs",
+        headers=headers,
+        files={"file": ("jobs.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"selection": json.dumps(selection), "threshold": str(threshold), "maxAgeDays": "30"},
+    )
+
+
+async def test_create_run_and_results(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    r = await create_run(client, h, acc)
+    assert r.status_code == 202, r.text
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["counts"]["total"] == 3 and run["counts"]["fetched"] == 1
+    assert run["profiles"][0]["name"] == "Backend"
+
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    by_url = {x["url"]: x for x in rows}
+    remote = by_url["https://jobs.example.com/remote"]
+    assert remote["status"] == "scored" and len(remote["suggestions"]) == 1
+    assert remote["suggestions"][0]["filename"] == "strong.md" and "jdText" not in remote and "scores" not in remote
+    assert by_url["https://jobs.example.com/hybrid"]["status"] == "excluded"
+    assert by_url["https://jobs.example.com/hybrid"]["suggestions"] == []
+    fetched = by_url["https://boards.greenhouse.io/acme/jobs/9"]
+    assert fetched["jdSource"] == "ats_api" and fetched["postedDate"].startswith("2026-09-28")
+
+    suggested = (await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested", headers=h)).json()
+    assert {x["url"] for x in suggested["rows"]} == {"https://jobs.example.com/remote", "https://boards.greenhouse.io/acme/jobs/9"}
+    excluded = (await client.get(f"/job-applies/runs/{run_id}/rows?view=excluded", headers=h)).json()
+    assert [x["url"] for x in excluded["rows"]] == ["https://jobs.example.com/hybrid"]
+
+    detail = (await client.get(f"/job-applies/rows/{remote['_id']}", headers=h)).json()
+    assert len(detail["scores"]) == 2 and detail["scores"][0]["components"]
+
+
+async def test_threshold_patch_changes_suggestions(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    r = await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"threshold": 100})
+    assert r.status_code == 200 and r.json()["threshold"] == 100
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    assert all(x["suggestions"] == [] for x in rows)
+
+
+async def test_mark_applied(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    row = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"][0]
+    r = await client.patch(f"/job-applies/rows/{row['_id']}", headers=h, json={"applied": True})
+    assert r.status_code == 200 and r.json()["applied"] is True
+
+
+async def test_location_gate_excludes_profile(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user, country="BR")
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    remote = next(x for x in rows if x["url"].endswith("/remote"))
+    assert remote["suggestions"] == [] and remote["profileGates"][0]["gates"][0]["result"] == "fail"
+
+
+async def test_cancel_and_retry_failed(client, staff_user, auth_header, monkeypatch):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["counts"]["failed"] == 1
+    failed = (await client.get(f"/job-applies/runs/{run_id}/rows?view=failed", headers=h)).json()["rows"]
+    assert len(failed) == 1 and failed[0]["status"] == "fetch_failed" and "no job text" in failed[0]["statusReason"]
+
+    monkeypatch.setattr(worker, "FETCH", fake_fetch)
+    r = await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)
+    assert r.status_code == 200 and r.json()["reset"] == 1
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["counts"]["failed"] == 0
+
+    queued = (await create_run(client, h, acc)).json()["runId"]
+    r = await client.post(f"/job-applies/runs/{queued}/cancel", headers=h)
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"
+    await worker.run_worker(PydanticObjectId(queued))  # no-op on a cancelled run
+    assert (await client.get(f"/job-applies/runs/{queued}", headers=h)).json()["status"] == "cancelled"
+    assert (await client.post(f"/job-applies/runs/{queued}/cancel", headers=h)).status_code == 409
+
+
+async def test_second_active_run_409(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    assert (await create_run(client, h, acc)).status_code == 202
+    r = await create_run(client, h, acc)
+    assert r.status_code == 409
+
+
+async def test_cannot_select_foreign_account_404(client, staff_user, staff_user_2, auth_header):
+    acc = await make_account(staff_user_2)
+    r = await create_run(client, auth_header(staff_user), acc)
+    assert r.status_code == 404
+
+
+async def test_bad_file_400(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    r = await create_run(client, h, acc, data=b"not a spreadsheet")
+    assert r.status_code == 400 and "spreadsheet" in r.json()["error"]
+    r = await create_run(client, h, acc, data=sheet([["a", "b"]]))
+    assert r.status_code == 400 and "URL" in r.json()["error"]
+
+
+async def test_runs_list_and_delete(client, staff_user, staff_user_2, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 409  # still queued
+    await worker.run_worker(PydanticObjectId(run_id))
+    runs = (await client.get("/job-applies/runs", headers=h)).json()["runs"]
+    assert [x["_id"] for x in runs] == [run_id] and runs[0]["suggested"] >= 1
+    assert (await client.get(f"/job-applies/runs/{run_id}", headers=auth_header(staff_user_2))).status_code == 404
+    assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 200
+    assert (await client.get(f"/job-applies/runs/{run_id}", headers=h)).status_code == 404

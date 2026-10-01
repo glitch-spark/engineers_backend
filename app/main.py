@@ -21,6 +21,7 @@ from app.routers import (
     integrations,
     interview_prep,
     interviews,
+    job_applies,
     metrics,
     profile,
     reports,
@@ -98,6 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(reports.router)
     app.include_router(resume.router)
+    app.include_router(job_applies.router)
     app.include_router(applications.router)
     app.include_router(integrations.router)
     app.include_router(integrations.oauth_router)
