@@ -14,6 +14,7 @@ from app.job_apply.schema import (
     Term,
     WorkAuth,
 )
+from app.job_apply.gates import normalize_country, region_key
 from app.job_apply.sections import line_kind, split_sections
 from app.job_apply.skills_dict import SKILLS, SOFT_SKILLS, canonical, find_skills, is_soft
 from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
@@ -91,6 +92,12 @@ def _str(v: Any) -> str:
     return v.strip() if isinstance(v, str) else ""
 
 
+def _str_list(v: Any) -> list[str]:
+    """LLMs sometimes return a bare string where a list was asked for."""
+    items = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+    return [x.strip() for x in items if isinstance(x, str) and x.strip()]
+
+
 def _opt_str(v: Any) -> Optional[str]:
     return _str(v) or None
 
@@ -118,7 +125,7 @@ def _terms(items: Any) -> list[Term]:
             continue
         seen.add(name.lower())
         tier = _str(it.get("tier")).lower()
-        aliases = [a.strip() for a in it.get("aliases") or [] if isinstance(a, str) and a.strip()]
+        aliases = _str_list(it.get("aliases"))
         term = Term(
             term=name,
             aliases=aliases,
@@ -135,6 +142,8 @@ def parse_extraction(raw: str) -> JobExtraction:
     obj = _try_parse_jsonish(raw or "")
     if not isinstance(obj, dict):
         raise ValueError("job extraction is not a JSON object")
+    if not _str(obj.get("title")) and not obj.get("terms"):
+        raise ValueError("job extraction has neither a title nor terms")
 
     years = obj.get("minYears")
     min_years = None
@@ -155,14 +164,20 @@ def parse_extraction(raw: str) -> JobExtraction:
         if isinstance(loc, dict) and _str(loc.get("kind")).lower() in ("country", "region") and _str(loc.get("value")):
             kind = _str(loc["kind"]).lower()
             value = _str(loc["value"])
-            locations.append(Location(kind=kind, value=value.upper() if kind == "country" else value))
+            if kind == "country":
+                code = normalize_country(value)
+                if code:
+                    value = code
+                elif region_key(value):
+                    kind = "region"  # e.g. "Europe" given as a country
+            locations.append(Location(kind=kind, value=value))
 
     wa = obj.get("workAuthorization")
     work_auth = None
     if isinstance(wa, dict):
         work_auth = WorkAuth(
             restricted=bool(wa.get("restricted")),
-            countries=[c.strip().upper() for c in wa.get("countries") or [] if isinstance(c, str) and c.strip()],
+            countries=[c for c in (normalize_country(x) for x in _str_list(wa.get("countries"))) if c],
             note=_opt_str(wa.get("note")),
         )
 

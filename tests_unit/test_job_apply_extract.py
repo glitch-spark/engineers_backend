@@ -111,3 +111,29 @@ async def test_extract_job_falls_back_on_llm_error():
 
     ex, src = await extract_job("Requirements:\n- Python", user=None, run_date=RUN, llm=boom)
     assert src == "rules" and ex.terms[0].term == "Python"
+
+
+def test_parse_normalises_string_lists_and_country_names():
+    raw = json.dumps({
+        "terms": [{"term": "PostgreSQL", "aliases": "Postgres", "tier": "required"}],
+        "workAuthorization": {"restricted": True, "countries": "United States"},
+        "allowedLocations": [
+            {"kind": "country", "value": "USA"},
+            {"kind": "country", "value": "United Kingdom"},
+            {"kind": "country", "value": "Europe"},
+            {"kind": "region", "value": "LATAM"},
+        ],
+    })
+    ex = parse_extraction(raw)
+    assert ex.terms[0].aliases == ["Postgres"]
+    assert ex.workAuthorization.countries == ["US"]
+    assert [(l.kind, l.value) for l in ex.allowedLocations] == [
+        ("country", "US"), ("country", "GB"), ("region", "Europe"), ("region", "LATAM"),
+    ]
+
+
+def test_parse_rejects_empty_extraction():
+    with pytest.raises(ValueError):
+        parse_extraction("{}")
+    with pytest.raises(ValueError):
+        parse_extraction('{"workMode": "remote"}')

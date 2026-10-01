@@ -77,3 +77,14 @@ def test_work_auth_gate():
 def test_blocked():
     assert blocked(job_gates(ex(workMode="hybrid"), run_date=RUN, max_age_days=30))
     assert not blocked(job_gates(ex(workMode="unknown"), run_date=RUN, max_age_days=30))
+
+
+def test_unrecognised_locations_are_unknown_not_fail():
+    def pg(locs):
+        return by_name(profile_gates(ex(allowedLocations=locs), country="US", region="US"))["location"].result
+
+    assert pg([Location(kind="region", value="Remote")]) == "unknown"
+    assert pg([Location(kind="region", value="Mars")]) == "unknown"
+    assert pg([Location(kind="region", value="Mars"), Location(kind="country", value="DE")]) == "fail"
+    assert pg([Location(kind="region", value="Western Europe")]) == "fail"
+    assert by_name(profile_gates(ex(allowedLocations=[Location(kind="region", value="Western Europe")]), country="DE", region="EU"))["location"].result == "pass"
