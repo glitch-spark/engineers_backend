@@ -262,3 +262,44 @@ async def test_run_detail_includes_resume_health(client, staff_user, auth_header
     assert set(by_name) == {"strong.md", "weak.md"}
     assert by_name["weak.md"]["accountId"] == str(acc.id)
     assert "no_email" in by_name["weak.md"]["health"]["issues"] and by_name["weak.md"]["health"]["score"] < 100
+
+
+GSHEET = "https://docs.google.com/spreadsheets/d/1AbC_dEf-123456/edit#gid=0"
+
+
+async def test_create_run_from_google_sheet(client, staff_user, auth_header, monkeypatch):
+    from app.job_apply import gsheet
+    from app.job_apply.sheet import parse_sheet
+
+    async def fake_download(url, *, client):
+        assert url == GSHEET
+        return "Jobs Oct - Sheet1", parse_sheet("s.xlsx", SHEET)
+
+    monkeypatch.setattr(gsheet, "download_gsheet", fake_download)
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    r = await client.post(
+        "/job-applies/runs", headers=h,
+        data={"sheetUrl": GSHEET, "selection": json.dumps([{"accountId": str(acc.id), "resumeIds": []}]), "threshold": "60"},
+    )
+    assert r.status_code == 202, r.text
+    assert r.json()["total"] == 3
+    run = (await client.get(f"/job-applies/runs/{r.json()['runId']}", headers=h)).json()
+    assert run["fileName"] == "Jobs Oct - Sheet1" and run["sourceUrl"] == GSHEET
+
+
+async def test_google_sheet_link_errors(client, staff_user, auth_header, monkeypatch):
+    from app.job_apply import gsheet
+    from app.job_apply.sheet import SheetError
+
+    async def private(url, *, client):
+        raise SheetError(gsheet.PRIVATE_HINT)
+
+    monkeypatch.setattr(gsheet, "download_gsheet", private)
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    sel = json.dumps([{"accountId": str(acc.id), "resumeIds": []}])
+    r = await client.post("/job-applies/runs", headers=h, data={"sheetUrl": GSHEET, "selection": sel})
+    assert r.status_code == 400 and "Anyone with the link" in r.json()["error"]
+    r = await client.post("/job-applies/runs", headers=h, data={"selection": sel})
+    assert r.status_code == 400 and "Google Sheets link" in r.json()["error"]

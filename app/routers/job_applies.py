@@ -4,12 +4,13 @@ import json
 from datetime import date, datetime
 from typing import Annotated, Any, Optional
 
+import httpx
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
-from app.job_apply import worker
+from app.job_apply import gsheet, worker
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, UserExtra
@@ -188,17 +189,27 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
 @router.post("/runs", status_code=status.HTTP_202_ACCEPTED)
 async def create_run(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    file: UploadFile = File(...),
     selection: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    sheetUrl: str = Form(""),
     threshold: int = Form(75),
     maxAgeDays: int = Form(30),
 ) -> dict:
+    """The job sheet comes either as an uploaded file or as a link-shared Google Sheet (`sheetUrl`)."""
     if await JobApplyRun.find_one({"userId": user.id, "status": {"$in": list(ACTIVE)}}):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is already in progress. Wait for it or cancel it.")
     sel = await _parse_selection(selection, user)
-    data = await file.read(MAX_BYTES + 1)
+    source_url = sheetUrl.strip() or None
     try:
-        rows = await asyncio.to_thread(parse_sheet, file.filename or "", data)
+        if source_url:
+            async with httpx.AsyncClient() as http:
+                file_name, rows = await gsheet.download_gsheet(source_url, client=http)
+        elif file is not None:
+            data = await file.read(MAX_BYTES + 1)
+            file_name = file.filename or "jobs"
+            rows = await asyncio.to_thread(parse_sheet, file.filename or "", data)
+        else:
+            raise SheetError("Upload a sheet or paste a Google Sheets link.")
     except SheetError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     if not rows:
@@ -206,7 +217,8 @@ async def create_run(
 
     run = JobApplyRun(
         userId=user.id,
-        fileName=(file.filename or "jobs")[:200],
+        fileName=file_name[:200],
+        sourceUrl=source_url,
         selection=sel,
         threshold=max(0, min(100, threshold)),
         maxAgeDays=max(1, min(365, maxAgeDays)),

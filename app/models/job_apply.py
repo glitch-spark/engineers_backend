@@ -31,7 +31,8 @@ class RunCounts(BaseModel):
 
 class JobApplyRun(TimestampedDocument):
     userId: PydanticObjectId
-    fileName: str
+    fileName: str  # uploaded file name, or the Google Sheet's title
+    sourceUrl: Optional[str] = None  # Google Sheets link when the run came from one
     status: RunStatus = "queued"
     selection: List[RunSelection]
     threshold: int = 75
