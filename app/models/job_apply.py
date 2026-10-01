@@ -108,6 +108,8 @@ class JobApplyRow(TimestampedDocument):
     profileGates: List[ProfileGates] = Field(default_factory=list)
     bestByProfile: List[ResumeScore] = Field(default_factory=list)
     topScore: Optional[int] = None
+    # Profiles without uploaded resumes this job is open to; you apply with a tailored resume.
+    tailorOnly: List[str] = Field(default_factory=list)
     scoredAt: Optional[datetime] = None
     applied: bool = False  # legacy single tick (before per-resume marks); read as "top suggestion applied"
     appliedResumes: List[AppliedMark] = Field(default_factory=list)

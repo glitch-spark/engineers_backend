@@ -1,5 +1,5 @@
 """One job row × the selected resumes → scores, profile gates and one best resume per profile (spec §3.8)."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
 
@@ -24,6 +24,8 @@ class ProfileInfo:
     name: str
     country: Optional[str]
     region: Optional[str]
+    # No uploaded resumes selected but has an HTML template: not scored, its eligible jobs are tailored.
+    tailor_only: bool = False
 
 
 @dataclass
@@ -32,6 +34,8 @@ class RowResult:
     scores: list[ResumeScore]
     best_by_profile: list[ResumeScore]
     top_score: Optional[int]
+    # Tailor-only profiles this job is open to (job and profile gates pass).
+    tailor_only: list[str] = field(default_factory=list)
 
 
 def score_row(
@@ -54,7 +58,11 @@ def score_row(
         for r in resumes
     ]
     order = list(dict.fromkeys(r.account_id for r in resumes))
+    tailor_only = [acc for acc, info in profiles.items() if info.tailor_only and acc not in order]
     gates = {}
+    for acc in tailor_only:
+        info = profiles[acc]
+        gates[acc] = profile_gates(ex, country=info.country, region=info.region)
     for acc in order:
         info = profiles.get(acc)
         gates[acc] = profile_gates(ex, country=info.country if info else None, region=info.region if info else None)
@@ -74,8 +82,9 @@ def score_row(
                 best.append(top.model_copy(update={"terms": []}))  # summary copy; detail lives in `scores`
     best.sort(key=lambda s: s.total, reverse=True)
     return RowResult(
-        profile_gates=[{"accountId": acc, "gates": gates[acc]} for acc in order],
+        profile_gates=[{"accountId": acc, "gates": gates[acc]} for acc in [*order, *tailor_only]],
         scores=scores,
         best_by_profile=best,
         top_score=best[0].total if best else None,
+        tailor_only=[] if job_blocked else [acc for acc in tailor_only if not blocked(gates[acc])],
     )

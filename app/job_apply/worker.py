@@ -92,7 +92,7 @@ async def _status(run_id: PydanticObjectId) -> Optional[str]:
 
 _FETCH_FIELDS = ("jdText", "jdSource", "fetchedPostedDate", "title", "company", "status", "statusReason")
 _EXTRACT_FIELDS = ("extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason")
-_SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "scoredAt", "status")
+_SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "tailorOnly", "scoredAt", "status")
 
 
 async def _save_fields(row: JobApplyRow, fields: tuple[str, ...]) -> None:
@@ -267,6 +267,7 @@ async def _load_resumes(run: JobApplyRun) -> tuple[list[ResumeInput], dict[str, 
         wanted = {str(x) for x in sel.resumeIds}
         acc_id = str(acc.id)
         profiles[acc_id] = ProfileInfo(account_id=acc_id, name=acc.name, country=acc.country, region=acc.region)
+        before = len(resumes)
         for r in acc.resumes:
             if wanted and str(r.id) not in wanted:
                 continue
@@ -274,6 +275,8 @@ async def _load_resumes(run: JobApplyRun) -> tuple[list[ResumeInput], dict[str, 
                 account_id=acc_id, resume_id=str(r.id), filename=r.filename, uploaded_at=r.uploadedAt,
                 parsed=parse_resume(r.markdown, run_date),
             ))
+        if len(resumes) == before and (acc.styleTemplate or "").strip():
+            profiles[acc_id].tailor_only = True
     return resumes, profiles, notes
 
 
@@ -299,6 +302,7 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
         row.profileGates = [ProfileGates(**pg) for pg in res.profile_gates]
         row.bestByProfile = res.best_by_profile
         row.topScore = res.top_score
+        row.tailorOnly = res.tailor_only
         row.scoredAt = datetime.utcnow()
         if row.status == "extracted":
             row.status = "scored"

@@ -56,7 +56,9 @@ async def _owned_row(row_id: str, user: UserExtra) -> JobApplyRow:
 
 
 async def _suggested_count(run: JobApplyRun) -> int:
-    return await JobApplyRow.find({"runId": run.id, "topScore": {"$gte": run.threshold}}).count()
+    return await JobApplyRow.find(
+        {"runId": run.id, "$or": [{"topScore": {"$gte": run.threshold}}, {"tailorOnly.0": {"$exists": True}}]}
+    ).count()
 
 
 async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
@@ -133,12 +135,13 @@ class _RowListView(BaseModel):
     scores: list[_ScoreBrief] = Field(default_factory=list)
     tailoredJobId: Optional[PydanticObjectId] = None
     tailoredAccountId: Optional[str] = None
+    tailorOnly: list[str] = Field(default_factory=list)
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
             "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
-            "applied": 1, "appliedResumes": 1, "tailoredJobId": 1, "tailoredAccountId": 1,
+            "applied": 1, "appliedResumes": 1, "tailoredJobId": 1, "tailoredAccountId": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
             "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1,
@@ -222,6 +225,8 @@ def _row_summary(
         # Applications to this URL recorded in other runs (permanent applied log).
         "previouslyApplied": previous or [],
         "tailored": _tailored_out(tailored),
+        # Profiles without uploaded resumes this job is open to (apply with a tailored resume).
+        "tailorOnly": row.tailorOnly,
         # Every other scored resume (below the threshold or filtered out), for "Other resume…".
         "otherResumes": sorted(
             (
@@ -243,7 +248,6 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
     if not isinstance(items, list) or not items:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Select at least one profile.")
     out: list[RunSelection] = []
-    resume_count = 0
     for it in items:
         if not isinstance(it, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid selection")
@@ -254,10 +258,12 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
         wanted = [str(x) for x in it.get("resumeIds") or []]
         if any(w not in have for w in wanted):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown resume on profile {acc.name}.")
-        resume_count += len(wanted) if wanted else len(have)
+        if not have and not (acc.styleTemplate or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{acc.name} has no resumes and no HTML template, so it can't be matched or tailored.",
+            )
         out.append(RunSelection(accountId=acc.id, resumeIds=[PydanticObjectId(w) for w in wanted]))
-    if resume_count == 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The selected profiles have no resumes.")
     return out
 
 
@@ -269,7 +275,7 @@ async def _rows_query(
     q: dict[str, Any] = {"runId": run.id}
     floor = max(run.threshold, min_score or 0)
     if view == "suggested":
-        q["topScore"] = {"$gte": floor}
+        q["$or"] = [{"topScore": {"$gte": floor}}, {"tailorOnly.0": {"$exists": True}}]
     elif view == "excluded":
         q["$or"] = [{"status": "excluded"}, {"status": "scored", "topScore": None}]
     elif view == "failed":
@@ -277,7 +283,11 @@ async def _rows_query(
     elif min_score is not None:
         q["topScore"] = {"$gte": min_score}
     if account_id:
-        q["bestByProfile"] = {"$elemMatch": {"accountId": account_id, **({"total": {"$gte": floor}} if view == "suggested" else {})}}
+        by_profile = {"$or": [
+            {"bestByProfile": {"$elemMatch": {"accountId": account_id, **({"total": {"$gte": floor}} if view == "suggested" else {})}}},
+            {"tailorOnly": account_id},
+        ]}
+        q = {"$and": [q, by_profile]}
     if applied != "any":
         run_urls = await JobApplyRow.get_motor_collection().distinct("url", {"runId": run.id})
         logged = await JobApplicationLog.get_motor_collection().distinct(
@@ -295,6 +305,32 @@ async def _rows_query(
 # ---------- runs ----------
 
 
+async def _read_sheet(file: Optional[UploadFile], sheet_url: Optional[str]) -> tuple[str, list]:
+    """The job sheet from an upload or a link-shared Google Sheet; 400 with a user-facing message on problems."""
+    try:
+        if sheet_url:
+            async with httpx.AsyncClient() as http:
+                return await gsheet.download_gsheet(sheet_url, client=http)
+        if file is not None:
+            data = await file.read(MAX_BYTES + 1)
+            return file.filename or "jobs", await asyncio.to_thread(parse_sheet, file.filename or "", data)
+        raise SheetError("Upload a sheet or paste a Google Sheets link.")
+    except SheetError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/sheet-preview")
+async def sheet_preview(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    file: Optional[UploadFile] = File(None),
+    sheetUrl: str = Form(""),
+) -> dict:
+    """Read a job sheet without starting a run, so problems (not shared, no URL column, empty) show up early."""
+    title, rows = await _read_sheet(file, sheetUrl.strip() or None)
+    with_jd = sum(1 for r in rows if r.jdText)
+    return {"title": title, "total": len(rows), "withDescription": with_jd, "urlOnly": len(rows) - with_jd}
+
+
 @router.post("/runs", status_code=status.HTTP_202_ACCEPTED)
 async def create_run(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -309,18 +345,7 @@ async def create_run(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is already in progress. Wait for it or cancel it.")
     sel = await _parse_selection(selection, user)
     source_url = sheetUrl.strip() or None
-    try:
-        if source_url:
-            async with httpx.AsyncClient() as http:
-                file_name, rows = await gsheet.download_gsheet(source_url, client=http)
-        elif file is not None:
-            data = await file.read(MAX_BYTES + 1)
-            file_name = file.filename or "jobs"
-            rows = await asyncio.to_thread(parse_sheet, file.filename or "", data)
-        else:
-            raise SheetError("Upload a sheet or paste a Google Sheets link.")
-    except SheetError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    file_name, rows = await _read_sheet(file, source_url)
     if not rows:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No job rows with a URL were found.")
 
@@ -685,6 +710,8 @@ def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
     """The profile whose resume scored best on this job (even below the threshold); else the run's first."""
     if row.scores:
         return max(row.scores, key=lambda s: s.total).accountId
+    if row.tailorOnly:
+        return row.tailorOnly[0]
     return str(run.selection[0].accountId)
 
 
@@ -762,11 +789,12 @@ async def tailor_all(run_id: str, body: TailorBody, user: Annotated[UserExtra, D
         if remaining <= 0:
             skipped += 1
             continue
-        tops = [s for s in row.bestByProfile if s.total >= run.threshold and (not body.accountId or s.accountId == body.accountId)]
+        tops = [s.accountId for s in row.bestByProfile if s.total >= run.threshold and (not body.accountId or s.accountId == body.accountId)]
+        tops += [a for a in row.tailorOnly if not body.accountId or a == body.accountId]
         if not tops:
             continue
         try:
-            await _tailor_row(row, run, owner, tops[0].accountId, body.coverLetter)
+            await _tailor_row(row, run, owner, tops[0], body.coverLetter)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 skipped += 1

@@ -640,3 +640,73 @@ async def test_deleting_a_run_drops_its_queued_tailored_jobs(client, staff_user,
     assert (await client.delete(f"/job-applies/runs/{run_id}", headers=h)).status_code == 200
     assert await ResumeApplication.find({"source": "job_applies", "status": "queued"}).count() == 0
     assert await ResumeApplication.get(ready["jobId"]) is not None
+
+
+async def _tailor_only_account(owner, country="US", template=True):
+    acc = Account(name="Tailor Only", country=country, region="US" if country == "US" else "Latam", createdBy=owner.id,
+                  resumes=[], styleTemplate="<html><body><h1>T</h1></body></html>" if template else None)
+    await acc.insert()
+    return acc
+
+
+async def _run_with(client, h, accounts, data=SHEET):
+    sel = [{"accountId": str(a.id), "resumeIds": []} for a in accounts]
+    r = await client.post("/job-applies/runs", headers=h, files={"file": ("jobs.xlsx", data, "application/octet-stream")},
+                          data={"selection": json.dumps(sel), "threshold": "60"})
+    return r
+
+
+async def test_tailor_only_profile_run(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await _tailor_only_account(staff_user)
+    r = await _run_with(client, h, [acc])
+    assert r.status_code == 202, r.text
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested", headers=h)).json()["rows"]
+    by_url = {x["url"]: x for x in rows}
+    assert set(by_url) == {"https://jobs.example.com/remote", "https://boards.greenhouse.io/acme/jobs/9"}  # hybrid excluded
+    assert by_url["https://jobs.example.com/remote"]["tailorOnly"] == [str(acc.id)]
+    assert by_url["https://jobs.example.com/remote"]["suggestions"] == []
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["toApply"] == 2 and run["suggested"] == 2
+
+    r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={})
+    assert r.json()["queued"] == 2
+    t = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"][0]["tailored"]
+    assert t["accountId"] == str(acc.id)
+
+
+async def test_tailor_only_profile_respects_location(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await _tailor_only_account(staff_user, country="BR")
+    run_id = (await _run_with(client, h, [acc])).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows?view=all", headers=h)).json()["rows"]
+    assert all(x["tailorOnly"] == [] for x in rows)
+    assert (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["toApply"] == 0
+
+
+async def test_profile_without_resumes_or_template_rejected(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await _tailor_only_account(staff_user, template=False)
+    r = await _run_with(client, h, [acc])
+    assert r.status_code == 400 and "no resumes and no HTML template" in r.json()["error"]
+
+
+async def test_sheet_preview(client, staff_user, auth_header, monkeypatch):
+    from app.job_apply import gsheet
+    from app.job_apply.sheet import parse_sheet
+
+    h = auth_header(staff_user)
+    r = await client.post("/job-applies/sheet-preview", headers=h, files={"file": ("jobs.xlsx", SHEET, "application/octet-stream")})
+    assert r.status_code == 200 and r.json() == {"title": "jobs.xlsx", "total": 3, "withDescription": 2, "urlOnly": 1}
+    bad = await client.post("/job-applies/sheet-preview", headers=h, files={"file": ("x.xlsx", b"nope", "application/octet-stream")})
+    assert bad.status_code == 400
+
+    async def fake(url, *, client):
+        return "Jobs Oct - Sheet1", parse_sheet("s.xlsx", SHEET)
+
+    monkeypatch.setattr(gsheet, "download_gsheet", fake)
+    r = await client.post("/job-applies/sheet-preview", headers=h, data={"sheetUrl": GSHEET})
+    assert r.json()["title"] == "Jobs Oct - Sheet1" and r.json()["total"] == 3
