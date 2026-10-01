@@ -470,6 +470,7 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "jobUrl": job.jobUrl,
         "status": job.status,
         "step": job.step,
+        "source": job.source,
         "pdfFilename": job.pdfFilename,
         "s3Key": job.s3Key,
         "errorMessage": job.errorMessage,

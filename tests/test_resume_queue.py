@@ -139,3 +139,10 @@ async def test_cap_counts_both_sources(staff_user, monkeypatch):
     # Yesterday's generations don't count.
     await ResumeApplication.get_motor_collection().update_many({}, {"$set": {"createdAt": datetime.utcnow() - timedelta(days=2)}})
     assert await resume_queue.remaining_today(staff_user) == 2
+
+
+async def test_job_list_includes_source(client, staff_user, auth_header):
+    acc = await make_account(staff_user)
+    await resume_queue.enqueue_generation(user=staff_user, account=acc, jd=JD, company="A", source="job_applies")
+    jobs = (await client.get("/resume/jobs", headers=auth_header(staff_user))).json()["jobs"]
+    assert jobs[0]["source"] == "job_applies"
