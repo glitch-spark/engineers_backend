@@ -277,7 +277,12 @@ async def _rows_query(
     if view == "suggested":
         q["$or"] = [{"topScore": {"$gte": floor}}, {"tailorOnly.0": {"$exists": True}}]
     elif view == "excluded":
-        q["$or"] = [{"status": "excluded"}, {"status": "scored", "topScore": None}]
+        # Failed a job check, or no profile can take it (every scored profile blocked by location/work
+        # authorization, and no tailor-only profile open to it).
+        q["$or"] = [
+            {"status": "excluded"},
+            {"status": "scored", "topScore": None, "tailorOnly.0": {"$exists": False}},
+        ]
     elif view == "failed":
         q["status"] = {"$in": list(FAILED)}
     elif min_score is not None:
@@ -396,6 +401,8 @@ async def get_run(
     log = JobApplicationLog.get_motor_collection()
     out["appliedInRun"] = await log.count_documents({"runId": run.id})
     out["toApply"] = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).count()
+    # Matches the Excluded tab (counts.excluded only counts jobs that failed a job-level check).
+    out["excludedCount"] = await JobApplyRow.find(await _rows_query(run, view="excluded")).count()
     tailored_ids = [
         i for i in await JobApplyRow.get_motor_collection().distinct("tailoredJobId", {"runId": run.id}) if i
     ]

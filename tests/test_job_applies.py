@@ -710,3 +710,24 @@ async def test_sheet_preview(client, staff_user, auth_header, monkeypatch):
     monkeypatch.setattr(gsheet, "download_gsheet", fake)
     r = await client.post("/job-applies/sheet-preview", headers=h, data={"sheetUrl": GSHEET})
     assert r.json()["title"] == "Jobs Oct - Sheet1" and r.json()["total"] == 3
+
+
+async def test_tailor_only_jobs_are_not_listed_as_excluded(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await _tailor_only_account(staff_user)
+    run_id = (await _run_with(client, h, [acc])).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    excluded = (await client.get(f"/job-applies/runs/{run_id}/rows?view=excluded", headers=h)).json()["rows"]
+    assert [x["url"] for x in excluded] == ["https://jobs.example.com/hybrid"]
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["excludedCount"] == 1
+
+
+async def test_excluded_count_includes_profiles_blocked_by_location(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user, country="BR")  # every US-only job is closed to this profile
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    excluded = (await client.get(f"/job-applies/runs/{run_id}/rows?view=excluded", headers=h)).json()["rows"]
+    assert run["excludedCount"] == len(excluded) == 3
