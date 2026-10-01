@@ -1,0 +1,118 @@
+"""scripts/migrate_plans_goal_done.py against the test database."""
+
+from datetime import datetime
+
+from app.models import DailyPlan, WeeklyPlan
+from scripts.migrate_plans_goal_done import run
+
+
+def _daily_col():
+    return DailyPlan.get_motor_collection()
+
+
+def _weekly_col():
+    return WeeklyPlan.get_motor_collection()
+
+
+async def _seed(user):
+    await _daily_col().insert_one({
+        "userId": user.id, "date": datetime(2026, 9, 30), "year": 2026, "weekNumber": 40,
+        "planType": "regular", "bidsHandsOn": 5, "bidsByBidder": 1, "interviewsDone": 1,
+        "todayItems": ["Fix resume"], "planBidsHandsOn": 7, "tomorrowItems": ["Prep"],
+        "createdAt": datetime(2026, 9, 30, 21), "updatedAt": datetime(2026, 9, 30, 21),
+    })
+    await _weekly_col().insert_one({
+        "userId": user.id, "year": 2026, "weekNumber": 40,
+        "startDate": datetime(2026, 9, 28, 4), "endDate": datetime(2026, 10, 5, 3, 59),
+        "metrics": [{"key": "bids", "label": "Job applies", "target": 40, "actual": 0}],
+        "content": "Plan", "result": "", "status": "planned",
+        "createdAt": datetime(2026, 9, 28), "updatedAt": datetime(2026, 9, 28),
+    })
+
+
+def _db():
+    return DailyPlan.get_motor_collection().database
+
+
+async def test_dry_run_writes_nothing(staff_user):
+    await _seed(staff_user)
+    before = [d async for d in _daily_col().find({})] + [d async for d in _weekly_col().find({})]
+    counts = await run(apply=False, database=_db())
+    after = [d async for d in _daily_col().find({})] + [d async for d in _weekly_col().find({})]
+    assert after == before
+    assert counts["dailyMigrated"] == 1
+    assert counts["nextDayGoalsCreated"] == 1
+    assert counts["weeklyMigrated"] == 1
+
+
+async def test_apply_then_second_run_is_noop(staff_user):
+    await _seed(staff_user)
+    counts = await run(apply=True, database=_db())
+    assert counts["dailyMigrated"] == 1 and counts["weeklyMigrated"] == 1
+    assert counts["nextDayGoalsCreated"] == 1
+
+    wed = await _daily_col().find_one({"date": datetime(2026, 9, 30)})
+    assert "bidsHandsOn" not in wed and wed["done"] == {"bidsSelf": 5, "bidsBidder": 1}
+    assert "doneOverrides" not in wed and "interviewsDone" not in wed
+    thu = await DailyPlan.find_one({"date": datetime(2026, 10, 1)})
+    assert thu.goal.bidsSelf == 7 and [i.text for i in thu.goalItems] == ["Prep"]
+    assert thu.loggedAt is None and thu.year == 2026
+    week = await _weekly_col().find_one({})
+    assert week["weekStart"] == datetime(2026, 9, 28) and week["goal"] == {"bidsSelf": 40}
+    assert "metrics" not in week and week["recapNotes"] == "Plan"
+
+    again = await run(apply=True, database=_db())
+    assert again["dailyMigrated"] == 0 and again["weeklyMigrated"] == 0
+    assert again["nextDayGoalsCreated"] == 0 and again["nextDayGoalsSkipped"] == 0
+
+
+async def test_next_day_goal_not_overwritten(staff_user):
+    await _seed(staff_user)
+    await _daily_col().insert_one({
+        "userId": staff_user.id, "date": datetime(2026, 10, 1), "year": 2026, "weekNumber": 40,
+        "goal": {"bidsSelf": 2}, "goalItems": [], "done": {}, "notes": "",
+        "loggedAt": None, "createdAt": datetime(2026, 10, 1), "updatedAt": datetime(2026, 10, 1),
+    })
+    counts = await run(apply=True, database=_db())
+    assert counts["nextDayGoalsSkipped"] == 1 and counts["nextDayGoalsCreated"] == 0
+    thu = await _daily_col().find_one({"date": datetime(2026, 10, 1)})
+    assert thu["goal"] == {"bidsSelf": 2}
+
+
+async def test_weekly_duplicates_reported(staff_user):
+    await _seed(staff_user)
+    await _weekly_col().insert_one({
+        "userId": staff_user.id, "year": 2026, "weekNumber": 40,
+        "startDate": datetime(2026, 9, 28), "endDate": datetime(2026, 10, 4),
+        "metrics": [], "content": "dup", "createdAt": datetime(2026, 9, 29), "updatedAt": datetime(2026, 9, 29),
+    })
+    counts = await run(apply=False, database=_db())
+    assert counts["weeklyDuplicates"] == 1
+
+
+async def test_consecutive_legacy_days_keep_carried_items(staff_user):
+    common = {"userId": staff_user.id, "year": 2026, "weekNumber": 40, "planType": "regular",
+              "createdAt": datetime(2026, 9, 28, 21), "updatedAt": datetime(2026, 9, 28, 21)}
+    await _daily_col().insert_many([
+        {**common, "date": datetime(2026, 9, 28), "bidsHandsOn": 3, "todayItems": [],
+         "tomorrowItems": ["Prep panel"], "planBidsHandsOn": 5},
+        {**common, "date": datetime(2026, 9, 29), "bidsHandsOn": 4, "todayItems": ["Did outreach"],
+         "tomorrowItems": []},
+        {**common, "date": datetime(2026, 9, 30), "bidsHandsOn": 2, "todayItems": [],
+         "tomorrowItems": []},
+    ])
+    await _daily_col().update_one({"date": datetime(2026, 9, 29)}, {"$set": {"tomorrowItems": ["Call recruiter"]}})
+
+    await run(apply=True, database=_db())
+
+    tue = await _daily_col().find_one({"date": datetime(2026, 9, 29)})
+    assert tue["goalItems"] == [{"text": "Did outreach", "done": True}, {"text": "Prep panel", "done": False}]
+    assert tue["goal"] == {"bidsSelf": 5}
+    assert tue["done"] == {"bidsSelf": 4, "bidsBidder": 0}
+    wed = await _daily_col().find_one({"date": datetime(2026, 9, 30)})
+    assert wed["goalItems"] == [{"text": "Call recruiter", "done": False}]
+
+    again = await run(apply=True, database=_db())
+    assert again["dailyMigrated"] == 0
+    tue = await _daily_col().find_one({"date": datetime(2026, 9, 29)})
+    assert len(tue["goalItems"]) == 2

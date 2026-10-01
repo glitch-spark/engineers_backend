@@ -92,25 +92,35 @@ def _dt_in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool
     return _as_aware(start) <= d <= _as_aware(end)  # type: ignore[operator]
 
 
-def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str]]:
-    """Trail of (stage, scheduledAt, status) — history keeps its own dates and
-    statuses; the tip falls back to the interview-level scheduledAt/status."""
-    trail: list[tuple[str, Optional[datetime], str]] = []
+def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str, Any]]:
+    """Trail of (stage, scheduledAt, status, caller) — history keeps its own dates,
+    statuses and callers; the tip falls back to the interview-level values."""
+    trail: list[tuple[str, Optional[datetime], str, Any]] = []
 
-    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any) -> None:
+    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any, caller: Any) -> None:
         stage = _norm_stage(stage_raw)
         if not stage:
             return
         status = _norm_status(status_raw)
         if trail and trail[-1][0] == stage:
-            _, prev_dt, prev_status = trail[-1]
-            trail[-1] = (stage, dt if dt is not None else prev_dt, status or prev_status)
+            _, prev_dt, prev_status, prev_caller = trail[-1]
+            trail[-1] = (
+                stage,
+                dt if dt is not None else prev_dt,
+                status or prev_status,
+                caller if caller is not None else prev_caller,
+            )
             return
-        trail.append((stage, dt, status))
+        trail.append((stage, dt, status, caller))
 
     for h in (iv.stageHistory or []):
-        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None), getattr(h, "status", None))
-    push(iv.stage, iv.scheduledAt, iv.status)
+        push(
+            getattr(h, "stage", None),
+            getattr(h, "scheduledAt", None),
+            getattr(h, "status", None),
+            getattr(h, "caller", None),
+        )
+    push(iv.stage, iv.scheduledAt, iv.status, getattr(iv, "caller", None))
     return trail
 
 
@@ -124,7 +134,7 @@ def count_interview_rounds(
     """
     breakdown = empty_breakdown()
     n = canceled = 0
-    for s, dt, round_status in _dated_rounds(iv):
+    for s, dt, round_status, _caller in _dated_rounds(iv):
         if not _dt_in_range(dt, start, end):
             continue
         if round_status == "canceled":
@@ -152,3 +162,22 @@ async def load_interviews_for_window(user_ids: list, start: datetime, end: datet
             ],
         }
     ).to_list()
+
+
+def split_rounds_by_day(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
+    """(local date, breakdown group, is_caller) for each round held in the window.
+
+    Same rules as `count_interview_rounds` (canceled rounds, AI interviews and
+    home assessments don't count). A round is a caller round when it has an
+    enabled caller; otherwise the owner took it (self).
+    """
+    out = []
+    for stage, dt, round_status, caller in _dated_rounds(iv):
+        if not _dt_in_range(dt, start, end) or round_status == "canceled" or stage in _ROUND_COUNT_EXCLUDED:
+            continue
+        group = _breakdown_group(stage)
+        if not group:
+            continue
+        day = _as_aware(dt).astimezone(tz).date()
+        out.append((day, group, bool(caller is not None and getattr(caller, "enabled", False))))
+    return out

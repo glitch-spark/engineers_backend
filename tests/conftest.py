@@ -112,3 +112,14 @@ async def staff_user_2(make_user) -> UserExtra:
 @pytest_asyncio.fixture
 async def admin_user(make_user) -> UserExtra:
     return await make_user(name="Admin One", email="admin@example.com", role="admin")
+
+
+@pytest.fixture(autouse=True)
+def plans_today():
+    """Daily follow-ups are refused for future days; tests use fixed 2026 dates,
+    so "today" is pinned after them (a test can patch it again)."""
+    from datetime import date
+    from unittest.mock import patch
+
+    with patch("app.routers.daily_plans._today", return_value=date(2026, 12, 31)):
+        yield

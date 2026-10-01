@@ -6,55 +6,56 @@ from beanie import PydanticObjectId
 from app.alerts import app_week_key
 from app.config import get_settings
 from app.models import DailyPlan, Interview, Transaction, WeeklyPlan
-from app.models.interview import InterviewStageEvent
+from app.models.interview import InterviewCaller
+from app.models.plan_common import Counts
 
 
 async def _plan(user, day: date, self_=0, bidder=0, iv=0, plan_type="regular"):
+    """A daily plan. `plan_type="custom"` stands for a goal-only entry (never
+    followed up), which the dashboard ignores. Interviews are never typed: `iv`
+    creates that many interview rounds on the day (self, intro) for logged days."""
     dt = datetime(day.year, day.month, day.day)
     year, week_number, _ = app_week_key(dt)
+    logged = plan_type == "regular"
     plan = DailyPlan(
         userId=user.id,
         date=dt,
         year=year,
         weekNumber=week_number,
-        planType=plan_type,
-        bidsHandsOn=self_,
-        bidsByBidder=bidder,
-        interviewsDone=iv,
+        goal=Counts(bidsSelf=self_, bidsBidder=bidder) if not logged else Counts(),
+        done=Counts(bidsSelf=self_, bidsBidder=bidder) if logged else Counts(),
+        loggedAt=dt if logged else None,
     )
     await plan.insert()
+    for n in range(iv if logged else 0):
+        await Interview(accountId=PydanticObjectId(), createdBy=user.id, scheduledAt=dt.replace(hour=12, minute=n),
+                        stage="intro", status="completed").insert()
     return plan
 
 
 async def _weekly_plan(user, monday: date, metrics):
     dt = datetime(monday.year, monday.month, monday.day)
     year, week_number, _ = app_week_key(dt)
-    plan = WeeklyPlan(
-        userId=user.id,
-        year=year,
-        weekNumber=week_number,
-        startDate=dt,
-        endDate=dt,
-        metrics=metrics,
+    return await _weekly_plan_raw(
+        user, year=year, week_number=week_number, start_date=dt, end_date=dt, metrics=metrics
     )
-    await plan.insert()
-    return plan
 
 
 async def _weekly_plan_raw(user, *, year, week_number, start_date, end_date, metrics):
-    """Like `_weekly_plan` but with explicit year/weekNumber/startDate/endDate,
-    so tests can construct the creation-date-vs-Monday mismatch that happens
-    around year boundaries (see test_week_plan_lookup_falls_back_across_year_boundary)."""
-    plan = WeeklyPlan(
-        userId=user.id,
-        year=year,
-        weekNumber=week_number,
-        startDate=start_date,
-        endDate=end_date,
-        metrics=metrics,
-    )
-    await plan.insert()
-    return plan
+    """A weekly plan stored in the pre Goal-vs-Done shape (metrics targets), so
+    these tests also cover the legacy fold: bids/interviews targets become
+    goal.bidsSelf / goal.interviewsSelf. Explicit year/weekNumber/startDate let
+    tests build the creation-date-vs-Monday mismatch around year boundaries."""
+    await WeeklyPlan.get_motor_collection().insert_one({
+        "userId": user.id,
+        "year": year,
+        "weekNumber": week_number,
+        "startDate": start_date,
+        "endDate": end_date,
+        "metrics": metrics,
+        "createdAt": start_date,
+        "updatedAt": start_date,
+    })
 
 
 async def test_week_requires_auth(client):
@@ -123,7 +124,7 @@ async def test_week_plan_without_core_metrics_has_no_target(client, staff_user, 
 
 async def test_week_stage_tiles_and_canceled(client, staff_user, auth_header):
     # interviews createdBy staff: intro Mon + tech_round_1 Wed (stageHistory), final Sat 23:30 UTC,
-    # rejected+scheduled Tue, ai_interview Thu, intro on next Mon Oct 5 (outside)
+    # canceled round Tue, ai_interview Thu, intro on next Mon Oct 5 (outside)
     account_id = PydanticObjectId()
 
     def _iv(**kw):
@@ -134,16 +135,15 @@ async def test_week_stage_tiles_and_canceled(client, staff_user, auth_header):
         stage="tech_round_1",
         status="scheduled",
         stageHistory=[
-            InterviewStageEvent(
-                stage="intro", at=datetime(2026, 9, 28, 9), scheduledAt=datetime(2026, 9, 28, 9)
-            ),
-            InterviewStageEvent(
-                stage="tech_round_1", at=datetime(2026, 9, 30, 10), scheduledAt=datetime(2026, 9, 30, 10)
-            ),
+            {"stage": "intro", "at": datetime(2026, 9, 28, 9), "scheduledAt": datetime(2026, 9, 28, 9),
+             "status": "completed"},
+            {"stage": "tech_round_1", "at": datetime(2026, 9, 30, 10), "scheduledAt": datetime(2026, 9, 30, 10),
+             "status": "scheduled"},
         ],
     ).insert()
     await _iv(scheduledAt=datetime(2026, 10, 3, 23, 30), stage="final", status="scheduled").insert()
-    await _iv(scheduledAt=datetime(2026, 9, 29, 12), stage="rejected", status="scheduled").insert()
+    # Canceled is a round status now (no "rejected" stage).
+    await _iv(scheduledAt=datetime(2026, 9, 29, 12), stage="intro", status="canceled").insert()
     await _iv(scheduledAt=datetime(2026, 10, 1, 9), stage="ai_interview", status="scheduled").insert()
     await _iv(scheduledAt=datetime(2026, 10, 5, 9), stage="intro", status="scheduled").insert()
 
@@ -425,3 +425,24 @@ async def test_net_monthly_naive_month_boundaries_regardless_of_app_timezone(
     b = r.json()
     assert b["months"][0]["period"] == "2025-10" and b["months"][0]["net"] == 100
     assert b["months"][-1]["period"] == "2026-09" and b["months"][-1]["net"] == 3000
+
+
+async def test_week_counts_unmigrated_legacy_daily_plans(client, staff_user, auth_header):
+    """Deployed before the migration runs: old-shape regular plans still count."""
+    await DailyPlan.get_motor_collection().insert_one({
+        "userId": staff_user.id, "date": datetime(2026, 9, 29), "year": 2026, "weekNumber": 40,
+        "planType": "regular", "bidsHandsOn": 5, "bidsByBidder": 2, "interviewsDone": 1,
+        "createdAt": datetime(2026, 9, 29, 21), "updatedAt": datetime(2026, 9, 29, 21),
+    })
+    await Interview(accountId=PydanticObjectId(), createdBy=staff_user.id, scheduledAt=datetime(2026, 9, 29, 15),
+                    stage="intro", status="scheduled",
+                    caller=InterviewCaller(enabled=True, startsAt=datetime(2026, 9, 29, 15))).insert()
+
+    b = (await client.get("/dashboard/week?today=2026-09-30", headers=auth_header(staff_user))).json()
+    assert b["bids"]["self"] == 5 and b["bids"]["bidder"] == 2
+    # Interviews come from the Interviews page only (the old typed count is ignored).
+    assert b["interviews"]["done"] == 1
+    assert b["streak"] == 1
+
+    a = (await client.get("/dashboard/activity?from=2026-09-28&to=2026-10-04", headers=auth_header(staff_user))).json()
+    assert a["totals"]["self"] == 5 and a["totals"]["interviews"] == 1

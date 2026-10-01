@@ -1,4 +1,4 @@
-"""Unit tests for the daily plan Slack post (post, edit in place, delete)."""
+"""Unit tests for the daily plan Slack post (text, post, edit in place, delete)."""
 
 import os
 from datetime import datetime
@@ -11,6 +11,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.config import get_settings
+from app.models.plan_common import ChecklistItem, Counts
 from app.slack_bot import (
     daily_plan_text,
     delete_daily_plan_message,
@@ -21,9 +22,11 @@ from app.slack_bot import (
 def _plan(**kw):
     base = dict(
         id="plan1",
-        date=datetime(2026, 9, 27),
-        today="Ship <filter> & tests",
-        tomorrow="",
+        date=datetime(2026, 10, 1),
+        goal=Counts(bidsSelf=150, bidsBidder=100),
+        goalItems=[ChecklistItem(text="Seek caller", done=True), ChecklistItem(text="Bidder <review>")],
+        done=Counts(bidsSelf=140, bidsBidder=100),
+        notes="Moved review & prep",
         slackChannel=None,
         slackTs=None,
     )
@@ -35,63 +38,29 @@ def _owner():
     return SimpleNamespace(name="Pedro", email="p@x.com", slackUserId="U123")
 
 
-def test_daily_plan_text_labels_mention_and_escapes():
-    text = daily_plan_text(_plan(), _owner())
-    assert "<@U123>" in text
-    assert "*9/27(Sun)*" in text
-    assert "*9/28(Mon)*" in text
-    assert "Ship &lt;filter&gt; &amp; tests" in text
-    assert "\n—\n" in text  # empty tomorrow
-
-
-def test_regular_daily_plan_text_numbers_both_days():
-    plan = _plan(
-        planType="regular",
-        bidsHandsOn=100,
-        bidsByBidder=150,
-        interviewsDone=2,
-        interviewsNew=3,
-        todayItems=["Create Linkedin Profile", "Update <resume>"],
-        planBidsHandsOn=90,
-        planBidsByBidder=160,
-        planInterviewsScheduled=5,
-        tomorrowItems=["Prep for Acme"],
-    )
-    lines = daily_plan_text(plan, _owner()).splitlines()
-    assert lines[0] == ":spiral_note_pad: *Daily plan* — <@U123>"
-    assert lines[1:-1] == [
-        "*9/27 (Sun)*",
-        "1. Bid 250 (hands-on: 100 + bidder: 150)",
-        "2. Interview Done/New Invitation : 2/3",
-        "3. Create Linkedin Profile",
-        "4. Update &lt;resume&gt;",
-        "*9/28 (Mon)*",
-        "1. Bid 250 (hands-on: 90 + bidder: 160)",
-        "2. Interview Scheduled : 5",
-        "3. Prep for Acme",
+def test_daily_plan_text_follow_up():
+    done = Counts(bidsSelf=140, bidsBidder=100, interviewsSelf=2, interviewsCaller=1)
+    lines = daily_plan_text(_plan(), _owner(), done=done).splitlines()
+    assert lines[:-1] == [
+        ":spiral_note_pad: *Daily plan* — <@U123>",
+        "*10/1 (Thu)*",
+        "Bids: self 140/150 · bidder 100/100",
+        "Interviews: self 2 · caller 1",
+        "✓ Seek caller",
+        "○ Bidder &lt;review&gt;",
+        "Moved review &amp; prep",
     ]
-    assert "Open Report" in lines[-1]
+    assert lines[-1].endswith("/report?week=2026-09-28|Open Report>")
 
 
-def test_regular_daily_plan_text_without_items_or_counts():
-    plan = _plan(
-        planType="regular",
-        bidsHandsOn=0,
-        bidsByBidder=0,
-        interviewsDone=0,
-        interviewsNew=0,
-        todayItems=[],
-        planBidsHandsOn=0,
-        planBidsByBidder=0,
-        planInterviewsScheduled=0,
-        tomorrowItems=[],
-    )
-    text = daily_plan_text(plan, _owner())
-    assert "1. Bid 0 (hands-on: 0 + bidder: 0)" in text
-    assert "2. Interview Done/New Invitation : 0/0" in text
-    assert "2. Interview Scheduled : 0" in text
-    assert not any(line.startswith("3. ") for line in text.splitlines())
-    assert "Ship" not in text  # the free-text note belongs to custom plans
+def test_daily_plan_text_minimal():
+    plan = _plan(goal=Counts(), goalItems=[], done=Counts(), notes="")
+    lines = daily_plan_text(plan, _owner(), done=Counts()).splitlines()
+    assert lines[1:-1] == ["*10/1 (Thu)*", "Bids: self 0/0 · bidder 0/0", "Interviews: self 0 · caller 0"]
+
+
+def test_daily_plan_text_defaults_done_to_stored_done():
+    assert "Bids: self 140/150 · bidder 100/100" in daily_plan_text(_plan(), _owner())
 
 
 @pytest.mark.asyncio

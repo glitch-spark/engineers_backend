@@ -10,7 +10,6 @@ Bid = ResumeApplication. Income = sum of approved Transaction.amount.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import math
@@ -28,7 +27,8 @@ from app.interview_rounds import (
     empty_breakdown as _empty_breakdown,
     load_interviews_for_window as _load_interviews_for_window,
 )
-from app.models import Interview, ResumeApplication, Transaction, UserExtra, WeeklyPlan
+from app.models import Interview, ResumeApplication, Transaction, UserExtra
+from app.plan_auto import week_snapshot
 from app.routers._util import parse_date
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
@@ -508,82 +508,26 @@ def _blank_plan_metrics() -> dict:
     return {"bidsTarget": 0, "bidsActual": 0, "interviewsTarget": 0}
 
 
-def _metrics_from_plan(plan: WeeklyPlan) -> dict:
-    out = _blank_plan_metrics()
-    for m in (plan.metrics or []):
-        if m.key == "bids":
-            out["bidsTarget"] = int(m.target or 0)
-            out["bidsActual"] = int(m.actual or 0)
-        elif m.key == "interviews":
-            out["interviewsTarget"] = int(m.target or 0)
-    return out
-
-
-async def _ensure_plan_metrics(plan: WeeklyPlan) -> WeeklyPlan:
-    """Populate metrics via the same extractor as 'Run Progress Report' when bids plan is missing."""
-    current = _metrics_from_plan(plan)
-    if current["bidsTarget"] > 0:
-        return plan
-    if not (plan.content or "").strip() and not (plan.result or "").strip():
-        return plan
-    try:
-        from app.routers.weekly_plans import _apply_badge_interview_counts, _set_interviews_metric
-        from app.weekly_report import extract_metrics
-        metrics = await extract_metrics(plan.content or "", plan.result or "")
-        plan.metrics = _set_interviews_metric(metrics, target=0, actual=0)
-        await _apply_badge_interview_counts(plan)
-        await plan.save()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("weekly plan metric extract failed for %s: %s", plan.id, exc)
-    return plan
-
-
 async def _weekly_targets_by_user(user_ids: list, year: int, week: int, *, week_start: datetime, week_end: datetime) -> dict:
-    """Pull bids/interviews plan metrics for the given week.
+    """Bids/interviews Goal (and bids Done) from each user's weekly plan.
 
-    Matches Weekly Plan the same way the UI does:
-    - by app weekNumber/year (not ISO week), and
-    - by startDate/endDate overlap as a fallback.
-    If stored bids target is 0 but plan text exists, runs Progress Report extraction.
+    `week_start` is the app-timezone Monday the week begins on; `year`/`week`
+    are kept for callers but plans are matched by their Monday.
     """
     if not user_ids:
         return {}
-
-    # Prefer exact weekNumber/year (how Weekly Plan stores rows), then date overlap.
-    plans_by_key = await WeeklyPlan.find({
-        "userId": {"$in": user_ids},
-        "year": year,
-        "weekNumber": week,
-    }).to_list()
-
-    ws = week_start.replace(tzinfo=None) if week_start.tzinfo else week_start
-    we = week_end.replace(tzinfo=None) if week_end.tzinfo else week_end
-    plans_by_dates = await WeeklyPlan.find({
-        "userId": {"$in": user_ids},
-        "startDate": {"$lte": we},
-        "endDate": {"$gte": ws},
-    }).to_list()
-
-    by_id: dict = {}
-    for p in plans_by_key + plans_by_dates:
-        by_id[str(p.id)] = p
-    plans = list(by_id.values())
-
-    # Fill missing bids targets using the Progress Report extractor (persisted).
-    await asyncio.gather(*[_ensure_plan_metrics(p) for p in plans])
-
+    monday = week_start.date()
+    snaps = await week_snapshot(user_ids, monday)
     out: dict = {u: _blank_plan_metrics() for u in user_ids}
-    for p in plans:
-        uid = p.userId
-        if uid not in out:
-            out[uid] = _blank_plan_metrics()
-        m = _metrics_from_plan(p)
-        # Keep the larger bids target if multiple plans somehow match.
-        if m["bidsTarget"] >= out[uid]["bidsTarget"]:
-            out[uid]["bidsTarget"] = m["bidsTarget"]
-            out[uid]["bidsActual"] = m["bidsActual"]
-        if m["interviewsTarget"] >= out[uid]["interviewsTarget"]:
-            out[uid]["interviewsTarget"] = m["interviewsTarget"]
+    for uid, snap in snaps.items():
+        plan = snap["plan"]
+        if plan is None:
+            continue
+        out[uid] = {
+            "bidsTarget": plan.goal.bidsSelf + plan.goal.bidsBidder,
+            "bidsActual": snap["done"].bidsSelf + snap["done"].bidsBidder,
+            "interviewsTarget": plan.goal.interviewsSelf + plan.goal.interviewsCaller,
+        }
     return out
 
 

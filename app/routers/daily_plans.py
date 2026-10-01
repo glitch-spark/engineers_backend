@@ -1,308 +1,163 @@
-from datetime import date, datetime, timedelta
-from typing import Annotated, Any, Literal, Optional
-from zoneinfo import ZoneInfo
+"""Daily plans: each day is followed up with what was done.
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
-from pymongo.errors import DuplicateKeyError
+The day's goal comes from the weekly plan's daily goal (set once a week); a
+day keeps its own copy of that goal once it is followed up.
+"""
+
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated, Any, Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.alerts import app_week_key
-from app.config import get_settings
-from app.daily_plan_stats import METRICS, PERIODS, build_series, sum_totals, window_start
 from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.daily_plan import DailyPlan
-from app.routers._util import populate_owner, to_object_id
+from app.models.plan_common import BidsIn, ChecklistItems, Counts
+from app.dashboard_stats import app_tz
+from app.models.plan_common import monday_of
+from app.plan_auto import day_goal, effective_daily_done, empty_day, interview_counts, weekly_plans_for
+from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
 router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
 
-PLAN_TYPES = ("custom", "regular")
-MAX_ITEMS = 20
-MAX_ITEM_LENGTH = 200
-ITEM_FIELDS = ("todayItems", "tomorrowItems")
+
+class DayIn(BaseModel):
+    """A follow-up: bids done, the daily goal lines with ticks, and notes."""
+
+    goalItems: ChecklistItems = []
+    done: BidsIn = Field(default_factory=BidsIn)
+    notes: str = Field(default="", max_length=2000)
 
 
-class DailyPlanUpdate(BaseModel):
-    date: Optional[str] = None
-    planType: Optional[str] = None
-    today: Optional[str] = None
-    tomorrow: Optional[str] = None
-    bidsHandsOn: Optional[int] = None
-    bidsByBidder: Optional[int] = None
-    interviewsDone: Optional[int] = None
-    interviewsNew: Optional[int] = None
-    todayItems: Optional[list[str]] = None
-    planBidsHandsOn: Optional[int] = None
-    planBidsByBidder: Optional[int] = None
-    planInterviewsScheduled: Optional[int] = None
-    tomorrowItems: Optional[list[str]] = None
+def _today() -> date:
+    return datetime.now(app_tz()).date()
 
 
-class DailyPlanCreate(DailyPlanUpdate):
-    date: str
+def _midnight(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day)
 
 
-def _reject_admin(user: UserExtra) -> None:
-    if user.role == "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admins can view daily plans but cannot change them",
-        )
+def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly) -> dict:
+    goal, items = day_goal(plan, weekly)
+    return {
+        "date": day.isoformat(),
+        "exists": plan is not None,
+        "userId": str(uid),
+        "goal": goal.model_dump(),
+        "goalItems": [i.model_dump() for i in items],
+        "done": effective_daily_done(plan, auto_day).model_dump(),
+        "interviews": {"self": auto_day["self"], "caller": auto_day["caller"], "stages": auto_day["stages"]},
+        "notes": plan.notes if plan else "",
+        "loggedAt": plan.loggedAt.isoformat() if plan and plan.loggedAt else None,
+    }
 
 
-def _parse_day(value: str) -> datetime:
-    raw = (value or "").strip()
-    if len(raw) >= 10:
-        raw = raw[:10]
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date")
-    return datetime(parsed.year, parsed.month, parsed.day)
+async def _interviews(uid, start: date, end: date) -> dict:
+    return (await interview_counts([uid], start, end)).get(uid, {})
 
 
-async def _sync_slack(plan: DailyPlan, owner: UserExtra) -> None:
-    """Post or edit the plan's Slack message; remember where it lives."""
-    posted = await sync_daily_plan_message(plan, owner)
+async def _weekly(uid, day: date):
+    return (await weekly_plans_for([uid], monday_of(day))).get(uid)
+
+
+async def _find(uid, day: date) -> Optional[DailyPlan]:
+    return await DailyPlan.find_one({"userId": uid, "date": _midnight(day)})
+
+
+async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts) -> None:
+    """Post or edit the day's follow-up message; remember where it lives."""
+    posted = await sync_daily_plan_message(plan, owner, done=done)
     if posted and posted != (plan.slackChannel, plan.slackTs):
         plan.slackChannel, plan.slackTs = posted
         await plan.save()
 
 
-def _apply_fields(plan: DailyPlan, body: DailyPlanUpdate) -> None:
-    """Copy the plan type, notes and counts that were sent; 400 on bad values."""
-    if body.planType is not None:
-        if body.planType not in PLAN_TYPES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="planType must be 'custom' or 'regular'",
-            )
-        plan.planType = body.planType
-    if body.today is not None:
-        plan.today = body.today
-    if body.tomorrow is not None:
-        plan.tomorrow = body.tomorrow
-    for field in METRICS:
-        value = getattr(body, field)
-        if value is None:
-            continue
-        if value < 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{field} cannot be negative",
-            )
-        setattr(plan, field, value)
-    for field in ITEM_FIELDS:
-        raw = getattr(body, field)
-        if raw is None:
-            continue
-        items = [item.strip() for item in raw if item.strip()]
-        if len(items) > MAX_ITEMS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"At most {MAX_ITEMS} custom items per day",
-            )
-        if any(len(item) > MAX_ITEM_LENGTH for item in items):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Custom items can be at most {MAX_ITEM_LENGTH} characters",
-            )
-        setattr(plan, field, items)
-
-
-def _slack_snapshot(plan: DailyPlan) -> tuple:
-    """Everything the Slack post shows, so unchanged saves skip the edit."""
-    return (
-        plan.date,
-        plan.planType,
-        plan.today,
-        plan.tomorrow,
-        *(getattr(plan, m) for m in METRICS),
-        *(tuple(getattr(plan, f)) for f in ITEM_FIELDS),
-    )
-
-
-def _app_today() -> date:
-    tz_name = (get_settings().APP_TIMEZONE or "").strip() or "UTC"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    return datetime.now(tz).date()
-
-
-def _week_fields(day: datetime) -> tuple[int, int]:
-    year, week_number, _key = app_week_key(day)
-    return year, week_number
-
-
-async def _duplicate_day(user_id, day: datetime, ignore_id=None) -> None:
-    existing = await DailyPlan.find_one({"userId": user_id, "date": day})
-    if existing is not None and existing.id != ignore_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Daily plan already exists for this date",
-        )
-
-
 @router.get("")
-async def list_plans(
+async def list_week(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    page: int = Query(1),
-    limit: int = Query(10),
-    year: Optional[int] = Query(None),
-    weekNumber: Optional[int] = Query(None),
+    weekStart: str = Query(...),
     userId: Optional[str] = Query(None),
 ) -> dict:
-    """List daily plans for the team. Any authenticated user can read all
-    plans. Admins are sorted newest-created first; everyone else by plan
-    date, newest day first."""
-    query: dict[str, Any] = {}
-    if userId:
-        query["userId"] = to_object_id(userId)
-    if year is not None:
-        query["year"] = year
-    if weekNumber is not None:
-        query["weekNumber"] = weekNumber
-
-    skip = (page - 1) * limit
-    total = await DailyPlan.find(query).count()
-    sort = [("createdAt", -1)] if user.role == "admin" else [("date", -1), ("createdAt", -1)]
-    plans = await DailyPlan.find(query).sort(sort).skip(skip).limit(limit).to_list()
-    plans_out = await populate_owner(plans, field="userId", only=("name", "email"))
-
-    total_pages = (total + limit - 1) // limit if limit else 0
+    """The week's days, Monday to Saturday, plus Sunday when it has an entry."""
+    monday = parse_monday(weekStart)
+    uid = await read_subject(user, userId)
+    sunday = monday + timedelta(days=6)
+    plans = await DailyPlan.find({
+        "userId": uid,
+        "date": {"$gte": _midnight(monday), "$lte": _midnight(sunday)},
+    }).to_list()
+    by_date = {p.date.date(): p for p in plans}
+    interviews = await _interviews(uid, monday, sunday)
+    weekly = await _weekly(uid, monday)
+    days = [monday + timedelta(days=n) for n in range(6)]
+    if sunday in by_date:
+        days.append(sunday)
     return {
-        "plans": plans_out,
-        "pagination": {
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "totalPages": total_pages,
-            "hasNext": page < total_pages,
-            "hasPrev": page > 1,
-        },
+        "weekStart": monday.isoformat(),
+        "days": [_day_out(uid, d, by_date.get(d), interviews.get(d, empty_day()), weekly) for d in days],
     }
 
 
-@router.get("/stats")
-async def plan_stats(
+@router.get("/{day}")
+async def get_day(
+    day: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
-    bucket: Literal["day", "week", "month"] = Query("day"),
     userId: Optional[str] = Query(None),
-    to: Optional[str] = Query(None, description="Last day of the window (YYYY-MM-DD)"),
 ) -> dict:
-    """Regular-plan counts per day, week or month for the dashboard chart.
-
-    The window ends on `to` (the caller's local today; APP_TIMEZONE's today
-    when omitted) and covers the last 14 days, 12 weeks or 12 months. Without
-    `userId` it sums the whole team. Readable by any signed-in user, like the
-    plan list.
-    """
-    today = _parse_day(to).date() if to else _app_today()
-    periods = PERIODS[bucket]
-    start = window_start(today, bucket, periods)
-    # The plan dated the day before the window holds the window's first planned day.
-    first = start - timedelta(days=1)
-
-    query: dict[str, Any] = {
-        "planType": "regular",
-        "date": {
-            "$gte": datetime(first.year, first.month, first.day),
-            "$lte": datetime(today.year, today.month, today.day),
-        },
-    }
-    if userId:
-        query["userId"] = to_object_id(userId)
-    plans = await DailyPlan.find(query).to_list()
-
-    series = build_series(plans, today, bucket, periods)
-    return {
-        "bucket": bucket,
-        "window": {"from": start.isoformat(), "to": today.isoformat()},
-        "series": series,
-        "totals": sum_totals(series),
-    }
+    when = parse_ymd(day, "date")
+    uid = await read_subject(user, userId)
+    interviews = await _interviews(uid, when, when)
+    return _day_out(uid, when, await _find(uid, when), interviews.get(when, empty_day()), await _weekly(uid, when))
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_plan(
-    body: DailyPlanCreate,
+@router.put("/{day}")
+async def put_day(
+    day: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    payload: Annotated[dict[str, Any], Body()] = None,
 ) -> dict:
-    _reject_admin(user)
-    if not body.date or not body.date.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Date is required")
-
-    day = _parse_day(body.date)
-    year, week_number = _week_fields(day)
-    await _duplicate_day(user.id, day)
-
-    plan = DailyPlan(userId=user.id, date=day, year=year, weekNumber=week_number)
-    _apply_fields(plan, body)
-    try:
+    """Save the day's follow-up (what was done) and post it to Slack."""
+    require_writer(user)
+    when = parse_ymd(day, "date")
+    body = parse_body(DayIn, payload)
+    if when > _today():
+        raise HTTPException(status_code=422, detail="A day can be followed up from that day on")
+    plan = await _find(user.id, when)
+    weekly = await _weekly(user.id, when)
+    if plan is None:
+        year, week_number, _key = app_week_key(_midnight(when))
+        plan = DailyPlan(userId=user.id, date=_midnight(when), year=year, weekNumber=week_number)
+    # Keep the goal this day was followed up against, even if the week's daily goal changes later.
+    goal, _items = day_goal(plan, weekly)
+    plan.goal = Counts(bidsSelf=goal.bidsSelf, bidsBidder=goal.bidsBidder)
+    plan.goalItems = body.goalItems
+    plan.done = Counts(bidsSelf=body.done.bidsSelf, bidsBidder=body.done.bidsBidder)
+    plan.notes = body.notes
+    if plan.loggedAt is None:
+        plan.loggedAt = datetime.now(timezone.utc).replace(tzinfo=None)
+    if plan.id is None:
         await plan.insert()
-    except DuplicateKeyError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Daily plan already exists for this date",
-        )
-    await _sync_slack(plan, user)
-    populated = await populate_owner([plan], field="userId", only=("name", "email"))
-    return populated[0]
-
-
-@router.put("/{plan_id}")
-async def update_plan(
-    plan_id: str,
-    body: DailyPlanUpdate,
-    user: Annotated[UserExtra, Depends(get_current_user)],
-) -> dict:
-    _reject_admin(user)
-    plan = await DailyPlan.get(to_object_id(plan_id))
-    if plan is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Daily plan not found")
-    if str(plan.userId) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-
-    before = _slack_snapshot(plan)
-    if body.date is not None:
-        if not body.date.strip():
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Date is required")
-        day = _parse_day(body.date)
-        await _duplicate_day(plan.userId, day, ignore_id=plan.id)
-        year, week_number = _week_fields(day)
-        plan.date = day
-        plan.year = year
-        plan.weekNumber = week_number
-    _apply_fields(plan, body)
-
-    try:
+    else:
         await plan.save()
-    except DuplicateKeyError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Daily plan already exists for this date",
-        )
-    if _slack_snapshot(plan) != before or not plan.slackTs:
-        await _sync_slack(plan, user)
-    populated = await populate_owner([plan], field="userId", only=("name", "email"))
-    return populated[0]
+
+    auto_day = (await _interviews(user.id, when, when)).get(when, empty_day())
+    await _sync_slack(plan, user, effective_daily_done(plan, auto_day))
+    return _day_out(user.id, when, plan, auto_day, weekly)
 
 
-@router.delete("/{plan_id}")
-async def delete_plan(
-    plan_id: str,
+@router.delete("/{day}")
+async def delete_day(
+    day: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    _reject_admin(user)
-    plan = await DailyPlan.get(to_object_id(plan_id))
+    require_writer(user)
+    when = parse_ymd(day, "date")
+    plan = await _find(user.id, when)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Daily plan not found")
-    if str(plan.userId) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-
-    await plan.delete()
     await delete_daily_plan_message(plan)
-    return {"message": "Daily plan deleted successfully"}
+    await plan.delete()
+    return {"message": "Daily plan deleted"}

@@ -1,73 +1,97 @@
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from beanie import PydanticObjectId
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
+from app.models.plan_common import ChecklistItems, Counts
+
+# Fields of the pre Goal-vs-Done shape. `planBids*` / `planInterviewsScheduled`
+# / `tomorrowItems` describe the NEXT day, so the fold drops them here and
+# scripts/migrate_plans_goal_done.py moves them onto that day's goal.
+_LEGACY_KEYS = (
+    "planType", "today", "tomorrow",
+    "bidsHandsOn", "bidsByBidder", "interviewsDone", "interviewsNew", "todayItems",
+    "planBidsHandsOn", "planBidsByBidder", "planInterviewsScheduled", "tomorrowItems",
+    "customItems",
+)
 
 
-def fold_counted_items(data: Any) -> Any:
-    """Regular plans saved before items were plain text stored
-    `customItems: [{label, value}]`; read them as today's items."""
-    if not isinstance(data, dict) or "customItems" not in data:
-        return data
-    data = dict(data)
-    legacy = data.pop("customItems") or []
-    if not data.get("todayItems"):
-        data["todayItems"] = [
+def _legacy_today_items(data: dict) -> list[str]:
+    items = [str(i) for i in (data.get("todayItems") or []) if str(i).strip()]
+    if not items:
+        # Regular plans saved before items were plain text stored
+        # `customItems: [{label, value}]`.
+        items = [
             f"{item['label'].strip()}: {item.get('value') or 0}"
-            for item in legacy
+            for item in (data.get("customItems") or [])
             if isinstance(item, dict) and (item.get("label") or "").strip()
         ]
+    return items
+
+
+def fold_legacy_daily(data: Any) -> Any:
+    """Read a pre Goal-vs-Done daily plan as the new shape (until migrated)."""
+    if not isinstance(data, dict) or "done" in data:
+        return data
+    if not any(key in data for key in _LEGACY_KEYS):
+        return data
+    data = dict(data)
+    bids_self = int(data.get("bidsHandsOn") or 0)
+    bids_bidder = int(data.get("bidsByBidder") or 0)
+    items = _legacy_today_items(data)
+    text = "\n\n".join(
+        part.strip() for part in (data.get("today") or "", data.get("tomorrow") or "") if part.strip()
+    )
+    # Interviews are never typed any more: the old count is dropped.
+    data["done"] = {"bidsSelf": bids_self, "bidsBidder": bids_bidder}
+    data["goalItems"] = [{"text": item[:200], "done": True} for item in items]
+    if text and not data.get("notes"):
+        data["notes"] = text
+    if bids_self or bids_bidder or data.get("interviewsDone") or items or text:
+        data.setdefault("loggedAt", data.get("createdAt"))
+    for key in _LEGACY_KEYS:
+        data.pop(key, None)
     return data
 
 
 class DailyPlan(TimestampedDocument):
-    """One staff member's note for a calendar day.
+    """One person's Goal vs Done for a calendar day.
 
-    `year` and `weekNumber` use the same calendar-year week as Weekly Plan
-    (`app.alerts.app_week_key`) so the shared Report filter matches both lists.
+    The goal (bids and goal lines) is set at the start of the day; the
+    follow-up records bids done, ticks goal lines and adds notes, and sets
+    `loggedAt` the first time. Interviews are never stored here: they come
+    from interview records (`app.plan_auto`).
 
-    `planType` "custom" is the free-text today/tomorrow note. "regular" covers
-    the same two days with counts: what was done on `date` (bids split by who
-    sent them, interviews done, new invitations) and the plan for the next day
-    (bids, scheduled interviews), each with plain-text items. The counts feed
-    `/daily-plans/stats`. Plans written before the toggle have no `planType`
-    and load as "custom".
+    `year` and `weekNumber` use the calendar-year week of
+    `app.alerts.app_week_key` like before.
     """
 
     userId: PydanticObjectId
     date: datetime
     year: int
     weekNumber: int
-    planType: Literal["custom", "regular"] = "custom"
-    today: str = ""
-    tomorrow: str = ""
-    # Done on `date`.
-    bidsHandsOn: int = 0
-    bidsByBidder: int = 0
-    interviewsDone: int = 0
-    interviewsNew: int = 0
-    todayItems: list[str] = []
-    # Planned for the day after `date`.
-    planBidsHandsOn: int = 0
-    planBidsByBidder: int = 0
-    planInterviewsScheduled: int = 0
-    tomorrowItems: list[str] = []
+    goal: Counts = Field(default_factory=Counts)
+    goalItems: ChecklistItems = []
+    done: Counts = Field(default_factory=Counts)
+    notes: str = Field(default="", max_length=2000)
+    loggedAt: Optional[datetime] = None
     # Bot post in SLACK_DAILY_PLAN_CHANNEL_ID, kept so edits update it in place.
     slackChannel: Optional[str] = None
     slackTs: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
-    def _fold_counted_items(cls, data: Any) -> Any:
-        # The next save writes the new shape, so no migration is needed.
-        return fold_counted_items(data)
+    def _fold_legacy(cls, data: Any) -> Any:
+        return fold_legacy_daily(data)
 
     class Settings:
         name = "dailyplans"
+        # Fetch whole documents: by default Beanie projects to the declared
+        # fields, which would hide the legacy keys the fold reads.
+        projection = None
         indexes = [
             IndexModel([("userId", 1), ("date", 1)], unique=True),
             IndexModel([("year", 1), ("weekNumber", 1)]),

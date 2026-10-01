@@ -17,7 +17,6 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.alerts import app_week_key
 from app.dashboard_stats import (
     app_tz,
     bucket_for,
@@ -38,7 +37,8 @@ from app.interview_rounds import (
     empty_breakdown,
     load_interviews_for_window,
 )
-from app.models import DailyPlan, Transaction, UserExtra, WeeklyPlan
+from app.models import DailyPlan, Transaction, UserExtra
+from app.plan_auto import interviews_by_day, weekly_plans_for
 from app.routers._util import to_object_id
 from app.routers.transactions import _TOTALS_GROUP
 
@@ -90,23 +90,25 @@ def _today(value: Optional[str]) -> date:
     return parsed if parsed is not None else datetime.now(app_tz()).date()
 
 
-async def _regular_plans(sid, start: date, end: date) -> list[DailyPlan]:
-    return await DailyPlan.find(
+# Logged plans, plus documents from before Goal vs Done (no `loggedAt` field
+# until scripts/migrate_plans_goal_done.py runs; the model folds them on read).
+_LOGGED_OR_LEGACY = {"$or": [{"loggedAt": {"$ne": None}}, {"loggedAt": {"$exists": False}}]}
+
+
+async def _logged_plans(user_ids: list, start: date, end: date) -> list[DailyPlan]:
+    """Daily plans whose Done was logged (goal-only entries don't count)."""
+    plans = await DailyPlan.find(
         {
-            "userId": sid,
-            "planType": "regular",
+            "userId": {"$in": user_ids},
             "date": {"$gte": _midnight(start), "$lte": _midnight(end)},
+            **_LOGGED_OR_LEGACY,
         }
     ).to_list()
+    return [p for p in plans if p.loggedAt is not None]
 
 
-def _metric_target(weekly_plan: Optional[WeeklyPlan], key: str) -> Optional[int]:
-    if weekly_plan is None:
-        return None
-    for m in weekly_plan.metrics:
-        if m.key == key:
-            return m.target or None
-    return None
+def _target(total: int) -> Optional[int]:
+    return total or None
 
 
 @router.get("/week")
@@ -120,34 +122,18 @@ async def dashboard_week(
     tz = app_tz()
     monday, saturday, sunday = week_window(day)
 
-    # Actuals: sum of regular daily plans over the counting window (Mon-Sun).
-    plans = await _regular_plans(sid, monday, sunday)
-    self_sum = sum(p.bidsHandsOn for p in plans)
-    bidder_sum = sum(p.bidsByBidder for p in plans)
+    # Actuals: logged daily plans over the counting window (Mon-Sun);
+    # interviews come from interview records.
+    plans = await _logged_plans([sid], monday, sunday)
+    self_sum = sum(p.done.bidsSelf for p in plans)
+    bidder_sum = sum(p.done.bidsBidder for p in plans)
     bids_total = self_sum + bidder_sum
-    interviews_done = sum(p.interviewsDone for p in plans)
 
-    # This week's weekly plan (targets): the plan whose startDate-endDate
-    # contains today, per spec. Primary lookup by startDate (the frontend
-    # stores year/weekNumber from the plan's *creation* date, which can
-    # disagree with the Monday it covers around year boundaries); fall back
-    # to the app_week_key(monday) year/weekNumber lookup for older plans
-    # that predate this rule.
-    monday_dt = _midnight(monday)
-    weekly_plan = await WeeklyPlan.find_one(
-        {
-            "userId": sid,
-            "startDate": {
-                "$gte": monday_dt - timedelta(hours=12),
-                "$lte": monday_dt + timedelta(hours=12),
-            },
-        }
-    )
-    if weekly_plan is None:
-        year, week_number, _key = app_week_key(monday_dt)
-        weekly_plan = await WeeklyPlan.find_one({"userId": sid, "year": year, "weekNumber": week_number})
-    bids_target = _metric_target(weekly_plan, "bids")
-    interviews_target = _metric_target(weekly_plan, "interviews")
+    # This week's weekly plan Goal is the target (0 means none set).
+    weekly_plan = (await weekly_plans_for([sid], monday)).get(sid)
+    goal = weekly_plan.goal if weekly_plan else None
+    bids_target = _target(goal.bidsSelf + goal.bidsBidder) if goal else None
+    interviews_target = _target(goal.interviewsSelf + goal.interviewsCaller) if goal else None
 
     # Stage tiles: interview rounds created by the user, dated in the window.
     iv_start = local_day_start_utc(monday, tz)
@@ -162,25 +148,22 @@ async def dashboard_week(
     stages = [{"key": key, "label": label, "count": breakdown.get(key, 0)} for key, label in BREAKDOWN_ORDER]
     stages.append({"key": "canceled", "label": "Canceled", "count": canceled_total})
 
-    # Streak: consecutive working days (Mon-Sat) with a regular plan, looking
+    # Streak: consecutive working days (Mon-Sat) with a logged plan, looking
     # back up to 400 days (the helper itself caps the walk at 365).
-    streak_docs = await _regular_plans(sid, day - timedelta(days=400), day)
+    streak_docs = await _logged_plans([sid], day - timedelta(days=400), day)
     plan_days = {p.date.date() for p in streak_docs}
     streak_value = streak(plan_days, day)
 
     # Percentile population: non-admin users that still exist, with >=1
-    # regular plan in the last 30 days (app timezone), always including the
+    # logged plan in the last 30 days (app timezone), always including the
     # subject. Intersecting with existing, non-admin users (rather than just
     # subtracting admins) drops plans left behind by deleted users, so they
     # no longer count toward N.
     population_start = day - timedelta(days=29)
-    active_docs = await DailyPlan.find(
-        {
-            "planType": "regular",
-            "date": {"$gte": _midnight(population_start), "$lte": _midnight(day)},
-        }
-    ).to_list()
-    active_ids = list({p.userId for p in active_docs})
+    active_ids = await DailyPlan.get_motor_collection().distinct(
+        "userId",
+        {"date": {"$gte": _midnight(population_start), "$lte": _midnight(day)}, **_LOGGED_OR_LEGACY},
+    )
     eligible = await UserExtra.find(
         {"_id": {"$in": active_ids}, "role": {"$ne": "admin"}},
         projection_model=_IdOnly,
@@ -188,18 +171,14 @@ async def dashboard_week(
     population = {u.id for u in eligible}
     population.add(sid)
 
-    score_docs = await DailyPlan.find(
-        {
-            "userId": {"$in": list(population)},
-            "planType": "regular",
-            "date": {"$gte": _midnight(monday), "$lte": _midnight(sunday)},
-        }
-    ).to_list()
+    members = list(population)
+    score_docs = await _logged_plans(members, monday, sunday)
     bids_scores = {uid: 0 for uid in population}
-    iv_scores = {uid: 0 for uid in population}
     for p in score_docs:
-        bids_scores[p.userId] = bids_scores.get(p.userId, 0) + p.bidsHandsOn + p.bidsByBidder
-        iv_scores[p.userId] = iv_scores.get(p.userId, 0) + p.interviewsDone
+        bids_scores[p.userId] = bids_scores.get(p.userId, 0) + p.done.bidsSelf + p.done.bidsBidder
+    interviews = await interviews_by_day(members, monday, sunday)
+    iv_scores = {uid: sum(interviews.get(uid, {}).values()) for uid in population}
+    interviews_done = iv_scores[sid]
 
     return {
         "week": {"start": monday.isoformat(), "end": saturday.isoformat()},
@@ -252,12 +231,12 @@ async def dashboard_activity(
         for key in keys
     }
 
-    plans = await _regular_plans(sid, start, end)
-    for p in plans:
+    for p in await _logged_plans([sid], start, end):
         row = series[bucket_for(p.date.date(), bucket, keys)]
-        row["self"] += p.bidsHandsOn
-        row["bidder"] += p.bidsByBidder
-        row["interviews"] += p.interviewsDone
+        row["self"] += p.done.bidsSelf
+        row["bidder"] += p.done.bidsBidder
+    for day, count in (await interviews_by_day([sid], start, end)).get(sid, {}).items():
+        series[bucket_for(day, bucket, keys)]["interviews"] += count
 
     series_list = [series[key] for key in keys]
     totals = {
