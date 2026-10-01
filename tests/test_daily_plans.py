@@ -186,3 +186,14 @@ async def test_legacy_doc_readable(client, staff_user, auth_header):
     assert day["done"]["interviewsSelf"] == 0  # old typed count dropped; no interview records
     assert day["goalItems"] == [{"text": "Old item", "done": True}]
     assert day["loggedAt"] is not None
+
+
+async def test_day_followed_up_before_any_daily_goal_uses_the_weeks(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    # Followed up while the week had no daily goal: the day's copy is empty.
+    await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up())
+    await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body())
+    day = (await client.get(f"/daily-plans/{DAY}", headers=h)).json()
+    assert (day["goal"]["bidsSelf"], day["goal"]["bidsBidder"]) == (150, 100)
+    # Its own ticked lines are kept.
+    assert [i["done"] for i in day["goalItems"]] == [True, False]
