@@ -57,8 +57,6 @@ async def test_team_last_logged_looks_before_this_week(client, staff_user, admin
     # Logged last Saturday only: on Monday the team view must still show that date.
     await client.put("/daily-plans/2026-09-26", headers=auth_header(staff_user),
                      json={"goal": {}, "done": {"bidsSelf": 2}})
-    # A later goal-only (not logged) entry doesn't count.
-    await client.put("/daily-plans/2026-09-29", headers=auth_header(staff_user), json={"goal": {"bidsSelf": 3}})
     # Logs after the viewed week are ignored.
     await client.put("/daily-plans/2026-10-06", headers=auth_header(staff_user),
                      json={"goal": {}, "done": {"bidsSelf": 1}})

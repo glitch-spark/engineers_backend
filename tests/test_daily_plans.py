@@ -1,6 +1,6 @@
 """Daily plan API: a goal set in the morning, a follow-up with what was done."""
 
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -11,22 +11,25 @@ from app.models import DailyPlan, Interview
 DAY = "2026-10-01"  # Thursday
 
 
-def _goal_body(**kw):
+WEEK = "2026-09-28"
+
+
+def _week_body(**kw):
     body = {
-        "goal": {"bidsSelf": 150, "bidsBidder": 100},
-        "goalItems": [{"text": "Seek caller"}, {"text": "Bidder review"}],
-        "notes": "",
+        "goal": {"bidsSelf": 750, "bidsBidder": 500, "interviewsSelf": 10, "interviewsCaller": 5},
+        "dailyGoal": {"bidsSelf": 150, "bidsBidder": 100},
+        "dailyGoalItems": [{"text": "Seek caller"}, {"text": "Bidder review"}],
     }
     body.update(kw)
     return body
 
 
 def _follow_up(**kw):
-    body = _goal_body(
-        goalItems=[{"text": "Seek caller", "done": True}, {"text": "Bidder review"}],
-        done={"bidsSelf": 140, "bidsBidder": 100},
-        notes="Bidder review moved to tomorrow.",
-    )
+    body = {
+        "goalItems": [{"text": "Seek caller", "done": True}, {"text": "Bidder review"}],
+        "done": {"bidsSelf": 140, "bidsBidder": 100},
+        "notes": "Bidder review moved to tomorrow.",
+    }
     body.update(kw)
     return body
 
@@ -35,26 +38,31 @@ async def test_requires_auth(client):
     assert (await client.get(f"/daily-plans/{DAY}")).status_code == 401
 
 
-async def test_goal_only_save_does_not_log_or_post(client, staff_user, auth_header):
-    with patch("app.routers.daily_plans.sync_daily_plan_message", new=AsyncMock(return_value=None)) as sync:
-        r = await client.put(f"/daily-plans/{DAY}", headers=auth_header(staff_user), json=_goal_body())
-    assert r.status_code == 200, r.text
-    day = r.json()
-    assert day["exists"] is True and day["loggedAt"] is None
-    assert day["goal"] == {"bidsSelf": 150, "bidsBidder": 100, "interviewsSelf": 0, "interviewsCaller": 0}
-    assert [i["text"] for i in day["goalItems"]] == ["Seek caller", "Bidder review"]
-    sync.assert_not_called()
-
-
-async def test_follow_up_logs_and_posts(client, staff_user, auth_header):
+async def test_day_shows_the_weeks_daily_goal(client, staff_user, auth_header):
     h = auth_header(staff_user)
-    await client.put(f"/daily-plans/{DAY}", headers=h, json=_goal_body())
+    await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body())
+    day = (await client.get(f"/daily-plans/{DAY}", headers=h)).json()
+    assert day["exists"] is False and day["loggedAt"] is None
+    assert day["goal"] == {"bidsSelf": 150, "bidsBidder": 100, "interviewsSelf": 0, "interviewsCaller": 0}
+    assert day["goalItems"] == [{"text": "Seek caller", "done": False}, {"text": "Bidder review", "done": False}]
+
+
+async def test_day_without_weekly_plan_has_no_goal(client, staff_user, auth_header):
+    day = (await client.get(f"/daily-plans/{DAY}", headers=auth_header(staff_user))).json()
+    assert day["goal"]["bidsSelf"] == 0 and day["goalItems"] == []
+
+
+async def test_follow_up_logs_posts_and_keeps_its_goal(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body())
     with patch("app.routers.daily_plans.sync_daily_plan_message", new=AsyncMock(return_value=None)) as sync:
-        r = await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up())
+        # Any goal sent with a follow-up is ignored: the goal comes from the weekly plan.
+        r = await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up(goal={"bidsSelf": 1}))
     assert r.status_code == 200, r.text
     day = r.json()
     assert day["loggedAt"] is not None
-    assert day["done"]["bidsSelf"] == 140 and day["done"]["bidsBidder"] == 100
+    assert (day["goal"]["bidsSelf"], day["goal"]["bidsBidder"]) == (150, 100)
+    assert (day["done"]["bidsSelf"], day["done"]["bidsBidder"]) == (140, 100)
     assert [i["done"] for i in day["goalItems"]] == [True, False]
     assert day["notes"] == "Bidder review moved to tomorrow."
     sync.assert_awaited_once()
@@ -62,9 +70,21 @@ async def test_follow_up_logs_and_posts(client, staff_user, auth_header):
     stored = await DailyPlan.find_one({"userId": staff_user.id})
     assert (stored.year, stored.weekNumber) == (2026, 40)
     first_logged = stored.loggedAt
+
+    # Changing the daily goal later doesn't rewrite a day already followed up.
+    await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body(dailyGoal={"bidsSelf": 200, "bidsBidder": 50}))
+    assert (await client.get(f"/daily-plans/{DAY}", headers=h)).json()["goal"]["bidsSelf"] == 150
+    assert (await client.get("/daily-plans/2026-09-30", headers=h)).json()["goal"]["bidsSelf"] == 200
+
     await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up(notes="edited"))
     stored = await DailyPlan.find_one({"userId": staff_user.id})
     assert stored.loggedAt == first_logged and stored.notes == "edited"
+
+
+async def test_future_day_cannot_be_followed_up(client, staff_user, auth_header):
+    with patch("app.routers.daily_plans._today", return_value=date(2026, 10, 1)):
+        r = await client.put("/daily-plans/2026-10-02", headers=auth_header(staff_user), json=_follow_up())
+    assert r.status_code == 422
 
 
 async def test_interviews_come_from_records_and_typed_values_are_ignored(client, staff_user, auth_header):
@@ -108,14 +128,13 @@ async def test_week_list_without_sunday_entry_has_six_days(client, staff_user, a
 
 async def test_delete_day(client, staff_user, auth_header):
     h = auth_header(staff_user)
-    await client.put(f"/daily-plans/{DAY}", headers=h, json=_goal_body())
+    await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up())
     assert (await client.delete(f"/daily-plans/{DAY}", headers=h)).status_code == 200
     assert await DailyPlan.find_one({"userId": staff_user.id}) is None
     assert (await client.delete(f"/daily-plans/{DAY}", headers=h)).status_code == 404
 
 
 @pytest.mark.parametrize("path,body", [
-    (f"/daily-plans/{DAY}", {"goal": {"bidsSelf": -1}}),
     (f"/daily-plans/{DAY}", {"done": {"bidsBidder": -2}}),
     (f"/daily-plans/{DAY}", {"goalItems": [{"text": f"item {n}"} for n in range(21)]}),
     (f"/daily-plans/{DAY}", {"goalItems": [{"text": "x" * 201}]}),
@@ -136,7 +155,7 @@ async def test_week_list_requires_monday(client, staff_user, auth_header):
 async def test_permissions_matrix(client, staff_user, staff_user_2, admin_user, auth_header):
     await client.put(f"/daily-plans/{DAY}", headers=auth_header(staff_user), json=_follow_up())
     other = f"/daily-plans/{DAY}?userId={staff_user.id}"
-    assert (await client.put(f"/daily-plans/{DAY}", headers=auth_header(admin_user), json=_goal_body())).status_code == 403
+    assert (await client.put(f"/daily-plans/{DAY}", headers=auth_header(admin_user), json=_follow_up())).status_code == 403
     assert (await client.delete(f"/daily-plans/{DAY}", headers=auth_header(admin_user))).status_code == 403
     assert (await client.get(other, headers=auth_header(staff_user_2))).status_code == 403
     r = await client.get(other, headers=auth_header(admin_user))

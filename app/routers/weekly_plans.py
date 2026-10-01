@@ -13,9 +13,9 @@ from pydantic import BaseModel, Field
 from app.alerts import app_week_key
 from app.deps import get_current_user
 from app.models import UserExtra
-from app.models.plan_common import ChecklistItems, Counts
+from app.models.plan_common import BidsIn, ChecklistItem, ChecklistItems, Counts
 from app.models.weekly_plan import WeeklyPlan
-from app.plan_auto import week_snapshot
+from app.plan_auto import day_goal, week_snapshot
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
 
 router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
@@ -24,6 +24,8 @@ router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
 class WeekIn(BaseModel):
     goal: Counts = Field(default_factory=Counts)
     goalItems: ChecklistItems = []
+    dailyGoal: BidsIn = Field(default_factory=BidsIn)
+    dailyGoalItems: ChecklistItems = []
     recapNotes: str = Field(default="", max_length=4000)
 
 
@@ -47,12 +49,15 @@ def _week_out(uid, monday: date, snap: dict) -> dict:
     days = [monday + timedelta(days=n) for n in range(6)]
     if sunday in by_date:
         days.append(sunday)
+    goals = {d: day_goal(by_date.get(d), plan) for d in days}
     return {
         "weekStart": monday.isoformat(),
         "exists": plan is not None,
         "userId": str(uid),
         "goal": (plan.goal if plan else Counts()).model_dump(),
         "goalItems": [i.model_dump() for i in (plan.goalItems if plan else [])],
+        "dailyGoal": (plan.dailyGoal if plan else Counts()).model_dump(),
+        "dailyGoalItems": [i.model_dump() for i in (plan.dailyGoalItems if plan else [])],
         "recapNotes": plan.recapNotes if plan else "",
         "done": snap["done"].model_dump(),
         "stages": _sum_stages(snap["dayAuto"]),
@@ -60,10 +65,10 @@ def _week_out(uid, monday: date, snap: dict) -> dict:
             {
                 "date": d.isoformat(),
                 "logged": d in by_date and by_date[d].loggedAt is not None,
-                "goal": (by_date[d].goal if d in by_date else Counts()).model_dump(),
+                "goal": goals[d][0].model_dump(),
                 "done": snap["dayDone"].get(d, Counts()).model_dump(),
-                "itemsDone": sum(1 for i in by_date[d].goalItems if i.done) if d in by_date else 0,
-                "itemsTotal": len(by_date[d].goalItems) if d in by_date else 0,
+                "itemsDone": sum(1 for i in goals[d][1] if i.done),
+                "itemsTotal": len(goals[d][1]),
             }
             for d in days
         ],
@@ -94,10 +99,12 @@ async def previous_goals(
     monday = parse_monday(week_start)
     plan = (await _snapshot(user.id, monday - timedelta(days=7)))["plan"]
     if plan is None:
-        return {"goal": None, "goalItems": []}
+        return {"goal": None, "goalItems": [], "dailyGoal": None, "dailyGoalItems": []}
     return {
         "goal": plan.goal.model_dump(),
         "goalItems": [{"text": i.text, "done": False} for i in plan.goalItems if not i.done],
+        "dailyGoal": plan.dailyGoal.model_dump(),
+        "dailyGoalItems": [{"text": i.text, "done": False} for i in plan.dailyGoalItems],
     }
 
 
@@ -124,6 +131,9 @@ async def put_week(
         )
     plan.goal = body.goal
     plan.goalItems = body.goalItems
+    plan.dailyGoal = Counts(bidsSelf=body.dailyGoal.bidsSelf, bidsBidder=body.dailyGoal.bidsBidder)
+    # Daily lines are a template: ticks happen on each day.
+    plan.dailyGoalItems = [ChecklistItem(text=i.text) for i in body.dailyGoalItems]
     plan.recapNotes = body.recapNotes
     if plan.id is None:
         await plan.insert()

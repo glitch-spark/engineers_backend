@@ -59,6 +59,10 @@ class WeeklyPlan(TimestampedDocument):
     endDate: datetime
     goal: Counts = Field(default_factory=Counts)
     goalItems: ChecklistItems = []
+    # The goal for every working day of the week (bids + goal lines), set
+    # once with the week; a day keeps its own copy once followed up.
+    dailyGoal: Counts = Field(default_factory=Counts)
+    dailyGoalItems: ChecklistItems = []
     recapNotes: str = Field(default="", max_length=4000)
 
     @model_validator(mode="before")

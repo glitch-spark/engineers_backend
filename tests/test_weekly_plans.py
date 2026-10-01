@@ -13,14 +13,16 @@ def _week_body(**kw):
     body = {
         "goal": {"bidsSelf": 750, "bidsBidder": 500, "interviewsSelf": 10, "interviewsCaller": 5},
         "goalItems": [{"text": "Profile update"}, {"text": "LinkedIn creation", "done": True}],
+        "dailyGoal": {"bidsSelf": 85, "bidsBidder": 125},
+        "dailyGoalItems": [{"text": "Seek caller"}, {"text": "Bidder review"}],
         "recapNotes": "",
     }
     body.update(kw)
     return body
 
 
-def _follow_up(self_=0, bidder=0):
-    return {"goal": {}, "done": {"bidsSelf": self_, "bidsBidder": bidder}}
+def _follow_up(self_=0, bidder=0, items=()):
+    return {"done": {"bidsSelf": self_, "bidsBidder": bidder}, "goalItems": list(items)}
 
 
 async def test_requires_auth(client):
@@ -35,6 +37,8 @@ async def test_put_and_get_week(client, staff_user, auth_header):
     assert week["weekStart"] == WEEK and week["exists"] is True
     assert week["goal"] == {"bidsSelf": 750, "bidsBidder": 500, "interviewsSelf": 10, "interviewsCaller": 5}
     assert [i["done"] for i in week["goalItems"]] == [False, True]
+    assert week["dailyGoal"] == {"bidsSelf": 85, "bidsBidder": 125, "interviewsSelf": 0, "interviewsCaller": 0}
+    assert [i["text"] for i in week["dailyGoalItems"]] == ["Seek caller", "Bidder review"]
     assert "planNotes" not in week
 
     stored = await WeeklyPlan.find_one({"userId": staff_user.id})
@@ -60,9 +64,9 @@ async def test_week_done_from_logged_days_and_interviews(client, staff_user, aut
     await client.put("/daily-plans/2026-09-28", headers=h, json=_follow_up(4, 1))
     await client.put("/daily-plans/2026-09-30", headers=h, json=_follow_up(6, 2))
     await client.put("/daily-plans/2026-10-04", headers=h, json=_follow_up(1, 0))  # Sunday
-    # A goal-only day doesn't add bids.
+    await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body())
     await client.put("/daily-plans/2026-10-01", headers=h,
-                     json={"goal": {"bidsSelf": 9}, "goalItems": [{"text": "A", "done": True}, {"text": "B"}]})
+                     json=_follow_up(0, 0, [{"text": "Seek caller", "done": True}, {"text": "Bidder review"}]))
     account_id = PydanticObjectId()
     await Interview(accountId=account_id, createdBy=staff_user.id, scheduledAt=datetime(2026, 9, 29, 15),
                     stage="intro", status="completed").insert()
@@ -77,8 +81,10 @@ async def test_week_done_from_logged_days_and_interviews(client, staff_user, aut
     assert "2026-10-04" in days
     assert days["2026-09-28"]["logged"] is True and days["2026-09-29"]["logged"] is False
     assert days["2026-09-30"]["done"]["bidsSelf"] == 6
-    assert days["2026-10-01"]["goal"]["bidsSelf"] == 9
+    # Every day's goal is the week's daily goal.
+    assert days["2026-09-29"]["goal"]["bidsSelf"] == 85 and days["2026-10-01"]["goal"]["bidsBidder"] == 125
     assert (days["2026-10-01"]["itemsDone"], days["2026-10-01"]["itemsTotal"]) == (1, 2)
+    assert (days["2026-09-29"]["itemsDone"], days["2026-09-29"]["itemsTotal"]) == (0, 2)
 
 
 async def test_previous_goals_carries_unticked_items(client, staff_user, auth_header):
@@ -88,8 +94,10 @@ async def test_previous_goals_carries_unticked_items(client, staff_user, auth_he
     assert r.status_code == 200
     assert r.json()["goal"]["bidsSelf"] == 750
     assert r.json()["goalItems"] == [{"text": "Profile update", "done": False}]
+    assert r.json()["dailyGoal"]["bidsSelf"] == 85
+    assert [i["text"] for i in r.json()["dailyGoalItems"]] == ["Seek caller", "Bidder review"]
     r = await client.get("/weekly-plans/2026-09-14/previous-goals", headers=h)
-    assert r.json() == {"goal": None, "goalItems": []}
+    assert r.json() == {"goal": None, "goalItems": [], "dailyGoal": None, "dailyGoalItems": []}
 
 
 async def test_delete_week(client, staff_user, auth_header):

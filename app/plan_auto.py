@@ -16,7 +16,7 @@ from typing import Any, Optional
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
 from app.models import DailyPlan, WeeklyPlan
-from app.models.plan_common import Counts
+from app.models.plan_common import ChecklistItem, Counts
 
 
 def empty_day() -> dict:
@@ -60,6 +60,19 @@ def effective_daily_done(plan: Optional[Any], auto_day: dict) -> Counts:
         interviewsSelf=auto_day["self"],
         interviewsCaller=auto_day["caller"],
     )
+
+
+def day_goal(plan: Optional[Any], weekly: Optional[Any]) -> tuple[Counts, list[ChecklistItem]]:
+    """A day's goal: its own copy once followed up (or carried over from older
+    data), otherwise the week's daily goal with every line unticked."""
+    if plan is not None and (
+        plan.loggedAt is not None or plan.goal.bidsSelf or plan.goal.bidsBidder or plan.goalItems
+    ):
+        return plan.goal, list(plan.goalItems)
+    if weekly is None:
+        return Counts(), []
+    goal = Counts(bidsSelf=weekly.dailyGoal.bidsSelf, bidsBidder=weekly.dailyGoal.bidsBidder)
+    return goal, [ChecklistItem(text=i.text) for i in weekly.dailyGoalItems]
 
 
 def weekly_done(days: list, week_interviews: dict) -> Counts:
