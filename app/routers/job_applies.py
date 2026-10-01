@@ -205,6 +205,37 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
     return out
 
 
+async def _rows_query(
+    run: JobApplyRun, *, view: str = "all", account_id: str = "", min_score: Optional[int] = None, applied: str = "any"
+) -> dict[str, Any]:
+    """The rows filter behind the table, the 'To apply' count and 'Mark all'. 'Applied' means marked in this
+    run, or the URL is in the permanent log from another run."""
+    q: dict[str, Any] = {"runId": run.id}
+    floor = max(run.threshold, min_score or 0)
+    if view == "suggested":
+        q["topScore"] = {"$gte": floor}
+    elif view == "excluded":
+        q["$or"] = [{"status": "excluded"}, {"status": "scored", "topScore": None}]
+    elif view == "failed":
+        q["status"] = {"$in": list(FAILED)}
+    elif min_score is not None:
+        q["topScore"] = {"$gte": min_score}
+    if account_id:
+        q["bestByProfile"] = {"$elemMatch": {"accountId": account_id, **({"total": {"$gte": floor}} if view == "suggested" else {})}}
+    if applied != "any":
+        run_urls = await JobApplyRow.get_motor_collection().distinct("url", {"runId": run.id})
+        logged = await JobApplicationLog.get_motor_collection().distinct(
+            "url", {"userId": run.userId, "url": {"$in": run_urls}, "runId": {"$ne": run.id}}
+        )
+        cond = (
+            {"$or": [{"appliedResumes.0": {"$exists": True}}, {"applied": True}, {"url": {"$in": logged}}]}
+            if applied == "yes"
+            else {"appliedResumes.0": {"$exists": False}, "applied": {"$ne": True}, "url": {"$nin": logged}}
+        )
+        q = {"$and": [q, cond]}
+    return q
+
+
 # ---------- runs ----------
 
 
@@ -283,6 +314,7 @@ async def get_run(
     out = await _run_out(run, with_profiles=True)
     log = JobApplicationLog.get_motor_collection()
     out["appliedInRun"] = await log.count_documents({"runId": run.id})
+    out["toApply"] = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).count()
     if appliedSince:
         out["appliedSince"] = await log.count_documents({"userId": run.userId, "appliedAt": {"$gte": _naive_utc(appliedSince)}})
     return out
@@ -364,30 +396,7 @@ async def list_rows(
     limit: int = Query(50, ge=1, le=200),
 ) -> dict:
     run = await _owned_run(run_id, user)
-    q: dict[str, Any] = {"runId": run.id}
-    floor = max(run.threshold, minScore or 0)
-    if view == "suggested":
-        q["topScore"] = {"$gte": floor}
-    elif view == "excluded":
-        q["$or"] = [{"status": "excluded"}, {"status": "scored", "topScore": None}]
-    elif view == "failed":
-        q["status"] = {"$in": list(FAILED)}
-    elif minScore is not None:
-        q["topScore"] = {"$gte": minScore}
-    if accountId:
-        q["bestByProfile"] = {"$elemMatch": {"accountId": accountId, **({"total": {"$gte": floor}} if view == "suggested" else {})}}
-    if applied != "any":
-        # "Applied" = marked in this run, or the URL is in the permanent log from another run.
-        run_urls = await JobApplyRow.get_motor_collection().distinct("url", {"runId": run.id})
-        logged = await JobApplicationLog.get_motor_collection().distinct(
-            "url", {"userId": run.userId, "url": {"$in": run_urls}, "runId": {"$ne": run.id}}
-        )
-        cond = (
-            {"$or": [{"appliedResumes.0": {"$exists": True}}, {"applied": True}, {"url": {"$in": logged}}]}
-            if applied == "yes"
-            else {"appliedResumes.0": {"$exists": False}, "applied": {"$ne": True}, "url": {"$nin": logged}}
-        )
-        q = {"$and": [q, cond]}
+    q = await _rows_query(run, view=view, account_id=accountId, min_score=minScore, applied=applied)
 
     total = await JobApplyRow.find(q).count()
     rows = await (
@@ -475,21 +484,60 @@ async def set_row_applied(row_id: str, body: AppliedBody, user: Annotated[UserEx
 
 
 class BulkAppliedBody(BaseModel):
-    rowIds: list[str] = Field(max_length=500)
+    rowIds: list[str] = Field(default_factory=list, max_length=1000)
+    # True = every job still to apply to in this run (all pages), instead of rowIds.
+    all: bool = False
+    # With a profile filter, use that profile's best resume.
+    accountId: str = ""
 
 
 @router.post("/runs/{run_id}/mark-top-applied")
 async def mark_top_applied(
     run_id: str, body: BulkAppliedBody, user: Annotated[UserExtra, Depends(get_current_user)]
 ) -> dict:
-    """Mark each selected job's top suggestion as applied (skips jobs with no suggestion or already marked)."""
+    """Mark the top suggestion applied for the selected jobs, or for every job still to apply to. Skips jobs
+    with no suggestion, already marked, or applied in an earlier run. Returns the marks made, for Undo."""
     run = await _owned_run(run_id, user)
-    ids = [to_object_id(i) for i in body.rowIds]
-    marked = 0
-    for row in await JobApplyRow.find({"_id": {"$in": ids}, "runId": run.id}).to_list():
-        tops = [s for s in row.bestByProfile if s.total >= run.threshold]
+    if body.all:
+        q = await _rows_query(run, view="suggested", account_id=body.accountId, applied="no")
+    else:
+        q = {"_id": {"$in": [to_object_id(i) for i in body.rowIds]}, "runId": run.id}
+        q = {"$and": [q, await _rows_query(run, applied="no")]}
+    marks = []
+    for row in await JobApplyRow.find(q).to_list():
+        tops = [
+            s for s in row.bestByProfile
+            if s.total >= run.threshold and (not body.accountId or s.accountId == body.accountId)
+        ]
         if not tops or row.appliedResumes or row.applied:
             continue
         await _set_applied(row, tops[0].accountId, tops[0].resumeId, tops[0].filename, True)
-        marked += 1
-    return {"marked": marked}
+        marks.append({"rowId": str(row.id), "accountId": tops[0].accountId, "resumeId": tops[0].resumeId})
+    return {"marked": len(marks), "marks": marks}
+
+
+class MarkRef(BaseModel):
+    rowId: str
+    accountId: str
+    resumeId: str
+
+
+class UnmarkBody(BaseModel):
+    marks: list[MarkRef] = Field(max_length=1000)
+
+
+@router.post("/runs/{run_id}/unmark-applied")
+async def unmark_applied(run_id: str, body: UnmarkBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Undo for a bulk mark: removes exactly the given marks."""
+    run = await _owned_run(run_id, user)
+    rows = {
+        str(r.id): r
+        for r in await JobApplyRow.find({"_id": {"$in": [to_object_id(m.rowId) for m in body.marks]}, "runId": run.id}).to_list()
+    }
+    done = 0
+    for m in body.marks:
+        row = rows.get(m.rowId)
+        if row and any(a.resumeId == m.resumeId for a in row.appliedResumes):
+            await _set_applied(row, m.accountId, m.resumeId, "", False)
+            done += 1
+    return {"unmarked": done}

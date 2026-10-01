@@ -406,3 +406,34 @@ async def test_mark_rejects_unknown_resume(client, staff_user, staff_user_2, aut
                          json={"accountId": str(acc.id), "resumeId": "nope", "applied": True})
     assert r.status_code == 400
     assert (await _mark(client, auth_header(staff_user_2), row)).status_code == 404
+
+
+async def test_mark_all_top_applied_and_undo(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id, rows = await _done_run(client, h, acc)
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["toApply"] == 2  # remote + fetched greenhouse job; the hybrid one is excluded
+
+    r = await client.post(f"/job-applies/runs/{run_id}/mark-top-applied", headers=h, json={"all": True})
+    body = r.json()
+    assert r.status_code == 200 and body["marked"] == 2 and len(body["marks"]) == 2
+    assert (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["toApply"] == 0
+
+    r = await client.post(f"/job-applies/runs/{run_id}/unmark-applied", headers=h, json={"marks": body["marks"]})
+    assert r.status_code == 200 and r.json()["unmarked"] == 2
+    assert (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["toApply"] == 2
+
+    other = await client.post(f"/job-applies/runs/{run_id}/mark-top-applied", headers=h, json={"all": True, "accountId": "000000000000000000000000"})
+    assert other.json()["marked"] == 0
+
+
+async def test_mark_all_skips_jobs_applied_in_earlier_runs(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    _, rows = await _done_run(client, h, acc)
+    await _mark(client, h, rows["https://jobs.example.com/remote"])
+    run2, _ = await _done_run(client, h, acc)
+    assert (await client.get(f"/job-applies/runs/{run2}", headers=h)).json()["toApply"] == 1
+    r = await client.post(f"/job-applies/runs/{run2}/mark-top-applied", headers=h, json={"all": True})
+    assert r.json()["marked"] == 1
