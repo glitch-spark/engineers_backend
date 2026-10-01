@@ -10,7 +10,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from app.interview_normalize import interview_status_value  # noqa: E402
 from app.models.interview import InterviewStatus  # noqa: E402
 from app.routers.applications import pipeline_outcome_for_status  # noqa: E402
-from app.routers.metrics import _count_interview_rounds  # noqa: E402
+from app.interview_rounds import count_interview_rounds as _count_interview_rounds  # noqa: E402
 
 START = datetime(2026, 9, 28, tzinfo=timezone.utc)
 END = datetime(2026, 10, 4, 23, 59, 59, tzinfo=timezone.utc)

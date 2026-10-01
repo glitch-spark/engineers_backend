@@ -15,12 +15,19 @@ import hashlib
 import logging
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.deps import get_current_user
 from app.interview_normalize import interview_status_value
+from app.interview_rounds import (
+    BREAKDOWN_ORDER as _BREAKDOWN_ORDER,
+    _as_aware,
+    count_interview_rounds as _count_interview_rounds,
+    empty_breakdown as _empty_breakdown,
+    load_interviews_for_window as _load_interviews_for_window,
+)
 from app.models import Interview, ResumeApplication, Transaction, UserExtra, WeeklyPlan
 from app.routers._util import parse_date
 
@@ -73,46 +80,6 @@ async def _bid_count(user_id, start: datetime, end: datetime) -> int:
     ).count()
 
 
-# Rounds excluded from interview KPIs / leaderboard (matches Interviews board).
-_ROUND_COUNT_EXCLUDED = frozenset({
-    "ai_interview",
-    "home_assessment",
-})
-
-# Board-style breakdown labels (order preserved for display).
-_BREAKDOWN_ORDER = (
-    ("intro", "Intro"),
-    ("tech", "Tech"),
-    ("hiring", "Hiring"),
-    ("panel", "Panel"),
-    ("final", "Final"),
-)
-
-
-def _breakdown_group(stage: str) -> Optional[str]:
-    if stage in _ROUND_COUNT_EXCLUDED:
-        return None
-    if stage == "intro":
-        return "intro"
-    if stage in {
-        "tech", "tech1", "tech2",
-        "tech_round_1", "tech_round_2",
-        "live_coding", "system_design",
-    }:
-        return "tech"
-    if stage in {"cultural", "hiring_manager"}:
-        return "hiring"
-    if stage == "panel":
-        return "panel"
-    if stage in {"final", "offer"}:
-        return "final"
-    return None
-
-
-def _empty_breakdown() -> dict[str, int]:
-    return {key: 0 for key, _ in _BREAKDOWN_ORDER}
-
-
 def _format_breakdown(counts: dict[str, int]) -> list[dict]:
     """[{label, count}, ...] with zero counts omitted."""
     return [
@@ -120,108 +87,6 @@ def _format_breakdown(counts: dict[str, int]) -> list[dict]:
         for key, label in _BREAKDOWN_ORDER
         if int(counts.get(key, 0)) > 0
     ]
-
-
-def _norm_stage(stage: Any) -> Optional[str]:
-    if stage is None:
-        return None
-    if hasattr(stage, "value"):
-        stage = stage.value
-    s = str(stage).strip()
-    if s.startswith("InterviewStage."):
-        s = s.split(".", 1)[1]
-    if s in ("tech", "tech1"):
-        return "tech_round_1"
-    if s == "tech2":
-        return "tech_round_2"
-    if s == "hiring_manager":
-        return "cultural"
-    return s or None
-
-
-def _norm_status(status: Any) -> str:
-    if status is None:
-        return ""
-    if hasattr(status, "value"):
-        status = status.value
-    return str(status).strip()
-
-
-def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _dt_in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool:
-    d = _as_aware(dt)
-    if d is None:
-        return False
-    return _as_aware(start) <= d <= _as_aware(end)  # type: ignore[operator]
-
-
-def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str]]:
-    """Trail of (stage, scheduledAt, status) — history keeps its own dates and
-    statuses; the tip falls back to the interview-level scheduledAt/status."""
-    trail: list[tuple[str, Optional[datetime], str]] = []
-
-    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any) -> None:
-        stage = _norm_stage(stage_raw)
-        if not stage:
-            return
-        status = _norm_status(status_raw)
-        if trail and trail[-1][0] == stage:
-            _, prev_dt, prev_status = trail[-1]
-            trail[-1] = (stage, dt if dt is not None else prev_dt, status or prev_status)
-            return
-        trail.append((stage, dt, status))
-
-    for h in (iv.stageHistory or []):
-        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None), getattr(h, "status", None))
-    push(iv.stage, iv.scheduledAt, iv.status)
-    return trail
-
-
-def _count_interview_rounds(
-    iv: Interview, start: datetime, end: datetime,
-) -> tuple[int, int, dict[str, int]]:
-    """Return (countable_rounds, canceled, breakdown_counts) for rounds dated in range.
-
-    A round with status canceled counts toward `canceled`, never as held.
-    Countable rounds exclude AI Interview and Home Assessment.
-    """
-    breakdown = _empty_breakdown()
-    n = canceled = 0
-    for s, dt, round_status in _dated_rounds(iv):
-        if not _dt_in_range(dt, start, end):
-            continue
-        if round_status == "canceled":
-            canceled += 1
-            continue
-        if s in _ROUND_COUNT_EXCLUDED:
-            continue
-        group = _breakdown_group(s)
-        if not group:
-            continue
-        breakdown[group] = breakdown.get(group, 0) + 1
-        n += 1
-    return n, canceled, breakdown
-
-
-async def _load_interviews_for_window(user_ids: list, start: datetime, end: datetime) -> list[Interview]:
-    if not user_ids:
-        return []
-    return await Interview.find(
-        {
-            "createdBy": {"$in": user_ids},
-            "$or": [
-                {"scheduledAt": {"$gte": start, "$lte": end}},
-                {"stageHistory.scheduledAt": {"$gte": start, "$lte": end}},
-            ],
-        }
-    ).to_list()
 
 
 async def _interview_stats_by_user(user_ids: list, start: datetime, end: datetime) -> dict:

@@ -1,69 +1,53 @@
-"""Unit tests for round-level helpers in the interviews router (no database)."""
+"""Unit tests for interview round counting (moved out of app.routers.metrics)."""
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from types import SimpleNamespace
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from app.models.interview import InterviewCaller, InterviewStageEvent, InterviewStatus  # noqa: E402
-from app.routers.interviews import _sync_top_from_tip, mark_previous_passed, round_ends_at  # noqa: E402
+from app.interview_rounds import BREAKDOWN_ORDER, count_interview_rounds
 
-AT = datetime(2026, 10, 1, 14, tzinfo=timezone.utc)
-
-
-def _round(status, stage="intro", **kw):
-    return InterviewStageEvent(stage=stage, at=AT, scheduledAt=AT, status=status, **kw)
+START, END = datetime(2026, 9, 28), datetime(2026, 10, 4, 23, 59, 59)
 
 
-def test_mark_previous_passed_only_from_scheduled_or_completed():
-    for start, changed in (("scheduled", True), ("completed", True), ("passed", False), ("rejected", False), ("canceled", False)):
-        history = [_round(start)]
-        assert mark_previous_passed(history) is changed
-        expected = InterviewStatus.passed if changed else InterviewStatus(start)
-        assert history[0].status == expected
-    assert mark_previous_passed([]) is False
-
-
-def test_round_ends_at_defaults_one_hour():
-    assert round_ends_at(AT, None) == AT + timedelta(hours=1)
-    assert round_ends_at(AT, AT) == AT + timedelta(hours=1)
-    assert round_ends_at(AT, AT + timedelta(minutes=45)) == AT + timedelta(minutes=45)
-
-
-def test_sync_top_mirrors_round_fields():
-    caller = InterviewCaller(enabled=True, callerName="Sam")
-    tip = _round("scheduled", stage="panel", interviewerName="Dana", caller=caller, endsAt=AT + timedelta(minutes=30))
-    iv = SimpleNamespace(
-        stage=None, status=None, scheduledAt=AT, endsAt=None,
-        interviewerName=None, caller=None, stageHistory=[tip],
+def _iv(stage, status, scheduled_at, history=None):
+    stage_history = [
+        SimpleNamespace(stage=h_stage, scheduledAt=h_at) for h_stage, h_at in (history or [])
+    ]
+    return SimpleNamespace(
+        stage=stage,
+        status=status,
+        scheduledAt=scheduled_at,
+        stageHistory=stage_history,
     )
-    _sync_top_from_tip(iv)
-    assert iv.interviewerName == "Dana"
-    assert iv.caller == caller
-    assert iv.endsAt == AT + timedelta(minutes=30)
 
 
-def test_sync_top_follows_timed_tip_within_same_day():
-    tip = _round("scheduled", stage="panel", endsAt=AT + timedelta(hours=6))
-    tip.scheduledAt = AT + timedelta(hours=5)  # 19:00, same UTC day as the interview's 14:00
-    iv = SimpleNamespace(
-        stage=None, status=None, scheduledAt=AT, endsAt=AT + timedelta(hours=1),
-        interviewerName=None, caller=None, stageHistory=[tip],
-    )
-    _sync_top_from_tip(iv)
-    assert iv.scheduledAt == AT + timedelta(hours=5)
-    assert iv.endsAt == AT + timedelta(hours=6)
+def test_counts_each_dated_round_by_group():
+    iv = _iv("tech_round_2", "scheduled", datetime(2026, 10, 1, 15),
+             history=[("intro", datetime(2026, 9, 28, 14)), ("tech_round_1", datetime(2026, 9, 30, 14))])
+    rounds, canceled, bd = count_interview_rounds(iv, START, END)
+    assert (rounds, canceled) == (3, 0)
+    assert bd == {"intro": 1, "tech": 2, "hiring": 0, "panel": 0, "final": 0}
 
 
-def test_coworker_on_earlier_round_can_still_view():
-    from bson import ObjectId
+def test_excluded_stages_not_counted():
+    iv = _iv("home_assessment", "scheduled", datetime(2026, 9, 29),
+             history=[("ai_interview", datetime(2026, 9, 28))])
+    assert count_interview_rounds(iv, START, END)[0] == 0
 
-    from app.routers.interviews import _can_view
-    mate, owner = ObjectId(), ObjectId()
-    earlier = _round("passed", caller=InterviewCaller(enabled=True, coworkerIds=[mate]))
-    later = _round("scheduled", stage="panel")
-    iv = SimpleNamespace(createdBy=owner, caller=None, stageHistory=[earlier, later])
-    assert _can_view(iv, SimpleNamespace(id=mate, role="staff")) is True
-    assert _can_view(iv, SimpleNamespace(id=ObjectId(), role="staff")) is False
+
+def test_canceled_round_counts_as_canceled():
+    # Canceled is a round status now (the old stage-rejected + scheduled trick is migrated away).
+    iv = _iv("intro", "canceled", datetime(2026, 9, 30))
+    assert count_interview_rounds(iv, START, END)[:2] == (0, 1)
+
+
+def test_rounds_outside_window_ignored():
+    iv = _iv("final", "scheduled", datetime(2026, 10, 5, 9))
+    assert count_interview_rounds(iv, START, END)[0] == 0
+
+
+def test_breakdown_order_labels():
+    assert [label for _, label in BREAKDOWN_ORDER] == ["Intro", "Tech", "Hiring", "Panel", "Final"]
