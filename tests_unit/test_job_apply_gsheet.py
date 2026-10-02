@@ -56,6 +56,25 @@ async def test_private_sheet_gives_sharing_hint():
             await download_gsheet(f"https://docs.google.com/spreadsheets/d/{SID}/edit", client=c)
 
 
+async def test_unknown_tab_falls_back_to_first_tab():
+    # A link can name a tab that no longer exists (e.g. gid=0 after the first tab was deleted): the browser
+    # quietly opens the first tab, but the export answers 400 with an HTML "Page Not Found".
+    seen = []
+
+    def handler(request):
+        seen.append(dict(request.url.params))
+        if "gid" in request.url.params:
+            return httpx.Response(400, text="<html>Page Not Found</html>", headers={"content-type": "text/html"})
+        return httpx.Response(200, content=f"url,description\nhttps://a.com/1,\"{JD}\"\n".encode(), headers={
+            "content-type": "text/csv",
+        })
+
+    async with client(handler) as c:
+        _, rows = await download_gsheet(f"https://docs.google.com/spreadsheets/d/{SID}/edit?gid=0#gid=0", client=c)
+    assert seen == [{"format": "csv", "gid": "0"}, {"format": "csv"}]
+    assert [r.url for r in rows] == ["https://a.com/1"]
+
+
 async def test_missing_sheet():
     async with client(lambda r: httpx.Response(404, text="nope")) as c:
         with pytest.raises(SheetError, match="not found"):

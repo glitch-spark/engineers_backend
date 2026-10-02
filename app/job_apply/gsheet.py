@@ -4,6 +4,7 @@ The linked tab is downloaded as CSV. CSV keeps only a cell's display text, so wh
 text ("Apply") and no URL column is found, the workbook is downloaded as .xlsx instead, which keeps
 hyperlinks; that reads the workbook's first tab.
 """
+import logging
 import re
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -12,7 +13,9 @@ import httpx
 
 from app.job_apply.sheet import MAX_BYTES, SheetError, SheetRow, parse_sheet
 
-EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sid}/export"
+log = logging.getLogger(__name__)
+
+EXPORT_URL ="https://docs.google.com/spreadsheets/d/{sid}/export"
 TIMEOUT = 30.0
 DEFAULT_TITLE = "Google Sheet"
 PRIVATE_HINT = (
@@ -50,9 +53,13 @@ async def _export(client: httpx.AsyncClient, sid: str, fmt: str, gid: Optional[s
     try:
         resp = await client.get(EXPORT_URL.format(sid=sid), params=params, timeout=TIMEOUT, follow_redirects=True)
     except httpx.HTTPError as exc:
+        log.warning("google sheet export failed for %s (%s): %r", sid, params, exc)
         raise SheetError("Could not reach Google Sheets. Try again in a moment.") from exc
     if resp.status_code == 404:
         raise SheetError("Google Sheet not found. Check the link.")
+    if resp.status_code == 400 and gid:
+        # The link names a tab that doesn't exist; the browser opens the first tab then, so do the same.
+        return await _export(client, sid, fmt, None)
     if (
         resp.status_code in (401, 403)
         or resp.url.host == "accounts.google.com"
