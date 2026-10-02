@@ -54,7 +54,7 @@ class InterviewCaller(BaseModel):
     callerName: str = "TBD"
     # Exact start in UTC; None means the time is still TBD.
     startsAt: Optional[datetime] = None
-    timezone: Optional[str] = None  # IANA id from the Slack timezone allowlist
+    timezone: Optional[str] = None  # legacy, no longer written: Slack shows each reader their own time
     method: Optional[CallerMethod] = None
     methodValue: str = ""
     coworkerIds: List[PydanticObjectId] = []

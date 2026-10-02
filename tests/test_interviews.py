@@ -614,18 +614,31 @@ async def test_caller_mode_create_and_coworker_can_view(
     assert r.status_code == 403
 
 
-async def test_caller_mode_rejects_bad_timezone_and_unknown_coworker(client, staff_user, auth_header):
+async def test_caller_mode_rejects_unknown_coworker(client, staff_user, auth_header):
     acc = await _make_account(owner_id=staff_user.id)
-    for caller in (
-        {"enabled": True, "timezone": "Mars/Olympus"},
-        {"enabled": True, "coworkerIds": ["64b7f0000000000000000000"]},
-    ):
-        r = await client.post(
-            "/interviews",
-            headers=auth_header(staff_user),
-            json=_payload(account=acc, scheduled_at="2026-09-29T12:00:00", caller=caller),
-        )
-        assert r.status_code == 400, r.text
+    r = await client.post(
+        "/interviews",
+        headers=auth_header(staff_user),
+        json=_payload(
+            account=acc, scheduled_at="2026-09-29T12:00:00",
+            caller={"enabled": True, "coworkerIds": ["64b7f0000000000000000000"]},
+        ),
+    )
+    assert r.status_code == 400, r.text
+
+
+async def test_caller_mode_ignores_timezone_from_old_clients(client, staff_user, auth_header):
+    acc = await _make_account(owner_id=staff_user.id)
+    r = await client.post(
+        "/interviews",
+        headers=auth_header(staff_user),
+        json=_payload(
+            account=acc, scheduled_at="2026-09-29T12:00:00",
+            caller={"enabled": True, "timezone": "Mars/Olympus"},
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["caller"]["timezone"] is None
 
 
 async def test_put_legacy_rejected_scheduled_sets_canceled_without_new_round(client, staff_user, auth_header):
