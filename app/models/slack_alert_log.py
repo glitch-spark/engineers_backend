@@ -15,6 +15,7 @@ class SlackAlertLog(TimestampedDocument):
     kind examples:
       - t30:<interviewId>
       - digest:2026-07-28
+      - caller-reminder:<roundId>:<startEpoch> (userId = channel sentinel)
     """
 
     userId: PydanticObjectId

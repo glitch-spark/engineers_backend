@@ -22,6 +22,7 @@ from app.slack_bot import (
     digest_blocks,
     digest_summary,
     fmt_caller_time,
+    slack_time,
     split_digest_interviews,
 )
 
@@ -38,7 +39,6 @@ def _build(previous=None, valid=None, **kw):
         starts_at=START,
         owner_id=OWNER,
         valid_coworker_ids={str(B), str(C)} if valid is None else valid,
-        default_tz="America/New_York",
         previous=previous,
     )
 
@@ -47,18 +47,20 @@ def _entry(caller):
     return InterviewStageEvent(stage="intro", at=START, scheduledAt=START, status="scheduled", caller=caller)
 
 
-def test_defaults_to_tbd_and_owner_timezone():
+def test_defaults_to_tbd():
     c = _build()
     assert c.enabled is True
     assert c.callerName == "TBD"
     assert c.startsAt == START  # the caller joins at the round's start
-    assert c.timezone == "America/New_York"
+    assert c.timezone is None  # Slack shows each reader their own time
     assert c.coworkerIds == []
 
 
-def test_rejects_bad_timezone_method_time_and_unknown_coworker():
-    with pytest.raises(CallerError):
-        _build(timezone="Mars/Olympus")
+def test_old_clients_may_still_send_a_timezone():
+    assert _build(timezone="Mars/Olympus").timezone is None
+
+
+def test_rejects_bad_method_and_unknown_coworker():
     with pytest.raises(CallerError):
         _build(method="carrier_pigeon")
     with pytest.raises(CallerError):
@@ -80,7 +82,6 @@ def test_disable_keeps_previous_data_but_turns_off():
         starts_at=START,
         owner_id=OWNER,
         valid_coworker_ids=set(),
-        default_tz=None,
         previous=prev,
     )
     assert off.enabled is False
@@ -108,6 +109,17 @@ def test_fmt_caller_time():
     assert fmt_caller_time(None, tz) == "TBD"
     assert fmt_caller_time(start, tz) == "Tue 9/29 10:30 AM EDT (GMT−4:00)"
     assert fmt_caller_time(start, tz, with_day=False) == "10:30 AM EDT"
+
+
+def test_slack_time_shows_each_reader_their_own_time():
+    ts = int(START.timestamp())
+    assert slack_time(None) == "TBD"
+    assert slack_time(START) == (
+        f"<!date^{ts}^{{date_short_pretty}} {{time}}|Tue 9/29 10:30 AM EDT (GMT−4:00)>"
+    )
+    assert slack_time(START, with_day=False) == f"<!date^{ts}^{{time}}|10:30 AM EDT>"
+    # Naive datetimes from Mongo are UTC.
+    assert slack_time(START.replace(tzinfo=None)) == slack_time(START)
 
 
 def _iv(owner, *, caller=None, company="Acme"):
@@ -179,12 +191,12 @@ def test_caller_round_text_with_and_without_details():
     iv.jobUrl = "https://job-boards.greenhouse.io/wikimedia/jobs/7919287"
     entry = SimpleNamespace(
         stage="intro",
-        scheduledAt=datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc),
+        scheduledAt=START,
+        status="scheduled",
         interviewerName="Natalie Ross",
         caller=InterviewCaller(
             enabled=True,
-            startsAt=datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc),
-            timezone="America/New_York",
+            startsAt=START,
             method="phone_hushed",
             methodValue="+1 555 0100",
         ),
@@ -202,14 +214,29 @@ def test_caller_round_text_with_and_without_details():
     assert "*JD Link:* https://job-boards.greenhouse.io/wikimedia/jobs/7919287" in text
     assert "*Recruiter name:* Natalie Ross 🇺🇸" in text
     assert "*Stage:* Intro" in text
-    assert "*Interview time:* Tue 9/29 10:30 AM EDT (GMT−4:00)" in text
+    assert f"*Interview time:* {slack_time(START)}" in text
     assert "*Method:* Phone (Hushed) — +1 555 0100" in text
     assert "*Caller assigned:* TBD" in text
     assert "*Coworkers:* <@UB> Casey" in text
 
     entry.interviewerName = None
-    entry.caller = InterviewCaller(enabled=True, timezone="America/New_York")
+    entry.caller = InterviewCaller(enabled=True)
     text = caller_round_text(iv, entry, account=account, owner=_user("A"), coworkers=[])
     assert "*Recruiter name:* —" in text
     assert "*Method:* TBD" in text
     assert "*Coworkers:*" not in text
+    assert "CANCELED" not in text
+
+
+def test_caller_round_text_marks_canceled_rounds():
+    iv = _iv(OWNER, company="Wikimedia")
+    entry = SimpleNamespace(
+        stage="intro", scheduledAt=START, status="canceled", interviewerName=None,
+        caller=InterviewCaller(enabled=True, startsAt=START),
+    )
+    for status, enabled in (("canceled", True), ("rejected", True), ("scheduled", False)):
+        entry.status = status
+        entry.caller.enabled = enabled
+        text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"), coworkers=[])
+        assert text.startswith(":x: *CANCELED* — ~Caller needed~ — posted by <@UA>")
+        assert f"*Interview time:* ~{slack_time(START)}~" in text

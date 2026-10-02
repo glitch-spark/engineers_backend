@@ -187,7 +187,6 @@ async def _round_caller(
     *,
     starts_at: datetime,
     owner_id: Any,
-    user: UserExtra,
     previous: Optional[InterviewCaller],
 ) -> InterviewCaller:
     raw_ids = [str(i).strip() for i in (body.coworkerIds or []) if str(i).strip()]
@@ -198,14 +197,12 @@ async def _round_caller(
             {"_id": {"$in": oids}, "isActive": {"$ne": False}}
         ).to_list()
         valid = {str(u.id) for u in rows}
-    owner = user if str(user.id) == str(owner_id) else await UserExtra.get(owner_id)
     try:
         return build_round_caller(
             body,
             starts_at=starts_at,
             owner_id=owner_id,
             valid_coworker_ids=valid,
-            default_tz=owner.slackTimezone if owner else None,
             previous=previous,
         )
     except CallerError as exc:
@@ -267,8 +264,8 @@ async def _sync_caller_posts(
     *,
     deleted: Iterable[str] = (),
 ) -> None:
-    """Post #caller create/update/cancel messages for rounds whose caller
-    details changed since `before` (snapshots taken before the write)."""
+    """Create, edit or delete #caller posts for rounds whose caller details
+    changed since `before` (snapshots taken before the write)."""
     gone = set(deleted)
     entries = {e.id: e for e in iv.stageHistory if e.id}
     ts_changed = False
@@ -278,7 +275,8 @@ async def _sync_caller_posts(
             continue
         removed = rid in gone
         new = None if removed else round_caller_snapshot(entry)
-        kind = caller_post_kind(before.get(rid), new, round_deleted=removed)
+        has_post = bool(entry.caller is not None and (entry.caller.slackChannelTs or "").strip())
+        kind = caller_post_kind(before.get(rid), new, has_post=has_post, round_deleted=removed)
         if kind is None:
             continue
         ts = await notify_round_caller(iv, entry, kind, prev=before.get(rid))
@@ -734,7 +732,7 @@ async def _build_round(
     )
     if rnd.caller is not None:
         entry.caller = await _round_caller(
-            rnd.caller, starts_at=start, owner_id=owner_id, user=user, previous=None,
+            rnd.caller, starts_at=start, owner_id=owner_id, previous=None,
         )
     return entry
 
@@ -975,7 +973,7 @@ async def update_interview_stage(
     if body.caller is not None:
         entry.caller = await _round_caller(
             body.caller, starts_at=entry.scheduledAt, owner_id=iv.createdBy,
-            user=user, previous=entry.caller,
+            previous=entry.caller,
         )
     iv.stageHistory[idx] = entry
 
@@ -1009,7 +1007,7 @@ async def delete_interview_stage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="An interview needs at least one round",
         )
-    # Cancel the round's #caller thread while the round still exists.
+    # Remove the round's #caller post while the round still exists.
     await _sync_caller_posts(iv, before, deleted={stage_id})
     iv.stageHistory.pop(idx)
     _reject_adjacent_duplicate(iv)

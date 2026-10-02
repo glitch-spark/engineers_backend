@@ -10,16 +10,17 @@ from pydantic import BaseModel
 
 from app.interview_normalize import normalize_stage, normalize_status
 from app.models.interview import InterviewCaller
-from app.slack_timezones import normalize_slack_timezone, validate_timezone
 
 CALLER_METHODS = ("video", "phone_hushed", "phone_slynumber")
+# Statuses that call a round off: its #caller post is marked canceled.
+ENDED_STATUSES = ("canceled", "rejected")
 
 
 class CallerIn(BaseModel):
+    # Older clients also send `timezone`; it is ignored (Slack shows each
+    # reader their own time).
     enabled: bool = False
     callerName: Optional[str] = None
-    # Display time zone for Slack; the caller joins at the round's start.
-    timezone: Optional[str] = None
     method: Optional[str] = None
     methodValue: Optional[str] = None
     coworkerIds: Optional[List[str]] = None
@@ -47,24 +48,14 @@ def build_round_caller(
     starts_at: datetime,
     owner_id: PydanticObjectId,
     valid_coworker_ids: set[str],
-    default_tz: Optional[str],
     previous: Optional[InterviewCaller] = None,
 ) -> InterviewCaller:
     """Caller subdocument for a round. The caller joins at the round's start,
-    so there is no separate caller time; `timezone` only drives Slack display."""
+    so there is no separate caller time."""
     if not body.enabled:
         if previous is None:
             return InterviewCaller(enabled=False)
         return previous.model_copy(update={"enabled": False})
-
-    tz_raw = (body.timezone or "").strip()
-    if tz_raw:
-        try:
-            tz_name = validate_timezone(tz_raw)
-        except ValueError as exc:
-            raise CallerError(str(exc)) from exc
-    else:
-        tz_name = normalize_slack_timezone(default_tz)
 
     method = (body.method or "").strip() or None
     if method is not None and method not in CALLER_METHODS:
@@ -85,7 +76,6 @@ def build_round_caller(
         enabled=True,
         callerName=(body.callerName or "").strip() or "TBD",
         startsAt=_as_utc(starts_at),
-        timezone=tz_name,
         method=method,
         methodValue=(body.methodValue or "").strip(),
         coworkerIds=ids,
@@ -121,20 +111,33 @@ def round_caller_snapshot(entry: Any) -> Optional[dict]:
     }
 
 
+def _is_on(snapshot: Optional[dict]) -> bool:
+    """A caller is requested and the round is not called off."""
+    return snapshot is not None and snapshot.get("status") not in ENDED_STATUSES
+
+
 def caller_post_kind(
-    prev: Optional[dict], new: Optional[dict], *, round_deleted: bool = False,
+    prev: Optional[dict], new: Optional[dict], *, has_post: bool, round_deleted: bool = False,
 ) -> Optional[str]:
-    """created / updated / canceled / None for a round's #caller thread."""
-    if prev is None:
-        if new is None or round_deleted or new.get("status") == "canceled":
-            return None
-        return "created"
-    # Only a still-scheduled call can be canceled: deleting an old interview or
-    # dropping the caller from a finished/canceled round posts nothing.
-    ending = round_deleted or new is None or new.get("status") == "canceled"
-    if ending:
-        return "canceled" if prev.get("status") == "scheduled" else None
-    return "updated" if new != prev else None
+    """What a write does to a round's #caller post.
+
+    created → new main post; updated / canceled / restored → main post edited
+    plus a thread reply; deleted → main post removed; None → nothing.
+    `has_post` is whether the round already has a main post.
+    """
+    if round_deleted:
+        return "deleted" if has_post else None
+    was_on, is_on = _is_on(prev), _is_on(new)
+    if not has_post:
+        # Also retries a first post that failed, on the next real change.
+        return "created" if is_on and new != prev else None
+    if was_on and not is_on:
+        return "canceled"
+    if is_on and not was_on:
+        return "restored"
+    if is_on and new != prev:
+        return "updated"
+    return None
 
 
 def caller_change_lines(
