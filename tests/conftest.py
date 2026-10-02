@@ -25,6 +25,8 @@ os.environ.setdefault("FRONTEND_ORIGIN", "http://test.localhost")
 os.environ.setdefault("APP_BASE_URL", "http://test.localhost")
 os.environ.setdefault("APP_TIMEZONE", "UTC")
 os.environ.setdefault("JWT_EXPIRES_MIN", "60")
+os.environ["JOB_APPLY_WORKER_DISABLED"] = "1"  # tests drive app.job_apply.worker.run_worker directly
+os.environ["RESUME_QUEUE_DISABLED"] = "1"  # tests drive app.resume_queue directly
 
 from typing import AsyncIterator  # noqa: E402
 
@@ -34,7 +36,22 @@ from asgi_lifespan import LifespanManager  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 from app.main import app as fastapi_app  # noqa: E402
-from app.models import Account, DailyPlan, Interview, Notification, RecurringCharge, Transaction, UserExtra, WeeklyPlan  # noqa: E402
+from app.models import (  # noqa: E402
+    Account,
+    DailyPlan,
+    Interview,
+    JobApplicationLog,
+    JobApplyRow,
+    JobApplyRun,
+    JobExtractionCache,
+    JobPostingCache,
+    Notification,
+    RecurringCharge,
+    ResumeApplication,
+    Transaction,
+    UserExtra,
+    WeeklyPlan,
+)
 from app.security import create_access_token, hash_password  # noqa: E402
 
 
@@ -59,7 +76,10 @@ async def client(app) -> AsyncIterator[AsyncClient]:
 
 @pytest_asyncio.fixture(autouse=True)
 async def db_clean(app) -> AsyncIterator[None]:
-    for model in (UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge):
+    for model in (
+        UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge,
+        JobApplyRun, JobApplyRow, JobExtractionCache, JobPostingCache, JobApplicationLog, ResumeApplication,
+    ):
         await model.delete_all()
     yield
 

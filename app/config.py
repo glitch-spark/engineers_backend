@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # the top; the tail is benefits/EEO/legal boilerplate. Trimming cuts
     # input tokens with negligible quality loss. ~12000 chars ≈ 3K tokens.
     RESUME_JD_MAX_CHARS: int = 12000
+    # Generation queue (app/resume_queue.py): resumes generating at once, PDF renders (Chromium) at once,
+    # and generations a user may queue per day (both the Generator page and Job Applies).
+    RESUME_LLM_CONCURRENCY: int = 3
+    RESUME_RENDER_CONCURRENCY: int = 2
+    RESUME_DAILY_CAP: int = 300
     # Reasoning effort for non-resume gpt-5* calls (interview rollup,
     # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for
@@ -60,6 +65,9 @@ class Settings(BaseSettings):
     # rest of the app still boots without these. EMAIL_TOKEN_KEY is a 32-byte
     # urlsafe-base64 Fernet key — generate one with
     #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Service account for writing Job Applies exports into a Google Sheet shared with its email as Editor:
+    # the key file's JSON (or a path to it). Unset = export disabled with a setup message.
+    GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = None
     GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
     GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None
     GOOGLE_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/gmail/oauth-callback"

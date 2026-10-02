@@ -36,6 +36,8 @@ class UserExtra(TimestampedDocument):
     # overrides take precedence per profile.
     resumePromptBody: Optional[str] = None
     screeningPromptBody: Optional[str] = None
+    # Google Sheet that Job Applies exports go to (shared with the service account as Editor).
+    jobApplySheetUrl: Optional[str] = None
     coverLetterPromptBody: Optional[str] = None
 
     # NVIDIA Integrate free-tier LLM (resume gen + job-linked screening only).

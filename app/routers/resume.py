@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import logging
 import re
@@ -12,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app import resume_queue
 from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import ScreeningPair as ScreeningPairModel
@@ -26,8 +26,6 @@ from app.routers._util import doc_to_dict, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
 log = logging.getLogger(__name__)
-
-MAX_JD_BYTES = 50_000
 
 _SAFE_FILENAME_SEG = re.compile(r"[^A-Za-z0-9 _\-().]+")
 
@@ -71,60 +69,22 @@ async def generate(
     body: GenerateBody,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Enqueue a resume-generation job and return immediately.
+    """Queue a resume-generation job and return immediately.
 
-    The actual OpenAI + PDF + (optional) screening work happens in a
-    background asyncio task. Frontend polls GET /resume/jobs to follow
-    progress.
+    The queue worker (app/resume_queue.py) runs the LLM + PDF + optional screening/cover-letter steps with
+    bounded concurrency. Frontend polls GET /resume/jobs to follow progress.
     """
-    if len(body.jobDescription.encode("utf-8")) > MAX_JD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"jobDescription exceeds {MAX_JD_BYTES} bytes",
-        )
-
     account = await _load_owned_account(body.accountId, user)
-    if not (account.styleTemplate or "").strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
-        )
-
-    company = body.company.strip()
-    questions = [q.strip() for q in body.questions if q and q.strip()]
-    profile_name = account.name or "profile"
-
-    job = ResumeApplication(
-        userId=user.id,
-        accountId=account.id,
-        profileName=profile_name,
-        companyName=company,
-        companyNameLower=company.lower(),
-        jobDescription=body.jobDescription,
-        jobUrl=(body.jobUrl or "").strip() or None,
-        screeningQuestions=questions,
-        status="queued",
-        step="queued",
-        pdfFilename=_build_filename(profile_name, company),
-        generateCoverLetter=bool(body.generateCoverLetter),
+    job = await resume_queue.enqueue_generation(
+        user=user,
+        account=account,
+        jd=body.jobDescription,
+        company=body.company,
+        job_url=body.jobUrl,
+        questions=body.questions,
+        prompt_body=body.promptBody,
+        cover_letter=body.generateCoverLetter,
     )
-    await job.insert()
-
-    prompt_body_override = (body.promptBody or "").strip()[:30000] or None
-
-    asyncio.create_task(
-        _run_job(
-            job_id=job.id,
-            account_id=account.id,
-            user_id=user.id,
-            jd=body.jobDescription,
-            company=company,
-            questions=questions,
-            prompt_body_override=prompt_body_override,
-            generate_cover_letter=body.generateCoverLetter,
-        )
-    )
-
     return {"jobId": str(job.id), "status": job.status}
 
 
@@ -168,10 +128,10 @@ async def _run_job(
         job.status = "in_progress"
         job.step = "generating_resume"
         job.startedAt = datetime.now(timezone.utc)
-        await job.save()
+        await resume_queue.persist_job(job)
 
         result = await generate_resume(
-            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner
+            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id)
         )
         job.inputTokens = result.input_tokens
         job.outputTokens = result.output_tokens
@@ -192,7 +152,7 @@ async def _run_job(
             job.s3Url = None    # legacy public URL — downloads use presigned URLs
         else:
             job.pdfData = base64.b64encode(result.pdf_bytes).decode("ascii")
-        await job.save()
+        await resume_queue.persist_job(job)
         log.info(
             "job %s pdf persisted: %d bytes (s3_key=%s)",
             job.id, len(result.pdf_bytes), result.s3_key or "<inline>",
@@ -201,7 +161,7 @@ async def _run_job(
         # ---- step 3: screening (optional) ----
         if questions:
             job.step = "generating_answers"
-            await job.save()
+            await resume_queue.persist_job(job)
 
             screening_result = await _run_screening(
                 account=account,
@@ -242,16 +202,32 @@ async def _run_job(
         job.step = "done"
         job.completedAt = datetime.now(timezone.utc)
         job.executionMs = int((time.monotonic() - started) * 1000)
-        await job.save()
+        await resume_queue.persist_job(job)
 
         # Pipeline is now driven entirely by email sync — completed resume
         # generations no longer auto-create Application rows. Users land in
         # the Pipeline board only when Gmail surfaces a confirmation,
         # recruiter reach-out, or interview email tied to a real company.
 
+    except resume_queue.Superseded:
+        log.info("resume job %s was re-queued elsewhere; this run stops", job_id)
     except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
         log.exception("resume job %s failed", job_id)
         await _mark_failed(job, str(exc), started)
+
+
+def run_job_doc(job: ResumeApplication):
+    """Run a claimed queue job with the inputs stored on it (used by app/resume_queue.py)."""
+    return _run_job(
+        job_id=job.id,
+        account_id=job.accountId,
+        user_id=job.userId,
+        jd=job.jobDescription,
+        company=job.companyName,
+        questions=list(job.screeningQuestions or []),
+        prompt_body_override=job.promptOverride,
+        generate_cover_letter=bool(job.generateCoverLetter),
+    )
 
 
 async def _mark_failed(job: ResumeApplication, message: str, started: float) -> None:
@@ -260,7 +236,9 @@ async def _mark_failed(job: ResumeApplication, message: str, started: float) -> 
     job.completedAt = datetime.now(timezone.utc)
     job.executionMs = int((time.monotonic() - started) * 1000)
     try:
-        await job.save()
+        await resume_queue.persist_job(job)
+    except resume_queue.Superseded:
+        pass
     except Exception:  # noqa: BLE001
         log.exception("could not persist failure for job %s", job.id)
 
@@ -496,6 +474,7 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "jobUrl": job.jobUrl,
         "status": job.status,
         "step": job.step,
+        "source": job.source,
         "pdfFilename": job.pdfFilename,
         "s3Key": job.s3Key,
         "errorMessage": job.errorMessage,
@@ -774,20 +753,10 @@ async def retry_job(
         )
 
     _reset_failed_job_fields(job)
+    job.attempts = 0
+    job.leaseAt = None
     await job.save()
-
-    asyncio.create_task(
-        _run_job(
-            job_id=job.id,
-            account_id=account.id,
-            user_id=job.userId,
-            jd=job.jobDescription,
-            company=job.companyName,
-            questions=list(job.screeningQuestions or []),
-            prompt_body_override=None,
-            generate_cover_letter=bool(job.generateCoverLetter),
-        )
-    )
+    resume_queue.wake()
 
     return {"jobId": str(job.id), "status": job.status}
 

@@ -18,6 +18,10 @@ class Resume(BaseModel):
     filename: str
     markdown: str
     uploadedAt: datetime = Field(default_factory=datetime.utcnow)
+    # Original uploaded file in S3 (app/resume_files.py); None when S3 isn't configured or for text-only resumes.
+    s3Key: Optional[str] = None
+    fileSize: Optional[int] = None
+    fileType: Optional[str] = None
 
 
 class Account(TimestampedDocument):
