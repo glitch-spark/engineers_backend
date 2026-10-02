@@ -37,6 +37,13 @@ class FetchError(Exception):
     pass
 
 
+class JobClosed(FetchError):
+    """The posting is gone. Raised instead of reading whatever page the dead link now shows."""
+
+
+_GONE = (404, 410)
+
+
 @dataclass
 class FetchResult:
     text: str
@@ -96,6 +103,17 @@ async def _get_page(client: httpx.AsyncClient, url: str) -> httpx.Response:
     raise FetchError("too many redirects")
 
 
+def _lands_on_job_list(original: str, final: str) -> bool:
+    """A closed job's link often redirects to the company's job list: Greenhouse adds ?error=true, others drop the
+    job's part of the path (/careers/597 -> /careers, or the site root)."""
+    end = urlsplit(final)
+    if "error=true" in end.query:
+        return True
+    start_segs = [s for s in urlsplit(original).path.split("/") if s]
+    end_segs = [s for s in end.path.split("/") if s]
+    return len(end_segs) < len(start_segs) and start_segs[: len(end_segs)] == end_segs
+
+
 # ---------- routing ----------
 
 
@@ -105,7 +123,7 @@ def route(url: str) -> tuple[str, dict]:
     segs = [s for s in parts.path.split("/") if s]
     if _UNSUPPORTED.search(host):
         return "unsupported", {}
-    if host in ("boards.greenhouse.io", "job-boards.greenhouse.io") and len(segs) >= 3 and segs[1] == "jobs":
+    if host in ("boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io") and len(segs) >= 3 and segs[1] == "jobs":
         return "greenhouse", {"board": segs[0], "id": segs[2]}
     if host == "jobs.lever.co" and len(segs) >= 2:
         return "lever", {"company": segs[0], "id": segs[1]}
@@ -252,7 +270,7 @@ async def _ashby(client, p) -> FetchResult:
     d = await _get_json(client, f"https://api.ashbyhq.com/posting-api/job-board/{p['org']}?includeCompensation=false")
     job = next((j for j in d.get("jobs") or [] if j.get("id") == p["id"]), None)
     if job is None:
-        raise FetchError("job not on board")
+        raise JobClosed("job closed (no longer on the Ashby board)")
     body = job.get("descriptionPlain") or html_to_text(job.get("descriptionHtml") or "")
     loc = job.get("location") or ""
     title = job.get("title", "")
@@ -373,13 +391,22 @@ async def fetch_job(
             res = await _ATS[kind](client, params)
             if len(res.text) >= MIN_TEXT:
                 return res
-        except Exception:  # noqa: BLE001 — any ATS API problem falls back to the page itself
+        except JobClosed:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in _GONE:
+                raise JobClosed(f"job closed (the {kind} API no longer lists it)") from exc
+        except Exception:  # noqa: BLE001 — any other ATS API problem falls back to the page itself
             pass
 
     await check_url(url)
     result: Optional[FetchResult] = None
     try:
         resp = await _get_page(client, url)
+        if resp.status_code in _GONE:
+            raise JobClosed(f"job closed (HTTP {resp.status_code})")
+        if _lands_on_job_list(url, str(resp.url)):
+            raise JobClosed("job closed (the link now opens the job list)")
         if resp.status_code < 400:
             result = await asyncio.to_thread(_from_page, resp.text, "html")
     except httpx.HTTPError:

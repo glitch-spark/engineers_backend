@@ -132,6 +132,66 @@ async def test_ats_failure_falls_back_to_generic():
     assert res.source == "html" and "distributed systems" in res.text
 
 
+def test_route_greenhouse_eu_board():
+    assert route("https://job-boards.eu.greenhouse.io/appinio/jobs/4949519101") == (
+        "greenhouse", {"board": "appinio", "id": "4949519101"},
+    )
+
+
+async def test_ats_job_off_the_board_is_closed():
+    # The API answering "gone" is definitive: the job page would only show the company's other openings.
+    page = f"<html><body>{LONG}</body></html>"
+    async with client({
+        "https://api.ashbyhq.com/posting-api/job-board/acme": (200, {"jobs": [{"id": "other"}]}),
+        "https://jobs.ashbyhq.com/acme/9a8b-77": (200, page),
+    }) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://jobs.ashbyhq.com/acme/9a8b-77", client=c)
+
+
+async def test_ats_404_is_closed():
+    page = f"<html><body>{LONG}</body></html>"
+    async with client({
+        "https://api.lever.co/v0/postings/acme/1f2e-33": (404, {"ok": False}),
+        "https://jobs.lever.co/acme/1f2e-33": (200, page),
+    }) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://jobs.lever.co/acme/1f2e-33", client=c)
+
+
+@pytest.mark.parametrize("status", [404, 410])
+async def test_gone_page_is_closed_without_trying_the_browser(status):
+    async def browser(url):  # renders the "no longer available" page as if it were the job
+        return f"<html><body>{LONG}</body></html>"
+
+    async with client({"https://careers.beta.io/": (status, f"<html><body>{LONG}</body></html>")}) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c, browser=browser)
+
+
+@pytest.mark.parametrize("target", ["/careers", "/", "/acme?error=true"])
+async def test_redirect_to_job_list_is_closed(target):
+    def handler(request):
+        if request.url.path == "/careers/597":
+            return httpx.Response(302, headers={"location": target})
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://careers.beta.io/careers/597", client=c)
+
+
+async def test_redirect_to_reposted_job_is_followed():
+    def handler(request):
+        if request.url.path == "/companies/acme/111-engineer":
+            return httpx.Response(301, headers={"location": "/companies/acme/222-engineer"})
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        res = await fetch_job("https://careers.beta.io/companies/acme/111-engineer", client=c)
+    assert "distributed systems" in res.text
+
+
 def test_html_to_text_keeps_line_structure():
     text = html_to_text("<h2>Requirements</h2><ul><li>Python</li><li>Go</li></ul>")
     assert text.splitlines() == ["Requirements", "- Python", "- Go"]
