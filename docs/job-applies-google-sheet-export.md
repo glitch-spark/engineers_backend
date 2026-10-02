@@ -35,7 +35,8 @@ shared Google Sheet. Each row has a **Download** link for the resume to send. Th
 
 - **Tabs:** one tab per day, named like `2026-10-02`. It is created on first use, with a bold frozen header and
   an **Applied** checkbox column. Later exports that day append to the same tab.
-- **Rows:** one per job still to apply to × profile the job is open to.
+- **Rows:** one per application still to go: a job × a profile it is open to that has a matching uploaded resume,
+  is tailor-only, or has a tailored resume for it. Applications already marked applied are left out.
 - **Resume:** the profile's tailored resume when it's ready. Otherwise its uploaded resume that meets the
   threshold, which has to have its original PDF stored in S3.
 - **Rows left out:** jobs still tailoring, with nothing to apply with, or already exported. The dialog shows how
