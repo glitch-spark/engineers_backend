@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v1"
+PROMPT_VERSION = "job-extract-v2"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -63,12 +63,20 @@ Rules:
 - degree.level: 1 associate/diploma, 2 bachelor, 3 master, 4 doctorate; the LOWEST degree accepted.
 - workMode: "remote with occasional travel or offsites" is remote. "Remote but must live within commuting distance
   of an office" or "N days in office" is hybrid. In-office/on-site only is onsite.
-- allowedLocations: where a remote hire may live. Regions: Worldwide, Americas, North America, Latam, EMEA, Europe,
-  EU, APAC, Asia. Countries as ISO-3166 alpha-2 codes. Empty list when the posting doesn't restrict location.
+- allowedLocations: where a remote hire may live. Take the first of these that the posting has:
+  1. Text on where hires may live or be based ("must be based in the US or EU", "can be done globally", "open to
+     candidates in the EMEA time zone"). List every country and region it allows. "Global", "globally", "anywhere"
+     and "international" are Worldwide. A time-zone window is the region it covers ("GMT +/-3" or "CET +/-2" is EMEA).
+  2. Otherwise the "Location:" line or the title ("Remote - UK" is GB, "Location: Bulgaria" is BG).
+  Never use where the company or its offices are. Keep a country a country; don't widen it into a region.
+  Regions: Worldwide, Americas, North America, Latam, EMEA, Europe, EU, APAC, Asia. Countries as ISO-3166 alpha-2
+  codes. Empty list only when the posting gives no location at all.
 - workAuthorization.restricted: true for "citizens only", "must be authorized to work in X without sponsorship",
   "no visa sponsorship"; countries are ISO-2 codes.
 - clearance.level "required" covers "must hold" AND "must be able to obtain" a security clearance.
-- postedDate: resolve relative phrases ("Posted 2 weeks ago") against today's date. null if not stated.
+- postedDate: when the job was posted or published; resolve relative phrases ("Posted 2 weeks ago") against today's
+  date. Never an archived, closing, expiry, deadline or updated date, nor a date from company news (founding,
+  funding, launches), and never today's date unless the posting says it was posted today. null if not stated.
 
 Job posting:
 <<<
@@ -231,6 +239,8 @@ _HYBRID = re.compile(
 _ONSITE = re.compile(r"\bon[- ]?site\b|\bin[- ]office\b|\bin[- ]person\b|\boffice[- ]based\b", re.I)
 _REMOTE = re.compile(r"\bremote\b|work from (?:home|anywhere)|\bWFH\b|fully distributed|distributed team", re.I)
 _REL_POSTED = re.compile(r"(\d+)\+?\s*(day|week|month)s?\s+ago", re.I)
+# "Archived 1 month ago" / "Updated 2 days ago" are not when the job was posted.
+_NOT_POSTED = re.compile(r"(?:archived|closed|expired|updated|deadline)\W*(?:\w+\W+){0,2}$", re.I)
 _POSTED_TODAY = re.compile(r"\bposted (?:today|just now)\b|\bjust posted\b", re.I)
 _POSTED_YESTERDAY = re.compile(r"\bposted yesterday\b", re.I)
 _POSTED_ISO = re.compile(r"(?:posted|published|date posted)[^\n\d]{0,25}(\d{4}-\d{2}-\d{2})", re.I)
@@ -293,7 +303,9 @@ def _posted_date(text: str, run_date: date) -> Optional[date]:
                     return d
             except ValueError:
                 continue
-    if m := _REL_POSTED.search(text):
+    for m in _REL_POSTED.finditer(text):
+        if _NOT_POSTED.search(text[max(0, m.start() - 30):m.start()]):
+            continue
         n, unit = int(m.group(1)), m.group(2).lower()
         days = n * {"day": 1, "week": 7, "month": 30}[unit]
         return run_date - timedelta(days=days)
@@ -415,6 +427,9 @@ async def extract_job(
     try:
         res = await llm(build_prompt(jd, run_date), user, validate=_validate, purpose="job_extract")
         ex = parse_extraction(res.text)
+        posted = ex.postedDate
+        if posted and (posted > run_date or (posted == run_date and _posted_date(jd, run_date) != run_date)):
+            ex.postedDate = None  # models answer "today" (from the prompt) when the posting gives no date
         if ex.postedDate is None:
             ex.postedDate = _posted_date(jd, run_date)
         return ex, "llm"

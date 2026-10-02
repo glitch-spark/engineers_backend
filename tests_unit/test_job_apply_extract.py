@@ -84,6 +84,50 @@ def test_rules_posted_absolute_date():
     assert rules_extract("Published: Sept. 3, 2026", RUN).postedDate == date(2026, 9, 3)
 
 
+def test_rules_posted_ignores_archived_and_closing_dates():
+    assert rules_extract("Archived 1 month ago\nRequirements\n- Python", RUN).postedDate is None
+    assert rules_extract("Closes in 3 days. Updated 2 days ago.", RUN).postedDate is None
+    assert rules_extract("Archived 1 month ago\nPosted 2 months ago", RUN).postedDate == date(2026, 8, 2)
+
+
+def _llm_says(text):
+    class R:
+        pass
+
+    R.text = text
+
+    async def fake(prompt, user, *, validate=None, purpose="llm"):
+        validate(R.text)
+        return R
+
+    return fake
+
+
+async def test_extract_job_drops_llm_date_of_today_without_evidence():
+    # Asked for a date the posting doesn't give, models answer with "today's date" from the prompt.
+    llm = _llm_says('{"title":"T","terms":[{"term":"Python"}],"postedDate":"2026-10-01"}')
+    ex, _ = await extract_job("Requirements:\n- Python", user=None, run_date=RUN, llm=llm)
+    assert ex.postedDate is None
+
+
+async def test_extract_job_keeps_llm_date_of_today_when_posted_today():
+    llm = _llm_says('{"title":"T","terms":[{"term":"Python"}],"postedDate":"2026-10-01"}')
+    ex, _ = await extract_job("Posted today\nRequirements:\n- Python", user=None, run_date=RUN, llm=llm)
+    assert ex.postedDate == RUN
+
+
+async def test_extract_job_drops_future_llm_date():
+    llm = _llm_says('{"title":"T","terms":[{"term":"Python"}],"postedDate":"2026-12-01"}')
+    ex, _ = await extract_job("Requirements:\n- Python", user=None, run_date=RUN, llm=llm)
+    assert ex.postedDate is None
+
+
+def test_build_prompt_location_and_date_rules():
+    p = build_prompt("JD", RUN)
+    assert "every country and region" in p and "GMT" in p and "Location:" in p
+    assert "archived" in p.lower() and "never today's date" in p.lower()
+
+
 def test_build_prompt_contains_rules():
     p = build_prompt("JD TEXT HERE", RUN)
     assert "JD TEXT HERE" in p and "2026-10-01" in p and '"workMode"' in p and "able to obtain" in p
