@@ -252,6 +252,127 @@ def _row_summary(
     }
 
 
+# ---------- applications (job × profile) ----------
+
+
+class _AppRowView(BaseModel):
+    """The fields that decide a job's applications (see `_applications`)."""
+    id: PydanticObjectId = Field(alias="_id")
+    url: Optional[str] = None
+    profileGates: list[ProfileGates] = Field(default_factory=list)
+    bestByProfile: list[_ScoreBrief] = Field(default_factory=list)
+    applied: bool = False
+    appliedResumes: list[AppliedMark] = Field(default_factory=list)
+    tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
+    tailorOnly: list[str] = Field(default_factory=list)
+
+    class Settings:
+        projection = {
+            "_id": 1, "url": 1, "profileGates": 1, "applied": 1, "appliedResumes": 1, "tailored": 1, "tailorOnly": 1,
+            "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1, "bestByProfile.total": 1,
+        }
+
+
+class _AppContext:
+    """What deciding application states needs beyond the rows: their tailored resumes, and which profiles
+    applied to these URLs in other runs (permanent log)."""
+
+    def __init__(self, tailored: dict[str, dict], logged: set[tuple[str, str]]):
+        self.tailored = tailored
+        self.logged = logged
+        self.logged_urls = {u for u, _ in logged}
+
+
+async def _app_context(run: JobApplyRun, rows: list) -> _AppContext:
+    tailored = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
+    urls = list({r.url for r in rows if r.url})
+    logged: set[tuple[str, str]] = set()
+    if urls:
+        cursor = JobApplicationLog.get_motor_collection().find(
+            {"userId": run.userId, "url": {"$in": urls}, "runId": {"$ne": run.id}}, {"url": 1, "accountId": 1}
+        )
+        async for e in cursor:
+            logged.add((e["url"], str(e.get("accountId") or "")))
+    return _AppContext(tailored, logged)
+
+
+def _marked_profiles(row, threshold: int) -> set[str]:
+    marked = {m.accountId for m in row.appliedResumes}
+    if row.applied and not marked:  # legacy single tick = the top suggestion
+        top = next((s for s in row.bestByProfile if s.total >= threshold), None)
+        if top:
+            marked.add(top.accountId)
+    return marked
+
+
+def _applications(row, threshold: int, ctx: _AppContext, account_id: str = "") -> list[dict]:
+    """The job's applications: one per profile it's open to that has a matching uploaded resume, has no uploaded
+    resumes (tailor-only), or has a tailored resume for it. State, in order: `applied` (marked in this run, or
+    this URL with this profile in another run), `ready` (tailored resume done, else the matching uploaded one),
+    `tailoring`, `needsResume`. A ready application carries the file to apply with."""
+    matching: dict[str, Any] = {}
+    for s in row.bestByProfile:
+        if s.total >= threshold:
+            matching.setdefault(s.accountId, s)
+    marked = _marked_profiles(row, threshold)
+    out = []
+    for acc in _open_profiles(row):
+        if account_id and acc != account_id:
+            continue
+        t = ctx.tailored.get(str(row.tailored[acc])) if acc in row.tailored else None
+        s = matching.get(acc)
+        if not (s or t or acc in row.tailorOnly):
+            continue
+        app: dict[str, Any] = {"accountId": acc, "score": s.total if s else None}
+        if acc in marked or (row.url, acc) in ctx.logged:
+            app["state"] = "applied"
+        elif t and t.get("status") == "completed":
+            app.update(state="ready", tailoredJobId=str(t["_id"]), filename=t.get("pdfFilename") or "Tailored resume")
+        elif t and t.get("status") in ("queued", "in_progress"):
+            app["state"] = "tailoring"
+        elif s:
+            app.update(state="ready", resumeId=s.resumeId, filename=s.filename)
+        else:
+            app["state"] = "needsResume"
+        out.append(app)
+    return out
+
+
+def _job_applied(row, apps: list[dict], ctx: _AppContext) -> bool:
+    """A job is applied when every one of its applications is. A job with none (e.g. under All) counts as applied
+    once anything was marked on it, here or in another run."""
+    if apps:
+        return all(a["state"] == "applied" for a in apps)
+    return bool(row.appliedResumes or row.applied or row.url in ctx.logged_urls)
+
+
+async def _application_counts(run: JobApplyRun) -> dict:
+    rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).project(_AppRowView).to_list()
+    ctx = await _app_context(run, rows)
+    counts = dict.fromkeys(("applied", "ready", "tailoring", "needsResume"), 0)
+    per_profile = {str(s.accountId): {"toGo": 0, "ready": 0} for s in run.selection}
+    jobs = 0
+    for row in rows:
+        apps = _applications(row, run.threshold, ctx)
+        pending = [a for a in apps if a["state"] != "applied"]
+        jobs += bool(pending)
+        for a in apps:
+            counts[a["state"]] += 1
+        for a in pending:
+            mine = per_profile.setdefault(a["accountId"], {"toGo": 0, "ready": 0})
+            mine["toGo"] += 1
+            mine["ready"] += a["state"] == "ready"
+    names = {str(a.id): a.name for a in await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()}
+    return {
+        "jobs": jobs,  # jobs with at least one application to go
+        "toGo": counts["ready"] + counts["tailoring"] + counts["needsResume"],
+        **counts,
+        "byProfile": [
+            {"accountId": acc, "name": names.get(acc, "(deleted profile)"), **n} for acc, n in per_profile.items()
+        ],
+    }
+
+
 async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
     try:
         items = json.loads(raw)
@@ -280,10 +401,10 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
 
 
 async def _rows_query(
-    run: JobApplyRun, *, view: str = "all", account_id: str = "", min_score: Optional[int] = None, applied: str = "any"
+    run: JobApplyRun, *, view: str = "all", account_id: str = "", min_score: Optional[int] = None
 ) -> dict[str, Any]:
-    """The rows filter behind the table, the 'To apply' count and 'Mark all'. 'Applied' means marked in this
-    run, or the URL is in the permanent log from another run."""
+    """The rows filter behind the table and the counts. To apply / Applied is per application, filtered after
+    (see `_applications`)."""
     q: dict[str, Any] = {"runId": run.id}
     floor = max(run.threshold, min_score or 0)
     if view == "suggested":
@@ -305,17 +426,6 @@ async def _rows_query(
             {"tailorOnly": account_id},
         ]}
         q = {"$and": [q, by_profile]}
-    if applied != "any":
-        run_urls = await JobApplyRow.get_motor_collection().distinct("url", {"runId": run.id})
-        logged = await JobApplicationLog.get_motor_collection().distinct(
-            "url", {"userId": run.userId, "url": {"$in": run_urls}, "runId": {"$ne": run.id}}
-        )
-        cond = (
-            {"$or": [{"appliedResumes.0": {"$exists": True}}, {"applied": True}, {"url": {"$in": logged}}]}
-            if applied == "yes"
-            else {"appliedResumes.0": {"$exists": False}, "applied": {"$ne": True}, "url": {"$nin": logged}}
-        )
-        q = {"$and": [q, cond]}
     return q
 
 
@@ -412,7 +522,9 @@ async def get_run(
     out = await _run_out(run, with_profiles=True)
     log = JobApplicationLog.get_motor_collection()
     out["appliedInRun"] = await log.count_documents({"runId": run.id})
-    out["toApply"] = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).count()
+    # Applications = job × profile: what's left to apply with, per profile and per state.
+    out["applications"] = await _application_counts(run)
+    out["toApply"] = out["applications"]["jobs"]
     # Matches the Excluded tab (counts.excluded only counts jobs that failed a job-level check).
     out["excludedCount"] = await JobApplyRow.find(await _rows_query(run, view="excluded")).count()
     tailored_ids = await _run_tailored_ids(run)
@@ -511,12 +623,23 @@ async def list_rows(
     limit: int = Query(50, ge=1, le=200),
 ) -> dict:
     run = await _owned_run(run_id, user)
-    q = await _rows_query(run, view=view, account_id=accountId, min_score=minScore, applied=applied)
+    q = await _rows_query(run, view=view, account_id=accountId, min_score=minScore)
 
-    total = await JobApplyRow.find(q).count()
-    rows = await (
-        JobApplyRow.find(q).sort("+rowIndex").skip((page - 1) * limit).limit(limit).project(_RowListView).to_list()
-    )
+    if applied == "any":
+        total = await JobApplyRow.find(q).count()
+        rows = await (
+            JobApplyRow.find(q).sort("+rowIndex").skip((page - 1) * limit).limit(limit).project(_RowListView).to_list()
+        )
+        ctx = await _app_context(run, rows)
+    else:
+        # Per application: a job stays To apply until every profile it's for has applied (≤ ~1,000 rows a run).
+        light = await JobApplyRow.find(q).sort("+rowIndex").project(_AppRowView).to_list()
+        ctx = await _app_context(run, light)
+        want = applied == "yes"
+        ids = [r.id for r in light if _job_applied(r, _applications(r, run.threshold, ctx, accountId), ctx) == want]
+        total = len(ids)
+        page_ids = ids[(page - 1) * limit : page * limit]
+        rows = await JobApplyRow.find({"_id": {"$in": page_ids}}).sort("+rowIndex").project(_RowListView).to_list()
     pages = (total + limit - 1) // limit
     previous: dict[str, list] = {}
     page_urls = [r.url for r in rows if r.url]
@@ -531,9 +654,16 @@ async def list_rows(
                 "filename": entry.get("filename", ""),
                 "accountId": entry.get("accountId"),
             })
-    tailored = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
+    out = []
+    for r in rows:
+        summary = _row_summary(r, run.threshold, accountId, previous.get(r.url), ctx.tailored)
+        apps = _applications(r, run.threshold, ctx, accountId)
+        # [{accountId, state}] per profile this job is for; the job is done when all are applied.
+        summary["applications"] = [{"accountId": a["accountId"], "state": a["state"]} for a in apps]
+        summary["applied"] = _job_applied(r, apps, ctx)
+        out.append(summary)
     return {
-        "rows": [_row_summary(r, run.threshold, accountId, previous.get(r.url), tailored) for r in rows],
+        "rows": out,
         "pagination": {"page": page, "limit": limit, "total": total, "totalPages": pages, "hasNext": page < pages, "hasPrev": page > 1},
     }
 
@@ -636,9 +766,9 @@ async def set_row_applied(row_id: str, body: AppliedBody, user: Annotated[UserEx
 
 class BulkAppliedBody(BaseModel):
     rowIds: list[str] = Field(default_factory=list, max_length=1000)
-    # True = every job still to apply to in this run (all pages), instead of rowIds.
+    # True = every suggested job in this run (all pages), instead of rowIds.
     all: bool = False
-    # With a profile filter, use that profile's best resume.
+    # Only this profile's applications.
     accountId: str = ""
 
 
@@ -646,45 +776,28 @@ class BulkAppliedBody(BaseModel):
 async def mark_top_applied(
     run_id: str, body: BulkAppliedBody, user: Annotated[UserExtra, Depends(get_current_user)]
 ) -> dict:
-    """Mark the top suggestion applied for the selected jobs, or for every job still to apply to. Skips jobs
-    with no suggestion, already marked, or applied in an earlier run. Returns the marks made, for Undo."""
+    """Mark every ready application applied (each profile with the file the export uses: its tailored resume when
+    done, else its matching uploaded one) on the selected jobs, or on every suggested job. Applications already
+    applied, still tailoring or without a resume are left. Returns the marks made, for Undo."""
     run = await _owned_run(run_id, user)
     if body.all:
-        q = await _rows_query(run, view="suggested", account_id=body.accountId, applied="no")
+        q = await _rows_query(run, view="suggested", account_id=body.accountId)
     else:
         q = {"_id": {"$in": [to_object_id(i) for i in body.rowIds]}, "runId": run.id}
-        q = {"$and": [q, await _rows_query(run, applied="no")]}
+    rows = await JobApplyRow.find(q).sort("+rowIndex").to_list()
+    ctx = await _app_context(run, rows)
     marks = []
-    rows = await JobApplyRow.find(q).to_list()
-    tailored = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
     for row in rows:
-        if row.appliedResumes or row.applied:
-            continue
-        order = [s.accountId for s in row.bestByProfile] + [a for a in row.tailorOnly] + list(row.tailored)
-        ready = next(
-            (
-                (acc, tailored[str(row.tailored[acc])])
-                for acc in dict.fromkeys(order)
-                if acc in row.tailored
-                and tailored.get(str(row.tailored[acc]), {}).get("status") == "completed"
-                and (not body.accountId or acc == body.accountId)
-            ),
-            None,
-        )
-        if ready:
-            acc, doc = ready
-            tid = str(doc["_id"])
-            await _set_applied(row, acc, doc.get("pdfFilename") or "Tailored resume", True, tailored_job_id=tid)
-            marks.append({"rowId": str(row.id), "accountId": acc, "tailoredJobId": tid})
-            continue
-        tops = [
-            s for s in row.bestByProfile
-            if s.total >= run.threshold and (not body.accountId or s.accountId == body.accountId)
-        ]
-        if not tops:
-            continue
-        await _set_applied(row, tops[0].accountId, tops[0].filename, True, resume_id=tops[0].resumeId)
-        marks.append({"rowId": str(row.id), "accountId": tops[0].accountId, "resumeId": tops[0].resumeId})
+        for app in _applications(row, run.threshold, ctx, body.accountId):
+            if app["state"] != "ready":
+                continue
+            acc = app["accountId"]
+            if app.get("tailoredJobId"):
+                await _set_applied(row, acc, app["filename"], True, tailored_job_id=app["tailoredJobId"])
+                marks.append({"rowId": str(row.id), "accountId": acc, "tailoredJobId": app["tailoredJobId"]})
+            else:
+                await _set_applied(row, acc, app["filename"], True, resume_id=app["resumeId"])
+                marks.append({"rowId": str(row.id), "accountId": acc, "resumeId": app["resumeId"]})
     return {"marked": len(marks), "marks": marks}
 
 
@@ -806,17 +919,20 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
 
 @router.post("/runs/{run_id}/tailor-all")
 async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Queue a tailored resume for each job still to apply to × each chosen profile the job is open to, unless that
-    profile already has one (a failed one is redone), up to the daily cap. `dryRun` only counts."""
+    """Queue a tailored resume for each suggested job × each chosen profile the job is open to and that hasn't
+    applied to it yet, unless that profile already has one (a failed one is redone), up to the daily cap.
+    `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
     chosen = set(body.accountIds or [str(s.accountId) for s in run.selection])
-    rows = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).sort("+rowIndex").to_list()
-    existing = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
+    rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
+    ctx = await _app_context(run, rows)
+    existing = ctx.tailored
     remaining = await resume_queue.remaining_today(owner)
     queued = skipped = other = 0
     for row in rows:
-        for acc in [a for a in _open_profiles(row) if a in chosen]:
+        done = _marked_profiles(row, run.threshold) | {acc for url, acc in ctx.logged if url == row.url}
+        for acc in [a for a in _open_profiles(row) if a in chosen and a not in done]:
             current = existing.get(str(row.tailored.get(acc)))
             if current and current.get("status") != "failed":
                 continue
@@ -871,8 +987,8 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     except SheetError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    rows = await JobApplyRow.find(await _rows_query(run, view="suggested", applied="no")).sort("+rowIndex").to_list()
-    tailored = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
+    rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
+    ctx = await _app_context(run, rows)
     accounts = {str(a.id): a for a in await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()}
     resumes = {str(r.id): r for a in accounts.values() for r in a.resumes}
     today = _today_label(user)
@@ -881,30 +997,30 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     marks: list[tuple] = []
     pending = needs = already = no_file = 0
     for row in rows:
-        matching = {s.accountId: s for s in row.bestByProfile if s.total >= run.threshold}
-        for acc in _open_profiles(row):
+        for app in _applications(row, run.threshold, ctx):
+            acc = app["accountId"]
+            if app["state"] == "applied":
+                continue
             if acc in row.exported:
                 already += 1
                 continue
-            t = tailored.get(str(row.tailored.get(acc)))
-            s = matching.get(acc)
-            if t and t.get("status") == "completed":
-                link, kind = file_links.file_url("tailored", str(t["_id"])), "Tailored"
-            elif t and t.get("status") in ("queued", "in_progress"):
+            if app["state"] == "tailoring":
                 pending += 1
                 continue
-            elif s:
-                resume = resumes.get(s.resumeId)
+            if app["state"] == "needsResume":
+                needs += 1  # nothing to apply with yet: tailor it first
+                continue
+            if app.get("tailoredJobId"):
+                link, kind = file_links.file_url("tailored", app["tailoredJobId"]), "Tailored"
+            else:
+                resume = resumes.get(app["resumeId"])
                 if not resume or not resume.s3Key:
                     no_file += 1  # the original PDF isn't stored, so there's nothing to link to
                     continue
-                link, kind = file_links.file_url("resume", s.resumeId, account_id=acc), f"Uploaded · {s.filename}"
-            else:
-                needs += 1  # nothing to apply with yet: tailor it first
-                continue
+                link, kind = file_links.file_url("resume", app["resumeId"], account_id=acc), f"Uploaded · {app['filename']}"
             out.append([
                 today, accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url,
-                f'=HYPERLINK("{link}","Download")', kind, s.total if s else "",
+                f'=HYPERLINK("{link}","Download")', kind, app["score"] if app["score"] is not None else "",
                 row.postedDate.isoformat() if row.postedDate else "", False,
             ])
             marks.append((row.id, acc))

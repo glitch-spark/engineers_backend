@@ -244,7 +244,7 @@ async def test_applied_set_during_run_is_kept(client, staff_user, auth_header, m
     monkeypatch.setattr(worker, "EXTRACT", extract_and_mark)
     await worker.run_worker(PydanticObjectId(run_id))
     rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
-    assert rows and all(r["applied"] for r in rows)
+    assert rows and all(r["appliedResumes"] for r in rows)  # the worker's writes kept the marks
 
 
 async def test_run_detail_includes_resume_health(client, staff_user, auth_header):
@@ -786,3 +786,58 @@ async def test_legacy_single_tailored_link_is_migrated(client, staff_user, auth_
     await _migrate_tailored_map(coll.database)
     doc = await coll.find_one({"_id": row_id})
     assert doc["tailored"] == {str(acc.id): legacy} and "tailoredJobId" not in doc
+
+
+async def _two_people_run(client, h, owner):
+    """Tharun (tailor-only) + Eric (one strong resume): remote & greenhouse jobs are open to both."""
+    tharun = await _tailor_only_account(owner)
+    eric = await make_account(owner, resumes=(("eric.md", STRONG),), name="Eric")
+    run_id = (await _run_with(client, h, [tharun, eric])).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = {x["url"]: x for x in (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]}
+    return run_id, rows, tharun, eric
+
+
+async def test_applications_count_per_profile(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric = await _two_people_run(client, h, staff_user)
+    apps = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    # 2 jobs × (Tharun needs a tailored resume, Eric ready with his uploaded one)
+    assert apps["jobs"] == 2 and apps["toGo"] == 4 and apps["ready"] == 2 and apps["needsResume"] == 2
+    assert apps["tailoring"] == 0 and apps["applied"] == 0
+    assert {p["accountId"]: p["toGo"] for p in apps["byProfile"]} == {str(tharun.id): 2, str(eric.id): 2}
+    assert {p["accountId"]: p["ready"] for p in apps["byProfile"]} == {str(tharun.id): 0, str(eric.id): 2}
+
+
+async def test_job_stays_to_apply_until_every_profile_applied(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric = await _two_people_run(client, h, staff_user)
+    remote = rows["https://jobs.example.com/remote"]
+    s = next(x for x in remote["suggestions"] if x["accountId"] == str(eric.id))
+    await client.put(f"/job-applies/rows/{remote['_id']}/applied", headers=h,
+                     json={"accountId": str(eric.id), "resumeId": s["resumeId"], "applied": True})
+    to_apply = {x["url"] for x in (await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested&applied=no", headers=h)).json()["rows"]}
+    assert "https://jobs.example.com/remote" in to_apply  # Tharun still has to apply
+    applied = (await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested&applied=yes", headers=h)).json()["rows"]
+    assert applied == []
+    apps = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    assert apps["applied"] == 1 and apps["toGo"] == 3
+
+
+async def test_mark_all_marks_every_ready_application(client, staff_user, auth_header):
+    from app.models import ResumeApplication
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric = await _two_people_run(client, h, staff_user)
+    remote = rows["https://jobs.example.com/remote"]
+    t = (await client.post(f"/job-applies/rows/{remote['_id']}/tailor", headers=h, json={"accountId": str(tharun.id)})).json()["tailored"]
+    await ResumeApplication.get_motor_collection().update_one(
+        {"_id": PydanticObjectId(t["jobId"])}, {"$set": {"status": "completed", "step": "done", "pdfData": "JVBERg=="}}
+    )
+    res = (await client.post(f"/job-applies/runs/{run_id}/mark-top-applied", headers=h, json={"all": True})).json()
+    # Eric on both jobs (uploaded) + Tharun on the remote job (tailored); Tharun on greenhouse has nothing yet.
+    assert res["marked"] == 3
+    assert {(m["accountId"], bool(m.get("tailoredJobId"))) for m in res["marks"]} == {
+        (str(eric.id), False), (str(tharun.id), True)}
+    apps = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    assert apps["applied"] == 3 and apps["toGo"] == 1 and apps["jobs"] == 1
