@@ -16,7 +16,8 @@ from bs4 import BeautifulSoup
 
 # Bump when what counts as a usable page changes: cached pages read by an older fetcher are fetched again.
 # 2: closed jobs (404/410, redirect to the job list, gone from the ATS) are no longer read as job text.
-FETCHER_VERSION = 2
+# 3: pages that say the job is gone ("no longer active", "job not found", "this job was removed"…).
+FETCHER_VERSION = 3
 MIN_TEXT = 200  # below this there's no usable job text
 THIN_PAGE = 400  # below this a script-rendered page is retried in the browser
 TIMEOUT = 20.0
@@ -55,6 +56,20 @@ class FetchResult:
     title: str = ""
     company: str = ""
     location: str = ""
+    closed: Optional[str] = None  # why the page says the job is gone (pages only)
+
+
+# A page can load fine and still say the posting is gone (Teamtailor, Built In, Recruitee, Zoho, Deel, N-iX…).
+# Phrased narrowly: ordinary job text ("you will no longer need…") must not match.
+_GONE_TEXT = re.compile(
+    r"\b(?:this|the) (?:job|position|role|vacancy|posting|opening)(?: posting)?(?: you(?: are|'re) looking for)? "
+    r"(?:is|has been|was) (?:no longer (?:active|available|open)|closed|removed|filled|expired)\b"
+    r"|\bno longer accepting (?:new )?(?:applications|candidates|applicants)\b|\bposition closed\b"
+    r"|\bvacancy is (?:already )?closed\b|\bjob not found\b"
+    r"|\bposition has been filled\b|\bjob (?:is )?no longer available\b",
+    re.I,
+)
+_GONE_SCAN_CHARS = 8000  # banners sit at the top; scanning the whole text only adds false positives
 
 
 # ---------- URL safety (user-supplied URLs are fetched from our servers) ----------
@@ -336,6 +351,9 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
     """CPU-bound (HTML parsing): callers run it in a thread. The page is parsed once."""
     soup = BeautifulSoup(markup or "", "html.parser")
     ld = parse_jsonld(soup)
+    closed = _gone_reason(soup, ld)
+    if closed:
+        return FetchResult(text="", source=source, closed=closed)
     if ld:
         body = html_to_text(html_lib.unescape(ld.get("description") or ""))
         org = ld.get("hiringOrganization")
@@ -352,6 +370,15 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
     else:
         posted = None
     return FetchResult(text=html_to_text(soup), source=source, postedDate=posted)
+
+
+def _gone_reason(soup: BeautifulSoup, ld: Optional[dict]) -> Optional[str]:
+    """Why a loaded page says the job is gone, or None. Reads the page before html_to_text drops nodes.
+    JobPosting.validThrough is not used: boards like Built In fill it in as posted + 30 days on jobs still open."""
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    head = " ".join(soup.get_text(" ", strip=True).split())[:_GONE_SCAN_CHARS]
+    m = _GONE_TEXT.search(f"{title} {head}")
+    return f"page says: {m.group(0)}" if m else None
 
 
 async def browser_html(url: str) -> str:
@@ -414,14 +441,19 @@ async def fetch_job(
             result = await asyncio.to_thread(_from_page, resp.text, "html")
     except httpx.HTTPError:
         result = None
+    if result is not None and result.closed:
+        raise JobClosed(f"job closed ({result.closed})")
 
     if browser is not None and (result is None or len(result.text) < THIN_PAGE):
+        rendered: Optional[FetchResult] = None
         try:
             rendered = await asyncio.to_thread(_from_page, await browser(url), "browser")
-            if result is None or len(rendered.text) > len(result.text):
-                result = rendered
         except Exception:  # noqa: BLE001 — browser failure leaves the plain-HTML result
             pass
+        if rendered is not None and rendered.closed:
+            raise JobClosed(f"job closed ({rendered.closed})")
+        if rendered is not None and (result is None or len(rendered.text) > len(result.text)):
+            result = rendered
 
     if result is None:
         raise FetchError("could not load the page")

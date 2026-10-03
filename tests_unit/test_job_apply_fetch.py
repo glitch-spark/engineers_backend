@@ -192,6 +192,53 @@ async def test_redirect_to_reposted_job_is_followed():
     assert "distributed systems" in res.text
 
 
+@pytest.mark.parametrize("banner", [
+    "This job is no longer active",
+    "Sorry, this job was removed by the employer.",
+    "We're sorry! The vacancy is already closed.",
+    "Job Not Found",
+    "This position has been filled.",
+    "This job is no longer available",
+    "Position Closed. Sorry, this position is no longer accepting candidates.",
+])
+async def test_page_saying_the_job_is_gone_is_closed(banner):
+    page = f"<html><head><title>Senior Engineer</title></head><body><div>{banner}</div>{LONG}</body></html>"
+    async with client({"https://careers.beta.io/": (200, page)}) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c)
+
+
+async def test_rendered_page_saying_the_job_is_gone_is_closed():
+    async def browser(url):
+        return "<html><head><title>Job Not Found</title></head><body><div id=root>Job Not Found</div></body></html>"
+
+    async with client({"https://careers.beta.io/": (200, "<html><body><div id=root></div></body></html>")}) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c, browser=browser)
+
+
+async def test_past_valid_through_alone_is_not_closed():
+    # Built In sets validThrough = posted + 30 days on jobs that are still open.
+    ld = {"@type": "JobPosting", "title": "Data Engineer", "datePosted": "2020-01-10", "validThrough": "2020-02-10",
+          "description": LONG}
+    page = f'<html><script type="application/ld+json">{json.dumps(ld)}</script><body>Log in to apply</body></html>'
+    async with client({"https://careers.beta.io/": (200, page)}) as c:
+        res = await fetch_job("https://careers.beta.io/jobs/1", client=c)
+    assert res.postedDate == date(2020, 1, 10)
+
+
+async def test_ordinary_wording_is_not_closed():
+    text = "<p>You will no longer need to wait for reviews. Our product is available anywhere.</p>"
+    page = f"<html><head><title>Senior Engineer</title></head><body>{text}{LONG}</body></html>"
+    async with client({"https://careers.beta.io/": (200, page)}) as c:
+        res = await fetch_job("https://careers.beta.io/jobs/1", client=c)
+    assert "distributed systems" in res.text
+
+
+def test_fetcher_version_bumped_for_closed_wording():
+    assert fetch_mod.FETCHER_VERSION >= 3
+
+
 def test_html_to_text_keeps_line_structure():
     text = html_to_text("<h2>Requirements</h2><ul><li>Python</li><li>Go</li></ul>")
     assert text.splitlines() == ["Requirements", "- Python", "- Go"]

@@ -821,8 +821,10 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     run = await JobApplyRun.get(row.runId)
     if run is None or run.status != "screened":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Jobs can only be included before scoring starts.")
+    is_job = row.extraction.isJobPosting if row.extraction is not None else True
     base = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
+        is_job=is_job,
     )
     if base not in FORCEABLE:
         raise HTTPException(
@@ -832,7 +834,7 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     row.forceInclude = body.include
     row.screen = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey,
-        force_include=row.forceInclude,
+        force_include=row.forceInclude, is_job=is_job,
     )
     await JobApplyRow.get_motor_collection().update_one(
         {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}

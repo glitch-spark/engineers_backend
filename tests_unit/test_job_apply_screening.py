@@ -44,6 +44,13 @@ def test_bucket_order():
     assert b("pending", g=[]) is None and b("fetched", g=[]) is None
 
 
+def test_not_a_job_page():
+    assert bucket(status="extracted", status_reason=None, gates=gates(), group_key="none", force_include=False,
+                  is_job=False) == "not_job"
+    assert bucket(status="excluded", status_reason=None, gates=gates(freshness="fail"), group_key="GB",
+                  force_include=True, is_job=False) == "not_job"
+
+
 def test_force_include():
     assert b("excluded", g=gates(freshness="fail"), force=True) == "check"
     assert b("excluded", g=gates(remote="fail", clearance="fail"), force=True) == "check"
@@ -60,6 +67,9 @@ def test_group_key():
     assert group_key([r("emea")]) == "EMEA"
     assert group_key([r("United States")]) == "US"
     assert group_key([]) == "none"
+    assert group_key([r("Western EU")]) == "Europe" and group_key([r("Central Europe")]) == "Europe"
+    assert group_key([r("CET +/-2")]) == "EMEA" and group_key([r("GMT±3")]) == "EMEA"
+    assert group_key([r("EST hours")]) == "North America"
 
 
 class _Row:
@@ -124,7 +134,7 @@ def test_build_report():
         [alex, sam], max_age_days=30,
     )
     assert rep["total"] == 8 and rep["worth"] == 3 and rep["check"] == 1 and rep["maxAgeDays"] == 30
-    assert rep["buckets"]["closed"] == 1 and rep["buckets"]["other_location"] == 3 and len(rep["buckets"]) == 9
+    assert rep["buckets"]["closed"] == 1 and rep["buckets"]["other_location"] == 3 and len(rep["buckets"]) == 10
     # the three target markets always show, then "not stated"; a Worldwide job is in every market
     assert rep["groups"] == [
         {"key": "US", "jobs": 1, "check": 0, "fits": ["a"]},

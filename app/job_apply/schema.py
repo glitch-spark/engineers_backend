@@ -57,6 +57,8 @@ class JobExtraction(BaseModel):
     timezoneNote: Optional[str] = None
     clearance: Clearance = Field(default_factory=Clearance)
     postedDate: Optional[date] = None
+    # False for error pages, cookie notices, job lists and careers landing pages read in place of a posting.
+    isJobPosting: bool = True
 
 
 class GateResult(BaseModel):

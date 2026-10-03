@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v2"
+PROMPT_VERSION = "job-extract-v3"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -48,7 +48,8 @@ JSON shape (use null when the posting doesn't say):
   "workAuthorization": {{"restricted": true, "countries": ["US"], "note": "US citizens only"}},
   "timezoneNote": "4h overlap with EST",
   "clearance": {{"level": "required|preferred|none", "note": "Active Secret"}},
-  "postedDate": "YYYY-MM-DD"
+  "postedDate": "YYYY-MM-DD",
+  "isJobPosting": true
 }}
 
 Rules:
@@ -61,7 +62,10 @@ Rules:
 - soft: true for soft skills (communication, leadership, teamwork...).
 - minYears: the minimum years of experience asked. A required figure beats a preferred one.
 - degree.level: 1 associate/diploma, 2 bachelor, 3 master, 4 doctorate; the LOWEST degree accepted.
-- workMode: "remote with occasional travel or offsites" is remote. "Remote but must live within commuting distance
+- isJobPosting: false when the text is not one specific job: an error or "not found" page, a cookie or consent
+  notice, a list of many openings, a careers landing page, or site navigation only. Then the other fields may be empty.
+- workMode: "remote with occasional travel or offsites" is remote. A role with a remote option ("work from our hub
+  or remotely within Europe", "onsite, hybrid or remote") is remote. "Remote but must live within commuting distance
   of an office" or "N days in office" is hybrid. In-office/on-site only is onsite.
 - allowedLocations: where a remote hire may live. Take the first of these that the posting has:
   1. Text on where hires may live or be based ("must be based in the US or EU", "can be done globally", "open to
@@ -69,6 +73,10 @@ Rules:
      and "international" are Worldwide. A time-zone window is the region it covers ("GMT +/-3" or "CET +/-2" is EMEA).
   2. Otherwise the "Location:" line or the title ("Remote - UK" is GB, "Location: Bulgaria" is BG).
   Never use where the company or its offices are. Keep a country a country; don't widen it into a region.
+  Examples: "Remote – USA, Canada, Europe or Australia" -> US, CA, Europe, AU. "Open to North America & Western EU"
+  -> North America, Europe. "Europe and the Americas only" -> Europe, Americas. "Remote Global" or "can be done
+  globally" -> Worldwide. "Location: Europe" with nothing else -> Europe (not Worldwide). "Within UTC to UTC+8"
+  -> EMEA, APAC. "Location: Remote" with nothing else -> empty list.
   Regions: Worldwide, Americas, North America, Latam, EMEA, Europe, EU, APAC, Asia. Countries as ISO-3166 alpha-2
   codes. Empty list only when the posting gives no location at all.
 - workAuthorization.restricted: true for "citizens only", "must be authorized to work in X without sponsorship",
@@ -151,7 +159,8 @@ def parse_extraction(raw: str) -> JobExtraction:
     obj = _try_parse_jsonish(raw or "")
     if not isinstance(obj, dict):
         raise ValueError("job extraction is not a JSON object")
-    if not _str(obj.get("title")) and not obj.get("terms"):
+    # A page that isn't a job (error page, job list) legitimately has no title or terms.
+    if not _str(obj.get("title")) and not obj.get("terms") and obj.get("isJobPosting") is not False:
         raise ValueError("job extraction has neither a title nor terms")
 
     years = obj.get("minYears")
@@ -213,6 +222,7 @@ def parse_extraction(raw: str) -> JobExtraction:
         timezoneNote=_opt_str(obj.get("timezoneNote")),
         clearance=clearance,
         postedDate=_iso_date(obj.get("postedDate")),
+        isJobPosting=obj.get("isJobPosting") is not False,
     )
 
 

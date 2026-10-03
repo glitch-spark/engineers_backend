@@ -128,6 +128,19 @@ def test_build_prompt_location_and_date_rules():
     assert "archived" in p.lower() and "never today's date" in p.lower()
 
 
+def test_parse_is_job_posting_flag():
+    assert parse_extraction('{"title":"T","terms":[{"term":"Python"}]}').isJobPosting is True
+    ex = parse_extraction('{"title":"","terms":[],"isJobPosting":false}')
+    assert ex.isJobPosting is False
+
+
+def test_build_prompt_has_location_and_posting_examples():
+    p = build_prompt("JD", RUN)
+    assert '"isJobPosting"' in p
+    assert "USA, Canada, Europe or Australia" in p and "Remote Global" in p and "UTC" in p
+    assert "remote option" in p.lower()
+
+
 def test_build_prompt_contains_rules():
     p = build_prompt("JD TEXT HERE", RUN)
     assert "JD TEXT HERE" in p and "2026-10-01" in p and '"workMode"' in p and "able to obtain" in p

@@ -329,3 +329,62 @@ def test_free_timeout_and_token_caps_by_purpose():
     assert _free_max_tokens_for_purpose("resume", 16384) == 16000
     assert _free_max_tokens_for_purpose("resume", 2048) == 2048
     assert _free_max_tokens_for_purpose("screening", 8192) == 8192
+
+
+async def test_job_extract_asks_openai_for_temperature_zero(monkeypatch):
+    """Extraction must give the same reading for the same posting run after run."""
+    import app.llm_router as router
+
+    seen = {}
+
+    async def fake_responses(prompt, model=None, *, temperature=None):
+        seen["temperature"] = temperature
+        return "{}", {}
+
+    monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini"))
+    monkeypatch.setattr(router, "_openai_responses", fake_responses)
+    await router.complete_with_fallback("p", None, purpose="job_extract")
+    assert seen["temperature"] == 0
+    await router.complete_with_fallback("p", None, purpose="resume")
+    assert seen["temperature"] is None
+
+
+async def test_openai_responses_sends_temperature_only_to_models_that_take_it(monkeypatch):
+    import app.llm_router as router
+
+    sent = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.responses = self
+
+        async def create(self, **kw):
+            sent.append(kw)
+            return SimpleNamespace(output_text="{}", usage=None)
+
+    monkeypatch.setattr(router, "AsyncOpenAI", FakeClient)
+    monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(
+        OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", RESUME_REASONING_EFFORT="low"))
+    await router._openai_responses("p", "gpt-4o-mini", temperature=0)
+    await router._openai_responses("p", "gpt-5-mini", temperature=0)
+    assert sent[0]["temperature"] == 0 and "temperature" not in sent[1]
+
+
+async def test_job_extract_uses_its_own_model_when_set(monkeypatch):
+    import app.llm_router as router
+
+    seen = []
+
+    async def fake_responses(prompt, model=None, *, temperature=None):
+        seen.append(model)
+        return "{}", {}
+
+    monkeypatch.setattr(router, "_openai_responses", fake_responses)
+    monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(
+        OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL="gpt-4.1-mini"))
+    await router.complete_with_fallback("p", None, purpose="job_extract")
+    await router.complete_with_fallback("p", None, purpose="resume")
+    monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(
+        OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL=""))
+    await router.complete_with_fallback("p", None, purpose="job_extract")
+    assert seen == ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o-mini"]

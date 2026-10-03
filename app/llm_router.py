@@ -122,9 +122,12 @@ async def _free_chat_completion(
     max_tokens: int,
     *,
     timeout: float = FREE_LLM_RESUME_TIMEOUT_SECONDS,
+    temperature: Optional[float] = None,
 ) -> tuple[str, dict]:
     client = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=timeout)
     kwargs = build_free_chat_kwargs(preset, prompt, max_tokens)
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     response = await client.chat.completions.create(**kwargs)
     text = ""
     if response.choices:
@@ -146,7 +149,23 @@ def _free_error_retryable(exc: Exception) -> bool:
     return True
 
 
-async def _openai_responses(prompt: str, model: Optional[str] = None) -> tuple[str, dict]:
+# Purposes whose output must not vary between runs of the same input (structured extraction, not writing).
+DETERMINISTIC_PURPOSES = frozenset({"job_extract"})
+
+
+def _temperature_for(purpose: str) -> Optional[float]:
+    return 0.0 if purpose in DETERMINISTIC_PURPOSES else None
+
+
+def _openai_model_for(purpose: str, settings) -> str:
+    if purpose == "job_extract" and (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip():
+        return settings.JOB_EXTRACT_MODEL.strip()
+    return settings.RESUME_OPENAI_MODEL
+
+
+async def _openai_responses(
+    prompt: str, model: Optional[str] = None, *, temperature: Optional[float] = None
+) -> tuple[str, dict]:
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
@@ -156,6 +175,8 @@ async def _openai_responses(prompt: str, model: Optional[str] = None) -> tuple[s
     if resolved.startswith("gpt-5"):
         effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
         kwargs["reasoning"] = {"effort": effort}
+    elif temperature is not None and not resolved.startswith(("o1", "o3", "o4")):  # reasoning models reject it
+        kwargs["temperature"] = temperature
     response = await client.responses.create(**kwargs)
     usage_out: dict = {}
     usage = getattr(response, "usage", None)
@@ -214,6 +235,7 @@ async def complete_with_fallback(
                 api_key,
                 free_max_tokens,
                 timeout=free_timeout,
+                temperature=_temperature_for(purpose),
             )
             if not text.strip():
                 raise ValueError("empty free LLM output")
@@ -247,8 +269,8 @@ async def complete_with_fallback(
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured and free LLM unavailable")
 
-    openai_model = settings.RESUME_OPENAI_MODEL
-    text, usage = await _openai_responses(prompt, openai_model)
+    openai_model = _openai_model_for(purpose, settings)
+    text, usage = await _openai_responses(prompt, openai_model, temperature=_temperature_for(purpose))
     if validate:
         validate(text)
     log.info(

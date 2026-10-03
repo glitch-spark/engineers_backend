@@ -19,7 +19,8 @@ RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fe
 # location group, then scores only those job x profile pairs.
 RunPhase = Literal["screen", "score"]
 ScreenBucket = Literal[
-    "valid", "check", "closed", "not_fetched", "read_failed", "clearance", "onsite", "too_old", "other_location",
+    "valid", "check", "closed", "not_fetched", "read_failed", "not_job", "clearance", "onsite", "too_old",
+    "other_location",
 ]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).

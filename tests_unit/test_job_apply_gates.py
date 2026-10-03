@@ -88,3 +88,11 @@ def test_unrecognised_locations_are_unknown_not_fail():
     assert pg([Location(kind="region", value="Mars"), Location(kind="country", value="DE")]) == "fail"
     assert pg([Location(kind="region", value="Western Europe")]) == "fail"
     assert by_name(profile_gates(ex(allowedLocations=[Location(kind="region", value="Western Europe")]), country="DE", region="EU"))["location"].result == "pass"
+
+
+def test_normalize_country_three_letter_codes():
+    from app.job_apply.gates import normalize_country
+
+    assert normalize_country("GBR") == "GB" and normalize_country("usa") == "US" and normalize_country("DEU") == "DE"
+    assert normalize_country("BRA") == "BR" and normalize_country("POL") == "PL" and normalize_country("CAN") == "CA"
+    assert normalize_country("XYZ") is None

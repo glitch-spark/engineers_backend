@@ -58,7 +58,13 @@ def profile_market(*, country: Optional[str], region: Optional[str]) -> Optional
 
 
 def bucket(
-    *, status: str, status_reason: Optional[str], gates: list[GateResult], group_key: Optional[str], force_include: bool
+    *,
+    status: str,
+    status_reason: Optional[str],
+    gates: list[GateResult],
+    group_key: Optional[str],
+    force_include: bool,
+    is_job: bool = True,
 ) -> Optional[ScreenBucket]:
     """The one bucket a job lands in, first match wins (spec §3.1). None while it is still being fetched or read."""
     if status in ("pending", "fetched"):
@@ -67,6 +73,8 @@ def bucket(
         return "closed" if (status_reason or "").startswith("job closed") else "not_fetched"
     if status == "llm_failed":
         return "read_failed"
+    if not is_job:
+        return "not_job"  # an error page, cookie notice or job list read in place of a posting
     result = {g.name: g.result for g in gates}
     for gate, name in (("clearance", "clearance"), ("remote", "onsite"), ("freshness", "too_old")):
         if result.get(gate) == "fail":
@@ -106,6 +114,7 @@ def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:
     row.screen = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates or [],
         group_key=row.groupKey, force_include=row.forceInclude,
+        is_job=row.extraction.isJobPosting if row.extraction is not None else True,
     )
 
 

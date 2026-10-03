@@ -83,6 +83,7 @@ def _screen(row: JobApplyRow) -> None:
     row.screen = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates or [],
         group_key=row.groupKey, force_include=row.forceInclude,
+        is_job=row.extraction.isJobPosting if row.extraction is not None else True,
     )
 
 
