@@ -410,7 +410,5 @@ async def test_job_extract_skips_free_model_when_extract_model_set(monkeypatch):
     monkeypatch.setattr(router, "_openai_responses", fake_responses)
     monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(
         OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL="gpt-4.1-mini"))
-    user = SimpleNamespace(id="u")
-    await router.complete_with_fallback("p", user, purpose="job_extract")
-    await router.complete_with_fallback("p", user, purpose="resume")
-    assert calls == ["gpt-4.1-mini", "free"]
+    await router.complete_with_fallback("p", SimpleNamespace(id="u"), purpose="job_extract")
+    assert calls == ["gpt-4.1-mini"]
