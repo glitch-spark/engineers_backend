@@ -12,7 +12,7 @@ from pymongo.errors import DuplicateKeyError
 from app.bids import rate_limit
 from app.bids.folders import folder_url
 from app.bids.invites import hash_code, invite_is_live
-from app.bids.rate_limit import FailureLimiter, client_ip
+from app.bids.rate_limit import FailureLimiter, client_ip, limiter_keys
 from app.bids.schemas import LoginIn, RegisterIn, bidder_me, credentials_problem
 from app.bids.storage import BidStorageError, get_bid_storage
 from app.bids.upload_keys import build_upload_key
@@ -34,7 +34,7 @@ _DUMMY_HASH = hash_password("not-a-real-password")
 
 
 def _keys(username: str, request: Request) -> list[str]:
-    return [f"user:{username}", f"ip:{client_ip(request)}"]
+    return limiter_keys(username, client_ip(request))
 
 
 def _reserve(keys: list[str]) -> datetime:
@@ -112,8 +112,9 @@ async def register(body: RegisterIn, request: Request) -> dict:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, _BAD_CODE)
     if await Bidder.find_one(Bidder.username == body.username) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, _TAKEN)
+    password_hash = await asyncio.to_thread(hash_password, body.password)  # bcrypt: off the event loop
     try:
-        claimed = await register_bidder_row(bidder, body.username, hash_password(body.password))
+        claimed = await register_bidder_row(bidder, body.username, password_hash)
     except (DuplicateKeyError, RevisionIdWasChanged):  # a concurrent registration took the username
         raise HTTPException(status.HTTP_409_CONFLICT, _TAKEN)
     if not claimed:
@@ -131,7 +132,7 @@ async def login(body: LoginIn, request: Request) -> dict:
     usable = bidder is not None and bidder.archivedAt is None and bidder.registeredAt is not None
     stored = bidder.passwordHash if usable and bidder.passwordHash else None
     try:
-        password_ok = verify_password(body.password, stored or _DUMMY_HASH)
+        password_ok = await asyncio.to_thread(verify_password, body.password, stored or _DUMMY_HASH)
     except ValueError:  # e.g. a password bcrypt refuses to hash: just a wrong password
         password_ok = False
     if not (usable and stored and password_ok):

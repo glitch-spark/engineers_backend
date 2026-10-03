@@ -269,6 +269,30 @@ async def test_failed_registrations_count(ext):
     assert (await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB"))).status_code == 429
 
 
+async def test_bcrypt_runs_off_the_event_loop(ext, monkeypatch):
+    import asyncio
+
+    ran, real = [], asyncio.to_thread
+
+    async def recording(fn, *a, **kw):
+        ran.append(fn.__name__)
+        return await real(fn, *a, **kw)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording)
+    await register(ext)
+    assert (await _login(ext, "ana", "password1")).status_code == 200
+    assert (await _login(ext, "ghost", "password1")).status_code == 401  # the dummy check
+    assert (ran.count("hash_password"), ran.count("verify_password")) == (1, 2)
+
+
+async def test_long_inputs_make_capped_limiter_keys(ext):
+    from app.routers import bidder_ext
+
+    forged = "f" * 500
+    assert (await _login(ext, "ana", ip=forged)).status_code == 401
+    assert set(bidder_ext.LIMITER._failures) == {"user:ana", "ip:" + "f" * 64}
+
+
 async def test_login_explains_the_username_and_password_rules(ext):
     for body, message in (
         ({"username": "ana@example.com", "password": "password1"}, USERNAME_RULE),
