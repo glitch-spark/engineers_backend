@@ -16,6 +16,12 @@ from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import ScreeningPair as ScreeningPairModel
 from app.llm_router import complete_screening, parse_screening_answers
+from app.model_catalog import (
+    Task,
+    available_models,
+    default_model_id,
+    public_view,
+)
 from app.resume_service import (
     generate_resume,
     generate_presigned_get,
@@ -457,6 +463,23 @@ async def ask_job_screening(
     ]
     await job.save()
     return {"pairs": screening_result.pairs}
+
+
+# ---------- Model catalog -----------------------------------------------------
+
+
+@router.get("/models")
+async def list_models(
+    task: Task,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Models the caller can pick for `task`, with the default flagged and a typical per-run cost."""
+    default_id = default_model_id(task, user)
+    return {
+        "task": task,
+        "defaultId": default_id,
+        "models": [public_view(s, task, default_id) for s in available_models(task, user)],
+    }
 
 
 # ---------- Job listing / polling / download ---------------------------------

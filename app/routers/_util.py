@@ -5,6 +5,7 @@ from typing import Iterable, Optional
 from beanie import Document, PydanticObjectId
 from fastapi import HTTPException, status
 
+from app.model_catalog import ModelNotAvailable, Task, validate_requested
 from app.models import UserExtra
 
 
@@ -90,3 +91,12 @@ async def populate_owner(
             _attach(item, d, id_field, prefix)
         out.append(item)
     return out
+
+
+def require_model(task: Task, model_id: Optional[str], user: Optional[UserExtra]) -> Optional[str]:
+    """Validate a client-supplied model id; blank means "let the server choose" (returns None)."""
+    try:
+        spec = validate_requested(task, model_id, user)
+    except ModelNotAvailable as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return spec.id if spec else None
