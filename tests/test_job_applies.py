@@ -760,7 +760,10 @@ async def test_sheet_preview(client, staff_user, auth_header, monkeypatch):
 
     h = auth_header(staff_user)
     r = await client.post("/job-applies/sheet-preview", headers=h, files={"file": ("jobs.xlsx", SHEET, "application/octet-stream")})
-    assert r.status_code == 200 and r.json() == {"title": "jobs.xlsx", "total": 3, "withDescription": 2, "urlOnly": 1}
+    assert r.status_code == 200 and r.json() == {
+        "title": "jobs.xlsx", "total": 3, "withDescription": 2, "urlOnly": 1,
+        "links": 3, "duplicates": 0, "cleaned": 0, "blocked": 0,
+    }
     bad = await client.post("/job-applies/sheet-preview", headers=h, files={"file": ("x.xlsx", b"nope", "application/octet-stream")})
     assert bad.status_code == 400
 
@@ -1250,3 +1253,13 @@ async def test_text_only_page_lands_in_needs_a_check(client, staff_user, auth_he
     assert gh["screen"] == "check" and gh["jdStructured"] is False
     remote = (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]
     assert remote["jdStructured"] is True  # the description came from the sheet
+
+
+async def test_sheet_preview_counts(client, staff_user, auth_header):
+    data = sheet([["URL"], ["https://jobs.lever.co/acme/1a2b/apply"], ["https://jobs.lever.co/acme/1a2b"],
+                  ["https://www.linkedin.com/jobs/view/123"], ["https://a.com/jobs/2?utm_source=x"]])
+    r = await client.post("/job-applies/sheet-preview", headers=auth_header(staff_user),
+                          files={"file": ("jobs.xlsx", data, "application/octet-stream")})
+    body = r.json()
+    assert body["total"] == 3 and body["links"] == 4 and body["duplicates"] == 1 and body["cleaned"] == 2
+    assert body["blocked"] == 1

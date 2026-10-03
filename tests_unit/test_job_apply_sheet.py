@@ -129,3 +129,9 @@ def test_urls_scattered_across_columns_are_all_collected():
                                        ["Gamma", "phone screen", ""],
                                        ["Delta", "n/a", ""]]))
     assert [r.url for r in rows] == ["https://a.com/jobs/1", "https://b.com/jobs/2", "https://b.com/jobs/3"]
+
+
+def test_sheet_counts_links_cleaned_and_duplicates():
+    rows = parse_sheet("j.xlsx", xlsx([["URL"], ["https://jobs.lever.co/acme/1a2b/apply?utm_source=x"],
+                                       ["https://jobs.lever.co/acme/1a2b"], ["https://a.com/jobs/2"]]))
+    assert len(rows) == 2 and rows.links == 3 and rows.cleaned == 1 and rows.duplicates == 1

@@ -147,13 +147,25 @@ def parse_sheet_ex(filename: str, data: bytes) -> tuple[list[SheetRow], bool]:
     return _dedupe(out), True
 
 
-def _dedupe(rows: list[SheetRow]) -> list[SheetRow]:
+class SheetRows(list):
+    """The job rows, plus what reading the sheet did: links found, links whose URL was cleaned, duplicates dropped."""
+
+    links = 0
+    cleaned = 0
+    duplicates = 0
+
+
+def _dedupe(rows: list[SheetRow]) -> "SheetRows":
     """Clean each URL (urls.normalize_url) and keep the first row per cleaned URL."""
-    out: list[SheetRow] = []
+    out = SheetRows()
     seen: set[str] = set()
+    out.links = len(rows)
     for row in rows:
-        row.url = normalize_url(row.url)
+        clean = normalize_url(row.url)
+        out.cleaned += clean != row.url
+        row.url = clean
         if row.url in seen:
+            out.duplicates += 1
             continue
         seen.add(row.url)
         out.append(row)

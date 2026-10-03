@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, gsheet, worker
+from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import FORCEABLE, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
@@ -473,7 +474,13 @@ async def sheet_preview(
     """Read a job sheet without starting a run, so problems (not shared, no URL column, empty) show up early."""
     title, rows = await _read_sheet(file, sheetUrl.strip() or None)
     with_jd = sum(1 for r in rows if r.jdText)
-    return {"title": title, "total": len(rows), "withDescription": with_jd, "urlOnly": len(rows) - with_jd}
+    counts = {
+        "links": getattr(rows, "links", len(rows)), "duplicates": getattr(rows, "duplicates", 0),
+        "cleaned": getattr(rows, "cleaned", 0),
+        # LinkedIn, Indeed, Glassdoor…: never fetched, so they need a description in the sheet or another link
+        "blocked": sum(1 for r in rows if not r.jdText and fetch_route(r.url)[0] == "blocked"),
+    }
+    return {"title": title, "total": len(rows), "withDescription": with_jd, "urlOnly": len(rows) - with_jd, **counts}
 
 
 @router.post("/runs", status_code=status.HTTP_202_ACCEPTED)
