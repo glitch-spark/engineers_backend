@@ -203,6 +203,10 @@ async def _run_job(
         job.completedAt = datetime.now(timezone.utc)
         job.executionMs = int((time.monotonic() - started) * 1000)
         await resume_queue.persist_job(job)
+        # Job Applies: a sheet row exported before this resume was ready gets its link now (never fails the job).
+        from app.job_apply import sheet_links
+
+        await sheet_links.fill_link(job)
 
         # Pipeline is now driven entirely by email sync — completed resume
         # generations no longer auto-create Application rows. Users land in

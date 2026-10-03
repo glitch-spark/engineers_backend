@@ -168,3 +168,84 @@ async def test_export_tailor_missing_over_the_daily_cap(client, staff_user, auth
     assert body["tailorQueued"] == 0 and body["overLimit"] == 1 and body["added"] == 4
     later = next(r for r in sheets["rows"] if r[1] == "Tharun" and r[4] == "https://boards.greenhouse.io/acme/jobs/9")
     assert later[5] == "To tailor"
+
+
+# ---------- filling the link in when the tailored resume is ready ----------
+
+
+@pytest.fixture
+def sheet_cells(monkeypatch, sheets):
+    """read_range serves what the export appended (header on row 1); update_range writes into it."""
+    writes = []
+
+    async def read(client, sid, a1):
+        return [["Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied"],
+                *sheets["rows"]]
+
+    async def update(client, sid, a1, values):
+        writes.append((a1, values))
+        n = int(a1.split("!F")[1].split(":")[0])
+        sheets["rows"][n - 2][5:7] = values[0]
+
+    monkeypatch.setattr(google_sheets, "read_range", read)
+    monkeypatch.setattr(google_sheets, "update_range", update)
+    return writes
+
+
+async def _tailor_and_finish(client, h, row_id, account_id, pdf="JVBERi0xLjc="):
+    t = (await client.post(f"/job-applies/rows/{row_id}/tailor", headers=h, json={"accountId": account_id})).json()["tailored"]
+    await ResumeApplication.get_motor_collection().update_one(
+        {"_id": PydanticObjectId(t["jobId"])}, {"$set": {"status": "completed", "step": "done", "pdfData": pdf}})
+    return await ResumeApplication.get(PydanticObjectId(t["jobId"]))
+
+
+async def test_link_filled_after_tailoring(client, staff_user, auth_header, sheets, sheet_cells):
+    from app.job_apply import sheet_links
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    job = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id))
+    assert await sheet_links.fill_link(job) is True
+    later = next(r for r in sheets["rows"] if r[1] == "Tharun" and r[4] == gh["url"])
+    assert later[5].startswith('=HYPERLINK("') and "/job-applies/files/" in later[5] and later[6] == "Tailored"
+
+
+async def test_link_refilled_after_retailor(client, staff_user, auth_header, sheets, sheet_cells):
+    from app.job_apply import sheet_links
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    first = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id))
+    await sheet_links.fill_link(first)
+    second = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id))
+    assert await sheet_links.fill_link(second) is True
+    assert await sheet_links.fill_link(first) is False  # an older resume finishing late doesn't win
+    assert len(sheet_cells) == 2 and sheet_cells[-1][0] == sheet_cells[0][0]  # the same row, rewritten once
+
+
+async def test_fill_link_sheet_error_is_swallowed(client, staff_user, auth_header, sheets, sheet_cells, monkeypatch):
+    from app.job_apply import sheet_links
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+
+    async def broken(client, sid, a1):
+        raise google_sheets.SheetsError("The app can't edit that sheet.")
+
+    monkeypatch.setattr(google_sheets, "read_range", broken)
+    job = await _tailor_and_finish(client, h, rows["https://boards.greenhouse.io/acme/jobs/9"]["_id"], str(tharun.id))
+    assert await sheet_links.fill_link(job) is False
+
+
+async def test_fill_link_ignores_jobs_never_exported(client, staff_user, auth_header, sheets, sheet_cells):
+    from app.job_apply import sheet_links
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    job = await _tailor_and_finish(client, h, rows["https://boards.greenhouse.io/acme/jobs/9"]["_id"], str(tharun.id))
+    assert await sheet_links.fill_link(job) is False and sheet_cells == []
