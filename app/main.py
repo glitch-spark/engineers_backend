@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -38,12 +39,23 @@ from app.routers import (
 )
 
 
+log = logging.getLogger(__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     # Bridge .env loading into db.py (which still reads os.environ directly).
     os.environ["MONGODB_URI"] = settings.MONGODB_URI
     await init_db()
+    try:
+        from app.bids.folders import backfill_folders
+
+        n = await backfill_folders()
+        if n:
+            log.info("Assigned folders to %d bidders", n)
+    except Exception:
+        log.exception("Bidder folder backfill failed")
     sweep = None
     if job_apply_worker.worker_enabled():
         # Restarts Job Applies runs whose worker died (redeploy/crash); see app/job_apply/worker.py.

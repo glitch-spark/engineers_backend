@@ -112,6 +112,8 @@ class Settings(BaseSettings):
     # https://s3.us-east-005.backblazeb2.com (with the B2 key ID / application key above).
     # Unset = AWS S3.
     BID_STORAGE_ENDPOINT_URL: Optional[str] = None
+    # Bucket for bidder screenshot folders (s3://<bucket>/<folder>/); blank = unset.
+    BID_STORAGE_BUCKET: Optional[str] = None
     # Report schedule: wall-clock times in BID_REPORT_TIMEZONE (an IANA name). Daily report at
     # BID_DAILY_REPORT_TIME; weekly report on BID_WEEKLY_REPORT_DAY (monday..sunday) at
     # BID_WEEKLY_REPORT_TIME. Times are 24h HH:MM; invalid values fail at startup.
@@ -140,6 +142,13 @@ class Settings(BaseSettings):
             return None
         # Backblaze's console shows the endpoint without a scheme; botocore rejects that.
         return s if "://" in s else f"https://{s}"
+
+    @field_validator("BID_STORAGE_BUCKET", mode="before")
+    @classmethod
+    def _normalize_bid_bucket(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        return str(v).strip() or None
 
     @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
     @classmethod

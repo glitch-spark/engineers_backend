@@ -45,6 +45,8 @@ BID_STORAGE_SECRET_ACCESS_KEY=K005...
 BID_STORAGE_REGION=us-east-005
 # Blank = AWS S3. Backblaze: https://s3.us-east-005.backblazeb2.com (https:// is added if missing)
 BID_STORAGE_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
+# Bucket that bidder screenshot folders live in (new bidders get s3://<bucket>/<folder>/).
+BID_STORAGE_BUCKET=bid-screenshots
 BID_REPORT_TIMEZONE=America/Chicago
 # HH:MM, 24h, in BID_REPORT_TIMEZONE.
 BID_DAILY_REPORT_TIME=18:30
