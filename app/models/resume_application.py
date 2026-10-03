@@ -29,6 +29,18 @@ class ScreeningPair(BaseModel):
     answer: str
 
 
+class CoverLetterVersion(BaseModel):
+    """A cover letter that was replaced by a regeneration, kept so it can be compared."""
+
+    text: str
+    provider: str = ""
+    model: str = ""
+    createdAt: datetime
+
+
+COVER_LETTER_HISTORY_MAX = 5
+
+
 class ResumeApplication(TimestampedDocument):
     """Backing record for one resume-generation job — covers the whole lifecycle
     (queued → in_progress → completed/failed). The async worker mutates `status`
@@ -86,6 +98,8 @@ class ResumeApplication(TimestampedDocument):
     coverLetterLlmModel: Optional[str] = None
     coverLetterLlmFallbackUsed: Optional[bool] = None
     coverLetterLlmFallbackReason: Optional[str] = None
+    # Letters replaced by "regenerate with another model", newest first (max COVER_LETTER_HISTORY_MAX).
+    coverLetterHistory: List[CoverLetterVersion] = []
 
     # Models the user picked at submit time (catalog ids; None = server default). Kept so
     # retries and queue restarts reuse the same choice.

@@ -138,7 +138,7 @@ def test_reset_failed_job_keeps_requested_models_and_clears_cost():
         screeningLlmProvider="x", screeningLlmModel="x", screeningLlmFallbackUsed=True, screeningLlmFallbackReason="r",
         estimatedCostUsd=0.5,
         coverLetterLlmProvider="anthropic", coverLetterLlmModel="claude-opus-5-5",
-        coverLetterLlmFallbackUsed=True, coverLetterLlmFallbackReason="r",
+        coverLetterLlmFallbackUsed=True, coverLetterLlmFallbackReason="r", coverLetterHistory=["old"],
         resumeModelId="anthropic:claude-opus-5-5", coverLetterModelId="anthropic:claude-fable-5-1",
         screeningModelId="anthropic:claude-sonnet-5-5", coverLetterHook="hook",
     )
@@ -146,6 +146,7 @@ def test_reset_failed_job_keeps_requested_models_and_clears_cost():
     assert job.estimatedCostUsd is None
     assert job.coverLetterLlmProvider is None and job.coverLetterLlmModel is None
     assert job.coverLetterLlmFallbackUsed is None and job.coverLetterLlmFallbackReason is None
+    assert job.coverLetterHistory == []
     assert job.resumeModelId == "anthropic:claude-opus-5-5"
     assert job.coverLetterModelId == "anthropic:claude-fable-5-1"
     assert job.screeningModelId == "anthropic:claude-sonnet-5-5"
