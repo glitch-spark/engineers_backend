@@ -964,7 +964,7 @@ async def test_start_twice_409(client, staff_user, auth_header):
     run_id = await screened_run(client, h)
     assert (await start(client, h, run_id, {"US": [us]}, [us])).status_code == 200
     r = await start(client, h, run_id, {"US": [us]}, [us])
-    assert r.status_code == 409 and r.json()["error"] == "Run is not waiting for review."
+    assert r.status_code == 409 and r.json()["error"] == "The run is still scoring."
 
 
 async def test_start_requires_screened(client, staff_user, auth_header):
@@ -1297,3 +1297,53 @@ async def test_runs_list_survives_a_summary_failure(client, staff_user, auth_hea
     monkeypatch.setattr(router_mod, "markets_for", boom)
     r = await client.get("/job-applies/runs", headers=h)
     assert r.status_code == 200 and r.json()["runs"][0]["summary"] is None
+
+
+# ---------- back to step 2: change the picks and score again ----------
+
+
+async def scored_run(client, h, assignments, accounts) -> str:
+    run_id = await screened_run(client, h)
+    assert (await start(client, h, run_id, assignments, accounts)).status_code == 200
+    await worker.run_worker(PydanticObjectId(run_id))
+    return run_id
+
+
+async def test_rescore_with_new_picks(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user, name="US")
+    us2 = await make_account(staff_user, name="US 2")
+    run_id = await scored_run(client, h, {"US": [us]}, [us])
+    r = await start(client, h, run_id, {"US": [us2]}, [us2])
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "queued" and r.json()["phase"] == "score"
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["counts"]["scored"] == 2
+    rows = await rows_by_url(client, h, run_id)
+    detail = (await client.get(f"/job-applies/rows/{rows['https://jobs.example.com/remote']['_id']}", headers=h)).json()
+    assert {s["accountId"] for s in detail["scores"]} == {str(us2.id)}  # the old profile's scores are gone
+    assert rows["https://jobs.example.com/hybrid"]["status"] == "excluded"  # never scored, untouched
+
+
+async def test_rescore_keeps_tailored_applied_and_exported(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    us = await make_account(staff_user, name="US")
+    us2 = await make_account(staff_user, name="US 2")
+    run_id = await scored_run(client, h, {"US": [us]}, [us])
+    remote = (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]
+    rid, acc, tailored = PydanticObjectId(remote["_id"]), str(us.id), PydanticObjectId()
+    kept = {
+        "appliedResumes": [{"accountId": acc, "resumeId": str(us.resumes[0].id), "at": datetime.utcnow()}],
+        f"tailored.{acc}": tailored,
+        f"exported.{acc}": datetime.utcnow(),
+        f"exportedRows.{acc}": {"sheetId": "s", "tab": "2026-10-03", "row": 2},
+    }
+    await JobApplyRow.get_motor_collection().update_one({"_id": rid}, {"$set": kept})
+    assert (await start(client, h, run_id, {"US": [us2]}, [us2])).status_code == 200  # `us` is no longer picked
+    await worker.run_worker(PydanticObjectId(run_id))
+    row = await JobApplyRow.get(rid)
+    assert [m.accountId for m in row.appliedResumes] == [acc]
+    assert row.tailored == {acc: tailored} and acc in row.exported and row.exportedRows[acc]["row"] == 2

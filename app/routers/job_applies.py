@@ -731,11 +731,29 @@ class StartBody(BaseModel):
     threshold: int = Field(75, ge=0, le=100)
 
 
+# Scoring results on a row; cleared when the run is scored again with new picks. Applied marks, tailored resumes
+# and sheet exports belong to a job x profile, not to a score, so they stay.
+_SCORE_RESET = {"scores": [], "profileGates": [], "bestByProfile": [], "topScore": None, "tailorOnly": [], "scoredAt": None}
+
+
+async def _clear_scores(run_id: PydanticObjectId) -> None:
+    coll = JobApplyRow.get_motor_collection()
+    now = datetime.utcnow()
+    scored = {"runId": run_id, "status": {"$in": ["scored", "unassigned"]}}
+    # a job brought back with "Include anyway" failed a check, so it goes back to excluded (scoring takes both)
+    await coll.update_many({**scored, "forceInclude": True}, {"$set": {**_SCORE_RESET, "status": "excluded", "updatedAt": now}})
+    await coll.update_many(scored, {"$set": {**_SCORE_RESET, "status": "extracted", "updatedAt": now}})
+
+
 @router.post("/runs/{run_id}/start")
 async def start_run(run_id: str, body: StartBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Score a screened run: each location group's jobs against the profiles picked for it."""
+    """Score a screened run: each location group's jobs against the profiles picked for it. A run that has finished
+    scoring can be scored again with new picks (back to step 2): its scores are replaced."""
     run = await _owned_run(run_id, user)
-    if run.status != "screened":
+    rescore = run.phase == "score" and run.status in ("done", "failed", "cancelled")
+    if run.phase == "score" and run.status in ACTIVE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The run is still scoring.")
+    if run.status != "screened" and not rescore:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not waiting for review.")
     if await JobApplyRun.find_one({"userId": run.userId, "status": {"$in": list(ACTIVE)}}):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Another run is in progress.")
@@ -748,16 +766,18 @@ async def start_run(run_id: str, body: StartBody, user: Annotated[UserExtra, Dep
     keys = {k for r in worth for k in (markets_for(r.groupKey) or [NO_LOCATION])}
     if not keys or not ("*" in assignments or keys & set(assignments)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least one profile for a group with jobs.")
-    res = await JobApplyRun.get_motor_collection().update_one(
-        {"_id": run.id, "status": "screened"},
-        {"$set": {
-            "assignments": {k: [PydanticObjectId(v) for v in ids] for k, ids in assignments.items()},
-            "selection": [s.model_dump() for s in sel], "threshold": body.threshold,
-            "phase": "score", "status": "queued", "updatedAt": datetime.utcnow(),
-        }},
-    )
+    fields = {
+        "assignments": {k: [PydanticObjectId(v) for v in ids] for k, ids in assignments.items()},
+        "selection": [s.model_dump() for s in sel], "threshold": body.threshold,
+        "phase": "score", "status": "queued", "updatedAt": datetime.utcnow(),
+    }
+    if rescore:
+        fields.update({"counts.scored": 0, "error": None, "finishedAt": None, "heartbeatAt": None})
+    res = await JobApplyRun.get_motor_collection().update_one({"_id": run.id, "status": run.status}, {"$set": fields})
     if not res.modified_count:  # a second click got here first
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not waiting for review.")
+    if rescore:
+        await _clear_scores(run.id)
     if worker.worker_enabled():
         worker.start_run(run.id)
     return await _run_out(await JobApplyRun.get(run.id), with_profiles=True)
