@@ -25,8 +25,11 @@ def script(monkeypatch, texts, *, model_id=OPUS, cost=0.01, fallback_used=False)
 
     async def fake(task, prompt, user, *, model_id=None, validate=None):
         calls.append({"task": task, "prompt": prompt, "model_id": model_id})
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
         return LlmResult(
-            text=queue.pop(0),
+            text=item,
             provider="anthropic",
             model="claude-opus-5-5",
             usage={"input": 100, "output": 50},
@@ -75,6 +78,22 @@ def test_check_word_range_only_when_enforced():
     assert any("words" in p for p in cl.check_cover_letter(letter(words=600), "Acme", enforce_length=True))
 
 
+def test_check_tolerates_legal_suffixes_in_company_name():
+    assert cl.check_cover_letter(letter(company="Acme"), "Acme, Inc.", enforce_length=True) == []
+    assert cl.check_cover_letter(letter(company="Acme"), "ACME LLC", enforce_length=True) == []
+    assert cl.check_cover_letter(letter(company="Other"), "Acme, Inc.", enforce_length=True)
+
+
+@pytest.mark.parametrize("fallback_name", ["boards.greenhouse.io", "jobs.lever.co", "www.acme.com"])
+def test_check_skips_company_check_for_hostname_fallbacks(fallback_name):
+    assert cl.check_cover_letter(letter(company="Acme"), fallback_name, enforce_length=True) == []
+
+
+def test_check_does_not_flag_angle_operators_as_placeholders():
+    text = letter(extra="I cut latency A <-> B and handled <3 years of backlog.")
+    assert cl.check_cover_letter(text, "Acme", enforce_length=True) == []
+
+
 # --- pipeline ---------------------------------------------------------------
 
 
@@ -101,6 +120,27 @@ async def test_deterministic_failure_retries_once_then_returns(monkeypatch):
     assert len(calls) == 4  # draft, critique, revise, one deterministic retry
     assert "placeholder" in calls[3]["prompt"]
     assert res.problems and "[Your Name]" in res.text  # returned, not raised
+
+
+async def test_critique_failure_keeps_the_draft(monkeypatch):
+    calls = script(monkeypatch, [letter(), RuntimeError("529 overloaded")])
+    res = await generate()
+    assert len(calls) == 2 and res.text == letter().strip()
+    assert any("critique" in p for p in res.problems)
+
+
+async def test_revise_failure_keeps_the_draft(monkeypatch):
+    script(monkeypatch, [letter(), "- too generic", RuntimeError("529 overloaded")])
+    res = await generate()
+    assert res.text == letter().strip() and any("revise" in p for p in res.problems)
+
+
+async def test_retry_failure_keeps_the_pre_retry_text(monkeypatch):
+    bad = letter(extra="Sincerely, [Your Name]")
+    script(monkeypatch, [letter(), "- fix tone", bad, RuntimeError("529 overloaded")])
+    res = await generate()
+    assert "[Your Name]" in res.text
+    assert any("retry" in p for p in res.problems) and any("placeholder" in p for p in res.problems)
 
 
 async def test_custom_prompt_disables_length_enforcement(monkeypatch):

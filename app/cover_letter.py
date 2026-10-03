@@ -59,9 +59,30 @@ _RUBRIC = (
 _PLACEHOLDER_RES = (
     re.compile(r"\[[^\]\n]{1,60}\]"),
     re.compile(r"\{\{.*?\}\}"),
-    re.compile(r"<[^>\n]{1,60}>"),
+    re.compile(r"<[A-Za-z][^>\n]{0,58}>"),
     re.compile(r"\byour name\b", re.IGNORECASE),
 )
+
+
+_LEGAL_SUFFIXES = frozenset(
+    {"inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation", "co", "company",
+     "gmbh", "plc", "lp", "llp", "ag", "sa", "bv", "pty"}
+)
+_HOSTNAME_RE = re.compile(r"^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+$", re.IGNORECASE)
+
+
+def _company_core(company: str) -> str:
+    """The name a letter would actually write: no legal suffix ("Acme, Inc." -> "acme").
+
+    Empty for hostnames: Job Applies falls back to the site's host when a posting has no company,
+    and the letter should not be pushed to mention that."""
+    name = (company or "").strip()
+    if not name or _HOSTNAME_RE.match(name):
+        return ""
+    words = re.findall(r"[\w&'-]+", name.lower())
+    while words and words[-1] in _LEGAL_SUFFIXES:
+        words.pop()
+    return " ".join(words)
 
 
 @dataclass
@@ -81,9 +102,9 @@ def check_cover_letter(text: str, company: str, *, enforce_length: bool) -> list
     problems: list[str] = []
     if any(rx.search(text) for rx in _PLACEHOLDER_RES):
         problems.append("contains a placeholder such as [Your Name], {{...}} or <...>; replace it with real text")
-    name = (company or "").strip()
-    if name and name.lower() not in text.lower():
-        problems.append(f"never mentions the company '{name}'")
+    core = _company_core(company)
+    if core and core not in text.lower():
+        problems.append(f"never mentions the company '{(company or '').strip()}'")
     if enforce_length:
         words = len(text.split())
         if not MIN_WORDS <= words <= MAX_WORDS:
@@ -173,6 +194,7 @@ async def generate_cover_letter(
 ) -> CoverLetterResult:
     ctx = dict(resume_text=resume_text, job_description=job_description, company=company)
     results: list[LlmResult] = []
+    step_errors: list[str] = []
 
     draft = await complete(
         "cover_letter",
@@ -186,42 +208,41 @@ async def generate_cover_letter(
     # Every later step runs on the model that actually answered the draft.
     used_model_id = draft.model_id or model_id
 
-    critique = await complete(
-        "cover_letter",
-        build_critique_prompt(draft=text, **ctx),
-        user,
-        model_id=used_model_id,
-    )
-    results.append(critique)
-    feedback = critique.text.strip()
-    if feedback.rstrip(".").strip().upper() != "OK":
-        revised = await complete(
-            "cover_letter",
-            build_revise_prompt(draft=text, feedback=feedback, **ctx),
-            user,
-            model_id=used_model_id,
+    async def attempt(label: str, prompt: str) -> Optional[LlmResult]:
+        """A review step. If every model fails, keep the best letter so far instead of losing it."""
+        try:
+            res = await complete("cover_letter", prompt, user, model_id=used_model_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cover letter %s step failed: %s", label, exc)
+            step_errors.append(f"{label} step failed: {str(exc)[:200]}")
+            return None
+        results.append(res)
+        return res
+
+    critique = await attempt("critique", build_critique_prompt(draft=text, **ctx))
+    if critique is not None and critique.text.strip().rstrip(".").strip().upper() != "OK":
+        revised = await attempt(
+            "revise", build_revise_prompt(draft=text, feedback=critique.text.strip(), **ctx)
         )
-        results.append(revised)
-        producer = revised
-        text = _clean(revised.text)
+        if revised is not None:
+            producer = revised
+            text = _clean(revised.text)
 
     enforce_length = not (prompt_body or "").strip()
     problems = check_cover_letter(text, company, enforce_length=enforce_length)
     if problems:
-        retry = await complete(
-            "cover_letter",
+        retry = await attempt(
+            "retry",
             build_revise_prompt(
                 draft=text,
                 feedback="Fix these problems:\n- " + "\n- ".join(problems),
                 **ctx,
             ),
-            user,
-            model_id=used_model_id,
         )
-        results.append(retry)
-        producer = retry
-        text = _clean(retry.text)
-        problems = check_cover_letter(text, company, enforce_length=enforce_length)
+        if retry is not None:
+            producer = retry
+            text = _clean(retry.text)
+            problems = check_cover_letter(text, company, enforce_length=enforce_length)
         if problems:
             log.warning("cover letter still has problems after retry: %s", problems)
 
@@ -235,5 +256,5 @@ async def generate_cover_letter(
         fallback_used=any(r.fallback_used for r in results),
         fallback_reason=reasons[0] if reasons else None,
         cost_usd=sum(costs) if costs else None,
-        problems=problems,
+        problems=[*step_errors, *problems],
     )
