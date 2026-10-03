@@ -45,7 +45,7 @@ def test_dedupe_urls():
 
 
 def test_normalize_url():
-    assert normalize_url("HTTPS://Boards.Greenhouse.io/acme/jobs/1?gh_src=abc&gh_jid=1/") == "https://boards.greenhouse.io/acme/jobs/1?gh_jid=1/"
+    assert normalize_url("HTTPS://Boards.Greenhouse.io/acme/jobs/1?gh_src=abc&gh_jid=1/") == "https://boards.greenhouse.io/acme/jobs/1"
     assert normalize_url(" https://a.com/x/?ref=foo&lever-source=bar ") == "https://a.com/x"
 
 

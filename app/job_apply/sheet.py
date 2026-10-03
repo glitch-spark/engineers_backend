@@ -5,7 +5,8 @@ import io
 import re
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit
+
+from app.job_apply.urls import normalize_url
 
 MAX_ROWS = 1000
 MAX_BYTES = 5_000_000
@@ -14,7 +15,6 @@ MIN_JD_CELL_CHARS = 100  # shorter cells are treated as "no JD" and the URL is f
 
 _URL = re.compile(r"^https?://\S+$", re.I)
 _HYPERLINK_FORMULA = re.compile(r'^=\s*HYPERLINK\(\s*"([^"]+)"(?:\s*[,;]\s*"([^"]*)")?', re.I)
-_DROP_PARAMS = re.compile(r"^(?:utm_[a-z]+|gh_src|source|src|ref|refid|trk|lever-source|lever-origin)$", re.I)
 
 
 class SheetError(ValueError):
@@ -39,17 +39,6 @@ class _Cell:
             if v and _URL.match(v.strip()):
                 return v.strip()
         return None
-
-
-def normalize_url(url: str) -> str:
-    parts = urlsplit((url or "").strip())
-    query = "&".join(
-        p for p in parts.query.split("&") if p and not _DROP_PARAMS.match(p.split("=", 1)[0])
-    )
-    path = parts.path.rstrip("/")
-    # Keep hash routes (#/job/1, #!/job/1): single-page career sites put the job id there.
-    fragment = parts.fragment if parts.fragment.startswith(("/", "!")) else ""
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, fragment))
 
 
 def _xlsx_cell(value_cell, formula_cell) -> _Cell:

@@ -236,6 +236,28 @@ async def _migrate_legacy_payer_to_admin(database) -> None:
         log.warning("legacy payer backfill failed: %s", exc)
 
 
+async def _migrate_job_apply_urls(database) -> None:
+    """Re-clean stored Job Applies URLs when the cleaning rules change (app/job_apply/urls.py URL_VERSION), so
+    applied history, the posting cache and run rows keep matching newly read sheets. Each document is marked
+    with the version it was cleaned at, so this runs once per version. Two applied-history records (or cache
+    entries) that become the same URL collapse to the first."""
+    from pymongo.errors import DuplicateKeyError
+
+    from app.job_apply.urls import URL_VERSION, normalize_url
+
+    for name in ("job_application_log", "job_posting_cache", "job_apply_rows"):
+        coll = database[name]
+        try:
+            async for doc in coll.find({"urlv": {"$ne": URL_VERSION}, "url": {"$type": "string"}}, {"url": 1}):
+                clean = normalize_url(doc["url"])
+                try:
+                    await coll.update_one({"_id": doc["_id"]}, {"$set": {"url": clean, "urlv": URL_VERSION}})
+                except DuplicateKeyError:
+                    await coll.delete_one({"_id": doc["_id"]})  # the same job is already recorded in clean form
+        except Exception as exc:  # noqa: BLE001
+            log.warning("job-apply URL re-clean of %s failed: %s", name, exc)
+
+
 async def _migrate_job_apply_screening(database) -> None:
     """Job Applies runs from before screening (no `phase`) keep working: they scored straight through, so they
     become auto-started score-phase runs with every group assigned to every selected profile, and their rows get
@@ -286,6 +308,7 @@ async def init_db():
     await _migrate_default_leaderboard_optin(database)
     await _migrate_billing_cycle(database)
     await _migrate_legacy_payer_to_admin(database)
+    await _migrate_job_apply_urls(database)
     await _migrate_job_apply_screening(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
     try:

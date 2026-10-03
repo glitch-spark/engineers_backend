@@ -1205,3 +1205,35 @@ async def test_other_location_migration(client, staff_user, auth_header):
     assert row["screen"] == "other_location"
     rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
     assert rep["others"] == [{"key": "CA", "jobs": 1}] and rep["buckets"]["other_location"] == 1
+
+
+async def test_stored_urls_are_recleaned_once(client, staff_user, auth_header):
+    """Applied history, posting cache and run rows move to the new URL form; two old records that are now the
+    same job collapse to one."""
+    from app.db import _migrate_job_apply_urls
+    from app.job_apply.urls import URL_VERSION
+    from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, JobPostingCache
+
+    log = JobApplicationLog.get_motor_collection()
+    old_apply = "https://jobs.lever.co/acme/1a2b/apply"
+    clean = "https://jobs.lever.co/acme/1a2b"
+    base = {"userId": staff_user.id, "accountId": "a1", "fileKey": "r1", "appliedAt": datetime.utcnow()}
+    await log.insert_one({**base, "url": old_apply})
+    await log.insert_one({**base, "url": clean + "?lever-via=x"})
+    await log.insert_one({**base, "fileKey": "r2", "url": "https://boards.greenhouse.io/acme/jobs/9?gh_jid=9"})
+    await JobPostingCache.get_motor_collection().insert_one(
+        {"url": old_apply, "text": "x" * 300, "source": "html", "fetchedAt": datetime.utcnow()})
+    run_id = await screened_run(client, auth_header(staff_user))
+    rows = JobApplyRow.get_motor_collection()
+    await rows.update_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"},
+                          {"$set": {"url": "https://jobs.example.com/remote?utm_source=sheet"}})
+
+    database = JobApplyRun.get_motor_collection().database
+    await _migrate_job_apply_urls(database)
+    await _migrate_job_apply_urls(database)  # second start: nothing left to do
+
+    logged = sorted(d["url"] for d in await log.find({"userId": staff_user.id}).to_list(None))
+    assert logged == ["https://boards.greenhouse.io/acme/jobs/9", clean]
+    assert await log.count_documents({"urlv": {"$ne": URL_VERSION}}) == 0
+    assert await JobPostingCache.get_motor_collection().find_one({"url": clean})
+    assert await rows.find_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"})
