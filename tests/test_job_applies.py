@@ -897,3 +897,151 @@ async def test_mark_all_marks_every_ready_application(client, staff_user, auth_h
         (str(eric.id), False), (str(tharun.id), True)}
     apps = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
     assert apps["applied"] == 3 and apps["toGo"] == 1 and apps["jobs"] == 1
+
+
+# ---------- screening: report, start, include anyway, max age, retry ----------
+
+
+async def rows_by_url(client, h, run_id, **params):
+    q = "&".join(f"{k}={v}" for k, v in params.items())
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows?{q}", headers=h)).json()["rows"]
+    return {x["url"]: x for x in rows}
+
+
+async def start(client, h, run_id, assignments, accounts, threshold=60):
+    body = {
+        "assignments": {k: [str(a.id) for a in v] for k, v in assignments.items()},
+        "selection": [{"accountId": str(a.id), "resumeIds": []} for a in accounts],
+        "threshold": threshold,
+    }
+    return await client.post(f"/job-applies/runs/{run_id}/start", headers=h, json=body)
+
+
+async def test_screening_report(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["total"] == 3 and rep["worth"] == 2 and rep["buckets"]["onsite"] == 1 and rep["maxAgeDays"] == 30
+    assert rep["groups"] == [{"key": "US", "jobs": 2, "check": rep["groups"][0]["check"], "fits": [str(us.id)]}]
+    assert rep["profiles"][0]["id"] == str(us.id) and rep["profiles"][0]["resumes"] == 2
+
+
+async def test_start_scores_assigned_only(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user, name="US")
+    gb = await make_account(staff_user, country="GB", name="UK")
+    run_id = await screened_run(client, h)
+    r = await start(client, h, run_id, {"US": [us]}, [us, gb])
+    assert r.status_code == 200, r.text
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["phase"] == "score"
+    rows = await rows_by_url(client, h, run_id)
+    remote = rows["https://jobs.example.com/remote"]
+    assert remote["status"] == "scored"
+    detail = (await client.get(f"/job-applies/rows/{remote['_id']}", headers=h)).json()
+    assert {s["accountId"] for s in detail["scores"]} == {str(us.id)}
+    assert rows["https://jobs.example.com/hybrid"]["status"] == "excluded"
+
+
+async def test_start_unassigned_group(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    r = await start(client, h, run_id, {"GB": [us]}, [us])
+    assert r.status_code == 400 and "at least one profile" in r.json()["error"]
+
+
+async def test_start_twice_409(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    assert (await start(client, h, run_id, {"US": [us]}, [us])).status_code == 200
+    r = await start(client, h, run_id, {"US": [us]}, [us])
+    assert r.status_code == 409 and r.json()["error"] == "Run is not waiting for review."
+
+
+async def test_start_requires_screened(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    r = await create_screen_run(client, h)
+    assert (await start(client, h, r.json()["runId"], {"US": [us]}, [us])).status_code == 409
+
+
+async def test_start_archived_profile_404(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    us.archived = True
+    await us.save()
+    assert (await start(client, h, run_id, {"US": [us]}, [us])).status_code == 404
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["profiles"] == []
+
+
+async def test_max_age_patch_rescreens(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    r = await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 1})
+    assert r.status_code == 200, r.text
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["maxAgeDays"] == 1 and rep["worth"] == 0 and rep["buckets"]["too_old"] == 2
+    await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 30})
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["worth"] == 2 and rep["buckets"]["too_old"] == 0
+
+
+async def test_max_age_patch_409_when_not_screened(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    await start(client, h, run_id, {"US": [us]}, [us])
+    r = await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 5})
+    assert r.status_code == 409 and r.json()["error"] == "Max age can only change before scoring starts."
+    assert (await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"threshold": 50})).status_code == 200
+
+
+async def test_include_anyway(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    hybrid, gh = rows["https://jobs.example.com/hybrid"], rows["https://boards.greenhouse.io/acme/jobs/9"]
+    r = await client.put(f"/job-applies/rows/{hybrid['_id']}/include", headers=h, json={"include": True})
+    assert r.status_code == 200 and r.json()["screen"] == "check" and r.json()["forceInclude"] is True
+    r = await client.put(f"/job-applies/rows/{gh['_id']}/include", headers=h, json={"include": True})
+    assert r.status_code == 400
+    r = await client.put(f"/job-applies/rows/{hybrid['_id']}/include", headers=h, json={"include": False})
+    assert r.json()["screen"] == "onsite"
+
+
+async def test_retry_from_screened_keeps_force_include(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    await client.put(f"/job-applies/rows/{rows['https://jobs.example.com/hybrid']['_id']}/include", headers=h, json={"include": True})
+    assert rows["https://boards.greenhouse.io/acme/jobs/9"]["screen"] == "not_fetched"
+    monkeypatch.setattr(worker, "FETCH", fake_fetch)
+    r = await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)
+    assert r.status_code == 200 and r.json()["reset"] == 1
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "screened"
+    rows = await rows_by_url(client, h, run_id)
+    assert rows["https://jobs.example.com/hybrid"]["screen"] == "check"
+    assert rows["https://boards.greenhouse.io/acme/jobs/9"]["screen"] in ("valid", "check")
+
+
+async def test_screen_view_projection():
+    from app.routers.job_applies import _ScreenView
+
+    assert set(_ScreenView.model_fields) == {"screen", "groupKey"}
+
+
+async def test_rows_screen_filter(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id, screen="onsite")
+    assert list(rows) == ["https://jobs.example.com/hybrid"]

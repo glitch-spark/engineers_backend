@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, gsheet, worker
+from app.job_apply.screening import FORCEABLE, WORTH, bucket, build_report, rescreen
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
@@ -392,7 +393,7 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
         if not isinstance(it, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid selection")
         acc = await Account.get(to_object_id(str(it.get("accountId", ""))))
-        if acc is None or not _can_see(acc.createdBy, user):
+        if acc is None or acc.archived or not _can_see(acc.createdBy, user):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
         have = {str(r.id) for r in acc.resumes}
         wanted = [str(x) for x in it.get("resumeIds") or []]
@@ -554,18 +555,99 @@ async def get_run(
 
 
 class RunPatch(BaseModel):
-    threshold: int = Field(ge=0, le=100)
+    threshold: Optional[int] = Field(None, ge=0, le=100)
+    maxAgeDays: Optional[int] = Field(None, ge=1, le=365)
+
+
+async def _rescreen_rows(run: JobApplyRun) -> None:
+    """Re-apply the job gates to every read row (max age changed). No fetch, no LLM."""
+    run_date = run.runDate.date()
+    coll = JobApplyRow.get_motor_collection()
+    excluded = 0
+    for row in await JobApplyRow.find({"runId": run.id, "extraction": {"$ne": None}}).to_list():
+        rescreen(row, run_date=run_date, max_age_days=run.maxAgeDays)
+        excluded += row.status == "excluded"
+        await coll.update_one({"_id": row.id}, {"$set": {
+            "gates": [g.model_dump() for g in row.gates], "status": row.status, "statusReason": row.statusReason,
+            "screen": row.screen, "updatedAt": datetime.utcnow(),
+        }})
+    await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$set": {"counts.excluded": excluded}})
 
 
 @router.patch("/runs/{run_id}")
 async def update_run(run_id: str, body: RunPatch, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     run = await _owned_run(run_id, user)
+    if body.maxAgeDays is not None and run.status != "screened":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Max age can only change before scoring starts.")
+    fields: dict[str, Any] = {k: v for k, v in body.model_dump().items() if v is not None}
     # Targeted $set: a full save() would overwrite counts/status the worker is updating meanwhile.
     await JobApplyRun.get_motor_collection().update_one(
-        {"_id": run.id}, {"$set": {"threshold": body.threshold, "updatedAt": datetime.utcnow()}}
+        {"_id": run.id}, {"$set": {**fields, "updatedAt": datetime.utcnow()}}
     )
-    run.threshold = body.threshold
+    for k, v in fields.items():
+        setattr(run, k, v)
+    if body.maxAgeDays is not None:
+        await _rescreen_rows(run)
     return await _run_out(run, with_profiles=True)
+
+
+class _ScreenView(BaseModel):
+    """The two fields the screening report reads (never the job text: runs have up to ~1,000 rows)."""
+
+    screen: Optional[str] = None
+    groupKey: Optional[str] = None
+
+
+@router.get("/runs/{run_id}/screening")
+async def get_screening(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """How many jobs are worth applying to and why the others aren't, plus the worthwhile jobs grouped by location
+    with the run owner's profiles that fit each group."""
+    run = await _owned_run(run_id, user)
+    rows = await JobApplyRow.find({"runId": run.id}).project(_ScreenView).to_list()
+    accounts = await Account.find({"createdBy": run.userId, "archived": {"$ne": True}}).sort("+name").to_list()
+    profiles = [
+        {"id": str(a.id), "name": a.name, "country": a.country, "region": a.region, "resumes": len(a.resumes)}
+        for a in accounts
+    ]
+    return build_report([(r.screen, r.groupKey) for r in rows], profiles, max_age_days=run.maxAgeDays)
+
+
+class StartBody(BaseModel):
+    assignments: dict[str, list[str]]
+    selection: list[dict[str, Any]]
+    threshold: int = Field(75, ge=0, le=100)
+
+
+@router.post("/runs/{run_id}/start")
+async def start_run(run_id: str, body: StartBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Score a screened run: each location group's jobs against the profiles picked for it."""
+    run = await _owned_run(run_id, user)
+    if run.status != "screened":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not waiting for review.")
+    if await JobApplyRun.find_one({"userId": run.userId, "status": {"$in": list(ACTIVE)}}):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Another run is in progress.")
+    sel = await _parse_selection(json.dumps(body.selection), user)
+    picked = {str(s.accountId) for s in sel}
+    assignments = {k: list(dict.fromkeys(ids)) for k, ids in body.assignments.items() if ids}
+    if any(v not in picked for ids in assignments.values() for v in ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick resumes for every assigned profile.")
+    worth = await JobApplyRow.find({"runId": run.id, "screen": {"$in": list(WORTH)}}).project(_ScreenView).to_list()
+    keys = {r.groupKey or "none" for r in worth}
+    if not keys or not ("*" in assignments or keys & set(assignments)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least one profile for a group with jobs.")
+    res = await JobApplyRun.get_motor_collection().update_one(
+        {"_id": run.id, "status": "screened"},
+        {"$set": {
+            "assignments": {k: [PydanticObjectId(v) for v in ids] for k, ids in assignments.items()},
+            "selection": [s.model_dump() for s in sel], "threshold": body.threshold,
+            "phase": "score", "status": "queued", "updatedAt": datetime.utcnow(),
+        }},
+    )
+    if not res.modified_count:  # a second click got here first
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not waiting for review.")
+    if worker.worker_enabled():
+        worker.start_run(run.id)
+    return await _run_out(await JobApplyRun.get(run.id), with_profiles=True)
 
 
 @router.post("/runs/{run_id}/cancel")
@@ -591,7 +673,7 @@ async def retry_failed(run_id: str, user: Annotated[UserExtra, Depends(get_curre
     coll = JobApplyRow.get_motor_collection()
     res = await coll.update_many(
         {"runId": run.id, "status": {"$in": list(FAILED)}},
-        {"$set": {"status": "pending", "statusReason": None, "updatedAt": datetime.utcnow()}},
+        {"$set": {"status": "pending", "statusReason": None, "screen": None, "updatedAt": datetime.utcnow()}},
     )
     reset = res.modified_count
     await JobApplyRun.get_motor_collection().update_one(
@@ -632,9 +714,12 @@ async def list_rows(
     applied: str = Query("any", pattern="^(any|yes|no)$"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    screen: str = Query(""),
 ) -> dict:
     run = await _owned_run(run_id, user)
     q = await _rows_query(run, view=view, account_id=accountId, min_score=minScore)
+    if screen:
+        q["screen"] = screen
 
     if applied == "any":
         total = await JobApplyRow.find(q).count()
@@ -689,6 +774,36 @@ async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_us
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None
     out["jdText"] = row.jdText
     return out
+
+
+class IncludeBody(BaseModel):
+    include: bool
+
+
+@router.put("/rows/{row_id}/include")
+async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Include anyway: bring a job dropped for clearance, on-site or age back into the jobs worth applying to."""
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    if run is None or run.status != "screened":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Jobs can only be included before scoring starts.")
+    base = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
+    )
+    if base not in FORCEABLE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only jobs excluded for clearance, on-site or age can be included.",
+        )
+    row.forceInclude = body.include
+    row.screen = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey,
+        force_include=row.forceInclude,
+    )
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}
+    )
+    return _row_summary(row, run.threshold)
 
 
 # ---------- applied marks ----------
