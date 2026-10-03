@@ -1263,3 +1263,37 @@ async def test_sheet_preview_counts(client, staff_user, auth_header):
     body = r.json()
     assert body["total"] == 3 and body["links"] == 4 and body["duplicates"] == 1 and body["cleaned"] == 2
     assert body["blocked"] == 1
+
+
+async def test_runs_list_summary(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    screened_id = await screened_run(client, h)
+    scored_id = await screened_run(client, h)
+    await start(client, h, scored_id, {"US": [us]}, [us])
+    await worker.run_worker(PydanticObjectId(scored_id))
+    rows = await rows_by_url(client, h, scored_id, view="suggested")
+    remote = rows["https://jobs.example.com/remote"]
+    r = await client.put(f"/job-applies/rows/{remote['_id']}/applied", headers=h,
+                         json={"accountId": str(us.id), "resumeId": remote["suggestions"][0]["resumeId"], "applied": True})
+    assert r.status_code == 200, r.text
+
+    runs = {x["_id"]: x for x in (await client.get("/job-applies/runs", headers=h)).json()["runs"]}
+    s = runs[screened_id]["summary"]
+    assert s["worth"] == 2 and s["closed"] == 0 and s["markets"] == {"US": 2, "UKEU": 0, "LATAM": 0}
+    t = runs[scored_id]["summary"]
+    assert t["applied"] == 1 and t["toApply"] == len(rows) - 1 and t["tailoring"] == 0
+
+
+async def test_runs_list_survives_a_summary_failure(client, staff_user, auth_header, monkeypatch):
+    from app.routers import job_applies as router_mod
+
+    h = auth_header(staff_user)
+    await screened_run(client, h)
+
+    def boom(key):
+        raise RuntimeError("aggregation trouble")
+
+    monkeypatch.setattr(router_mod, "markets_for", boom)
+    r = await client.get("/job-applies/runs", headers=h)
+    assert r.status_code == 200 and r.json()["runs"][0]["summary"] is None

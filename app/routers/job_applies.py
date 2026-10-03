@@ -1,6 +1,7 @@
 """Job Applies: upload a sheet of job postings, score selected resumes, suggest one resume per profile."""
 import asyncio
 import json
+import logging
 from datetime import date, datetime, timezone
 from typing import Annotated, Any, Optional
 
@@ -14,7 +15,9 @@ from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, gsheet, worker
 from app.job_apply.fetch import route as fetch_route
-from app.job_apply.screening import FORCEABLE, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen
+from app.job_apply.screening import (
+    FORCEABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen,
+)
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
@@ -30,6 +33,8 @@ from app.models.job_apply import (
     RunSelection,
 )
 from app.routers._util import doc_to_dict, to_object_id
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/job-applies", tags=["job-applies"])
 
@@ -528,10 +533,68 @@ async def create_run(
     return {"runId": str(run.id), "status": run.status, "total": len(rows)}
 
 
+async def _run_summaries(runs: list[JobApplyRun]) -> dict[str, Optional[dict]]:
+    """Per run, the numbers its card shows: jobs worth applying to, closed, per candidate market, and (scored runs)
+    jobs still to apply to / applied, tailored resumes in progress. Counts are per job. Two aggregations for the
+    whole list; on failure every summary is None and the cards show without numbers."""
+    ids = [r.id for r in runs]
+    out: dict[str, dict] = {
+        str(i): {"worth": 0, "closed": 0, "markets": {m: 0 for m in MARKETS}, "toApply": 0, "applied": 0, "tailoring": 0}
+        for i in ids
+    }
+    if not ids:
+        return out
+    try:
+        pipeline = [
+            {"$match": {"runId": {"$in": ids}}},
+            {"$lookup": {"from": "job_apply_runs", "localField": "runId", "foreignField": "_id", "as": "run",
+                         "pipeline": [{"$project": {"threshold": 1}}]}},
+            {"$set": {
+                "thr": {"$first": "$run.threshold"},
+                "isApplied": {"$or": [{"$eq": ["$applied", True]}, {"$gt": [{"$size": {"$ifNull": ["$appliedResumes", []]}}, 0]}]},
+            }},
+            {"$set": {"isSuggested": {"$or": [
+                {"$and": [{"$ne": ["$topScore", None]}, {"$gte": ["$topScore", "$thr"]}]},
+                {"$gt": [{"$size": {"$ifNull": ["$tailorOnly", []]}}, 0]},
+            ]}}},
+            {"$group": {
+                "_id": {"run": "$runId", "screen": "$screen", "key": "$groupKey"},
+                "n": {"$sum": 1},
+                "toApply": {"$sum": {"$cond": [{"$and": ["$isSuggested", {"$not": ["$isApplied"]}]}, 1, 0]}},
+                "applied": {"$sum": {"$cond": ["$isApplied", 1, 0]}},
+            }},
+        ]
+        async for g in JobApplyRow.get_motor_collection().aggregate(pipeline):
+            s = out[str(g["_id"]["run"])]
+            screen = g["_id"].get("screen")
+            if screen in WORTH:
+                s["worth"] += g["n"]
+                for m in markets_for(g["_id"].get("key")):
+                    s["markets"][m] += g["n"]
+            elif screen == "closed":
+                s["closed"] += g["n"]
+            s["toApply"] += g["toApply"]
+            s["applied"] += g["applied"]
+        tailoring = [
+            {"$match": {"userId": runs[0].userId, "jobApplyRowId": {"$ne": None}, "status": {"$in": ["queued", "in_progress"]}}},
+            {"$lookup": {"from": "job_apply_rows", "localField": "jobApplyRowId", "foreignField": "_id", "as": "row",
+                         "pipeline": [{"$project": {"runId": 1}}]}},
+            {"$group": {"_id": {"$first": "$row.runId"}, "n": {"$sum": 1}}},
+        ]
+        async for g in ResumeApplication.get_motor_collection().aggregate(tailoring):
+            if g["_id"] is not None and str(g["_id"]) in out:
+                out[str(g["_id"])]["tailoring"] = g["n"]
+    except Exception as exc:  # noqa: BLE001 — the list still loads; cards show without numbers
+        log.warning("job-apply run summaries failed: %s", exc)
+        return {str(i): None for i in ids}
+    return out
+
+
 @router.get("/runs")
 async def list_runs(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     runs = await JobApplyRun.find({"userId": user.id}).sort("-createdAt").limit(50).to_list()
-    return {"runs": [await _run_out(r) for r in runs]}
+    summaries = await _run_summaries(runs)
+    return {"runs": [{**await _run_out(r), "summary": summaries.get(str(r.id))} for r in runs]}
 
 
 def _naive_utc(value: str) -> datetime:
