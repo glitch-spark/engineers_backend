@@ -367,3 +367,71 @@ async def test_at_most_four_requests_per_site_at_once():
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
         await asyncio.gather(*(fetch_job(f"https://careers.beta.io/jobs/{i}", client=c) for i in range(10)))
     assert peak == 4
+
+
+# ---------- more job boards (from job_url_filter's screen.py) ----------
+
+
+def test_route_more_boards():
+    assert route("https://jobs.eu.lever.co/acme/1f2e-33") == ("lever", {"company": "acme", "id": "1f2e-33", "eu": True})
+    kind, p = route("https://wd3.myworkdaysite.com/en-US/recruiting/acme/Careers/job/Remote/Engineer_R1")
+    assert kind == "workday" and p == {"host": "wd3.myworkdaysite.com", "tenant": "acme", "site": "Careers",
+                                       "path": "Remote/Engineer_R1"}
+    assert route("https://careers.smartrecruiters.com/Acme/7445-engineer") == ("smartrecruiters", {"company": "Acme", "id": "7445"})
+    assert route("https://app.careerpuck.com/job-board/acme/job/4004") == ("greenhouse", {"board": "acme", "id": "4004"})
+    assert route("https://acme.bamboohr.com/careers/251") == ("bamboohr", {"host": "acme.bamboohr.com", "id": "251"})
+    assert route("https://acme.zohorecruit.com/jobs/Careers/6485000/Senior-Dev") == (
+        "zoho", {"page": "https://acme.zohorecruit.com/jobs/Careers/6485000/Senior-Dev", "id": "6485000"})
+
+
+async def test_lever_eu_uses_the_eu_api():
+    body = {"text": "Engineer", "descriptionPlain": "Build things in Python. " * 20, "createdAt": 1790000000000,
+            "categories": {"location": "Berlin"}}
+    async with client({"https://api.eu.lever.co/v0/postings/acme/1f2e-33": (200, body)}) as c:
+        res = await fetch_job("https://jobs.eu.lever.co/acme/1f2e-33", client=c)
+    assert res.source == "ats_api" and "Berlin" in res.text
+
+
+async def test_bamboohr_api():
+    body = {"result": {"jobOpening": {
+        "jobOpeningName": "Support Engineer (EMEA)", "description": LONG, "datePosted": "2026-09-04",
+        "atsLocation": {"city": "Berlin", "country": "Germany"}, "locationType": "1"}}}
+    async with client({"https://acme.bamboohr.com/careers/251/detail": (200, body)}) as c:
+        res = await fetch_job("https://acme.bamboohr.com/careers/251", client=c)
+    assert res.source == "ats_api" and res.title == "Support Engineer (EMEA)" and res.postedDate == date(2026, 9, 4)
+    assert "Berlin, Germany" in res.text and "Workplace type: remote" in res.text
+
+
+async def test_bamboohr_gone_is_closed():
+    async with client({"https://acme.bamboohr.com/careers/597/detail": (404, {"type": "not_found"})}) as c:
+        with pytest.raises(FetchError, match="job closed"):
+            await fetch_job("https://acme.bamboohr.com/careers/597", client=c)
+
+
+async def test_zoho_embedded_jobs():
+    jobs = [{"id": "6485000", "Posting_Title": "Senior Dev", "Job_Description": LONG, "City": "Kyiv",
+             "Country": "Ukraine", "Remote_Job": True}]
+    escaped = json.dumps(json.dumps(jobs))[1:-1].replace("'", "\'")
+    page = f"<html><script>var jobs = JSON.parse('{escaped}');</script><body>menu</body></html>"
+    async with client({"https://acme.zohorecruit.com/": (200, page)}) as c:
+        res = await fetch_job("https://acme.zohorecruit.com/jobs/Careers/6485000/Senior-Dev", client=c)
+    assert res.title == "Senior Dev" and "distributed systems" in res.text and "Kyiv" in res.text
+
+
+async def test_gh_jid_page_with_embedded_greenhouse_board():
+    # a company careers page that embeds its Greenhouse board: read the job from Greenhouse, not the job list
+    listing = "<html><body>" + "<a>Open role</a>" * 60 + \
+        '<script src="https://boards.greenhouse.io/embed/job_board/js?for=nebius"></script></body></html>'
+    gh = {"title": "Senior Engineer", "content": "&lt;p&gt;" + "Build things in Python. " * 20 + "&lt;/p&gt;",
+          "first_published": "2026-09-15T10:00:00-04:00", "location": {"name": "Remote - Europe"}}
+    async with client({"https://careers.nebius.com/": (200, listing),
+                       "https://boards-api.greenhouse.io/v1/boards/nebius/jobs/4950073101": (200, gh)}) as c:
+        res = await fetch_job("https://careers.nebius.com/?gh_jid=4950073101", client=c)
+    assert res.source == "ats_api" and res.title == "Senior Engineer" and "Remote - Europe" in res.text
+
+
+async def test_workday_hidden_job_says_so():
+    async with client({"https://acme.wd3.myworkdayjobs.com/wday/cxs/": (403, {"errorCode": "HTTP_403"}),
+                       "https://acme.wd3.myworkdayjobs.com/": (200, "<html><body><div id=root></div></body></html>")}) as c:
+        with pytest.raises(FetchError, match="Workday doesn't show this job"):
+            await fetch_job("https://acme.wd3.myworkdayjobs.com/Careers/job/Remote/Engineer_R1", client=c)

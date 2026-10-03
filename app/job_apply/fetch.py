@@ -39,6 +39,14 @@ _BOT_TITLE = re.compile(
 )
 _BOT_MARKERS = ("g-recaptcha", "h-captcha", "cf-chl-", "captcha-delivery.com", "/_incapsula_resource")
 _BLOCKING_STATUS = {401, 403, 405, 503, 999}
+# A company careers page that embeds its Greenhouse board (job_url_filter extractors.py): with ?gh_jid=N the job
+# is board X, id N — read it from Greenhouse instead of the page (which lists every opening).
+_GH_EMBED = re.compile(r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/embed/job_board(?:/js)?\?for=([\w-]+)")
+_GH_JID = re.compile(r"(?:^|&)gh_jid=(\d+)")
+_ZOHO_JOBS = re.compile(r"var\s+jobs\s*=\s*JSON\.parse\('(.*?)'\)\s*;", re.DOTALL)
+_JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.DOTALL)
+_JS_SIMPLE = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+_WORKDAY_SITE_HOST = re.compile(r"^wd\d+\.myworkdaysite\.com$")
 
 # One retry for a rate limit, timeout or dropped connection; at most HOST_CONCURRENCY requests per site at once.
 RETRY_DELAY = 2.0
@@ -184,15 +192,19 @@ def route(url: str) -> tuple[str, dict]:
         return "blocked", {}
     if host in ("boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io") and len(segs) >= 3 and segs[1] == "jobs":
         return "greenhouse", {"board": segs[0], "id": segs[2]}
+    if host == "app.careerpuck.com" and len(segs) >= 4 and segs[0] == "job-board" and segs[2] == "job":
+        return "greenhouse", {"board": segs[1], "id": segs[3]}  # CareerPuck boards are Greenhouse boards
     if host == "jobs.lever.co" and len(segs) >= 2:
         return "lever", {"company": segs[0], "id": segs[1]}
+    if host == "jobs.eu.lever.co" and len(segs) >= 2:
+        return "lever", {"company": segs[0], "id": segs[1], "eu": True}
     if host == "jobs.ashbyhq.com" and len(segs) >= 2:
         return "ashby", {"org": segs[0], "id": segs[1]}
     if host == "apply.workable.com" and len(segs) >= 3 and segs[1] == "j":
         return "workable", {"account": segs[0], "shortcode": segs[2]}
     if host.endswith(".workable.com") and host != "apply.workable.com" and len(segs) >= 2 and segs[0] == "j":
         return "workable", {"account": host.split(".")[0], "shortcode": segs[1]}
-    if host == "jobs.smartrecruiters.com" and len(segs) >= 2 and (m := re.match(r"(\d+)", segs[1])):
+    if host in ("jobs.smartrecruiters.com", "careers.smartrecruiters.com") and len(segs) >= 2 and (m := re.match(r"(\d+)", segs[1])):
         return "smartrecruiters", {"company": segs[0], "id": m.group(1)}
     if host.endswith(".myworkdayjobs.com") and "job" in segs:
         i = segs.index("job")
@@ -201,6 +213,14 @@ def route(url: str) -> tuple[str, dict]:
             return "workday", {
                 "host": host, "tenant": host.split(".")[0], "site": site_segs[-1], "path": "/".join(segs[i + 1:]),
             }
+    if _WORKDAY_SITE_HOST.match(host):
+        segs_nl = [s for s in segs if not re.fullmatch(r"[a-z]{2}-[A-Z]{2}", s)]
+        if len(segs_nl) >= 5 and segs_nl[0] == "recruiting" and segs_nl[3] == "job":
+            return "workday", {"host": host, "tenant": segs_nl[1], "site": segs_nl[2], "path": "/".join(segs_nl[4:])}
+    if host.endswith(".bamboohr.com") and len(segs) >= 2 and segs[0] == "careers" and segs[1].isdigit():
+        return "bamboohr", {"host": host, "id": segs[1]}
+    if ".zohorecruit." in host and len(segs) >= 3 and [s.lower() for s in segs[:2]] == ["jobs", "careers"] and segs[2].isdigit():
+        return "zoho", {"page": url, "id": segs[2]}
     return "generic", {}
 
 
@@ -312,7 +332,8 @@ async def _greenhouse(client, p) -> FetchResult:
 
 
 async def _lever(client, p) -> FetchResult:
-    d = await _get_json(client, f"https://api.lever.co/v0/postings/{p['company']}/{p['id']}")
+    api = "api.eu.lever.co" if p.get("eu") else "api.lever.co"
+    d = await _get_json(client, f"https://{api}/v0/postings/{p['company']}/{p['id']}")
     parts = [d.get("descriptionPlain") or html_to_text(d.get("description") or "")]
     for lst in d.get("lists") or []:
         parts.append(f"{lst.get('text', '')}\n{html_to_text(lst.get('content') or '')}")
@@ -379,10 +400,73 @@ async def _workday(client, p) -> FetchResult:
     )
 
 
+_BAMBOO_MODE = {"1": "remote", "2": "hybrid"}  # BambooHR locationType ("0" / missing = on-site or unknown)
+
+
+async def _bamboohr(client, p) -> FetchResult:
+    d = await _get_json(client, f"https://{p['host']}/careers/{p['id']}/detail")
+    job = (d.get("result") or {}).get("jobOpening") if isinstance(d, dict) else None
+    if not isinstance(job, dict):
+        raise JobClosed("job closed (no longer on the BambooHR careers page)")
+    title = (job.get("jobOpeningName") or "").strip()
+    where = job.get("atsLocation") or job.get("location") or {}
+    loc = ", ".join(x for x in (where.get("city"), where.get("country") or where.get("addressCountry")) if x)
+    return FetchResult(
+        text=_compose(html_to_text(job.get("description") or ""), title=title, location=loc,
+                      workplace=_BAMBOO_MODE.get(str(job.get("locationType") or ""), "")),
+        source="ats_api", postedDate=_date(job.get("datePosted")), title=title, location=loc,
+    )
+
+
+def _js_unescape(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        esc = m.group(1)
+        if esc[0] in "xu" and len(esc) > 1:
+            return chr(int(esc[1:], 16))
+        return _JS_SIMPLE.get(esc, esc)
+
+    return _JS_ESCAPE.sub(repl, text)
+
+
+async def _zoho(client, p) -> FetchResult:
+    """Zoho Recruit embeds its openings in the careers page as `var jobs = JSON.parse('…')`."""
+    resp = await _get_page(client, p["page"])
+    resp.raise_for_status()
+    m = _ZOHO_JOBS.search(resp.text)
+    if not m:
+        raise FetchError("no Zoho job data on the page")
+    records = json.loads(_js_unescape(m.group(1)), strict=False)
+    job = next((r for r in records if isinstance(r, dict) and str(r.get("id")) == p["id"]), None)
+    if job is None:
+        raise JobClosed("job closed (no longer on the Zoho careers page)")
+    title = html_lib.unescape(str(job.get("Posting_Title") or "")).strip()
+    loc = ", ".join(str(x) for x in (job.get("City"), job.get("Country")) if x)
+    return FetchResult(
+        text=_compose(html_to_text(job.get("Job_Description") or ""), title=title, location=loc,
+                      remote=bool(job.get("Remote_Job"))),
+        source="ats_api", title=title, location=loc,
+    )
+
+
 _ATS = {
     "greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby, "workable": _workable,
-    "smartrecruiters": _smartrecruiters, "workday": _workday,
+    "smartrecruiters": _smartrecruiters, "workday": _workday, "bamboohr": _bamboohr, "zoho": _zoho,
 }
+
+
+async def _embedded_greenhouse(client, url: str, markup: str) -> Optional[FetchResult]:
+    """`?gh_jid=N` on a page that embeds Greenhouse board X: the job is X/N on Greenhouse."""
+    jid = _GH_JID.search(urlsplit(url).query)
+    board = _GH_EMBED.search(markup or "") if jid else None
+    if not board:
+        return None
+    try:
+        res = await _greenhouse(client, {"board": board.group(1), "id": jid.group(1)})
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in _GONE:
+            raise JobClosed("job closed (the greenhouse API no longer lists it)") from exc
+        return None
+    return res if len(res.text) >= MIN_TEXT else None
 
 
 # ---------- generic pages ----------
@@ -478,6 +562,9 @@ async def fetch_job(
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in _GONE:
                 raise JobClosed(f"job closed (the {kind} API no longer lists it)") from exc
+            if kind == "workday" and exc.response.status_code in (401, 403):
+                # Workday answers 403 for postings it no longer shows; the page is an empty app shell.
+                raise FetchError("Workday doesn't show this job any more (it may be closed)") from exc
         except Exception:  # noqa: BLE001 — any other ATS API problem falls back to the page itself
             pass
 
@@ -491,6 +578,8 @@ async def fetch_job(
         if _lands_on_job_list(url, str(resp.url)):
             raise JobClosed("job closed (the link now opens the job list)")
         if resp.status_code < 400:
+            if embedded := await _embedded_greenhouse(client, url, resp.text):
+                return embedded
             result = await asyncio.to_thread(_from_page, resp.text, "html")
         else:
             problem = _status_problem(resp.status_code)
@@ -505,10 +594,15 @@ async def fetch_job(
 
     if browser is not None and (result is None or len(result.text) < THIN_PAGE):
         rendered: Optional[FetchResult] = None
+        markup: Optional[str] = None
         try:
-            rendered = await asyncio.to_thread(_from_page, await browser(url), "browser")
+            markup = await browser(url)
         except Exception:  # noqa: BLE001 — browser failure leaves the plain-HTML result
             pass
+        if markup is not None:
+            if embedded := await _embedded_greenhouse(client, url, markup):
+                return embedded
+            rendered = await asyncio.to_thread(_from_page, markup, "browser")
         if rendered is not None and rendered.closed:
             raise JobClosed(f"job closed ({rendered.closed})")
         if rendered is not None and rendered.bot_check:
