@@ -21,8 +21,6 @@ def configured(monkeypatch):
         lambda: SimpleNamespace(
             ANTHROPIC_API_KEY="sk-ant-test",
             OPENAI_API_KEY="sk-openai-test",
-            RESUME_OPENAI_MODEL="gpt-5-mini",
-            RESUME_REASONING_EFFORT="low",
             RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
             COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
             SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
@@ -78,13 +76,13 @@ async def test_refusal_and_truncation_fall_back(monkeypatch, error):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": error,
-            "openai:gpt-5-mini": ("ok", USAGE),
+            "openai:gpt-6.1-sol": ("ok", USAGE),
         },
     )
     res = await llm_router.complete("resume", "p", None)
-    assert seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-5-mini"]
+    assert seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-6.1-sol"]
     assert res.provider == "openai" and res.fallback_used is True
-    assert res.cost_usd is None  # OpenAI prices unknown
+    assert res.cost_usd == pytest.approx((1000 * 2 + 500 * 10) / 1e6)
 
 
 async def test_validate_failure_falls_back(monkeypatch):
@@ -92,7 +90,7 @@ async def test_validate_failure_falls_back(monkeypatch):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": ("bad", USAGE),
-            "openai:gpt-5-mini": ("good", USAGE),
+            "openai:gpt-6.1-sol": ("good", USAGE),
         },
     )
 
@@ -101,14 +99,14 @@ async def test_validate_failure_falls_back(monkeypatch):
             raise ValueError("not good enough")
 
     res = await llm_router.complete("resume", "p", None, validate=validate)
-    assert res.text == "good" and seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-5-mini"]
+    assert res.text == "good" and seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-6.1-sol"]
     assert "not good enough" in (res.fallback_reason or "")
 
 
 async def test_empty_output_counts_as_failure(monkeypatch):
     script(
         monkeypatch,
-        {"anthropic:claude-sonnet-5-5": ("   ", USAGE), "openai:gpt-5-mini": ("fine", USAGE)},
+        {"anthropic:claude-sonnet-5-5": ("   ", USAGE), "openai:gpt-6.1-sol": ("fine", USAGE)},
     )
     res = await llm_router.complete("resume", "p", None)
     assert res.text == "fine"
@@ -119,7 +117,7 @@ async def test_all_fail_raises_last_error(monkeypatch):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": RuntimeError("first"),
-            "openai:gpt-5-mini": RuntimeError("last"),
+            "openai:gpt-6.1-sol": RuntimeError("last"),
         },
     )
     with pytest.raises(RuntimeError, match="last"):
@@ -133,8 +131,6 @@ async def test_empty_chain_raises_runtime_error(monkeypatch):
         lambda: SimpleNamespace(
             ANTHROPIC_API_KEY=None,
             OPENAI_API_KEY=None,
-            RESUME_OPENAI_MODEL="gpt-5-mini",
-            RESUME_REASONING_EFFORT="low",
             RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
             COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
             SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
@@ -148,22 +144,6 @@ async def test_unavailable_requested_model_raises_model_not_available(monkeypatc
     script(monkeypatch, {})
     with pytest.raises(mc.ModelNotAvailable):
         await llm_router.complete("resume", "p", None, model_id="anthropic:nope")
-
-
-async def test_free_first_for_screening_but_not_cover_letter(monkeypatch):
-    user = SimpleNamespace(freeLlmModelId="glm-5.2", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
-    seen = script(
-        monkeypatch,
-        {
-            "free:glm-5.2": ("free answer", USAGE),
-            "anthropic:claude-opus-5-5": ("letter", USAGE),
-        },
-    )
-    res = await llm_router.complete("screening", "p", user)
-    assert seen == ["free:glm-5.2"] and res.provider == "free" and res.cost_usd == 0.0
-    seen.clear()
-    res = await llm_router.complete("cover_letter", "p", user)
-    assert seen == ["anthropic:claude-opus-5-5"]
 
 
 async def test_complete_screening_passes_model_id(monkeypatch):

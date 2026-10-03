@@ -1,4 +1,4 @@
-"""Unit tests for the model catalog: availability, defaults, validation, fallback chain, cost."""
+"""Unit tests for the model catalog: providers, per-task presets, defaults, validation, fallback chain, cost."""
 
 import os
 
@@ -16,8 +16,6 @@ def settings(**over):
     base = dict(
         ANTHROPIC_API_KEY="sk-ant-test",
         OPENAI_API_KEY="sk-openai-test",
-        RESUME_OPENAI_MODEL="gpt-5-mini",
-        RESUME_REASONING_EFFORT="low",
         RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
         COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
         SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
@@ -35,53 +33,85 @@ def use_settings(monkeypatch):
     return apply
 
 
-def user(model_id="glm-5.2", key="nvapi-x", max_tokens=None):
-    return SimpleNamespace(freeLlmModelId=model_id, freeLlmApiKey=key, freeLlmMaxTokens=max_tokens)
-
-
 def ids(models):
     return [m.id for m in models]
 
 
-def test_anthropic_models_need_api_key(use_settings):
+def provider_ids(task, provider):
+    return [m.id for m in mc.available_models(task, None) if m.provider == provider]
+
+
+A = "anthropic:claude-"
+O = "openai:"
+
+# The agreed presets: ordered, first entry is the provider's recommended model for the task.
+EXPECTED = {
+    ("resume", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
+    ("cover_letter", "anthropic"): [
+        A + "opus-5-5", A + "fable-5-1", A + "sonnet-5-5", A + "opus-5", A + "opus-4-8",
+    ],
+    ("screening", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
+    ("resume", "openai"): [O + "gpt-6.1-sol", O + "gpt-5.4-mini", O + "gpt-5-mini", O + "gpt-6-luna"],
+    ("cover_letter", "openai"): [
+        O + "gpt-6.1-sol", O + "gpt-6-astra", O + "gpt-5.6-sol", O + "gpt-5.5", O + "gpt-5.6-terra",
+    ],
+    ("screening", "openai"): [
+        O + "gpt-6.1-sol", O + "gpt-6-astra", O + "gpt-5.4-mini", O + "gpt-5-mini", O + "gpt-6-luna",
+    ],
+}
+
+
+@pytest.mark.parametrize("task,provider", list(EXPECTED))
+def test_presets_match_the_agreed_lists(use_settings, task, provider):
+    assert provider_ids(task, provider) == EXPECTED[(task, provider)]
+
+
+def test_providers_are_listed_anthropic_first_and_only_two(use_settings):
+    got = mc.available_models("resume", None)
+    assert [m.provider for m in got][0] == "anthropic"
+    assert {m.provider for m in got} == {"anthropic", "openai"}
+
+
+def test_provider_needs_its_api_key(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
-    assert not [i for i in ids(mc.available_models("resume", None)) if i.startswith("anthropic:")]
-    use_settings()
-    got = ids(mc.available_models("cover_letter", None)) + ids(mc.available_models("resume", None))
-    for needed in ("haiku-4-5", "sonnet-5-5", "opus-5-5", "fable-5-1"):
-        assert f"anthropic:claude-{needed}" in got
+    assert {m.provider for m in mc.available_models("resume", None)} == {"openai"}
+    use_settings(OPENAI_API_KEY="  ")
+    assert {m.provider for m in mc.available_models("resume", None)} == {"anthropic"}
+    use_settings(ANTHROPIC_API_KEY=None, OPENAI_API_KEY=None)
+    assert mc.available_models("resume", None) == []
 
 
-def test_free_models_need_user_key(use_settings):
-    assert not [i for i in ids(mc.available_models("resume", None)) if i.startswith("free:")]
-    assert not [i for i in ids(mc.available_models("resume", user(key="  "))) if i.startswith("free:")]
-    assert "free:glm-5.2" in ids(mc.available_models("resume", user()))
+def test_nvidia_free_models_are_never_offered(use_settings):
+    user = SimpleNamespace(freeLlmModelId="glm-5.3", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
+    assert not [i for i in ids(mc.available_models("resume", user)) if i.startswith("free:")]
+    with pytest.raises(mc.ModelNotAvailable):
+        mc.validate_requested("resume", "free:glm-5.3", user)
+    assert mc.default_model_id("resume", user) == "anthropic:claude-sonnet-5-5"
 
 
-def test_cover_letter_excludes_free_and_haiku(use_settings):
-    got = ids(mc.available_models("cover_letter", user()))
-    assert not [i for i in got if i.startswith("free:") or "haiku" in i]
-    assert "anthropic:claude-fable-5-1" in got
+def test_fable_is_cover_letter_only_and_haiku_never_writes_letters(use_settings):
+    assert A + "fable-5-1" not in ids(mc.available_models("resume", None))
+    assert A + "fable-5-1" not in ids(mc.available_models("screening", None))
+    assert A + "haiku-4-5" not in ids(mc.available_models("cover_letter", None))
 
 
 def test_defaults_per_task(use_settings):
-    assert mc.default_model_id("resume", None) == "anthropic:claude-sonnet-5-5"
-    assert mc.default_model_id("screening", None) == "anthropic:claude-sonnet-5-5"
-    assert mc.default_model_id("cover_letter", None) == "anthropic:claude-opus-5-5"
+    assert mc.default_model_id("resume", None) == A + "sonnet-5-5"
+    assert mc.default_model_id("screening", None) == A + "sonnet-5-5"
+    assert mc.default_model_id("cover_letter", None) == A + "opus-5-5"
 
 
-def test_default_prefers_saved_free_preset_for_resume_and_screening_not_cover_letter(use_settings):
-    u = user()
-    assert mc.default_model_id("resume", u) == "free:glm-5.2"
-    assert mc.default_model_id("screening", u) == "free:glm-5.2"
-    assert mc.default_model_id("cover_letter", u) == "anthropic:claude-opus-5-5"
-
-
-def test_default_falls_back_to_openai_without_anthropic_key(use_settings):
+def test_default_falls_back_to_the_openai_recommendation_without_anthropic(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
-    assert mc.default_model_id("resume", None) == "openai:gpt-5-mini"
+    assert mc.default_model_id("resume", None) == O + "gpt-6.1-sol"
+    assert mc.default_model_id("cover_letter", None) == O + "gpt-6.1-sol"
     use_settings(ANTHROPIC_API_KEY=None, OPENAI_API_KEY=None)
     assert mc.default_model_id("resume", None) is None
+
+
+def test_configured_default_must_be_a_usable_preset(use_settings):
+    use_settings(RESUME_DEFAULT_MODEL="anthropic:claude-fable-5-1")  # not a resume preset
+    assert mc.default_model_id("resume", None) == A + "sonnet-5-5"
 
 
 def test_validate_requested_blank_returns_none(use_settings):
@@ -98,13 +128,17 @@ def test_validate_requested_unknown_id_raises(use_settings):
 def test_validate_requested_missing_provider_key_raises(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
     with pytest.raises(mc.ModelNotAvailable) as exc:
-        mc.validate_requested("resume", "anthropic:claude-sonnet-5-5", None)
+        mc.validate_requested("resume", A + "sonnet-5-5", None)
     assert "not configured" in str(exc.value)
 
 
-def test_validate_requested_wrong_task_raises(use_settings):
+@pytest.mark.parametrize(
+    "task,model_id",
+    [("cover_letter", A + "haiku-4-5"), ("resume", A + "fable-5-1"), ("resume", O + "gpt-6-astra")],
+)
+def test_validate_requested_wrong_task_raises(use_settings, task, model_id):
     with pytest.raises(mc.ModelNotAvailable):
-        mc.validate_requested("cover_letter", "anthropic:claude-haiku-4-5", None)
+        mc.validate_requested(task, model_id, None)
 
 
 def test_validate_requested_returns_spec(use_settings):
@@ -113,58 +147,51 @@ def test_validate_requested_returns_spec(use_settings):
 
 
 def test_fallback_chain_order_and_dedup(use_settings):
-    assert ids(mc.fallback_chain("resume", "anthropic:claude-haiku-4-5", None)) == [
-        "anthropic:claude-haiku-4-5",
-        "anthropic:claude-sonnet-5-5",
-        "openai:gpt-5-mini",
+    assert ids(mc.fallback_chain("resume", A + "haiku-4-5", None)) == [
+        A + "haiku-4-5", A + "sonnet-5-5", O + "gpt-6.1-sol",
     ]
-    assert ids(mc.fallback_chain("resume", "anthropic:claude-sonnet-5-5", None)) == [
-        "anthropic:claude-sonnet-5-5",
-        "openai:gpt-5-mini",
+    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", O + "gpt-6.1-sol"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [
+        O + "gpt-5-mini", A + "sonnet-5-5", O + "gpt-6.1-sol",
     ]
-    assert ids(mc.fallback_chain("resume", None, user())) == [
-        "free:glm-5.2",
-        "anthropic:claude-sonnet-5-5",
-        "openai:gpt-5-mini",
-    ]
+    assert ids(mc.fallback_chain("cover_letter", None, None)) == [A + "opus-5-5", O + "gpt-6.1-sol"]
 
 
-def test_usage_cost(use_settings):
+def test_fallback_chain_with_one_provider(use_settings):
+    use_settings(ANTHROPIC_API_KEY=None)
+    assert ids(mc.fallback_chain("resume", O + "gpt-6-luna", None)) == [O + "gpt-6-luna", O + "gpt-6.1-sol"]
+
+
+def test_usage_cost_uses_official_prices(use_settings):
     one_m = {"input": 1_000_000, "output": 1_000_000}
-    sonnet = mc.get_model("anthropic:claude-sonnet-5-5", None)
-    assert mc.usage_cost(sonnet, one_m) == pytest.approx(12.0)
-    assert mc.usage_cost(mc.get_model("openai:gpt-5-mini", None), one_m) is None
-    assert mc.usage_cost(mc.get_model("free:glm-5.2", user()), one_m) == 0.0
+    prices = {
+        A + "sonnet-5-5": 12.0, A + "opus-5-5": 24.0, A + "fable-5-1": 60.0, A + "haiku-4-5": 6.0,
+        A + "opus-5": 30.0, A + "opus-4-8": 30.0, A + "sonnet-5": 12.0,
+        O + "gpt-6.1-sol": 12.0, O + "gpt-6-astra": 60.0, O + "gpt-6-luna": 0.6, O + "gpt-5.6-sol": 24.0,
+        O + "gpt-5.5": 35.0, O + "gpt-5.6-terra": 14.0, O + "gpt-5.4-mini": 5.25, O + "gpt-5-mini": 2.25,
+    }
+    for model_id, expected in prices.items():
+        assert mc.usage_cost(mc.get_model(model_id, None), one_m) == pytest.approx(expected), model_id
 
 
-def test_estimate_call_cost_resume_sonnet(use_settings):
-    sonnet = mc.get_model("anthropic:claude-sonnet-5-5", None)
-    assert mc.estimate_call_cost(sonnet, "resume") == pytest.approx(0.062)
+def test_estimate_call_cost(use_settings):
+    assert mc.estimate_call_cost(mc.get_model(A + "sonnet-5-5", None), "resume") == pytest.approx(0.062)
+    assert mc.estimate_call_cost(mc.get_model(O + "gpt-6-luna", None), "resume") == pytest.approx(0.0031)
 
 
 def test_cache_lane(use_settings):
-    u = user()
-    assert mc.cache_lane(mc.get_model("openai:gpt-5-mini", None), "resume", u) == "openai:gpt-5-mini:low"
-    assert mc.cache_lane(mc.get_model("free:glm-5.2", u), "resume", u) == "free:z-ai/glm-5.2:16384"
-    assert (
-        mc.cache_lane(mc.get_model("anthropic:claude-sonnet-5-5", None), "resume", u)
-        == "anthropic:claude-sonnet-5-5:low"
-    )
-    assert (
-        mc.cache_lane(mc.get_model("anthropic:claude-haiku-4-5", None), "resume", u)
-        == "anthropic:claude-haiku-4-5:none"
-    )
+    assert mc.cache_lane(mc.get_model(O + "gpt-5-mini", None), "resume", None) == "openai:gpt-5-mini:low"
+    assert mc.cache_lane(mc.get_model(O + "gpt-6.1-sol", None), "cover_letter", None) == "openai:gpt-6.1-sol:high"
+    assert mc.cache_lane(mc.get_model(A + "sonnet-5-5", None), "resume", None) == "anthropic:claude-sonnet-5-5:low"
+    assert mc.cache_lane(mc.get_model(A + "haiku-4-5", None), "resume", None) == "anthropic:claude-haiku-4-5:none"
 
 
-def test_public_view_shape(use_settings):
-    spec = mc.get_model("anthropic:claude-sonnet-5-5", None)
-    view = mc.public_view(spec, "resume", "anthropic:claude-sonnet-5-5")
-    assert view == {
-        "id": "anthropic:claude-sonnet-5-5",
-        "label": spec.label,
-        "provider": "anthropic",
-        "tier": "balanced",
-        "bestFor": spec.best_for,
-        "estCostUsd": pytest.approx(0.062),
-        "isDefault": True,
-    }
+def test_public_view_has_tag_and_marks_each_providers_recommendation(use_settings):
+    default_id = mc.default_model_id("resume", None)
+    views = {m.id: mc.public_view(m, "resume", default_id) for m in mc.available_models("resume", None)}
+    sonnet = views[A + "sonnet-5-5"]
+    assert sonnet["isDefault"] is True and sonnet["recommended"] is True and sonnet["tag"]
+    assert set(sonnet) == {"id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault", "recommended", "tag"}
+    assert views[O + "gpt-6.1-sol"]["recommended"] is True and views[O + "gpt-6.1-sol"]["isDefault"] is False
+    assert views[A + "opus-5-5"]["recommended"] is False
+    assert views[O + "gpt-6-luna"]["tag"] == "Cheapest"

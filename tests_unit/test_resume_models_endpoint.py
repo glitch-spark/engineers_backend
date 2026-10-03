@@ -21,8 +21,6 @@ def settings(**over):
     base = dict(
         ANTHROPIC_API_KEY="sk-ant-test",
         OPENAI_API_KEY=None,
-        RESUME_OPENAI_MODEL="gpt-5-mini",
-        RESUME_REASONING_EFFORT="low",
         RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
         COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
         SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
@@ -70,15 +68,35 @@ async def test_models_lists_anthropic_when_key_configured(use_settings, make_cli
     ids = [m["id"] for m in body["models"]]
     assert "anthropic:claude-sonnet-5-5" in ids and "anthropic:claude-haiku-4-5" in ids
     assert [m["id"] for m in body["models"] if m["isDefault"]] == ["anthropic:claude-sonnet-5-5"]
-    assert set(body["models"][0]) == {"id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault"}
+    assert set(body["models"][0]) == {
+        "id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault", "recommended", "tag",
+    }
+    assert body["providers"] == [{"id": "anthropic", "label": "Anthropic"}]
 
 
-async def test_models_cover_letter_excludes_haiku_and_free(use_settings, make_client):
-    user = SimpleNamespace(freeLlmModelId="glm-5.2", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
+async def test_models_list_both_providers_in_preset_order(use_settings, make_client):
+    use_settings(OPENAI_API_KEY="sk-openai-test")
+    async with make_client() as client:
+        r = await client.get("/resume/models", params={"task": "screening"})
+    body = r.json()
+    assert body["providers"] == [
+        {"id": "anthropic", "label": "Anthropic"}, {"id": "openai", "label": "OpenAI"},
+    ]
+    assert [m["id"] for m in body["models"] if m["provider"] == "openai"] == [
+        "openai:gpt-6.1-sol", "openai:gpt-6-astra", "openai:gpt-5.4-mini", "openai:gpt-5-mini", "openai:gpt-6-luna",
+    ]
+    assert [m["id"] for m in body["models"] if m["recommended"]] == [
+        "anthropic:claude-sonnet-5-5", "openai:gpt-6.1-sol",
+    ]
+
+
+async def test_models_cover_letter_excludes_haiku_and_nvidia(use_settings, make_client):
+    user = SimpleNamespace(freeLlmModelId="glm-5.3", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
     async with make_client(user=user) as client:
         r = await client.get("/resume/models", params={"task": "cover_letter"})
     ids = [m["id"] for m in r.json()["models"]]
     assert ids and not [i for i in ids if "haiku" in i or i.startswith("free:")]
+    assert "anthropic:claude-fable-5-1" in ids
     assert r.json()["defaultId"] == "anthropic:claude-opus-5-5"
 
 
@@ -87,7 +105,7 @@ async def test_models_empty_when_nothing_configured(use_settings, make_client):
     async with make_client() as client:
         r = await client.get("/resume/models", params={"task": "resume"})
     assert r.status_code == 200
-    assert r.json() == {"task": "resume", "defaultId": None, "models": []}
+    assert r.json() == {"task": "resume", "defaultId": None, "providers": [], "models": []}
 
 
 async def test_models_invalid_task_422(use_settings, make_client):

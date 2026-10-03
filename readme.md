@@ -37,8 +37,9 @@ uvicorn app.main:app --reload
 | `SLACK_WEBHOOK_URL` | no | Slack notifications are no-ops when unset |
 | `JWT_EXPIRES_MIN` | no | JWT lifetime in minutes; default 720 (12 h) |
 | `OPENAI_API_KEY` | no* | Required for `/ai-review/*` and `/resume/generate`; those routes 503 without it |
-| `RESUME_OPENAI_MODEL` | no | OpenAI model offered in the selector and used as the last fallback; default `gpt-5-mini` |
-| `ANTHROPIC_API_KEY` | no | Enables the Claude models (Haiku 4.5, Sonnet 5.5, Opus 5.5, Fable 5.1) in the resume / cover letter / screening model selector; they are hidden without it |
+| `RESUME_OPENAI_MODEL` | no | OpenAI model for the interview features and job extraction (not the resume/cover letter/screening selector); default `gpt-5-mini` |
+| `ANTHROPIC_API_KEY` | no | Enables the Anthropic presets in the resume / cover letter / screening model picker; hidden without it. `OPENAI_API_KEY` enables the OpenAI presets the same way |
+| `ANTHROPIC_WORKSPACE_ID` | no | Only for user-level Anthropic keys (`sk-ant-usr-…`), which are not tied to a workspace: the workspace id (`wrkspc_…`) sent with every request |
 | `RESUME_DEFAULT_MODEL`, `COVER_LETTER_DEFAULT_MODEL`, `SCREENING_DEFAULT_MODEL` | no | Default model per task when a request doesn't pick one (provider-prefixed ids); defaults `anthropic:claude-sonnet-5-5`, `anthropic:claude-opus-5-5`, `anthropic:claude-sonnet-5-5` |
 | `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
 | `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |

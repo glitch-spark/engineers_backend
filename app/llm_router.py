@@ -157,16 +157,23 @@ def _free_error_retryable(exc: Exception) -> bool:
     return True
 
 
-async def _openai_responses(prompt: str, model: Optional[str] = None) -> tuple[str, dict]:
+_REASONING_FAMILIES = ("gpt-5", "gpt-6")
+
+
+async def _openai_responses(
+    prompt: str, model: Optional[str] = None, effort: Optional[str] = None
+) -> tuple[str, dict]:
+    """One OpenAI Responses call. Reasoning effort goes only to the gpt-5/gpt-6 families; `effort`
+    defaults to the RESUME_REASONING_EFFORT setting (legacy callers pass none)."""
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     resolved = model or settings.RESUME_OPENAI_MODEL
     kwargs: dict = {"model": resolved, "input": prompt}
-    if resolved.startswith("gpt-5"):
-        effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
-        kwargs["reasoning"] = {"effort": effort}
+    if resolved.startswith(_REASONING_FAMILIES):
+        resolved_effort = effort or (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
+        kwargs["reasoning"] = {"effort": resolved_effort}
     response = await client.responses.create(**kwargs)
     usage_out: dict = {}
     usage = getattr(response, "usage", None)
@@ -280,9 +287,6 @@ async def complete_with_fallback(
     )
 
 
-_TASK_PURPOSE = {"resume": "resume", "cover_letter": "resume", "screening": "screening"}
-
-
 async def _call_spec(
     spec: ModelSpec, prompt: str, task: Task, user: Optional[UserExtra]
 ) -> tuple[str, dict]:
@@ -290,24 +294,10 @@ async def _call_spec(
     if spec.provider == "anthropic":
         effort = TASK_EFFORT[task] if spec.supports_effort else None
         return await anthropic_complete(spec.api_model, prompt, effort=effort)
-    if spec.provider == "openai":
-        return await _openai_responses(prompt, spec.api_model)
-    preset = get_preset(spec.id.split(":", 1)[1])
-    api_key = (getattr(user, "freeLlmApiKey", None) or "").strip()
-    if preset is None or not api_key:
-        raise RuntimeError(f"{spec.id} is not configured for this user")
-    purpose = _TASK_PURPOSE[task]
-    max_tokens = _free_max_tokens_for_purpose(
-        purpose, clamp_max_tokens(getattr(user, "freeLlmMaxTokens", None), preset)
-    )
-    return await _free_chat_completion(
-        prompt, preset, api_key, max_tokens, timeout=_free_timeout_for_purpose(purpose, preset)
-    )
+    return await _openai_responses(prompt, spec.api_model, effort=TASK_EFFORT[task])
 
 
 def _failure_reason(spec: ModelSpec, exc: Exception) -> str:
-    if spec.provider == "free":
-        return _free_llm_user_message(exc, timeout_seconds=float(FREE_LLM_RESUME_TIMEOUT_SECONDS))
     return f"{spec.label}: {str(exc)[:300]}"
 
 

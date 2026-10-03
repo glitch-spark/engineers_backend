@@ -22,6 +22,7 @@ from app.models.resume_application import (
 )
 from app.llm_router import complete_screening, parse_screening_answers
 from app.model_catalog import (
+    PROVIDER_LABEL,
     Task,
     available_models,
     default_model_id,
@@ -194,8 +195,7 @@ async def _run_job(
                 jd=jd,
                 questions=questions,
                 screening_prompt=resolved_screening,
-                owner=owner,
-                use_free_llm=True,
+                owner=owner,
                 model_id=job.screeningModelId,
             )
             _add_cost(job, screening_result.cost_usd)
@@ -383,19 +383,14 @@ async def _run_screening(
     screening_prompt: str,
     resume_text: Optional[str] = None,
     owner: Optional[UserExtra] = None,
-    use_free_llm: bool = False,
     model_id: Optional[str] = None,
 ) -> ScreeningResult:
-    """Run screening on `model_id` (or the task default).
-
-    Job-linked screening keeps the free-first default for users with a saved NVIDIA key;
-    standalone does not, unless the user explicitly picked a model."""
+    """Run screening on `model_id` (or the task default)."""
     prompt = _build_screening_prompt(
         account, jd, questions, screening_prompt, resume_text=resume_text
     )
 
-    router_user = owner if (use_free_llm or model_id) else None
-    llm_result = await complete_screening(prompt, router_user, questions, model_id=model_id)
+    llm_result = await complete_screening(prompt, owner, questions, model_id=model_id)
 
     answers = parse_screening_answers(llm_result.text, questions)
     pairs = [{"question": q, "answer": a} for q, a in zip(questions, answers)]
@@ -447,8 +442,7 @@ async def screening_answers(
         jd=body.jobDescription or "",
         questions=questions,
         screening_prompt=screening,
-        owner=user,
-        use_free_llm=False,
+        owner=user,
         model_id=model_id,
     )
     return {"pairs": result.pairs}
@@ -498,8 +492,7 @@ async def ask_job_screening(
         questions=questions,
         screening_prompt=screening_prompt,
         resume_text=job.plainText or "",
-        owner=owner,
-        use_free_llm=True,
+        owner=owner,
         model_id=model_id,
     )
 
@@ -609,10 +602,13 @@ async def list_models(
 ) -> dict:
     """Models the caller can pick for `task`, with the default flagged and a typical per-run cost."""
     default_id = default_model_id(task, user)
+    models = available_models(task, user)
+    providers = list(dict.fromkeys(m.provider for m in models))  # configured providers, in picker order
     return {
         "task": task,
         "defaultId": default_id,
-        "models": [public_view(s, task, default_id) for s in available_models(task, user)],
+        "providers": [{"id": p, "label": PROVIDER_LABEL[p]} for p in providers],
+        "models": [public_view(s, task, default_id) for s in models],
     }
 
 

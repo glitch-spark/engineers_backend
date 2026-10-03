@@ -31,10 +31,16 @@ async def anthropic_complete(
     max_tokens: int = 16000,
     timeout: float = ANTHROPIC_TIMEOUT_SECONDS,
 ) -> tuple[str, dict]:
-    api_key = (get_settings().ANTHROPIC_API_KEY or "").strip()
+    settings = get_settings()
+    api_key = (settings.ANTHROPIC_API_KEY or "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not configured")
-    client = AsyncAnthropic(api_key=api_key, timeout=timeout)
+    client_kwargs: dict = {"api_key": api_key, "timeout": timeout}
+    # User-level keys (sk-ant-usr-...) aren't tied to a workspace, so each request names one.
+    workspace_id = (getattr(settings, "ANTHROPIC_WORKSPACE_ID", None) or "").strip()
+    if workspace_id:
+        client_kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
+    client = AsyncAnthropic(**client_kwargs)
     kwargs: dict = {
         "model": api_model,
         "max_tokens": max_tokens,

@@ -64,19 +64,15 @@ async def run(**kw):
 
 
 async def test_run_screening_forwards_model_and_returns_cost(recorder):
-    res = await run(owner=OWNER, use_free_llm=True, model_id="anthropic:claude-opus-5-5")
+    res = await run(owner=OWNER, model_id="anthropic:claude-opus-5-5")
     assert recorder[0]["model_id"] == "anthropic:claude-opus-5-5" and recorder[0]["user"] is OWNER
     assert res.pairs == [{"question": "Python?", "answer": "Yes, 5 years."}]
     assert res.llm_model == "claude-opus-5-5" and res.cost_usd == 0.002
 
 
-async def test_default_user_passing_keeps_standalone_off_the_free_tier(recorder):
-    await run(owner=OWNER, use_free_llm=False)  # standalone, no explicit model
-    assert recorder[-1]["user"] is None
-    await run(owner=OWNER, use_free_llm=True)  # job-linked keeps free-first
-    assert recorder[-1]["user"] is OWNER
-    await run(owner=OWNER, use_free_llm=False, model_id="anthropic:claude-opus-5-5")  # explicit pick
-    assert recorder[-1]["user"] is OWNER
+async def test_run_screening_always_routes_with_the_owner(recorder):
+    await run(owner=OWNER)
+    assert recorder[-1]["user"] is OWNER and recorder[-1]["model_id"] is None
 
 
 def client():

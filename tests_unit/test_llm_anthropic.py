@@ -108,3 +108,26 @@ async def test_missing_key_raises_runtime_error(monkeypatch):
     )
     with pytest.raises(RuntimeError):
         await llm_anthropic.anthropic_complete("claude-sonnet-5-5", "p")
+
+
+async def test_workspace_id_is_sent_as_a_header_when_configured(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        llm_anthropic,
+        "get_settings",
+        lambda: SimpleNamespace(ANTHROPIC_API_KEY="sk-ant-test", ANTHROPIC_WORKSPACE_ID=" wrkspc_123 "),
+    )
+    monkeypatch.setattr(
+        llm_anthropic, "AsyncAnthropic", make_client(msg([SimpleNamespace(type="text", text="x")]), calls)
+    )
+    await llm_anthropic.anthropic_complete("claude-sonnet-5-5", "p")
+    assert calls[0]["client_kwargs"]["default_headers"] == {"anthropic-workspace-id": "wrkspc_123"}
+
+
+async def test_no_workspace_header_when_not_configured(monkeypatch, key):
+    calls = []
+    monkeypatch.setattr(
+        llm_anthropic, "AsyncAnthropic", make_client(msg([SimpleNamespace(type="text", text="x")]), calls)
+    )
+    await llm_anthropic.anthropic_complete("claude-sonnet-5-5", "p")
+    assert "default_headers" not in calls[0]["client_kwargs"]
