@@ -102,3 +102,25 @@ async def test_count_folders_keeps_going_after_an_error():
             return 7
     got = await count_folders([("a", "s3://ok/a/"), ("b", "s3://bad/b/")], START, END, Storage())
     assert got == {"a": (7, None), "b": (None, "NoSuchBucket")}
+
+
+async def test_lazy_client_is_built_once_under_concurrency(monkeypatch):
+    import asyncio
+    import time
+
+    built = []
+
+    class SlowSession:
+        def client(self, name, **kwargs):
+            time.sleep(0.05)
+            built.append(name)
+            return FakeClient(pages=[{"Contents": [obj("a/1.png", utc(2026, 10, 2))]}])
+
+    monkeypatch.setattr("boto3.session.Session", SlowSession)
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(
+        BID_STORAGE_REGION=None, AWS_REGION="us-east-1", BID_STORAGE_ACCESS_KEY_ID=None,
+        AWS_ACCESS_KEY_ID=None, BID_STORAGE_SECRET_ACCESS_KEY=None, AWS_SECRET_ACCESS_KEY=None))
+    storage = S3BidStorage()
+    counts = await asyncio.gather(*(storage.count_screenshots("s3://shots/a/", START, END) for _ in range(5)))
+    assert counts == [1] * 5
+    assert built == ["s3"]

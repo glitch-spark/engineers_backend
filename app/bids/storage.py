@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 from datetime import datetime
 from typing import Iterable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import unquote, urlsplit
@@ -62,24 +63,27 @@ def count_in_window(objects: Iterable[Mapping], start: datetime, end: datetime) 
 class S3BidStorage:
     def __init__(self, client=None):
         self._client = client
+        self._lock = threading.Lock()  # count_folders runs _get_client from several threads
 
     def _get_client(self):
-        if self._client is None:
-            import boto3
-            from botocore.config import Config
+        with self._lock:
+            if self._client is None:
+                import boto3
+                from botocore.config import Config
 
-            s = get_settings()
-            kwargs = {
-                "region_name": s.BID_STORAGE_REGION or s.AWS_REGION,
-                "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
-            }
-            key = s.BID_STORAGE_ACCESS_KEY_ID or s.AWS_ACCESS_KEY_ID
-            secret = s.BID_STORAGE_SECRET_ACCESS_KEY or s.AWS_SECRET_ACCESS_KEY
-            if key and secret:
-                kwargs["aws_access_key_id"] = key
-                kwargs["aws_secret_access_key"] = secret
-            self._client = boto3.client("s3", **kwargs)
-        return self._client
+                s = get_settings()
+                kwargs = {
+                    "region_name": s.BID_STORAGE_REGION or s.AWS_REGION,
+                    "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+                }
+                key = s.BID_STORAGE_ACCESS_KEY_ID or s.AWS_ACCESS_KEY_ID
+                secret = s.BID_STORAGE_SECRET_ACCESS_KEY or s.AWS_SECRET_ACCESS_KEY
+                if key and secret:
+                    kwargs["aws_access_key_id"] = key
+                    kwargs["aws_secret_access_key"] = secret
+                # Own session: the shared default session is not thread-safe.
+                self._client = boto3.session.Session().client("s3", **kwargs)
+            return self._client
 
     def _count(self, bucket: str, prefix: str, start: datetime, end: datetime) -> int:
         # Pages are fetched lazily, so the whole loop runs inside one worker thread.
