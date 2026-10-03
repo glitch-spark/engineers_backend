@@ -358,7 +358,7 @@ def _checks_tab(sheets):
     return tabs[0], sheets["values"][tabs[0]]
 
 
-async def test_export_rows_carry_check_columns(client, staff_user, auth_header, sheets):
+async def test_export_rows_carry_job_columns(client, staff_user, auth_header, sheets):
     from app.job_apply.sheet_checks import APPLY_HEADER
     from app.routers.job_applies import EXPORT_HEADER
 
@@ -368,9 +368,8 @@ async def test_export_rows_carry_check_columns(client, staff_user, auth_header, 
     assert sheets["header"] == EXPORT_HEADER and EXPORT_HEADER[10:] == APPLY_HEADER
     assert sheets["checkbox"][sheets["tab"]] == "Applied"  # the checkboxes stay in column J
     gh = next(r for r in sheets["rows"] if r[4] == "https://boards.greenhouse.io/acme/jobs/9" and r[1] == "Eric")
-    assert len(gh) == 14 and gh[9] is False
-    assert gh[10:13] == ["US", "Remote", "None"]
-    assert gh[13].startswith("✓ posted") and "(job page data)" in gh[13] and "✓ location: US" in gh[13]
+    assert len(gh) == 13 and gh[9] is False
+    assert gh[10:] == ["US", "None", "Remote"]  # Location, Security Clearance, Remote/Hybrid/Onsite
 
 
 async def test_export_refreshes_the_header_of_an_existing_tab(client, staff_user, auth_header, sheets):
@@ -395,11 +394,12 @@ async def test_export_checks_before_scoring(client, staff_user, auth_header, she
     tab, values = _checks_tab(sheets)
     assert r.json()["tab"] == tab and r.json()["jobs"] == 3 and tab.startswith("Checks · jobs.xlsx · ")
     assert values[0] == CHECKS_HEADER and len(values) == 4
-    by_url = {v[3]: dict(zip(CHECKS_HEADER, v)) for v in values[1:]}
+    by_url = {v[1]: dict(zip(CHECKS_HEADER, v)) for v in values[1:]}
     hybrid = by_url["https://jobs.example.com/hybrid"]
-    assert hybrid["Result"] == "On-site / hybrid" and hybrid["Work mode"] == "Hybrid" and "✗ remote: hybrid" in hybrid["Checks"]
-    assert by_url["https://boards.greenhouse.io/acme/jobs/9"]["Posted from"] == "job page data"
-    assert all(v["Top score"] == "" for v in by_url.values())
+    assert hybrid["Status"] == "On-site / hybrid" and hybrid["Remote/Hybrid/Onsite"] == "Hybrid"
+    gh = by_url["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["Posting Date"] == "2026-09-28" and gh["Location"] == "US" and gh["Security Clearance"] == "None"
+    assert all(len(v) == 8 for v in values)
     assert sheets["checkbox"][tab] is None and sheets["rows"] == []  # no checkboxes, no application rows
     again = await client.post(f"/job-applies/runs/{run_id}/export-checks", headers=h, json={})
     assert again.status_code == 200 and again.json()["sheetUrl"] == GSHEET  # the link is remembered
@@ -412,6 +412,15 @@ async def test_export_checks_twice_overwrites_the_tab(client, staff_user, auth_h
         assert (await client.post(f"/job-applies/runs/{run_id}/export-checks", headers=h, json={"sheetUrl": GSHEET})).status_code == 200
     tab, values = _checks_tab(sheets)
     assert len(values) == 4 and len([c for c in sheets["cleared"] if tab in c]) == 2
+
+
+async def test_export_checks_clears_the_whole_tab(client, staff_user, auth_header, sheets):
+    """A tab written by an earlier, wider version of the export loses its old header and extra columns."""
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    await client.post(f"/job-applies/runs/{run_id}/export-checks", headers=h, json={"sheetUrl": GSHEET})
+    tab, _ = _checks_tab(sheets)
+    assert sheets["cleared"] == [f"'{tab}'!A1:Z"]
 
 
 async def test_export_checks_dry_run_writes_nothing(client, staff_user, auth_header, sheets):
@@ -445,8 +454,8 @@ async def test_step3_export_refreshes_the_checks_tab(client, staff_user, auth_he
     first = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})).json()
     tab, values = _checks_tab(sheets)
     assert first["checksTab"] == tab and first["checksJobs"] == 3 and len(values) == 4
-    gh = dict(zip(CHECKS_HEADER, next(v for v in values[1:] if v[3] == "https://boards.greenhouse.io/acme/jobs/9")))
-    assert isinstance(gh["Top score"], (int, float)) and " | Eric: ✓ location: US" in gh["Checks"]
+    gh = dict(zip(CHECKS_HEADER, next(v for v in values[1:] if v[1] == "https://boards.greenhouse.io/acme/jobs/9")))
+    assert gh["Status"] in ("Worth applying", "Needs a check") and gh["Remote/Hybrid/Onsite"] == "Remote"
     second = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})).json()
     assert second["added"] == 0 and second["checksJobs"] == 3  # nothing new to add: the checks tab still updates
     assert len([a for a, _ in sheets["updates"] if tab in a]) == 2

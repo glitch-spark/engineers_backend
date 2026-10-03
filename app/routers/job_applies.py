@@ -1255,22 +1255,18 @@ async def _remember_sheet(url: str, user: UserExtra) -> None:
 
 
 async def _checks_rows(run: JobApplyRun) -> list[list]:
-    """The run's Checks tab: every job, in sheet order, with what the checks found."""
+    """The run's Checks tab: every job, in sheet order, with its details and status."""
     rows = await JobApplyRow.find({"runId": run.id}).sort("+rowIndex").to_list()
-    ids = {p.accountId for r in rows for p in r.profileGates or []}
-    names = {
-        str(a.id): a.name
-        for a in await Account.find({"_id": {"$in": [PydanticObjectId(i) for i in ids]}}).to_list()
-    } if ids else {}
-    return [sheet_checks.checks_row(r, names) for r in rows]
+    return [sheet_checks.checks_row(r) for r in rows]
 
 
 async def _write_checks(http: httpx.AsyncClient, sheet_id: str, run: JobApplyRun, info: dict) -> tuple[str, int]:
-    """Write (or rewrite) the run's own Checks tab; exporting again replaces its rows, never adds to them."""
+    """Write (or rewrite) the run's own Checks tab; exporting again replaces it, never adds to it."""
     tab = sheet_checks.checks_tab_name(run)
     values = await _checks_rows(run)
     await google_sheets.ensure_tab(http, sheet_id, tab, sheet_checks.CHECKS_HEADER, info)
-    await google_sheets.clear_range(http, sheet_id, google_sheets._a1(tab, "A2:Z"))
+    # the whole tab, header too: one written by an earlier, wider export loses its extra columns
+    await google_sheets.clear_range(http, sheet_id, google_sheets._a1(tab, "A1:Z"))
     await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [sheet_checks.CHECKS_HEADER, *values])
     return tab, len(values)
 
@@ -1347,7 +1343,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 today, *map(sheet_text, (accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url)),
                 resume_cell, kind_cell, app["score"] if app["score"] is not None else "",
                 row.postedDate.isoformat() if row.postedDate else "", False,
-                *sheet_checks.apply_cells(row, acc),
+                *sheet_checks.apply_cells(row),
             ])
             marks.append((row.id, acc))
 
@@ -1424,9 +1420,9 @@ class ChecksBody(BaseModel):
 
 @router.post("/runs/{run_id}/export-checks")
 async def export_checks(run_id: str, body: ChecksBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Write every job in the run, with what the checks found (result, reason, posted date and where it came from,
-    location, market, work mode, clearance, each check), to the run's own "Checks · …" tab, replacing what an earlier
-    export wrote there. Available once the jobs are checked (step 2 onward); adds no application rows."""
+    """Write every job in the run (company, URL, title, posting date, location, security clearance, remote / hybrid /
+    on-site, status) to the run's own "Checks · …" tab, replacing what an earlier export wrote there. Available once
+    the jobs are checked (step 2 onward); adds no application rows."""
     run = await _owned_run(run_id, user)
     if run.phase == "screen" and run.status in ("queued", "running"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The jobs are still being checked.")
