@@ -78,30 +78,28 @@ replies.
 
 ## 3. Storage permissions
 
-The backend lists keys to count bids and, for the Bid Track extension, signs screenshot
-uploads (see "Bidder extension" below); it never reads objects.
+The backend lists keys to count bids and signs the Bid Track extension's screenshot
+uploads (section 5), so its key needs write access as well as listing, on the whole
+bucket. Bidders hold no storage keys of their own.
 
-**Backblaze B2:** create a separate application key for the backend (do not reuse
-the bidders' upload key) on the `bid-screenshots` bucket with `listBuckets`,
-`listFiles` and `writeFiles` on the whole bucket (signed uploads need `writeFiles`).
-Put its key ID and key in `BID_STORAGE_ACCESS_KEY_ID` / `BID_STORAGE_SECRET_ACCESS_KEY`.
+**Backblaze B2:** create an application key for the backend on the `bid-screenshots`
+bucket with `listBuckets`, `listFiles` and `writeFiles`. Put its key ID and key in
+`BID_STORAGE_ACCESS_KEY_ID` / `BID_STORAGE_SECRET_ACCESS_KEY` (both are required when
+`BID_STORAGE_ENDPOINT_URL` is set; AWS_* keys are never used for Backblaze).
 
-**AWS S3:** listing needs only a read-only identity (add `s3:PutObject` on the bidder prefixes if the extension uploads through the backend):
+**AWS S3:** use an identity that can list and write the bucket:
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "s3:ListBucket",
-    "Resource": "arn:aws:s3:::<bucket>",
-    "Condition": {"StringLike": {"s3:prefix": ["<bidder-prefix-1>/*", "<bidder-prefix-2>/*"]}}
-  }]
+  "Statement": [
+    {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::<bucket>"},
+    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::<bucket>/*"}
+  ]
 }
 ```
 
-List the bidders' prefixes, or `*` if one bucket holds only screenshots. A folder
-that cannot be read does not stop the report: that bidder shows a warning in Slack
+A folder that cannot be read does not stop the report: that bidder shows a warning in Slack
 and on the page, and the rest are reported normally.
 
 ## 4. Cron and catch-up
@@ -146,9 +144,10 @@ object path and returns a short-lived signed upload link, so bidders hold no sto
 - **Reset login** invalidates the bidder's tokens and password and issues a new invite code;
   archiving also invalidates tokens. **New invite code** is for bidders not yet registered.
 - **Backend key.** The backend's application key needs `listBuckets`, `listFiles` and
-  `writeFiles` on the whole bucket (this replaces the earlier read-only advice). `BID_STORAGE_BUCKET`
+  `writeFiles` on the whole bucket (this replaces the earlier read-only advice; see section 3). `BID_STORAGE_BUCKET`
   must be set, otherwise uploads answer 503.
 - **Routes** (`/ext`): `POST /ext/register` (invite code, username, password), `POST /ext/login`,
   `GET /ext/me`, and `POST /ext/upload-url` (`job`, `step`, `trigger`, `capturedAt`) which returns
   `url`, `key`, `expiresAt` and `headers`; PUT the PNG to `url` within 5 minutes with
-  `Content-Type: image/png`. Failed logins and registrations are rate limited (429).
+  `Content-Type: image/png`. Registering switches counting to the bidder's folder
+  (`s3://<bucket>/<folder>/`). Failed logins and registrations are rate limited (429).

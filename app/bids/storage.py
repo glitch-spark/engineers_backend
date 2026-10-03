@@ -116,6 +116,8 @@ class S3BidStorage:
                     # A non-AWS store must never be sent the AWS_* region or keys.
                     region = s.BID_STORAGE_REGION or _endpoint_region(endpoint)
                     key, secret = s.BID_STORAGE_ACCESS_KEY_ID, s.BID_STORAGE_SECRET_ACCESS_KEY
+                    if not (key and secret):  # else boto3 would fall back to the AWS_* env keys
+                        raise BidStorageError("BID_STORAGE_ACCESS_KEY_ID and BID_STORAGE_SECRET_ACCESS_KEY are required")
                 else:
                     region = s.BID_STORAGE_REGION or s.AWS_REGION
                     key = s.BID_STORAGE_ACCESS_KEY_ID or s.AWS_ACCESS_KEY_ID
@@ -147,6 +149,8 @@ class S3BidStorage:
             )
         except ValueError:
             raise BidStorageError("invalid BID_STORAGE_ENDPOINT_URL") from None
+        except BotoCoreError as e:
+            raise BidStorageError(type(e).__name__) from e
 
     def _count(self, bucket: str, prefix: str, windows: Sequence[Window]) -> list[int]:
         # Pages are fetched lazily, so the whole loop runs inside one worker thread. A job's
@@ -183,11 +187,29 @@ class _UnsupportedStorage:
         raise BidStorageError(f"unsupported storage provider: {self._provider}")
 
 
+_cached: Optional[tuple[tuple, "S3BidStorage"]] = None
+_cache_lock = threading.Lock()
+_SETTINGS = ("BID_STORAGE_ENDPOINT_URL", "BID_STORAGE_REGION", "BID_STORAGE_ACCESS_KEY_ID",
+             "BID_STORAGE_SECRET_ACCESS_KEY", "AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+
+
+def reset_bid_storage() -> None:
+    global _cached
+    with _cache_lock:
+        _cached = None
+
+
 def get_bid_storage() -> BidStorage:
-    provider = get_settings().BID_STORAGE_PROVIDER
-    if provider == "s3":
-        return S3BidStorage()
-    return _UnsupportedStorage(provider)
+    """One process-wide S3BidStorage (building a boto3 client is slow); rebuilt when its settings change."""
+    global _cached
+    s = get_settings()
+    if s.BID_STORAGE_PROVIDER != "s3":
+        return _UnsupportedStorage(s.BID_STORAGE_PROVIDER)
+    sig = tuple(getattr(s, name, None) for name in _SETTINGS)
+    with _cache_lock:
+        if _cached is None or _cached[0] != sig:
+            _cached = (sig, S3BidStorage())
+        return _cached[1]
 
 
 T = TypeVar("T")

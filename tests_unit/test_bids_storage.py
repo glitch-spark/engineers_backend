@@ -262,9 +262,17 @@ def test_without_an_endpoint_the_client_targets_aws(monkeypatch):
 
 def test_backblaze_endpoint_never_falls_back_to_aws_region_or_keys(monkeypatch):
     seen = _client_kwargs(monkeypatch, BID_STORAGE_ENDPOINT_URL="https://s3.us-east-005.backblazeb2.com",
-                          AWS_REGION="us-east-1", AWS_ACCESS_KEY_ID="AKIAAWS", AWS_SECRET_ACCESS_KEY="awssecret")
+                          AWS_REGION="us-east-1", AWS_ACCESS_KEY_ID="AKIAAWS", AWS_SECRET_ACCESS_KEY="awssecret",
+                          BID_STORAGE_ACCESS_KEY_ID="005abc", BID_STORAGE_SECRET_ACCESS_KEY="K005")
     assert seen["region_name"] == "us-east-005"   # read from the endpoint host
-    assert "aws_access_key_id" not in seen and "aws_secret_access_key" not in seen
+    assert (seen["aws_access_key_id"], seen["aws_secret_access_key"]) == ("005abc", "K005")
+
+
+@pytest.mark.parametrize("settings", [{}, {"BID_STORAGE_ACCESS_KEY_ID": "005abc"}])
+def test_backblaze_endpoint_without_both_bid_keys_is_a_storage_error(monkeypatch, settings):
+    with pytest.raises(BidStorageError, match="BID_STORAGE_ACCESS_KEY_ID"):
+        _client_kwargs(monkeypatch, BID_STORAGE_ENDPOINT_URL="https://s3.us-east-005.backblazeb2.com",
+                       AWS_ACCESS_KEY_ID="AKIAAWS", AWS_SECRET_ACCESS_KEY="awssecret", **settings)
 
 
 async def test_a_bad_endpoint_is_a_storage_error_not_a_crash(monkeypatch):
@@ -274,8 +282,8 @@ async def test_a_bad_endpoint_is_a_storage_error_not_a_crash(monkeypatch):
 
     monkeypatch.setattr("boto3.session.Session", Session)
     monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(
-        BID_STORAGE_REGION="x", AWS_REGION=None, BID_STORAGE_ACCESS_KEY_ID=None, AWS_ACCESS_KEY_ID=None,
-        BID_STORAGE_SECRET_ACCESS_KEY=None, AWS_SECRET_ACCESS_KEY=None, BID_STORAGE_ENDPOINT_URL="nope"))
+        BID_STORAGE_REGION="x", AWS_REGION=None, BID_STORAGE_ACCESS_KEY_ID="k", AWS_ACCESS_KEY_ID=None,
+        BID_STORAGE_SECRET_ACCESS_KEY="s", AWS_SECRET_ACCESS_KEY=None, BID_STORAGE_ENDPOINT_URL="nope"))
     with pytest.raises(BidStorageError, match="invalid BID_STORAGE_ENDPOINT_URL"):
         await S3BidStorage().count_bids("s3://shots/a/", START, END)
 
@@ -303,3 +311,18 @@ def test_presign_put_is_a_short_lived_png_put_on_backblaze(monkeypatch):
     assert parts.path == "/bid-screenshots/puma/2026-10-03/upwork/acme/step1_step_2026-10-03_093015.png"
     assert q["X-Amz-Expires"] == ["300"] and "content-type" in q["X-Amz-SignedHeaders"][0]
     assert q["X-Amz-Credential"][0].startswith("005abc/") and "/us-east-005/s3/" in q["X-Amz-Credential"][0]
+
+
+def test_get_bid_storage_is_cached_until_settings_change(monkeypatch):
+    from app.bids.storage import reset_bid_storage
+
+    s = SimpleNamespace(BID_STORAGE_PROVIDER="s3", BID_STORAGE_ENDPOINT_URL=None, BID_STORAGE_REGION=None,
+                        BID_STORAGE_ACCESS_KEY_ID=None, BID_STORAGE_SECRET_ACCESS_KEY=None, AWS_REGION="us-east-1",
+                        AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None)
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: s)
+    reset_bid_storage()
+    first = get_bid_storage()
+    assert get_bid_storage() is first
+    s.BID_STORAGE_ENDPOINT_URL = "https://s3.us-east-005.backblazeb2.com"
+    assert get_bid_storage() is not first
+    reset_bid_storage()

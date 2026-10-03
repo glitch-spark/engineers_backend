@@ -1,5 +1,6 @@
 """Routes the Bid Track extension calls: register with an invite code, log in, who am I."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 
@@ -9,6 +10,7 @@ from pydantic import AwareDatetime, BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
 from app.bids import rate_limit
+from app.bids.folders import folder_url
 from app.bids.invites import hash_code, invite_is_live
 from app.bids.rate_limit import FailureLimiter, client_ip
 from app.bids.schemas import LoginIn, RegisterIn, bidder_me
@@ -74,6 +76,10 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
     """Claim the invite in ONE conditional write. False when the code was reused, replaced, or the bidder
     was archived or registered since it was read (the filter, not our earlier read, is the guard)."""
     now = datetime.now(timezone.utc)
+    updates = {"username": username, "passwordHash": password_hash, "registeredAt": now, "updatedAt": now}
+    bucket = get_settings().BID_STORAGE_BUCKET
+    if bucket and bidder.folder:  # counting switches to the folder the extension uploads to
+        updates["screenshotFolderUrl"] = folder_url(bucket, bidder.folder)
     result = await Bidder.get_motor_collection().update_one(
         {
             "_id": bidder.id,
@@ -82,7 +88,7 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
             "archivedAt": {"$exists": False},
         },
         {
-            "$set": {"username": username, "passwordHash": password_hash, "registeredAt": now, "updatedAt": now},
+            "$set": updates,
             "$unset": {"inviteCodeHash": "", "inviteExpiresAt": ""},
         },
     )
@@ -153,7 +159,7 @@ async def upload_url(body: UploadUrlIn, bidder: Annotated[Bidder, Depends(get_cu
     except ValueError:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "capturedAt is not current")
     try:
-        url = storage.presign_put(bucket, key)
+        url = await asyncio.to_thread(storage.presign_put, bucket, key)
     except BidStorageError:
         raise unavailable from None
     return {

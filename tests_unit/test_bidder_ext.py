@@ -44,6 +44,7 @@ async def ext(db, owner, monkeypatch):
     from httpx import ASGITransport, AsyncClient
 
     from app.bids.rate_limit import FailureLimiter
+    from app.bids.storage import reset_bid_storage
     from app.config import get_settings
     from app.deps import get_current_user
     from app.routers import bidder_ext, bidders
@@ -54,6 +55,7 @@ async def ext(db, owner, monkeypatch):
     app.dependency_overrides[get_current_user] = lambda: owner
     monkeypatch.setenv("BID_STORAGE_BUCKET", "bid-screenshots")
     get_settings.cache_clear()
+    reset_bid_storage()
     monkeypatch.setattr(bidder_ext, "LIMITER", FailureLimiter())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         async def create(name="Ana Lima"):
@@ -364,3 +366,26 @@ async def test_upload_url_unsupported_provider_or_storage_error_is_503(ext, monk
     monkeypatch.setattr(bidder_ext, "get_bid_storage", lambda: _FakeStorage(BidStorageError("invalid endpoint")))
     r = await ext.post("/ext/upload-url", json=_shot()[0], headers=h)
     assert r.status_code == 503 and r.json()["detail"] == "Uploads are not configured"
+
+
+async def test_backblaze_without_its_own_keys_is_503_and_never_leaks_aws_keys(ext, monkeypatch):
+    from app.config import get_settings
+
+    _, _, body = await register(ext)
+    for k, v in {"BID_STORAGE_ENDPOINT_URL": "https://s3.us-east-005.backblazeb2.com",
+                 "AWS_ACCESS_KEY_ID": "AKIAAWSLEAK", "AWS_SECRET_ACCESS_KEY": "awssecret",
+                 "BID_STORAGE_ACCESS_KEY_ID": "005abc"}.items():  # key id only: half-set
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("BID_STORAGE_SECRET_ACCESS_KEY", "")
+    get_settings.cache_clear()
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
+    assert r.status_code == 503 and "AKIAAWSLEAK" not in r.text
+
+
+async def test_registering_switches_counting_to_the_bidders_folder(ext):
+    bid, code = await ext.create("Test Bidder")
+    b = await Bidder.get(PydanticObjectId(bid))
+    b.screenshotFolderUrl, b.folder = "s3://bucket/test", "test"
+    await b.save()
+    assert (await ext.post("/ext/register", json=reg(code))).status_code == 200
+    assert (await Bidder.get(PydanticObjectId(bid))).screenshotFolderUrl == "s3://bid-screenshots/test/"
