@@ -24,7 +24,7 @@ ScreenBucket = Literal[
 ]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
-RUN_RETENTION_DAYS = 3
+RUN_RETENTION_DAYS = 7
 # Job description per URL and LLM reading per description. Matches the default max posting age: anything older
 # is excluded as stale anyway.
 CACHE_DAYS = 30

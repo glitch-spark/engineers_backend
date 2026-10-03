@@ -365,13 +365,14 @@ async def test_export_checks_twice_overwrites_the_tab(client, staff_user, auth_h
     assert len(values) == 4 and len([c for c in sheets["cleared"] if tab in c]) == 2
 
 
-async def test_export_checks_clears_the_whole_tab(client, staff_user, auth_header, sheets):
-    """A tab written by an earlier, wider version of the export loses its old header and extra columns."""
+async def test_export_checks_keeps_notes_beside_its_columns(client, staff_user, auth_header, sheets):
+    """Only the export's own columns (A-H) are cleared: notes typed in the next columns stay next to the same jobs
+    (re-exporting a run writes its jobs in the same order)."""
     h = auth_header(staff_user)
     run_id = await screened_run(client, h)
     await client.post(f"/job-applies/runs/{run_id}/export-checks", headers=h, json={"sheetUrl": GSHEET})
     tab, _ = _checks_tab(sheets)
-    assert sheets["cleared"] == [f"'{tab}'!A1:Z"]
+    assert sheets["cleared"] == [f"'{tab}'!A1:H"]
 
 
 async def test_export_checks_dry_run_writes_nothing(client, staff_user, auth_header, sheets):

@@ -1347,3 +1347,43 @@ async def test_rescore_keeps_tailored_applied_and_exported(client, staff_user, a
     row = await JobApplyRow.get(rid)
     assert [m.accountId for m in row.appliedResumes] == [acc]
     assert row.tailored == {acc: tailored} and acc in row.exported and row.exportedRows[acc]["row"] == 2
+
+
+# ---------- runs are kept 7 days ----------
+
+
+async def test_migration_keeps_runs_seven_days(client, staff_user, auth_header):
+    from app.db import _migrate_run_retention
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    h = auth_header(staff_user)
+    rid = PydanticObjectId(await screened_run(client, h))
+    created = datetime.utcnow().replace(microsecond=0) - timedelta(days=2)
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": rid}, {"$set": {"createdAt": created, "expiresAt": created + timedelta(days=3)}})
+    rows = JobApplyRow.get_motor_collection()
+    await rows.update_many({"runId": rid}, {"$set": {"createdAt": created, "expiresAt": created + timedelta(days=3)}})
+    longer = await rows.find_one({"runId": rid})
+    await rows.update_one({"_id": longer["_id"]}, {"$set": {"expiresAt": created + timedelta(days=30)}})
+
+    database = JobApplyRun.get_motor_collection().database
+    await _migrate_run_retention(database)
+    await _migrate_run_retention(database)  # second start: nothing left to do
+
+    week = created + timedelta(days=7)
+    assert (await JobApplyRun.get(rid)).expiresAt == week
+    after = {r["_id"]: r["expiresAt"] for r in await rows.find({"runId": rid}).to_list(None)}
+    assert after.pop(longer["_id"]) == created + timedelta(days=30)  # never shortened
+    assert after and set(after.values()) == {week}
+
+
+async def test_runs_list_goes_back_past_fifty(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplyRun
+
+    h = auth_header(staff_user)
+    rid = PydanticObjectId(await screened_run(client, h))
+    coll = JobApplyRun.get_motor_collection()
+    base = await coll.find_one({"_id": rid})
+    await coll.insert_many([{**base, "_id": PydanticObjectId()} for _ in range(60)])
+    runs = (await client.get("/job-applies/runs", headers=h)).json()["runs"]
+    assert len(runs) == 61

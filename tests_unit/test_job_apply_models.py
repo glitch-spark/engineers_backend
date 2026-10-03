@@ -21,8 +21,8 @@ def _ttl(model):
     return [ix.document for ix in model.Settings.indexes if "expireAfterSeconds" in ix.document]
 
 
-def test_runs_and_rows_expire_after_three_days():
-    assert RUN_RETENTION_DAYS == 3
+def test_runs_and_rows_expire_after_seven_days():
+    assert RUN_RETENTION_DAYS == 7
     for model in (JobApplyRun, JobApplyRow):
         expires = model.model_fields["expiresAt"].default_factory()
         assert abs((expires - datetime.utcnow()) - timedelta(days=RUN_RETENTION_DAYS)) < timedelta(minutes=1)

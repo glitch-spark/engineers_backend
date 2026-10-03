@@ -296,6 +296,23 @@ async def _migrate_job_apply_screening(database) -> None:
         log.warning("job-apply screening back-fill failed: %s", exc)
 
 
+async def _migrate_run_retention(database) -> None:
+    """Runs (and their rows) were kept 3 days: give the ones still here RUN_RETENTION_DAYS from their upload.
+    Only ever lengthens; a second start finds nothing to do."""
+    from app.models.job_apply import RUN_RETENTION_DAYS
+
+    keep = RUN_RETENTION_DAYS * 24 * 3600 * 1000
+    target = {"$add": ["$createdAt", keep]}
+    try:
+        for name in ("job_apply_runs", "job_apply_rows"):
+            await database[name].update_many(
+                {"createdAt": {"$type": "date"}, "$expr": {"$lt": ["$expiresAt", target]}},
+                [{"$set": {"expiresAt": target}}],
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("job-apply retention back-fill failed: %s", exc)
+
+
 async def init_db():
     global _client
     uri = os.environ["MONGODB_URI"]
@@ -311,6 +328,7 @@ async def init_db():
     await _migrate_legacy_payer_to_admin(database)
     await _migrate_job_apply_urls(database)
     await _migrate_job_apply_screening(database)
+    await _migrate_run_retention(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
     try:
         from app.alerts_service import seed_recurring_charges_from_transactions

@@ -597,7 +597,8 @@ async def _run_summaries(runs: list[JobApplyRun]) -> dict[str, Optional[dict]]:
 
 @router.get("/runs")
 async def list_runs(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    runs = await JobApplyRun.find({"userId": user.id}).sort("-createdAt").limit(50).to_list()
+    # every run still kept (RUN_RETENTION_DAYS): the page filters and pages them
+    runs = await JobApplyRun.find({"userId": user.id}).sort("-createdAt").limit(200).to_list()
     summaries = await _run_summaries(runs)
     return {"runs": [{**await _run_out(r), "summary": summaries.get(str(r.id))} for r in runs]}
 
@@ -1262,8 +1263,8 @@ async def _write_checks(http: httpx.AsyncClient, sheet_id: str, run: JobApplyRun
     tab = sheet_checks.checks_tab_name(run)
     values = await _checks_rows(run)
     await google_sheets.ensure_tab(http, sheet_id, tab, sheet_checks.CHECKS_HEADER, info)
-    # the whole tab, header too: one written by an earlier, wider export loses its extra columns
-    await google_sheets.clear_range(http, sheet_id, google_sheets._a1(tab, "A1:Z"))
+    # only the export's own columns: notes typed beside them stay next to the same jobs (same order each time)
+    await google_sheets.clear_range(http, sheet_id, google_sheets._a1(tab, "A1:H"))
     await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [sheet_checks.CHECKS_HEADER, *values])
     return tab, len(values)
 
