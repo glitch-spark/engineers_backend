@@ -86,3 +86,8 @@ def test_user_text_is_escaped_but_slack_mentions_are_kept():
                     "• Ana &lt;!channel&gt; &amp; co · &lt;https://evil.example|click&gt; — 2\n"
                     "• ⚠️ Bad &lt;!here&gt; — couldn't read screenshot folder")
     assert "<!" not in "".join(t)
+
+
+def test_daily_footer_says_bidder_for_one():
+    _, messages = format_report("daily", START, END, [row(PEDRO, "Ana", 3)], OWNERS, CT, "https://a")
+    assert texts(messages)[-1].startswith("*Total: 3 bids · 1 bidder*")

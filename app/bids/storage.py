@@ -22,8 +22,6 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.config import get_settings
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
-# The extension's "Test upload" button writes these next to the job folders; they are not bids.
-TEST_UPLOAD_PREFIX = "_bid_track_connection_test_"
 
 # bucket.s3.amazonaws.com / bucket.s3.<region>.amazonaws.com (bucket names may contain dots),
 # bucket.s3.<region>.backblazeb2.com
@@ -86,9 +84,9 @@ def job_first_seen(objects: Iterable[Mapping], into: Optional[dict[str, datetime
     Pass `into` to accumulate across listing pages.
     """
     first = {} if into is None else into
-    for o in objects:
+    for o in objects:  # "_"-prefixed files (connection tests) are not bids
         folder, _, name = o["Key"].rpartition("/")
-        if not name.lower().endswith(IMAGE_EXTENSIONS) or name.startswith(TEST_UPLOAD_PREFIX):
+        if not name.lower().endswith(IMAGE_EXTENSIONS) or name.startswith("_"):
             continue
         job, when = folder + "/", o["LastModified"]
         if job not in first or when < first[job]:

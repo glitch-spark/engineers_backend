@@ -93,7 +93,7 @@ def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[Bid
     if kind == "daily":
         header = (f"📨 *Daily bids — {_date(end)}* · {start:%a} {_time(start)} → "
                   f"{end:%a} {_time(end)} {end:%Z}")
-        footer_total = f"*Total: {_bids(total)} · {len(rows):,} bidders*"
+        footer_total = f"*Total: {_bids(total)} · {len(rows):,} bidder{'' if len(rows) == 1 else 's'}*"
         fallback = f"Daily bids — {_date(end)}: {_bids(total)}"
     else:
         header = (f"💰 *Weekly bids & pay — week ending {_date(end)}* · {_date(start)} {_time(start)} → "

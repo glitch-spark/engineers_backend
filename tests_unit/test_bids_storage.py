@@ -278,3 +278,11 @@ async def test_a_bad_endpoint_is_a_storage_error_not_a_crash(monkeypatch):
         BID_STORAGE_SECRET_ACCESS_KEY=None, AWS_SECRET_ACCESS_KEY=None, BID_STORAGE_ENDPOINT_URL="nope"))
     with pytest.raises(BidStorageError, match="invalid BID_STORAGE_ENDPOINT_URL"):
         await S3BidStorage().count_bids("s3://shots/a/", START, END)
+
+
+def test_any_underscore_file_is_not_a_bid():
+    objs = [obj("puma/_aws4_test_1791030694686.png", utc(2026, 10, 3)),
+            obj("puma/_node_test_1791030767411.png", utc(2026, 10, 3)),
+            obj("puma/2026-10-03/upwork/_bid_track_connection_test_x.png", utc(2026, 10, 3)),
+            obj("puma/2026-10-03/upwork/acme_1/step1_step_x.png", utc(2026, 10, 3))]
+    assert list(job_first_seen(objs)) == ["puma/2026-10-03/upwork/acme_1/"]
