@@ -233,7 +233,18 @@ async def test_extract_job_keeps_remote_and_unknown():
         assert ex.workMode == mode
 
 
-def test_prompt_version_bumped_for_the_work_mode_rule():
+def test_prompt_version_is_current():
     from app.job_apply.extract import PROMPT_VERSION
 
-    assert PROMPT_VERSION == "job-extract-v4"
+    assert PROMPT_VERSION == "job-extract-v5"  # v4: work mode only when stated; v5: remoteAreas
+
+
+def test_parse_remote_areas():
+    ex = parse_extraction('{"title":"T","terms":[{"term":"Python"}],"remoteAreas":["Austin Metro"," North Carolina ",5,""]}')
+    assert ex.remoteAreas == ["Austin Metro", "North Carolina"]
+    assert parse_extraction('{"title":"T","terms":[{"term":"Python"}]}').remoteAreas == []
+
+
+def test_build_prompt_asks_for_remote_areas():
+    p = build_prompt("JD", RUN)
+    assert '"remoteAreas"' in p and "metro areas" in p

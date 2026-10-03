@@ -9,7 +9,7 @@ import socket
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Awaitable, Callable, Literal, Optional
-from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 # 2: closed jobs (404/410, redirect to the job list, gone from the ATS) are no longer read as job text.
 # 3: pages that say the job is gone ("no longer active", "job not found", "this job was removed"…).
 # 4: results say whether they came from structured data (job-site API / JobPosting) or page text only.
-FETCHER_VERSION = 5
+FETCHER_VERSION = 6
 MIN_TEXT = 200  # below this there's no usable job text
 THIN_PAGE = 400  # below this a script-rendered page is retried in the browser
 TIMEOUT = 20.0
@@ -51,6 +51,9 @@ _ASHBY_EMBED = re.compile(r"jobs\.ashbyhq\.com/([\w.-]+)/embed")
 _ASHBY_JID = re.compile(r"(?:^|&)ashby_jid=([\w-]+)")
 # Text of a page whose script never ran: Angular / Vue placeholders still in it ("{{company.name}}").
 _TEMPLATE = re.compile(r"\{\{\s*[\w.$\[\]]+\s*\}\}")
+# Dayforce marks a remote job in its page data (shown as "Virtual • <location>"), not in its JobPosting data.
+_VIRTUAL = re.compile(r'hasVirtualLocation\\?"\s*:\s*true')
+_PAGE_TITLE = re.compile(r"<title[^>]*>([^<]*)</title>", re.I)
 _ZOHO_JOBS = re.compile(r"var\s+jobs\s*=\s*JSON\.parse\('(.*?)'\)\s*;", re.DOTALL)
 _JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.DOTALL)
 _JS_SIMPLE = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
@@ -232,6 +235,10 @@ def route(url: str) -> tuple[str, dict]:
         return "bamboohr", {"host": host, "id": segs[1]}
     if ".zohorecruit." in host and len(segs) >= 3 and [s.lower() for s in segs[:2]] == ["jobs", "careers"] and segs[2].isdigit():
         return "zoho", {"page": url, "id": segs[2]}
+    if host == "workforcenow.adp.com":
+        q = parse_qs(parts.query)
+        if q.get("cid") and q.get("jobId"):
+            return "adp", {"cid": q["cid"][0], "ccId": (q.get("ccId") or [""])[0], "jobId": q["jobId"][0]}
     domain = parse_qs(parts.query).get("domain")
     if len(segs) == 3 and segs[:2] == ["careers", "job"] and segs[2].isdigit() and domain:
         # Eightfold career sites live on the company's domain (careers.deere.com/careers/job/<id>?domain=johndeere.com)
@@ -381,9 +388,10 @@ async def _ashby(client, p) -> FetchResult:
 async def _workable(client, p) -> FetchResult:
     d = await _get_json(client, f"https://apply.workable.com/api/v2/accounts/{p['account']}/jobs/{p['shortcode']}")
     body = "\n\n".join(html_to_text(d.get(k) or "") for k in ("description", "requirements", "benefits"))
-    loc = ""
-    if isinstance(d.get("location"), dict):
-        loc = ", ".join(x for x in (d["location"].get("city"), d["location"].get("country")) if x)
+    # `location` is only the first of the job's `locations` (Laravel: Argentina of AR, BR, GB, PT, DK)
+    places = [", ".join(x for x in (l.get("city"), l.get("country")) if x)
+              for l in [*(d.get("locations") or []), d.get("location")] if isinstance(l, dict)]
+    loc = "; ".join(dict.fromkeys(x for x in places if x))
     title = d.get("title", "")
     return FetchResult(
         text=_compose(body, title=title, location=loc, remote=d.get("remote")), source="ats_api",
@@ -410,7 +418,8 @@ async def _smartrecruiters(client, p) -> FetchResult:
 async def _workday(client, p) -> FetchResult:
     d = await _get_json(client, f"https://{p['host']}/wday/cxs/{p['tenant']}/{p['site']}/job/{p['path']}")
     info = d.get("jobPostingInfo") or {}
-    loc = info.get("location") or ""
+    extra = [x for x in info.get("additionalLocations") or [] if isinstance(x, str)]
+    loc = "; ".join(dict.fromkeys(x for x in [info.get("location") or "", *extra] if x))
     title = info.get("title", "")
     return FetchResult(
         text=_compose(html_to_text(info.get("jobDescription") or ""), title=title, location=loc, workplace=(info.get("remoteType") or "").lower()),
@@ -458,11 +467,39 @@ async def _zoho(client, p) -> FetchResult:
     if job is None:
         raise JobClosed("job closed (no longer on the Zoho careers page)")
     title = html_lib.unescape(str(job.get("Posting_Title") or "")).strip()
-    loc = ", ".join(str(x) for x in (job.get("City"), job.get("Country")) if x)
+    loc = ", ".join(str(x) for x in (job.get("City"), job.get("State"), job.get("Country")) if x)
+    body = "\n\n".join(
+        x for x in (html_to_text(job.get("Job_Description") or ""), html_to_text(job.get("Roles_and_Responsibilities") or "")) if x
+    )
+    # the careers page is titled "<Company> - <Posting title> - …"
+    company = ""
+    page_title = _PAGE_TITLE.search(resp.text)
+    if page_title and title:
+        head, sep, rest = html_lib.unescape(page_title.group(1)).strip().partition(" - ")
+        if sep and rest.startswith(title):
+            company = head.strip()
     return FetchResult(
-        text=_compose(html_to_text(job.get("Job_Description") or ""), title=title, location=loc,
-                      remote=bool(job.get("Remote_Job"))),
-        source="ats_api", title=title, location=loc,
+        text=_compose(body, title=title, company=company, location=loc, remote=bool(job.get("Remote_Job"))),
+        source="ats_api", postedDate=_date(job.get("Date_Opened")), title=title, company=company, location=loc,
+    )
+
+
+async def _adp(client, p) -> FetchResult:
+    """ADP Workforce Now career centers load the job from this public API (the page is a script app that can show
+    another opening, or none, to a plain fetch)."""
+    params = {"cid": p["cid"], **({"ccId": p["ccId"]} if p.get("ccId") else {}), "lang": "en_US", "locale": "en_US"}
+    d = await _get_json(
+        client,
+        f"https://workforcenow.adp.com/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions/{p['jobId']}"
+        f"?{urlencode(params)}",
+    )
+    title = d.get("requisitionTitle") or ""
+    places = [((l.get("nameCode") or {}).get("shortName") or (l.get("address") or {}).get("cityName") or "").strip()
+              for l in d.get("requisitionLocations") or [] if isinstance(l, dict)]
+    loc = "; ".join(dict.fromkeys(x for x in places if x))
+    return FetchResult(
+        text=_compose(html_to_text(d.get("requisitionDescription") or ""), title=title, location=loc), source="ats_api",
+        postedDate=_date(d.get("postDate")), title=title, location=loc,
     )
 
 
@@ -494,7 +531,7 @@ async def _eightfold(client, p) -> FetchResult:
 _ATS = {
     "greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby, "workable": _workable,
     "smartrecruiters": _smartrecruiters, "workday": _workday, "bamboohr": _bamboohr, "zoho": _zoho,
-    "eightfold": _eightfold,
+    "eightfold": _eightfold, "adp": _adp,
 }
 
 
@@ -569,6 +606,7 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
     # reCAPTCHA / challenge scripts also sit on real job pages (apply forms): they only mean a bot wall when the
     # page has nothing else on it
     marked = any(m in (markup or "") for m in _BOT_MARKERS)
+    virtual = bool(_VIRTUAL.search(markup or ""))
     ld = parse_jsonld(soup)
     closed = _gone_reason(soup, ld)
     if closed:
@@ -577,7 +615,7 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
         body = html_to_text(html_lib.unescape(ld.get("description") or ""))
         org = ld.get("hiringOrganization")
         company = org.get("name", "") if isinstance(org, dict) else ""
-        remote = str(ld.get("jobLocationType") or "").upper() == "TELECOMMUTE"
+        remote = str(ld.get("jobLocationType") or "").upper() == "TELECOMMUTE" or virtual
         loc = _names(ld.get("applicantLocationRequirements")) or _names(ld.get("jobLocation"))
         if len(body) >= MIN_TEXT:
             title = ld.get("title", "") if isinstance(ld.get("title"), str) else ""
@@ -591,6 +629,8 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
     text = html_to_text(soup)
     if marked and len(text) < THIN_PAGE:
         return FetchResult(text="", source=source, bot_check=True)
+    if virtual:
+        text = _compose(text, remote=True)
     return FetchResult(text=text, source=source, postedDate=posted, structured=False)
 
 

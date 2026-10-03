@@ -96,3 +96,11 @@ def test_normalize_country_three_letter_codes():
     assert normalize_country("GBR") == "GB" and normalize_country("usa") == "US" and normalize_country("DEU") == "DE"
     assert normalize_country("BRA") == "BR" and normalize_country("POL") == "PL" and normalize_country("CAN") == "CA"
     assert normalize_country("XYZ") is None
+
+
+def test_remote_only_in_some_areas_needs_a_check():
+    # "Remote - Austin Metro" / "Remote - North Carolina": profiles have no city or state, so a person decides
+    g = by_name(job_gates(ex(workMode="remote", remoteAreas=["Austin Metro", "North Carolina"]), run_date=RUN, max_age_days=30))
+    assert g["area"].result == "unknown" and g["area"].reason == "remote only in Austin Metro, North Carolina"
+    assert not blocked(list(g.values()))
+    assert "area" not in by_name(job_gates(ex(workMode="remote"), run_date=RUN, max_age_days=30))

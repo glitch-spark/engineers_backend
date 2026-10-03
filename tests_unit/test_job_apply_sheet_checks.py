@@ -84,3 +84,9 @@ def test_tab_name_is_per_run_and_sheet_safe():
     run = NS(fileName="Jobs [Oct]: list/1.xlsx", id="6ac0b0831f138761131726de")
     assert sc.checks_tab_name(run) == "Checks · Jobs Oct list1.xlsx · 1726de"
     assert len(sc.checks_tab_name(NS(fileName="x" * 300, id="6ac0b0831f138761131726de"))) <= 100
+
+
+def test_location_shows_remote_areas():
+    ex = JobExtraction(workMode="remote", allowedLocations=[Location(kind="country", value="US")],
+                       remoteAreas=["Austin Metro", "North Carolina"])
+    assert cells(row(extraction=ex))["Location"] == "US (Austin Metro; North Carolina)"

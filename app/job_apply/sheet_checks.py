@@ -31,9 +31,12 @@ def checks_tab_name(run: Any) -> str:
 
 
 def _location(row: Any) -> str:
+    """Where candidates may live: "US", "US (Austin Metro; North Carolina)" when remote is limited to some areas."""
     if row.extraction is None:
         return ""
-    return ", ".join(loc.value for loc in row.extraction.allowedLocations) or "Not stated"
+    where = ", ".join(loc.value for loc in row.extraction.allowedLocations) or "Not stated"
+    areas = getattr(row.extraction, "remoteAreas", None) or []
+    return f"{where} ({'; '.join(areas)})" if areas else where
 
 
 def _clearance(row: Any) -> str:

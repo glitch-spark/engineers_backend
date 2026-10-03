@@ -166,7 +166,10 @@ def job_gates(
             fresh = GateResult(name="freshness", result="fail", reason=f"posted {age} days ago")
         else:
             fresh = GateResult(name="freshness", result="pass", reason=f"posted {max(age, 0)} days ago")
-    return [remote, clearance, fresh]
+    gates = [remote, clearance, fresh]
+    if ex.remoteAreas:  # profiles have a country / region only, so a person checks the city or state
+        gates.append(GateResult(name="area", result="unknown", reason=f"remote only in {', '.join(ex.remoteAreas)}"))
+    return gates
 
 
 def profile_gates(ex: JobExtraction, *, country: Optional[str], region: Optional[str]) -> list[GateResult]:

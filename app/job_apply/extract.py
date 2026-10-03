@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v4"
+PROMPT_VERSION = "job-extract-v5"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -45,6 +45,7 @@ JSON shape (use null when the posting doesn't say):
   "degree": {{"level": 2, "required": true, "equivalentExperience": false}},
   "workMode": "remote|hybrid|onsite|unknown",
   "allowedLocations": [{{"kind": "country|region", "value": "US"}}],
+  "remoteAreas": ["Austin Metro", "North Carolina"],
   "workAuthorization": {{"restricted": true, "countries": ["US"], "note": "US citizens only"}},
   "timezoneNote": "4h overlap with EST",
   "clearance": {{"level": "required|preferred|none", "note": "Active Secret"}},
@@ -69,6 +70,10 @@ Rules:
   of an office" or "N days in office" is hybrid. In-office/on-site only is onsite.
   If the posting doesn't say where the work is done, workMode is "unknown": a "Location:" line or a city alone
   does not make a job onsite.
+- remoteAreas: when the posting limits where a remote hire may live to particular cities, metro areas, states or
+  provinces ("Remote - Austin Metro", "must reside in the Seattle or Los Angeles metro areas", "remote from Green Bay,
+  Madison, Milwaukee or Chicago only"), list those areas as written; allowedLocations still gets their country.
+  Empty when a whole country or more is open.
 - allowedLocations: where a remote hire may live. Take the first of these that the posting has:
   1. Text on where hires may live or be based ("must be based in the US or EU", "can be done globally", "open to
      candidates in the EMEA time zone"). List every country and region it allows. "Global", "globally", "anywhere"
@@ -220,6 +225,7 @@ def parse_extraction(raw: str) -> JobExtraction:
         degree=degree,
         workMode=mode if mode in _WORK_MODES else "unknown",
         allowedLocations=locations,
+        remoteAreas=_str_list(obj.get("remoteAreas")),
         workAuthorization=work_auth,
         timezoneNote=_opt_str(obj.get("timezoneNote")),
         clearance=clearance,

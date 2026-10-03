@@ -637,3 +637,110 @@ async def test_eightfold_api_checks_the_address():
 
 def test_fetcher_version_bumped_for_these_readers():
     assert fetch_mod.FETCHER_VERSION >= 5
+
+
+# ---------- manual validation notes (2026-10-03): Dayforce, Workable, Zoho, Workday, ADP ----------
+
+
+async def test_dayforce_virtual_location_is_remote():
+    # Dayforce shows "Virtual • US" from hasVirtualLocation; its JobPosting data has no jobLocationType
+    ld = {"@type": "JobPosting", "title": "Fullstack Engineer, Marketing", "description": LONG, "datePosted": "2026-09-30",
+          "jobLocation": {"@type": "Place", "address": {"addressCountry": "US"}}}
+    page = (f'<html><script type="application/ld+json">{json.dumps(ld)}</script>'
+            '<script>self.__next_f.push([1,"{\\"hasVirtualLocation\\":true,\\"jobId\\":10549}"])</script><body>x</body></html>')
+    async with client({"https://jobs.dayforcehcm.com/": (200, page)}) as c:
+        res = await fetch_job("https://jobs.dayforcehcm.com/imgacademy/careers/jobs/10549", client=c)
+    assert "Workplace type: remote" in res.text and res.postedDate == date(2026, 9, 30)
+
+
+async def test_dayforce_without_virtual_location_says_nothing():
+    ld = {"@type": "JobPosting", "title": "Engineer", "description": LONG}
+    page = (f'<html><script type="application/ld+json">{json.dumps(ld)}</script>'
+            '<script>x={"hasVirtualLocation":false}</script><body>x</body></html>')
+    async with client({"https://jobs.dayforcehcm.com/": (200, page)}) as c:
+        res = await fetch_job("https://jobs.dayforcehcm.com/acme/careers/jobs/1", client=c)
+    assert "Workplace type" not in res.text
+
+
+async def test_workable_keeps_every_location():
+    body = {"title": "Senior SRE", "description": LONG, "published": "2026-09-30T10:00:00Z", "remote": True,
+            "location": {"country": "Argentina", "city": ""},
+            "locations": [{"country": "Argentina", "city": "", "hidden": True}, {"country": "Brazil", "city": "", "hidden": True},
+                          {"country": "United Kingdom", "city": "", "hidden": True}, {"country": "Portugal", "city": ""}]}
+    async with client({"https://apply.workable.com/api/v2/accounts/laravel/jobs/6C1E9F512C": (200, body)}) as c:
+        res = await fetch_job("https://apply.workable.com/laravel/j/6C1E9F512C", client=c)
+    assert "Location: Argentina; Brazil; United Kingdom; Portugal" in res.text and res.location.startswith("Argentina; Brazil")
+
+
+ZOHO_JOB = {"id": "831352000001667005", "Posting_Title": "Software Developer", "City": "", "State": "Texas",
+            "Country": "United States", "Remote_Job": True, "Date_Opened": "2026-09-30",
+            "Job_Description": "<p>We build payment systems.</p>",
+            "Roles_and_Responsibilities": "• Develop and support production software in Python.\r\n" * 12}
+
+
+def _zoho_page(job, title="Vyusoft - Software Developer - Remote Job"):
+    data = json.dumps([job]).replace("'", "\\'")
+    return f"<html><head><title>{title}</title></head><body><script>var jobs = JSON.parse('{data}');</script></body></html>"
+
+
+async def test_zoho_reads_responsibilities_date_and_company():
+    url = "https://vyusoft.zohorecruit.com/jobs/careers/831352000001667005/Software-Developer"
+    async with client({"https://vyusoft.zohorecruit.com/": (200, _zoho_page(ZOHO_JOB))}) as c:
+        res = await fetch_job(url, client=c)
+    assert res.company == "Vyusoft" and "Company: Vyusoft" in res.text and res.postedDate == date(2026, 9, 30)
+    assert "production software in Python" in res.text and "Location: Texas, United States" in res.text
+    assert "Workplace type: remote" in res.text
+
+
+async def test_zoho_title_without_company_leaves_it_empty():
+    url = "https://acme.zohorecruit.com/jobs/careers/831352000001667005/Software-Developer"
+    async with client({"https://acme.zohorecruit.com/": (200, _zoho_page(ZOHO_JOB, title="Careers"))}) as c:
+        res = await fetch_job(url, client=c)
+    assert res.company == "" and "Company:" not in res.text
+
+
+async def test_workday_keeps_additional_locations():
+    body = {"jobPostingInfo": {"title": "Senior Python Engineer", "jobDescription": LONG, "startDate": "2026-09-30",
+                               "location": "Remote - Austin Metro", "additionalLocations": ["Remote - North Carolina"]}}
+    async with client({"https://dimensional.wd5.myworkdayjobs.com/wday/cxs/": (200, body)}) as c:
+        res = await fetch_job("https://dimensional.wd5.myworkdayjobs.com/dfa_careers/job/Remote---Austin-Metro/Senior-Python-Engineer_2026-9045", client=c)
+    assert "Location: Remote - Austin Metro; Remote - North Carolina" in res.text
+
+
+ADP_URL = ("https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html"
+           "?cid=17359519-82d6-4375-b440-8bcf0d291475&ccId=19000101_000001&jobId=571062")
+ADP_API = "https://workforcenow.adp.com/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions/571062"
+ADP_JOB = {"requisitionTitle": "Application Engineer", "postDate": "2026-09-30T11:18:00.000-04:00",
+           "requisitionDescription": "<p><strong>Application Engineer, Press Brake</strong></p>" + LONG,
+           "requisitionLocations": [{"nameCode": {"shortName": " Manitowoc, WI, US"}, "address": {"cityName": "Manitowoc"}}]}
+
+
+def test_route_adp():
+    assert route(ADP_URL) == ("adp", {"cid": "17359519-82d6-4375-b440-8bcf0d291475", "ccId": "19000101_000001", "jobId": "571062"})
+    assert route("https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html?cid=x")[0] == "generic"  # no job
+
+
+async def test_adp_api():
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if str(request.url).startswith(ADP_API):
+            return httpx.Response(200, json=ADP_JOB)
+        return httpx.Response(404, text="nope")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        res = await fetch_job(ADP_URL, client=c)
+    assert res.source == "ats_api" and res.title == "Application Engineer" and res.postedDate == date(2026, 9, 30)
+    assert "Location: Manitowoc, WI, US" in res.text and "Press Brake" in res.text
+    assert "cid=17359519-82d6-4375-b440-8bcf0d291475" in seen[0] and "ccId=19000101_000001" in seen[0]
+
+
+async def test_adp_missing_job_is_closed():
+    async with client({ADP_API: (404, {"error": "not found"})}) as c:
+        with pytest.raises(fetch_mod.JobClosed):
+            await fetch_job(ADP_URL, client=c)
+
+
+def test_fetcher_version_bumped_for_these_sites():
+    assert fetch_mod.FETCHER_VERSION >= 6

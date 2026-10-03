@@ -165,3 +165,8 @@ def test_build_report_profile_without_location_fits_every_market():
     nowhere = {"id": "n", "name": "N", "country": None, "region": None, "resumes": 1}
     rep = build_report([("valid", "US")], [nowhere], max_age_days=30)
     assert all(g["fits"] == ["n"] for g in rep["groups"])
+
+
+def test_remote_area_limit_needs_a_check():
+    area = GateResult(name="area", result="unknown", reason="remote only in Austin Metro")
+    assert b(g=[*gates(), area]) == "check"
