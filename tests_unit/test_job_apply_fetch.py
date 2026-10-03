@@ -43,8 +43,8 @@ def test_route_kinds():
     assert route("https://jobs.smartrecruiters.com/Acme/7445-senior-engineer") == ("smartrecruiters", {"company": "Acme", "id": "7445"})
     kind, p = route("https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Remote-USA/Senior-Engineer_R123")
     assert kind == "workday" and p == {"host": "acme.wd5.myworkdayjobs.com", "tenant": "acme", "site": "Careers", "path": "Remote-USA/Senior-Engineer_R123"}
-    assert route("https://www.linkedin.com/jobs/view/1")[0] == "unsupported"
-    assert route("https://uk.indeed.com/viewjob?jk=1")[0] == "unsupported"
+    assert route("https://www.linkedin.com/jobs/view/1")[0] == "blocked"
+    assert route("https://uk.indeed.com/viewjob?jk=1")[0] == "blocked"
     assert route("https://careers.example.com/jobs/1")[0] == "generic"
 
 
@@ -115,7 +115,7 @@ async def test_browser_used_when_page_is_thin():
 
 async def test_unsupported_host_raises():
     async with client({}) as c:
-        with pytest.raises(FetchError, match="unsupported"):
+        with pytest.raises(FetchError, match="blocks automated access"):
             await fetch_job("https://www.linkedin.com/jobs/view/1", client=c)
 
 
@@ -278,3 +278,92 @@ async def test_follows_public_redirects():
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
         res = await fetch_job("https://careers.beta.io/old", client=c)
     assert "distributed systems" in res.text
+
+
+# ---------- why a page can't be read; retries; per-site limit (from job_url_filter's screen.py) ----------
+
+
+@pytest.fixture
+def no_retry_wait(monkeypatch):
+    monkeypatch.setattr(fetch_mod, "RETRY_DELAY", 0)
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.glassdoor.com/job-listing/x-JV_1.htm", "https://www.ziprecruiter.com/c/Acme/Job/x",
+    "https://wellfound.com/jobs/1", "https://uk.indeed.com/viewjob?jk=1", "https://www.linkedin.com/jobs/view/1",
+])
+async def test_sites_that_block_bots_are_never_requested(url):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url)
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        with pytest.raises(FetchError, match="blocks automated access"):
+            await fetch_job(url, client=c)
+    assert calls == []
+
+
+async def test_bot_check_page_is_not_read_as_the_job():
+    page = f"<html><head><title>Just a moment...</title></head><body>{LONG}</body></html>"
+
+    async def browser(url):
+        return page
+
+    async with client({"https://careers.beta.io/": (200, page)}) as c:
+        with pytest.raises(FetchError, match="bot protection"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c, browser=browser)
+
+
+@pytest.mark.parametrize("status, reason", [(403, "blocks automated access"), (503, "blocks automated access"),
+                                            (429, "rate-limited"), (500, "HTTP 500")])
+async def test_failed_page_says_why(status, reason, no_retry_wait):
+    async with client({"https://careers.beta.io/": (status, "<html></html>")}) as c:
+        with pytest.raises(FetchError, match=reason):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c)
+
+
+async def test_rate_limit_is_retried_once(no_retry_wait):
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(429)
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        res = await fetch_job("https://careers.beta.io/jobs/1", client=c)
+    assert len(calls) == 2 and "distributed systems" in res.text
+
+
+async def test_timeout_is_retried_once_then_reported(no_retry_wait):
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        with pytest.raises(FetchError, match="timed out"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c)
+    assert len(calls) == 2
+
+
+async def test_at_most_four_requests_per_site_at_once():
+    import asyncio
+
+    live, peak = 0, 0
+
+    async def handler(request):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        await asyncio.sleep(0.02)
+        live -= 1
+        return httpx.Response(200, text=f"<html><body>{LONG}</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        await asyncio.gather(*(fetch_job(f"https://careers.beta.io/jobs/{i}", client=c) for i in range(10)))
+    assert peak == 4

@@ -27,7 +27,23 @@ UA = (
     "Chrome/126.0 Safari/537.36"
 )
 
-_UNSUPPORTED = re.compile(r"(?:^|\.)(?:linkedin\.com|indeed\.[a-z.]+)$", re.I)
+# Sites that refuse automated access: never requested (job_url_filter's deny-list, plus LinkedIn).
+_BLOCKED = re.compile(
+    r"(?:^|\.)(?:linkedin\.com|indeed\.[a-z.]+|glassdoor\.[a-z.]+|ziprecruiter\.[a-z.]+|wellfound\.com|angel\.co)$", re.I
+)
+# A bot check or captcha served instead of the page (job_url_filter extractors.py).
+_BOT_TITLE = re.compile(
+    r"just a moment|human verification|attention required|access denied|are you a robot|security check|"
+    r"verify you are human|pardon our interruption|captcha",
+    re.I,
+)
+_BOT_MARKERS = ("g-recaptcha", "h-captcha", "cf-chl-", "captcha-delivery.com", "/_incapsula_resource")
+_BLOCKING_STATUS = {401, 403, 405, 503, 999}
+
+# One retry for a rate limit, timeout or dropped connection; at most HOST_CONCURRENCY requests per site at once.
+RETRY_DELAY = 2.0
+HOST_CONCURRENCY = 4
+_host_slots: dict[tuple[int, str], asyncio.Semaphore] = {}
 _BLOCK_TAGS = ["p", "div", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article", "br", "dt", "dd", "table"]
 _DROP_TAGS = ["script", "style", "noscript", "nav", "header", "footer", "svg", "form", "iframe"]
 
@@ -57,6 +73,7 @@ class FetchResult:
     company: str = ""
     location: str = ""
     closed: Optional[str] = None  # why the page says the job is gone (pages only)
+    bot_check: bool = False  # the page is a bot check / captcha, not the site's content
 
 
 # A page can load fine and still say the posting is gone (Teamtailor, Built In, Recruitee, Zoho, Deel, N-iX…).
@@ -109,11 +126,35 @@ async def check_url(url: str) -> None:
         raise FetchError("blocked URL: private or reserved address")
 
 
+def _host_slot(url: str) -> asyncio.Semaphore:
+    key = (id(asyncio.get_running_loop()), (urlsplit(url).hostname or "").lower())
+    if key not in _host_slots and len(_host_slots) > 2000:
+        _host_slots.clear()  # bounded: one entry per site seen; dropping them only loosens the limit briefly
+    return _host_slots.setdefault(key, asyncio.Semaphore(HOST_CONCURRENCY))
+
+
+async def _send(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """GET with at most HOST_CONCURRENCY in flight per site, retried once after RETRY_DELAY on a rate limit,
+    timeout or dropped connection (the slot is free while waiting)."""
+    for attempt in (1, 2):
+        async with _host_slot(url):
+            try:
+                resp = await client.get(url, **kwargs)
+            except (httpx.TimeoutException, httpx.TransportError):
+                if attempt == 2:
+                    raise
+                resp = None
+        if resp is not None and (resp.status_code != 429 or attempt == 2):
+            return resp
+        await asyncio.sleep(RETRY_DELAY)
+    raise AssertionError("unreachable")
+
+
 async def _get_page(client: httpx.AsyncClient, url: str) -> httpx.Response:
     """GET with redirects followed by hand, so every hop is checked."""
     for _ in range(MAX_REDIRECTS + 1):
         await check_url(url)
-        resp = await client.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT, follow_redirects=False)
+        resp = await _send(client, url, headers={"User-Agent": UA}, timeout=TIMEOUT, follow_redirects=False)
         if resp.is_redirect and resp.headers.get("location"):
             url = urljoin(url, resp.headers["location"])
             continue
@@ -139,8 +180,8 @@ def route(url: str) -> tuple[str, dict]:
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     segs = [s for s in parts.path.split("/") if s]
-    if _UNSUPPORTED.search(host):
-        return "unsupported", {}
+    if _BLOCKED.search(host):
+        return "blocked", {}
     if host in ("boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io") and len(segs) >= 3 and segs[1] == "jobs":
         return "greenhouse", {"board": segs[0], "id": segs[2]}
     if host == "jobs.lever.co" and len(segs) >= 2:
@@ -254,7 +295,7 @@ def _names(value: Any) -> str:
 
 
 async def _get_json(client: httpx.AsyncClient, url: str) -> Any:
-    resp = await client.get(url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=TIMEOUT)
+    resp = await _send(client, url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -350,6 +391,9 @@ _ATS = {
 def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
     """CPU-bound (HTML parsing): callers run it in a thread. The page is parsed once."""
     soup = BeautifulSoup(markup or "", "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if _BOT_TITLE.search(title) or any(m in (markup or "") for m in _BOT_MARKERS):
+        return FetchResult(text="", source=source, bot_check=True)
     ld = parse_jsonld(soup)
     closed = _gone_reason(soup, ld)
     if closed:
@@ -379,6 +423,14 @@ def _gone_reason(soup: BeautifulSoup, ld: Optional[dict]) -> Optional[str]:
     head = " ".join(soup.get_text(" ", strip=True).split())[:_GONE_SCAN_CHARS]
     m = _GONE_TEXT.search(f"{title} {head}")
     return f"page says: {m.group(0)}" if m else None
+
+
+def _status_problem(status: int) -> str:
+    if status in _BLOCKING_STATUS:
+        return f"site blocks automated access (HTTP {status})"
+    if status == 429:
+        return "rate-limited, try again later"
+    return f"the site answered HTTP {status}"
 
 
 async def browser_html(url: str) -> str:
@@ -414,8 +466,8 @@ async def fetch_job(
     browser: Optional[Callable[[str], Awaitable[str]]] = None,
 ) -> FetchResult:
     kind, params = route(url)
-    if kind == "unsupported":
-        raise FetchError("unsupported host (LinkedIn/Indeed block automated fetching)")
+    if kind == "blocked":
+        raise FetchError(f"site blocks automated access ({urlsplit(url).hostname})")
     if kind in _ATS:
         try:
             res = await _ATS[kind](client, params)
@@ -431,6 +483,7 @@ async def fetch_job(
 
     await check_url(url)
     result: Optional[FetchResult] = None
+    problem: Optional[str] = None  # why the page couldn't be read, for the "Not fetched" list
     try:
         resp = await _get_page(client, url)
         if resp.status_code in _GONE:
@@ -439,10 +492,16 @@ async def fetch_job(
             raise JobClosed("job closed (the link now opens the job list)")
         if resp.status_code < 400:
             result = await asyncio.to_thread(_from_page, resp.text, "html")
+        else:
+            problem = _status_problem(resp.status_code)
+    except httpx.TimeoutException:
+        problem = "timed out"
     except httpx.HTTPError:
-        result = None
+        problem = "couldn't reach the site"
     if result is not None and result.closed:
         raise JobClosed(f"job closed ({result.closed})")
+    if result is not None and result.bot_check:
+        result, problem = None, "blocked by bot protection"
 
     if browser is not None and (result is None or len(result.text) < THIN_PAGE):
         rendered: Optional[FetchResult] = None
@@ -452,11 +511,13 @@ async def fetch_job(
             pass
         if rendered is not None and rendered.closed:
             raise JobClosed(f"job closed ({rendered.closed})")
+        if rendered is not None and rendered.bot_check:
+            rendered, problem = None, problem or "blocked by bot protection"
         if rendered is not None and (result is None or len(rendered.text) > len(result.text)):
             result = rendered
 
     if result is None:
-        raise FetchError("could not load the page")
+        raise FetchError(problem or "could not load the page")
     if len(result.text) < MIN_TEXT:
         raise FetchError("no job text on the page")
     return result
