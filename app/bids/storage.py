@@ -1,6 +1,11 @@
-"""Storage adapter: counts bidders' screenshots in a time window.
+"""Storage adapter: counts bidders' bids in a time window.
 
-Only S3 is implemented; `get_bid_storage()` picks the provider from settings.
+The Bid Track extension uploads one or more screenshots per job application, under
+`<member>/<YYYY-MM-DD>/<profile>/<job>/step<n>_<trigger>_<stamp>.png`. A bid is one job
+folder, counted in the window of its earliest screenshot.
+
+Only S3 is implemented (AWS, or an S3-compatible endpoint such as Backblaze B2);
+`get_bid_storage()` picks the provider from settings.
 """
 
 from __future__ import annotations
@@ -17,11 +22,18 @@ from botocore.exceptions import BotoCoreError, ClientError
 from app.config import get_settings
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+# The extension's "Test upload" button writes these next to the job folders; they are not bids.
+TEST_UPLOAD_PREFIX = "_bid_track_connection_test_"
 
-# bucket.s3.amazonaws.com / bucket.s3.<region>.amazonaws.com (bucket names may contain dots)
-_VIRTUAL_HOST = re.compile(r"^(?P<bucket>.+)\.s3[.-](?:[a-z0-9-]+\.)?amazonaws\.com$")
-# s3.amazonaws.com / s3.<region>.amazonaws.com / s3-<region>.amazonaws.com
-_PATH_HOST = re.compile(r"^s3[.-](?:[a-z0-9-]+\.)?amazonaws\.com$")
+# bucket.s3.amazonaws.com / bucket.s3.<region>.amazonaws.com (bucket names may contain dots),
+# bucket.s3.<region>.backblazeb2.com
+_VIRTUAL_HOST = re.compile(
+    r"^(?P<bucket>.+)\.s3[.-](?:[a-z0-9-]+\.)?amazonaws\.com$|^(?P<b2bucket>.+)\.s3\.[a-z0-9-]+\.backblazeb2\.com$"
+)
+# s3.amazonaws.com / s3.<region>.amazonaws.com / s3-<region>.amazonaws.com / s3.<region>.backblazeb2.com
+_PATH_HOST = re.compile(r"^s3[.-](?:[a-z0-9-]+\.)?amazonaws\.com$|^s3\.[a-z0-9-]+\.backblazeb2\.com$")
+# Backblaze web console "friendly URL": https://f005.backblazeb2.com/file/<bucket>/<prefix>
+_B2_FRIENDLY_HOST = re.compile(r"^f\d+\.backblazeb2\.com$")
 
 
 class BidStorageError(Exception):
@@ -32,15 +44,15 @@ Window = tuple[datetime, datetime]
 
 
 class BidStorage(Protocol):
-    async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int: ...
+    async def count_bids(self, folder_url: str, start: datetime, end: datetime) -> int: ...
 
     async def count_windows(self, folder_url: str, windows: Sequence[Window]) -> list[int]:
-        """Counts for several windows from one folder listing (S3 cannot filter by date)."""
+        """Bid counts for several windows from one folder listing (S3 cannot filter by date)."""
         ...
 
 
 def parse_folder_url(url: str) -> tuple[str, str]:
-    """Return (bucket, prefix ending in '/') for an S3 folder URL, else ValueError."""
+    """Return (bucket, prefix ending in '/') for an S3 or Backblaze folder URL, else ValueError."""
     parts = urlsplit((url or "").strip())
     host = (parts.hostname or "").lower()
     path = unquote(parts.path).lstrip("/")
@@ -49,7 +61,9 @@ def parse_folder_url(url: str) -> tuple[str, str]:
     elif parts.scheme == "https" and _PATH_HOST.match(host):
         bucket, _, prefix = path.partition("/")
     elif parts.scheme == "https" and (m := _VIRTUAL_HOST.match(host)):
-        bucket, prefix = m.group("bucket"), path
+        bucket, prefix = m.group("bucket") or m.group("b2bucket"), path
+    elif parts.scheme == "https" and _B2_FRIENDLY_HOST.match(host) and path.startswith("file/"):
+        bucket, _, prefix = path.removeprefix("file/").partition("/")
     else:
         raise ValueError(f"unrecognised folder URL: {url!r}")
     prefix = prefix.strip("/")
@@ -58,13 +72,25 @@ def parse_folder_url(url: str) -> tuple[str, str]:
     return bucket, prefix + "/"
 
 
-def count_in_window(objects: Iterable[Mapping], start: datetime, end: datetime) -> int:
-    """Count image objects with start <= LastModified < end (subfolders included)."""
-    return sum(
-        1
-        for o in objects
-        if o["Key"].lower().endswith(IMAGE_EXTENSIONS) and start <= o["LastModified"] < end
-    )
+def job_first_seen(objects: Iterable[Mapping], into: Optional[dict[str, datetime]] = None) -> dict[str, datetime]:
+    """Map each job folder (the folder holding a screenshot) to its earliest image upload time.
+
+    Pass `into` to accumulate across listing pages.
+    """
+    first = {} if into is None else into
+    for o in objects:
+        folder, _, name = o["Key"].rpartition("/")
+        if not name.lower().endswith(IMAGE_EXTENSIONS) or name.startswith(TEST_UPLOAD_PREFIX):
+            continue
+        job, when = folder + "/", o["LastModified"]
+        if job not in first or when < first[job]:
+            first[job] = when
+    return first
+
+
+def count_jobs_in_window(first_seen: Mapping[str, datetime], start: datetime, end: datetime) -> int:
+    """Count jobs whose first screenshot was uploaded in start <= t < end."""
+    return sum(1 for when in first_seen.values() if start <= when < end)
 
 
 class S3BidStorage:
@@ -79,10 +105,15 @@ class S3BidStorage:
                 from botocore.config import Config
 
                 s = get_settings()
+                endpoint = s.BID_STORAGE_ENDPOINT_URL
                 kwargs = {
                     "region_name": s.BID_STORAGE_REGION or s.AWS_REGION,
-                    "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+                    # Path style for custom endpoints (Backblaze): no per-bucket DNS or TLS name needed.
+                    "config": Config(signature_version="s3v4",
+                                     s3={"addressing_style": "path" if endpoint else "virtual"}),
                 }
+                if endpoint:
+                    kwargs["endpoint_url"] = endpoint
                 key = s.BID_STORAGE_ACCESS_KEY_ID or s.AWS_ACCESS_KEY_ID
                 secret = s.BID_STORAGE_SECRET_ACCESS_KEY or s.AWS_SECRET_ACCESS_KEY
                 if key and secret:
@@ -93,15 +124,14 @@ class S3BidStorage:
             return self._client
 
     def _count(self, bucket: str, prefix: str, windows: Sequence[Window]) -> list[int]:
-        # Pages are fetched lazily, so the whole loop runs inside one worker thread.
-        totals = [0] * len(windows)
+        # Pages are fetched lazily, so the whole loop runs inside one worker thread. A job's
+        # screenshots can sit on different pages, so first-seen times are gathered before counting.
+        first: dict[str, datetime] = {}
         for page in self._get_client().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-            contents = page.get("Contents", [])
-            for i, (start, end) in enumerate(windows):
-                totals[i] += count_in_window(contents, start, end)
-        return totals
+            job_first_seen(page.get("Contents", []), into=first)
+        return [count_jobs_in_window(first, start, end) for start, end in windows]
 
-    async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int:
+    async def count_bids(self, folder_url: str, start: datetime, end: datetime) -> int:
         return (await self.count_windows(folder_url, [(start, end)]))[0]
 
     async def count_windows(self, folder_url: str, windows: Sequence[Window]) -> list[int]:
@@ -121,7 +151,7 @@ class _UnsupportedStorage:
     def __init__(self, provider: str):
         self._provider = provider
 
-    async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int:
+    async def count_bids(self, folder_url: str, start: datetime, end: datetime) -> int:
         return (await self.count_windows(folder_url, [(start, end)]))[0]
 
     async def count_windows(self, folder_url: str, windows: Sequence[Window]) -> list[int]:
@@ -163,7 +193,7 @@ async def count_folders(
     limit: int = 5,
 ) -> dict[str, tuple[Optional[int], Optional[str]]]:
     """Count each (id, folder_url) in one window -> {id: (count, error)}."""
-    return await _each_folder(items, lambda url: storage.count_screenshots(url, start, end), limit)
+    return await _each_folder(items, lambda url: storage.count_bids(url, start, end), limit)
 
 
 async def count_folder_windows(

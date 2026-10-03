@@ -70,6 +70,15 @@ def test_schedule_from_settings_parses_values():
                                                     weekly_at=time(9, 0))
 
 
+@pytest.mark.parametrize("value,expected", [
+    (None, None), ("", None), ("   ", None),
+    (" https://s3.us-east-005.backblazeb2.com/ ", "https://s3.us-east-005.backblazeb2.com"),
+])
+def test_storage_endpoint_url_is_optional_and_trimmed(value, expected):
+    s = Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a", BID_STORAGE_ENDPOINT_URL=value)
+    assert s.BID_STORAGE_ENDPOINT_URL == expected
+
+
 @pytest.mark.parametrize("field,value", [
     ("BID_DAILY_REPORT_TIME", "25:00"), ("BID_DAILY_REPORT_TIME", "6:30pm"), ("BID_WEEKLY_REPORT_TIME", "16"),
     ("BID_WEEKLY_REPORT_DAY", "funday"), ("BID_REPORT_TIMEZONE", "Mars/Base"),
@@ -96,6 +105,6 @@ def test_env_examples_have_no_inline_comments_in_bid_values():
     example = _bid_env_values((root / ".env.example").read_text(encoding="utf-8"))
     doc = (root / "docs" / "bids.md").read_text(encoding="utf-8")
     doc_env = _bid_env_values(doc.split("```env", 1)[1].split("```", 1)[0])
-    assert len(example) == 9 and set(doc_env) == set(example)
+    assert len(example) == 10 and set(doc_env) == set(example)
     for values in (example, doc_env):
         assert all("#" not in (v or "") for v in values.values()), values

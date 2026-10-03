@@ -62,7 +62,7 @@ class BidderIn(BaseModel):
         try:
             parse_folder_url(v)
         except ValueError:
-            raise ValueError("Use an s3:// or amazonaws.com folder URL") from None
+            raise ValueError("Use an s3://, amazonaws.com or backblazeb2.com folder URL") from None
         return v
 
 

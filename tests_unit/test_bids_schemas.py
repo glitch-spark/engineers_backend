@@ -42,6 +42,18 @@ def test_bidder_in_rejects(field, value):
     assert exc.value.errors()[0]["loc"] == (field,)
 
 
+def test_backblaze_folder_urls_are_accepted():
+    for url in ("https://s3.us-east-005.backblazeb2.com/bid-screenshots/puma/",
+                "https://f005.backblazeb2.com/file/bid-screenshots/puma/"):
+        assert BidderIn(**valid(screenshotFolderUrl=url)).screenshotFolderUrl == url
+
+
+def test_folder_url_error_names_every_accepted_form():
+    with pytest.raises(ValidationError) as exc:
+        BidderIn(**valid(screenshotFolderUrl="https://example.com/a/"))
+    assert "Use an s3://, amazonaws.com or backblazeb2.com folder URL" in exc.value.errors()[0]["msg"]
+
+
 @pytest.mark.parametrize("rate", [0, 0.1, 0.29, 19.99, 1000])
 def test_two_decimal_rates_accepted(rate):
     assert BidderIn(**valid(rate=rate)).rate == rate

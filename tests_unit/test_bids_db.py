@@ -148,7 +148,7 @@ class FakeStorage:
         self.listings.append((folder_url, list(windows)))
         return [self.per_window for _ in windows]
 
-    async def count_screenshots(self, folder_url, start, end):
+    async def count_bids(self, folder_url, start, end):
         return (await self.count_windows(folder_url, [(start, end)]))[0]
 
 

@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     BID_STORAGE_ACCESS_KEY_ID: Optional[str] = None
     BID_STORAGE_SECRET_ACCESS_KEY: Optional[str] = None
     BID_STORAGE_REGION: Optional[str] = None
+    # S3-compatible endpoint for non-AWS storage, e.g. Backblaze B2:
+    # https://s3.us-east-005.backblazeb2.com (with the B2 key ID / application key above).
+    # Unset = AWS S3.
+    BID_STORAGE_ENDPOINT_URL: Optional[str] = None
     # Report schedule: wall-clock times in BID_REPORT_TIMEZONE (an IANA name). Daily report at
     # BID_DAILY_REPORT_TIME; weekly report on BID_WEEKLY_REPORT_DAY (monday..sunday) at
     # BID_WEEKLY_REPORT_TIME. Times are 24h HH:MM; invalid values fail at startup.
@@ -125,6 +129,13 @@ class Settings(BaseSettings):
             return None
         s = str(v).strip()
         return s or None
+
+    @field_validator("BID_STORAGE_ENDPOINT_URL", mode="before")
+    @classmethod
+    def _normalize_bid_endpoint(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        return str(v).strip().rstrip("/") or None
 
     @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
     @classmethod

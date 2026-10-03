@@ -1,19 +1,45 @@
 # Bidder bid reports (Slack channel)
 
-Users manage bidders on the Bidders page. Each bidder points at a screenshot
-folder in S3. The 5-minute cron counts the screenshots in each folder and posts
-a **daily** bid count and a **weekly** count + pay report to one shared Slack
-channel. A bid is one `.png`, `.jpg`, `.jpeg` or `.webp` object (any case, subfolders
-included) whose `LastModified` falls in the report window `[start, end)`.
+Users manage bidders on the Bidders page. Each bidder points at the screenshot
+folder the Bid Track browser extension uploads to (Backblaze B2 or AWS S3). The
+5-minute cron counts each folder's bids and posts a **daily** bid count and a
+**weekly** count + pay report to one shared Slack channel.
+
+## What counts as a bid
+
+The extension uploads one screenshot per step of an application, under
+`<member>/<YYYY-MM-DD>/<profile>/<job>/step<n>_<trigger>_<stamp>.png`. A bidder's
+folder is their member prefix, e.g. `s3://bid-screenshots/puma/`.
+
+- **One bid = one job folder** (the folder that holds the screenshots). step1,
+  step2, next and submit screenshots of the same job count once.
+- The job counts in the report window `[start, end)` that holds its **earliest**
+  screenshot, so a job whose screenshots straddle the 6:30 PM cutoff counts once,
+  on the day it started.
+- Only `.png`, `.jpg`, `.jpeg` and `.webp` (any case) count. The extension's
+  connection-test uploads (`_bid_track_connection_test_*`) are ignored.
+- A job continued after the bidder's local midnight lands in a new date folder and
+  counts twice; the extension decides that path.
+
+Accepted folder URLs: `s3://<bucket>/<folder>/`, `https://<bucket>.s3.<region>.amazonaws.com/<folder>/`,
+`https://s3.<region>.amazonaws.com/<bucket>/<folder>/`,
+`https://s3.us-east-005.backblazeb2.com/<bucket>/<folder>/`,
+`https://<bucket>.s3.us-east-005.backblazeb2.com/<folder>/` and the Backblaze console's
+`https://f005.backblazeb2.com/file/<bucket>/<folder>/`. The URL only names the bucket
+and folder; which service is read comes from `BID_STORAGE_ENDPOINT_URL`.
 
 ## 1. Backend env
 
 ```env
 BID_STORAGE_PROVIDER=s3
 # Optional; blank falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION.
-BID_STORAGE_ACCESS_KEY_ID=
-BID_STORAGE_SECRET_ACCESS_KEY=
-BID_STORAGE_REGION=
+# Backblaze: the application key ID (005...) and application key (K005...).
+BID_STORAGE_ACCESS_KEY_ID=005...
+BID_STORAGE_SECRET_ACCESS_KEY=K005...
+# Backblaze: us-east-005
+BID_STORAGE_REGION=us-east-005
+# Blank = AWS S3. Backblaze: https://s3.us-east-005.backblazeb2.com
+BID_STORAGE_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
 BID_REPORT_TIMEZONE=America/Chicago
 # HH:MM, 24h, in BID_REPORT_TIMEZONE.
 BID_DAILY_REPORT_TIME=18:30
@@ -43,9 +69,16 @@ bot to the bids channel** (`/invite @<bot>`) or posts fail with `not_in_channel`
 The report is one channel post per run; a long report continues as thread
 replies.
 
-## 3. S3 permissions
+## 3. Storage permissions
 
-Use a read-only identity. It only lists keys, it never reads objects:
+The backend only lists keys; it never reads or writes objects.
+
+**Backblaze B2:** create a separate application key for the backend (do not reuse
+the bidders' upload key) with **read-only** access to the `bid-screenshots` bucket.
+Listing needs the `listBuckets` and `listFiles` capabilities. Put its key ID and
+key in `BID_STORAGE_ACCESS_KEY_ID` / `BID_STORAGE_SECRET_ACCESS_KEY`.
+
+**AWS S3:** use a read-only identity:
 
 ```json
 {

@@ -47,7 +47,7 @@ class FakeStore:
 class FakeStorage:
     def __init__(self, counts): self.counts, self.calls = counts, 0
 
-    async def count_screenshots(self, url, start, end):
+    async def count_bids(self, url, start, end):
         self.calls += 1
         c = self.counts[url]
         if isinstance(c, Exception):
