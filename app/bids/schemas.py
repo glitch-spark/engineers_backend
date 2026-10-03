@@ -1,5 +1,6 @@
 """Request schema and response shapes for bidders."""
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from beanie import PydanticObjectId
@@ -65,6 +66,15 @@ class BidderIn(BaseModel):
         return v
 
 
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """UTC ISO string with a Z suffix (as app/routers/interviews.py:_iso_utc). Motor returns naive UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat() + "Z"
+
+
 def bidder_out(b, profile_name: Optional[str]) -> dict:
     return {
         "_id": str(b.id),
@@ -74,8 +84,8 @@ def bidder_out(b, profile_name: Optional[str]) -> dict:
         "profileName": profile_name,
         "rate": b.rate,
         "screenshotFolderUrl": b.screenshotFolderUrl,
-        "archivedAt": b.archivedAt.isoformat() if b.archivedAt else None,
-        "createdAt": b.createdAt.isoformat(),
+        "archivedAt": _iso_utc(b.archivedAt),
+        "createdAt": _iso_utc(b.createdAt),
     }
 
 
@@ -83,8 +93,8 @@ def report_out(r) -> dict:
     return {
         "kind": r.kind,
         "periodKey": r.periodKey,
-        "periodStart": r.periodStart.isoformat(),
-        "periodEnd": r.periodEnd.isoformat(),
+        "periodStart": _iso_utc(r.periodStart),
+        "periodEnd": _iso_utc(r.periodEnd),
         "count": r.count,
         "rate": r.rate,
         "amount": r.amount,
