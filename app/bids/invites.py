@@ -33,13 +33,11 @@ def generate_code(folder: str) -> str:
 def normalize_code(code: str) -> str:
     """Normalize an invite code for hashing.
 
-    Upper-case, remove spaces and dashes, replace O→0, I→1, L→1.
+    Upper-case, replace O→0, I→1, L→1, then drop everything outside [0-9A-Z]: spaces, dashes, and the tabs,
+    NBSPs and zero-width spaces a code picks up when pasted from a chat app.
     """
-    # Upper-case and remove spaces and dashes
-    normalized = code.strip().upper().replace(" ", "").replace("-", "")
-    # Replace O→0, I→1, L→1
-    normalized = normalized.replace("O", "0").replace("I", "1").replace("L", "1")
-    return normalized
+    normalized = code.upper().replace("O", "0").replace("I", "1").replace("L", "1")
+    return re.sub(r"[^0-9A-Z]", "", normalized)
 
 
 def hash_code(code: str) -> str:

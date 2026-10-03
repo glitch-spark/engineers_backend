@@ -33,6 +33,13 @@ def test_normalize_forgives_typing():
     assert hash_code("puma-7k2q-9xmd") == hash_code("PUMA7K2Q9XMD")
 
 
+def test_normalize_drops_invisible_and_stray_characters():
+    """Codes pasted from chat apps carry zero-width spaces, NBSPs and tabs."""
+    assert normalize_code("​puma -7k2q\t9xmd") == "PUMA7K2Q9XMD"
+    assert normalize_code("PUMA–7K2Q—9XMD.\n") == "PUMA7K2Q9XMD"  # en/em dashes, a full stop
+    assert hash_code("​puma -7k2q\t9xmd") == hash_code("PUMA-7K2Q-9XMD")
+
+
 def test_issue_and_live():
     now = datetime(2026, 10, 3, tzinfo=timezone.utc)
     b = SimpleNamespace(
