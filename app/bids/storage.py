@@ -9,7 +9,7 @@ import asyncio
 import re
 import threading
 from datetime import datetime
-from typing import Iterable, Mapping, Optional, Protocol, Sequence
+from typing import Awaitable, Callable, Iterable, Mapping, Optional, Protocol, Sequence, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -28,8 +28,15 @@ class BidStorageError(Exception):
     """Short message, shown to users."""
 
 
+Window = tuple[datetime, datetime]
+
+
 class BidStorage(Protocol):
     async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int: ...
+
+    async def count_windows(self, folder_url: str, windows: Sequence[Window]) -> list[int]:
+        """Counts for several windows from one folder listing (S3 cannot filter by date)."""
+        ...
 
 
 def parse_folder_url(url: str) -> tuple[str, str]:
@@ -85,20 +92,25 @@ class S3BidStorage:
                 self._client = boto3.session.Session().client("s3", **kwargs)
             return self._client
 
-    def _count(self, bucket: str, prefix: str, start: datetime, end: datetime) -> int:
+    def _count(self, bucket: str, prefix: str, windows: Sequence[Window]) -> list[int]:
         # Pages are fetched lazily, so the whole loop runs inside one worker thread.
-        total = 0
+        totals = [0] * len(windows)
         for page in self._get_client().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-            total += count_in_window(page.get("Contents", []), start, end)
-        return total
+            contents = page.get("Contents", [])
+            for i, (start, end) in enumerate(windows):
+                totals[i] += count_in_window(contents, start, end)
+        return totals
 
     async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int:
+        return (await self.count_windows(folder_url, [(start, end)]))[0]
+
+    async def count_windows(self, folder_url: str, windows: Sequence[Window]) -> list[int]:
         try:
             bucket, prefix = parse_folder_url(folder_url)
         except ValueError:
             raise BidStorageError("invalid folder URL") from None
         try:
-            return await asyncio.to_thread(self._count, bucket, prefix, start, end)
+            return await asyncio.to_thread(self._count, bucket, prefix, list(windows))
         except ClientError as e:
             raise BidStorageError(e.response.get("Error", {}).get("Code") or "ClientError") from e
         except BotoCoreError as e:
@@ -110,6 +122,9 @@ class _UnsupportedStorage:
         self._provider = provider
 
     async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int:
+        return (await self.count_windows(folder_url, [(start, end)]))[0]
+
+    async def count_windows(self, folder_url: str, windows: Sequence[Window]) -> list[int]:
         raise BidStorageError(f"unsupported storage provider: {self._provider}")
 
 
@@ -120,6 +135,26 @@ def get_bid_storage() -> BidStorage:
     return _UnsupportedStorage(provider)
 
 
+T = TypeVar("T")
+
+
+async def _each_folder(
+    items: Sequence[tuple[str, str]], count: Callable[[str], Awaitable[T]], limit: int,
+) -> dict[str, tuple[Optional[T], Optional[str]]]:
+    """Run count(folder_url) per (id, folder_url), bounded; one failing folder doesn't stop the rest."""
+    sem = asyncio.Semaphore(limit)
+
+    async def one(folder_url: str) -> tuple[Optional[T], Optional[str]]:
+        async with sem:
+            try:
+                return await count(folder_url), None
+            except BidStorageError as e:
+                return None, str(e)
+
+    results = await asyncio.gather(*(one(url) for _, url in items))
+    return {item_id: res for (item_id, _), res in zip(items, results)}
+
+
 async def count_folders(
     items: Sequence[tuple[str, str]],
     start: datetime,
@@ -127,15 +162,15 @@ async def count_folders(
     storage: BidStorage,
     limit: int = 5,
 ) -> dict[str, tuple[Optional[int], Optional[str]]]:
-    """Count each (id, folder_url) with bounded concurrency; one failing folder doesn't stop the rest."""
-    sem = asyncio.Semaphore(limit)
+    """Count each (id, folder_url) in one window -> {id: (count, error)}."""
+    return await _each_folder(items, lambda url: storage.count_screenshots(url, start, end), limit)
 
-    async def one(folder_url: str) -> tuple[Optional[int], Optional[str]]:
-        async with sem:
-            try:
-                return await storage.count_screenshots(folder_url, start, end), None
-            except BidStorageError as e:
-                return None, str(e)
 
-    results = await asyncio.gather(*(one(url) for _, url in items))
-    return {item_id: res for (item_id, _), res in zip(items, results)}
+async def count_folder_windows(
+    items: Sequence[tuple[str, str]],
+    windows: Sequence[Window],
+    storage: BidStorage,
+    limit: int = 5,
+) -> dict[str, tuple[Optional[list[int]], Optional[str]]]:
+    """Count each (id, folder_url) in every window from one listing -> {id: (counts per window, error)}."""
+    return await _each_folder(items, lambda url: storage.count_windows(url, windows), limit)

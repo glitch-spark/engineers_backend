@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 
-from app.bids.storage import BidStorageError, S3BidStorage, count_folders, count_in_window, get_bid_storage, parse_folder_url
+from app.bids.storage import (
+    BidStorageError, S3BidStorage, count_folder_windows, count_folders, count_in_window, get_bid_storage, parse_folder_url,
+)
 
 
 def utc(*a):
@@ -124,3 +126,61 @@ async def test_lazy_client_is_built_once_under_concurrency(monkeypatch):
     counts = await asyncio.gather(*(storage.count_screenshots("s3://shots/a/", START, END) for _ in range(5)))
     assert counts == [1] * 5
     assert built == ["s3"]
+
+
+DAY = (utc(2026, 10, 2, 23, 30), utc(2026, 10, 3, 3))   # open daily window
+WEEK = (utc(2026, 9, 26, 21), utc(2026, 10, 3, 3))      # open weekly window
+
+
+async def test_count_windows_lists_the_folder_once_for_every_window():
+    client = FakeClient(pages=[{"Contents": [obj("a/1.png", utc(2026, 10, 3, 1)), obj("a/2.png", utc(2026, 9, 28))]},
+                               {"Contents": [obj("a/3.jpg", utc(2026, 10, 2, 23, 30)), obj("a/x.txt", utc(2026, 10, 3))]}])
+    assert await S3BidStorage(client=client).count_windows("s3://shots/a/", [DAY, WEEK]) == [2, 3]
+    assert client.calls == [("shots", "a/")]
+
+
+async def test_count_screenshots_delegates_to_count_windows():
+    storage = S3BidStorage(client=FakeClient())
+    seen = []
+
+    async def count_windows(url, windows):
+        seen.append((url, list(windows)))
+        return [6]
+
+    storage.count_windows = count_windows
+    assert await storage.count_screenshots("s3://shots/a/", START, END) == 6
+    assert seen == [("s3://shots/a/", [(START, END)])]
+
+
+async def test_count_windows_errors_become_bid_storage_error(monkeypatch):
+    err = ClientError({"Error": {"Code": "NoSuchBucket", "Message": "nope"}}, "ListObjectsV2")
+    with pytest.raises(BidStorageError, match="NoSuchBucket"):
+        await S3BidStorage(client=FakeClient(error=err)).count_windows("s3://shots/a/", [DAY, WEEK])
+    with pytest.raises(BidStorageError, match="invalid folder URL"):
+        await S3BidStorage(client=FakeClient()).count_windows("ftp://x/a/", [DAY])
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(BID_STORAGE_PROVIDER="dropbox"))
+    with pytest.raises(BidStorageError, match="unsupported storage provider: dropbox"):
+        await get_bid_storage().count_windows("s3://shots/a/", [DAY])
+
+
+async def test_count_folder_windows_isolates_errors_and_bounds_concurrency():
+    import asyncio
+
+    running, peak = 0, 0
+
+    class Storage:
+        async def count_windows(self, url, windows):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+            if "bad" in url:
+                raise BidStorageError("AccessDenied")
+            return [1, 2][: len(windows)]
+
+    items = [(str(i), f"s3://ok/{i}/") for i in range(8)] + [("x", "s3://bad/x/")]
+    got = await count_folder_windows(items, [DAY, WEEK], Storage())
+    assert got["0"] == ([1, 2], None) and got["7"] == ([1, 2], None)
+    assert got["x"] == (None, "AccessDenied")
+    assert peak == 5

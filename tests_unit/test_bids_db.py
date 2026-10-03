@@ -280,3 +280,16 @@ async def test_reports_history_is_newest_first_and_limited(api):
     assert len((await api.get(f"/bidders/{b.id}/reports")).json()["reports"]) == 5
     assert (await api.get(f"/bidders/{b.id}/reports", params={"limit": 201})).status_code == 422
     assert (await api.get(f"/bidders/{b.id}/reports", params={"limit": 0})).status_code == 422
+
+
+async def test_live_counts_route(api):
+    me, other = await make_user("Pedro"), await make_user("Maria")
+    ana = await make_bidder(me, "Ana")
+    await make_bidder(me, "Old", archived=True)
+    await make_bidder(other, "Theirs")
+    api.login(me)
+    res = await api.get("/bidders/live-counts")
+    assert res.status_code == 200
+    assert res.json() == {str(ana.id): {"today": 4, "week": 4, "error": None}}
+    assert [url for url, _ in api.storage.listings] == ["s3://shots/ana/"]  # one listing, both windows
+    assert len(api.storage.listings[0][1]) == 2
