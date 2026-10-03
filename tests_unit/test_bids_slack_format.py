@@ -71,3 +71,18 @@ def test_large_reports_respect_slack_limits():
     assert all(len(s) <= 3000 for s in texts(messages))
     body = "\n".join(texts(messages))
     assert all(body.count(f"Bidder {i:03d} ") == 1 for i in range(300))
+
+
+def test_user_text_is_escaped_but_slack_mentions_are_kept():
+    hostile = "Ana <!channel> & co"
+    owners = {**OWNERS, str(MARIA): Owner("maria", "<https://evil.example|Maria>")}
+    rows = [row(PEDRO, hostile, 2, profile="<https://evil.example|click>"),
+            row(PEDRO, "Bad <!here>", None, error="AccessDenied"),
+            row(MARIA, "Mia", 1)]
+    _, messages = format_report("daily", START, END, rows, owners, CT, "https://app.example")
+    t = texts(messages)
+    assert t[1] == "*&lt;https://evil.example|Maria&gt;* — 1 bid\n• Mia — 1"
+    assert t[2] == ("*<@U1>* — 2 bids · 1 failed\n"
+                    "• Ana &lt;!channel&gt; &amp; co · &lt;https://evil.example|click&gt; — 2\n"
+                    "• ⚠️ Bad &lt;!here&gt; — couldn't read screenshot folder")
+    assert "<!" not in "".join(t)

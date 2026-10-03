@@ -1,5 +1,6 @@
 """Slack Block Kit formatting for the daily and weekly bid reports."""
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,10 +10,11 @@ from zoneinfo import ZoneInfo
 from app.bids.windows import Kind
 from app.models.bid_report import BidReportRow
 from app.slack import _fmt_usd
-from app.slack_bot import _country_flag
+from app.slack_bot import _country_flag, _slack_escape
 
 MAX_SECTION_CHARS = 3000
 MAX_BLOCKS = 50
+_USER_MENTION = re.compile(r"<@[UW][A-Z0-9]+>")
 
 
 @dataclass(frozen=True)
@@ -40,13 +42,19 @@ def _section(text: str) -> dict:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
 
 
+def _owner_label(label: str) -> str:
+    """A Slack user mention passes through; any other text is escaped so it cannot ping or link."""
+    return label if _USER_MENTION.fullmatch(label) else _slack_escape(label)
+
+
 def _bidder_line(kind: Kind, r: BidReportRow) -> str:
+    name = _slack_escape(r.bidderName)  # user-entered: keep <!channel> or <url|text> from rendering
     if r.error:
-        return f"• ⚠️ {r.bidderName} — couldn't read screenshot folder"
+        return f"• ⚠️ {name} — couldn't read screenshot folder"
     flag = _country_flag(r.country)
-    label = f"{flag} {r.bidderName}" if flag else r.bidderName
+    label = f"{flag} {name}" if flag else name
     if r.profileName:
-        label += f" · {r.profileName}"
+        label += f" · {_slack_escape(r.profileName)}"
     count = r.count or 0
     if kind == "weekly":
         return f"• {label} — {_bids(count)} × {_fmt_usd(r.rate)} = {_fmt_usd(r.amount or 0)}"
@@ -57,7 +65,7 @@ def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow]) -> lis
     """One mrkdwn text per owner; split into "(cont.)" sections to stay under Slack's 3,000-char limit."""
     ok = [r for r in rows if not r.error]
     failed = len(rows) - len(ok)
-    head = f"*{label}* — {_bids(sum(r.count or 0 for r in ok))}"
+    head = f"*{_owner_label(label)}* — {_bids(sum(r.count or 0 for r in ok))}"
     if kind == "weekly":
         head += f" · *{_fmt_usd(round(sum(r.amount or 0 for r in ok), 2))}*"
     if failed:
