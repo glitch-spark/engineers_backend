@@ -34,8 +34,10 @@ def sheets(monkeypatch):
         return True
 
     async def append(client, sid, tab, rows):
+        first = len(state["rows"]) + 2  # row 1 is the header
         state["rows"].extend(rows)
         state["tab"] = tab
+        return f"'{tab}'!A{first}:J{first + len(rows) - 1}"
 
     monkeypatch.setattr(google_sheets, "sheet_info", info)
     monkeypatch.setattr(google_sheets, "ensure_tab", ensure)
@@ -71,23 +73,25 @@ async def test_export_rows_per_job_and_profile(client, staff_user, auth_header, 
     run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
 
     preview = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET, "dryRun": True})).json()
-    assert preview["ready"] == 3 and preview["alreadyExported"] == 0 and preview["sheetTitle"] == "Applies"
-    assert preview["needsResume"] == 1  # Tharun on the greenhouse job: not tailored yet
+    assert preview["ready"] == 4 and preview["alreadyExported"] == 0 and preview["sheetTitle"] == "Applies"
+    assert preview["needsResume"] == 1 and preview["pendingLinks"] == 1  # Tharun on the greenhouse job: link later
     assert preview["serviceAccount"] == "exporter@proj.iam.gserviceaccount.com" and sheets["rows"] == []
 
     r = await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["added"] == 3 and body["tab"] == sheets["tab"]
+    assert body["added"] == 4 and body["tab"] == sheets["tab"]
     assert sheets["header"][:6] == ["Date", "Profile", "Company", "Title", "Job URL", "Resume"] and sheets["header"][-1] == "Applied"
     by = {(row[1], row[4]): row for row in sheets["rows"]}
     tailored = by[("Tharun", "https://jobs.example.com/remote")]
     assert tailored[5].startswith('=HYPERLINK("') and "/job-applies/files/" in tailored[5] and tailored[6] == "Tailored"
     uploaded = by[("Eric", "https://jobs.example.com/remote")]
     assert uploaded[6] == "Uploaded · eric.pdf" and uploaded[-1] is False
+    later = by[("Tharun", "https://boards.greenhouse.io/acme/jobs/9")]
+    assert later[5] == "To tailor" and later[6] == "Tailored (pending)"
 
     again = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={})).json()  # saved link reused
-    assert again["added"] == 0 and again["alreadyExported"] == 3
+    assert again["added"] == 0 and again["alreadyExported"] == 4
     assert (await UserExtra.get(staff_user.id)).jobApplySheetUrl == GSHEET
     listed = (await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested", headers=h)).json()["rows"]
     remote = next(x for x in listed if x["url"] == "https://jobs.example.com/remote")
@@ -98,7 +102,7 @@ async def test_resume_links_work_without_login(client, staff_user, auth_header, 
     h = auth_header(staff_user)
     run_id, *_ = await _run(client, h, staff_user)
     await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
-    links = {row[6]: row[5].split('"')[1] for row in sheets["rows"]}
+    links = {row[6]: row[5].split('"')[1] for row in sheets["rows"] if row[5].startswith("=HYPERLINK")}
     path = lambda url: url[url.index("/job-applies/files/"):]  # noqa: E731
 
     pdf = await client.get(path(links["Tailored"]))  # no Authorization header
@@ -116,3 +120,51 @@ async def test_export_reports_sharing_problem(client, staff_user, auth_header, s
     assert r.status_code == 400 and "Share it with exporter@" in r.json()["error"]
     bad = await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": "https://example.com/x"})
     assert bad.status_code == 400 and "Google Sheets link" in bad.json()["error"]
+
+
+async def test_export_records_where_each_row_went(client, staff_user, auth_header, sheets):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    placed = {}
+    for r in await JobApplyRow.find({"runId": PydanticObjectId(run_id)}).to_list():
+        for acc, where in (r.exportedRows or {}).items():
+            placed[(acc, r.url)] = where
+    assert sorted(w["row"] for w in placed.values()) == [2, 3, 4, 5]
+    by_row = {w["row"]: k for k, w in placed.items()}
+    for n, (acc, url) in by_row.items():
+        sheet_row = sheets["rows"][n - 2]
+        assert sheet_row[4] == url and sheet_row[1] == ("Tharun" if acc == str(tharun.id) else "Eric")
+    assert all(w["tab"] == sheets["tab"] and w["sheetId"] for w in placed.values())
+
+
+async def test_export_tailor_missing_queues_tailoring(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    body = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h,
+                              json={"sheetUrl": GSHEET, "tailorMissing": True})).json()
+    assert body["tailorQueued"] == 1 and body["overLimit"] == 0 and body["added"] == 4
+    later = next(r for r in sheets["rows"] if r[1] == "Tharun" and r[4] == "https://boards.greenhouse.io/acme/jobs/9")
+    assert later[5] == "Tailoring…"
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    detail = (await client.get(f"/job-applies/rows/{gh['_id']}", headers=h)).json()
+    assert any(t["accountId"] == str(tharun.id) for t in detail["tailored"])
+
+
+async def test_export_tailor_missing_over_the_daily_cap(client, staff_user, auth_header, sheets, monkeypatch):
+    from app import resume_queue
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+
+    async def none_left(user):
+        return 0
+
+    monkeypatch.setattr(resume_queue, "remaining_today", none_left)
+    body = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h,
+                              json={"sheetUrl": GSHEET, "tailorMissing": True})).json()
+    assert body["tailorQueued"] == 0 and body["overLimit"] == 1 and body["added"] == 4
+    later = next(r for r in sheets["rows"] if r[1] == "Tharun" and r[4] == "https://boards.greenhouse.io/acme/jobs/9")
+    assert later[5] == "To tailor"
