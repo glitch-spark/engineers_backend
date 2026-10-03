@@ -76,8 +76,9 @@ One row per bidder per reported period.
 | `amount` | `Optional[float]` | `round(count × rate, 2)`; `None` when `count` is `None`. Stored for both kinds; the weekly value is the payout. |
 | `error` | `Optional[str]` | Short reason when `count` is `None`. |
 
-Indexes: unique `[("kind", 1), ("periodKey", 1), ("bidderId", 1)]`; `[("bidderId", 1), ("kind", 1), ("periodKey", -1)]`
-for history.
+Indexes: unique `[("bidderId", 1), ("kind", 1), ("periodKey", 1)]` (also serves newest-first history by a
+backward scan); `[("kind", 1), ("periodKey", 1)]` for loading a period. Beanie merges indexes with the same
+field set, so no second index may use exactly these three fields.
 
 Both models are registered in `app/db.py` alongside the existing documents.
 
