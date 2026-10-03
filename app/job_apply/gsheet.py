@@ -7,7 +7,7 @@ hyperlinks; that reads the workbook's first tab.
 import logging
 import re
 from typing import Optional
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -16,28 +16,31 @@ from app.job_apply.sheet import MAX_BYTES, SheetError, SheetRow, parse_sheet, pa
 log = logging.getLogger(__name__)
 
 EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sid}/export"
+PUBLISHED_URL = "https://docs.google.com/spreadsheets/d/{sid}/pub"  # sid "e/<published id>" (File > Publish to web)
 TIMEOUT = 30.0
 DEFAULT_TITLE = "Google Sheet"
 PRIVATE_HINT = (
     "This sheet isn't shared by link. In Google Sheets: Share → General access → Anyone with the link (Viewer)."
 )
 
-_PATH = re.compile(r"^/spreadsheets/(?:u/\d+/)?d/([A-Za-z0-9_-]{10,})")
+_PATH = re.compile(r"^/spreadsheets/(?:u/\d+/)?d/(e/[A-Za-z0-9_-]{10,}|[A-Za-z0-9_-]{10,})")
 _GID = re.compile(r"(?:^|[&#?])gid=(\d+)")
 _CD_STAR = re.compile(r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)")
 _CD = re.compile(r'filename\s*=\s*"([^"]+)"')
 
 
 def parse_gsheet_url(url: str) -> tuple[str, Optional[str]]:
-    """Google Sheets link → (spreadsheet id, tab gid or None for the first tab)."""
-    parts = urlsplit((url or "").strip())
+    """Google Sheets link → (spreadsheet id, tab gid or None for the first tab). A published sheet's id is
+    "e/<published id>". When the link names the tab twice (?gid=0#gid=5) the last one is the tab on screen."""
+    raw = (url or "").strip()
+    if raw.lower().startswith("docs.google.com/"):
+        raw = "https://" + raw
+    parts = urlsplit(raw)
     m = _PATH.match(parts.path) if parts.hostname == "docs.google.com" else None
     if not m:
         raise SheetError("Paste a Google Sheets link (https://docs.google.com/spreadsheets/d/…).")
-    gid = (parse_qs(parts.query).get("gid") or [None])[0]
-    if gid is None and (fm := _GID.search(parts.fragment)):
-        gid = fm.group(1)
-    return m.group(1), gid
+    gids = _GID.findall(f"?{parts.query}#{parts.fragment}")
+    return m.group(1), (gids[-1] if gids else None)
 
 
 def _title(resp: httpx.Response) -> str:
@@ -49,9 +52,11 @@ def _title(resp: httpx.Response) -> str:
 
 
 async def _export(client: httpx.AsyncClient, sid: str, fmt: str, gid: Optional[str]) -> httpx.Response:
-    params = {"format": fmt, **({"gid": gid} if gid else {})}
+    published = sid.startswith("e/")
+    params = {("output" if published else "format"): fmt, **({"gid": gid} if gid else {})}
+    url = (PUBLISHED_URL if published else EXPORT_URL).format(sid=sid)
     try:
-        resp = await client.get(EXPORT_URL.format(sid=sid), params=params, timeout=TIMEOUT, follow_redirects=True)
+        resp = await client.get(url, params=params, timeout=TIMEOUT, follow_redirects=True)
     except httpx.HTTPError as exc:
         log.warning("google sheet export failed for %s (%s): %r", sid, params, exc)
         raise SheetError("Could not reach Google Sheets. Try again in a moment.") from exc

@@ -121,3 +121,27 @@ async def test_hidden_links_win_over_a_stray_url_in_the_csv():
     async with client(handler) as c:
         _, rows = await download_gsheet(f"https://docs.google.com/spreadsheets/d/{SID}/edit", client=c)
     assert [r.url for r in rows] == [f"https://x.com/jobs/{i}" for i in range(3)]
+
+
+def test_parse_published_link_and_last_gid():
+    pub = "2PACX-1vAbc_123xyz"
+    assert parse_gsheet_url(f"https://docs.google.com/spreadsheets/d/e/{pub}/pubhtml?gid=7&single=true") == (f"e/{pub}", "7")
+    assert parse_gsheet_url(f"https://docs.google.com/spreadsheets/d/e/{pub}/pub?output=csv") == (f"e/{pub}", None)
+    # the tab in the address bar (#gid=) is the one the user is looking at
+    assert parse_gsheet_url(f"https://docs.google.com/spreadsheets/d/{SID}/edit?gid=0#gid=5") == (SID, "5")
+    assert parse_gsheet_url(f"docs.google.com/spreadsheets/d/{SID}/view") == (SID, None)
+
+
+async def test_download_published_sheet():
+    pub = "2PACX-1vAbc_123xyz"
+    seen = {}
+
+    def handler(request):
+        seen["path"], seen["params"] = request.url.path, dict(request.url.params)
+        return httpx.Response(200, content=f"url,description\nhttps://a.com/1,\"{JD}\"\n".encode(),
+                              headers={"content-type": "text/csv"})
+
+    async with client(handler) as c:
+        _, rows = await download_gsheet(f"https://docs.google.com/spreadsheets/d/e/{pub}/pubhtml?gid=7", client=c)
+    assert seen == {"path": f"/spreadsheets/d/e/{pub}/pub", "params": {"output": "csv", "gid": "7"}}
+    assert [r.url for r in rows] == ["https://a.com/1"]
