@@ -143,10 +143,14 @@ class _RowListView(BaseModel):
     tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
     exported: dict[str, datetime] = Field(default_factory=dict)
     tailorOnly: list[str] = Field(default_factory=list)
+    screen: Optional[str] = None
+    groupKey: Optional[str] = None
+    forceInclude: bool = False
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
+            "screen": 1, "groupKey": 1, "forceInclude": 1,
             "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
             "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
@@ -225,6 +229,9 @@ def _row_summary(
         "company": row.company,
         "status": row.status,
         "statusReason": row.statusReason,
+        "screen": row.screen,
+        "groupKey": row.groupKey,
+        "forceInclude": row.forceInclude,
         "jdSource": row.jdSource,
         "postedDate": row.postedDate.isoformat() if row.postedDate else None,
         "workMode": ex.workMode if ex else None,
@@ -461,16 +468,18 @@ async def sheet_preview(
 @router.post("/runs", status_code=status.HTTP_202_ACCEPTED)
 async def create_run(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    selection: str = Form(...),
+    selection: str = Form(""),
     file: Optional[UploadFile] = File(None),
     sheetUrl: str = Form(""),
     threshold: int = Form(75),
     maxAgeDays: int = Form(30),
 ) -> dict:
-    """The job sheet comes either as an uploaded file or as a link-shared Google Sheet (`sheetUrl`)."""
+    """The job sheet comes either as an uploaded file or as a link-shared Google Sheet (`sheetUrl`). Without a
+    `selection` the run screens the jobs and waits at "screened" for profiles per location group (POST /start);
+    with one it scores straight after screening, every group against every selected profile."""
     if await JobApplyRun.find_one({"userId": user.id, "status": {"$in": list(ACTIVE)}}):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is already in progress. Wait for it or cancel it.")
-    sel = await _parse_selection(selection, user)
+    sel = await _parse_selection(selection, user) if selection.strip() else []
     source_url = sheetUrl.strip() or None
     file_name, rows = await _read_sheet(file, source_url)
     if not rows:
@@ -481,6 +490,8 @@ async def create_run(
         fileName=file_name[:200],
         sourceUrl=source_url,
         selection=sel,
+        autoStart=bool(sel),
+        assignments={"*": [s.accountId for s in sel]} if sel else {},
         threshold=max(0, min(100, threshold)),
         maxAgeDays=max(1, min(365, maxAgeDays)),
         counts=RunCounts(total=len(rows)),

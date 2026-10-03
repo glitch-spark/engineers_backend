@@ -9,7 +9,7 @@ from beanie import PydanticObjectId
 from openpyxl import Workbook
 
 from app.job_apply import worker
-from app.job_apply.fetch import FetchError, FetchResult
+from app.job_apply.fetch import FetchError, FetchResult, JobClosed
 from app.job_apply.schema import JobExtraction, Location, MinYears, Term
 from app.models import Account
 from app.models.account import Resume
@@ -82,6 +82,62 @@ async def create_run(client, headers, acc, *, data=SHEET, threshold=60, resume_i
         files={"file": ("jobs.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         data={"selection": json.dumps(selection), "threshold": str(threshold), "maxAgeDays": "30"},
     )
+
+
+async def create_screen_run(client, headers, *, data=SHEET, max_age=30):
+    """A run created without profiles: it screens the jobs and waits for review."""
+    return await client.post(
+        "/job-applies/runs",
+        headers=headers,
+        files={"file": ("jobs.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"maxAgeDays": str(max_age)},
+    )
+
+
+async def screened_run(client, headers) -> str:
+    r = await create_screen_run(client, headers)
+    assert r.status_code == 202, r.text
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    return run_id
+
+
+async def test_screen_phase_pauses(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "screened" and run["phase"] == "screen" and run["screenedAt"]
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    by_url = {x["url"]: x for x in rows}
+    assert all(x["status"] in ("extracted", "excluded") for x in rows)
+    detail = (await client.get(f"/job-applies/rows/{by_url['https://jobs.example.com/hybrid']['_id']}", headers=h)).json()
+    assert detail["screen"] == "onsite" and detail["groupKey"] == "US"
+    remote = (await client.get(f"/job-applies/rows/{by_url['https://jobs.example.com/remote']['_id']}", headers=h)).json()
+    assert remote["screen"] in ("valid", "check") and remote["groupKey"] == "US" and not remote.get("scoredAt")
+
+
+async def test_closed_fetch_is_bucketed(client, staff_user, auth_header, monkeypatch):
+    async def closed(url, *, client, browser=None):
+        raise JobClosed("job closed (HTTP 404)")
+
+    monkeypatch.setattr(worker, "FETCH", closed)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    gh = next(x for x in rows if "greenhouse" in x["url"])
+    detail = (await client.get(f"/job-applies/rows/{gh['_id']}", headers=h)).json()
+    assert detail["status"] == "fetch_failed" and detail["screen"] == "closed"
+
+
+async def test_create_with_selection_runs_through(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    r = await create_run(client, h, acc)
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["autoStart"] is True and run["phase"] == "score"
+    assert run["assignments"] == {"*": [str(acc.id)]}
 
 
 async def test_create_run_and_results(client, staff_user, auth_header):
