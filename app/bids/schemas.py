@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class BidderIn(BaseModel):
@@ -101,20 +101,40 @@ def report_out(r) -> dict:
     }
 
 
-_USERNAME = re.compile(r"^[a-z0-9._-]{3,40}$")
+_USERNAME = re.compile(r"[a-z0-9._-]{3,40}")
+USERNAME_RULE = "Username must be 3–40 characters: lowercase letters, numbers, dots, underscores or dashes"
+PASSWORD_TOO_SHORT = "Password must be at least 8 characters"
+PASSWORD_TOO_LONG = "Password is too long"
 
 
-def _username(v: str) -> str:
-    v = v.strip().lower()
-    if not _USERNAME.match(v):
-        raise ValueError("Username must be 3-40 characters: letters, digits, . _ -")
-    return v
+def credentials_problem(username: str, password: str) -> Optional[str]:
+    """The first username/password rule broken, as a message for the bidder; None when both are fine.
+
+    Checked in the route, not the schema: the app's validation handler turns schema errors into a bare
+    "Invalid request", and the bidder needs to see the rule."""
+    if not _USERNAME.fullmatch(username):
+        return USERNAME_RULE
+    if len(password) < 8:
+        return PASSWORD_TOO_SHORT
+    if len(password.encode()) > 72:  # bcrypt ignores everything past 72 bytes
+        return PASSWORD_TOO_LONG
+    return None
 
 
-class RegisterIn(BaseModel):
+class LoginIn(BaseModel):
+    """Length caps only bound memory (past them: the generic 400); the rules are credentials_problem()."""
+
+    username: str = Field(max_length=100)
+    password: str = Field(max_length=1024)
+
+    @field_validator("username")
+    @classmethod
+    def _user(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class RegisterIn(LoginIn):
     inviteCode: str
-    username: str
-    password: str
 
     @field_validator("inviteCode")
     @classmethod
@@ -122,30 +142,6 @@ class RegisterIn(BaseModel):
         if len(v) > 100:
             raise ValueError("Invalid invite code")
         return v
-
-    @field_validator("username")
-    @classmethod
-    def _user(cls, v: str) -> str:
-        return _username(v)
-
-    @field_validator("password")
-    @classmethod
-    def _password(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
-        if len(v.encode()) > 72:  # bcrypt ignores everything past 72 bytes
-            raise ValueError("Password must be at most 72 bytes")
-        return v
-
-
-class LoginIn(BaseModel):
-    username: str
-    password: str
-
-    @field_validator("username")
-    @classmethod
-    def _user(cls, v: str) -> str:
-        return v.strip().lower()  # no format rule: a malformed name is just a wrong name
 
 
 def bidder_me(b, profile_name: Optional[str]) -> dict:

@@ -23,6 +23,9 @@ pytestmark = [
 
 BAD = "Wrong username or password"
 INVALID = "Invite code is invalid or expired"
+USERNAME_RULE = "Username must be 3–40 characters: lowercase letters, numbers, dots, underscores or dashes"
+SHORT_PASSWORD = "Password must be at least 8 characters"
+LONG_PASSWORD = "Password is too long"
 
 
 @pytest.fixture
@@ -129,10 +132,16 @@ async def test_register_wrong_code(ext):
 
 async def test_register_rejects_bad_credentials(ext):
     _, code = await ext.create()
-    for body in (reg(code, "ab"), reg(code, "Bad Name!"), reg(code, "ana", "1234567")):
+    for body, message in (
+        (reg(code, "ab"), USERNAME_RULE),
+        (reg(code, "Bad Name!"), USERNAME_RULE),
+        (reg(code, "x" * 41), USERNAME_RULE),
+        (reg(code, "ana", "1234567"), SHORT_PASSWORD),
+        (reg(code, "ana", "x" * 73), LONG_PASSWORD),
+        (reg(code, "ana", "é" * 37), LONG_PASSWORD),  # 37 characters, 74 bytes
+    ):
         r = await ext.post("/ext/register", json=body)
-        assert r.status_code == 422, body
-        assert r.json()["detail"][0]["loc"][0] == "body"
+        assert (r.status_code, r.json()["detail"]) == (400, message), body
     await register(ext, name="Bia Souza", username="taken")
     r = await ext.post("/ext/register", json=reg(code, "taken"))
     assert r.status_code == 409 and r.json()["detail"] == "Username is taken"
@@ -258,6 +267,44 @@ async def test_failed_registrations_count(ext):
         r = await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB"))
         assert r.status_code == 400
     assert (await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB"))).status_code == 429
+
+
+async def test_login_explains_the_username_and_password_rules(ext):
+    for body, message in (
+        ({"username": "ana@example.com", "password": "password1"}, USERNAME_RULE),
+        ({"username": "ana", "password": "short"}, SHORT_PASSWORD),
+    ):
+        r = await ext.post("/ext/login", json=body)
+        assert (r.status_code, r.json()["detail"]) == (400, message), body
+
+
+async def test_rule_failures_count_toward_the_limit(ext):
+    for _ in range(10):
+        assert (await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB", "a b"))).status_code == 400
+    assert (await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB", "a b"))).status_code == 429
+
+
+@pytest.fixture
+async def real_app(db, monkeypatch):
+    """The production app (create_app, with its error handlers) without running its lifespan (no real DB)."""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.bids.rate_limit import FailureLimiter
+    from app.main import create_app
+    from app.routers import bidder_ext
+
+    monkeypatch.setattr(bidder_ext, "LIMITER", FailureLimiter())
+    async with AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test") as client:
+        yield client
+
+
+async def test_production_error_bodies_carry_a_readable_error(real_app):
+    r = await real_app.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB"))
+    assert (r.status_code, r.json()) == (400, {"error": INVALID})
+    r = await real_app.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB", "Bad Name!"))
+    assert (r.status_code, r.json()) == (400, {"error": USERNAME_RULE})
+    r = await real_app.post("/ext/login", json={"username": "x" * 101, "password": "password1"})
+    assert (r.status_code, r.json()) == (400, {"error": "Invalid request"})  # past the schema's length cap
 
 
 async def test_successful_logins_do_not_count_toward_the_ip(ext):

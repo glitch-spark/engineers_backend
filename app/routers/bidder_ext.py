@@ -13,7 +13,7 @@ from app.bids import rate_limit
 from app.bids.folders import folder_url
 from app.bids.invites import hash_code, invite_is_live
 from app.bids.rate_limit import FailureLimiter, client_ip
-from app.bids.schemas import LoginIn, RegisterIn, bidder_me
+from app.bids.schemas import LoginIn, RegisterIn, bidder_me, credentials_problem
 from app.bids.storage import BidStorageError, get_bid_storage
 from app.bids.upload_keys import build_upload_key
 from app.config import get_settings
@@ -49,6 +49,13 @@ def _reserve(keys: list[str]) -> datetime:
             headers={"Retry-After": str(wait)},
         )
     return now
+
+
+def _check_rules(body: LoginIn) -> None:
+    """400 with the broken username/password rule (after _reserve, so it counts as a failed attempt)."""
+    problem = credentials_problem(body.username, body.password)
+    if problem:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, problem)
 
 
 def _succeed(keys: list[str], reserved_at: datetime) -> None:
@@ -99,6 +106,7 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
 async def register(body: RegisterIn, request: Request) -> dict:
     keys = _keys(body.username, request)
     reserved_at = _reserve(keys)
+    _check_rules(body)
     bidder = await Bidder.find_one(Bidder.inviteCodeHash == hash_code(body.inviteCode))
     if bidder is None or not invite_is_live(bidder, datetime.now(timezone.utc)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, _BAD_CODE)
@@ -118,7 +126,8 @@ async def register(body: RegisterIn, request: Request) -> dict:
 async def login(body: LoginIn, request: Request) -> dict:
     keys = _keys(body.username, request)
     reserved_at = _reserve(keys)
-    bidder = await Bidder.find_one(Bidder.username == body.username) if body.username else None
+    _check_rules(body)
+    bidder = await Bidder.find_one(Bidder.username == body.username)
     usable = bidder is not None and bidder.archivedAt is None and bidder.registeredAt is not None
     stored = bidder.passwordHash if usable and bidder.passwordHash else None
     try:
