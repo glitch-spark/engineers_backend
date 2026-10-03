@@ -1045,3 +1045,13 @@ async def test_rows_screen_filter(client, staff_user, auth_header):
     run_id = await screened_run(client, h)
     rows = await rows_by_url(client, h, run_id, screen="onsite")
     assert list(rows) == ["https://jobs.example.com/hybrid"]
+
+
+async def test_rows_list_includes_group(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    await start(client, h, run_id, {"US": [us]}, [us])
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    assert rows and all(r["groupKey"] == "US" and r["screen"] for r in rows)
