@@ -1142,12 +1142,33 @@ async def test_max_age_patch_writes_only_changed_rows(client, staff_user, auth_h
 async def test_stale_cache_used_when_refetch_fails(client, staff_user, auth_header, monkeypatch):
     from app.models.job_apply import JobPostingCache
 
+    from app.job_apply.fetch import FETCHER_VERSION
+
     await JobPostingCache(
         url="https://boards.greenhouse.io/acme/jobs/9", text=REMOTE_JD, source="ats_api",
-        fetchedAt=datetime.utcnow() - timedelta(days=2),
+        fetchedAt=datetime.utcnow() - timedelta(days=2), fetcher=FETCHER_VERSION,
     ).insert()
     monkeypatch.setattr(worker, "FETCH", failing_fetch)
     h = auth_header(staff_user)
     run_id = await screened_run(client, h)
     gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
     assert gh["status"] == "extracted" and gh["jdSource"] == "ats_api"
+
+
+async def test_cache_from_older_fetcher_is_refetched(client, staff_user, auth_header, monkeypatch):
+    """A page cached before closed-job detection (e.g. a 404 page read as the job) isn't reused, however fresh."""
+    from app.models.job_apply import JobPostingCache
+
+    await JobPostingCache.get_motor_collection().insert_one({
+        "url": "https://boards.greenhouse.io/acme/jobs/9", "text": "We couldn't find this job. " * 20,
+        "source": "browser", "fetchedAt": datetime.utcnow() - timedelta(hours=1), "title": "", "company": "",
+    })
+
+    async def closed(url, *, client, browser=None):
+        raise JobClosed("job closed (HTTP 404)")
+
+    monkeypatch.setattr(worker, "FETCH", closed)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["screen"] == "closed"

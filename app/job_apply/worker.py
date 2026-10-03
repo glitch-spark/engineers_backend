@@ -166,7 +166,7 @@ async def _cache_description(url: str, text: str) -> None:
     await JobPostingCache.get_motor_collection().update_one(
         {"url": url},
         {"$set": {"url": url, "text": text, "source": "sheet", "postedDate": None, "title": "", "company": "",
-                  "fetchedAt": now, "updatedAt": now},
+                  "fetchedAt": now, "updatedAt": now, "fetcher": fetch_mod.FETCHER_VERSION},
          "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
@@ -177,6 +177,8 @@ async def _cache_description(url: str, text: str) -> None:
 
 async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
     cached = await JobPostingCache.find_one(JobPostingCache.url == row.url)
+    if cached and cached.fetcher != fetch_mod.FETCHER_VERSION:
+        cached = None  # read before the current rules (e.g. a closed job's 404 page): fetch again
     res = None
     if not (cached and posting_reusable(cached.fetchedAt, datetime.utcnow())):
         try:
@@ -198,6 +200,7 @@ async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
                 "url": row.url, "text": text, "source": source,
                 "postedDate": datetime.combine(posted, datetime.min.time()) if posted else None,
                 "title": title, "company": company, "fetchedAt": datetime.utcnow(), "updatedAt": datetime.utcnow(),
+                "fetcher": fetch_mod.FETCHER_VERSION,
             }, "$setOnInsert": {"createdAt": datetime.utcnow()}},
             upsert=True,
         )

@@ -14,6 +14,9 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from bs4 import BeautifulSoup
 
+# Bump when what counts as a usable page changes: cached pages read by an older fetcher are fetched again.
+# 2: closed jobs (404/410, redirect to the job list, gone from the ATS) are no longer read as job text.
+FETCHER_VERSION = 2
 MIN_TEXT = 200  # below this there's no usable job text
 THIN_PAGE = 400  # below this a script-rendered page is retried in the browser
 TIMEOUT = 20.0

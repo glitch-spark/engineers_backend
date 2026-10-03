@@ -166,6 +166,7 @@ class JobPostingCache(TimestampedDocument):
     title: str = ""
     company: str = ""
     fetchedAt: datetime = Field(default_factory=datetime.utcnow)
+    fetcher: int = 0  # fetch.FETCHER_VERSION that read it; pages from an older fetcher are fetched again
 
     class Settings:
         name = "job_posting_cache"
