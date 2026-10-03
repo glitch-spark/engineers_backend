@@ -42,13 +42,16 @@ async def _load_owned(bidder_id: str, user) -> Bidder:
     return ensure_owner(await Bidder.get(PydanticObjectId(bidder_id)), user)
 
 
-async def _check_profile(body: BidderIn, user) -> Optional[Account]:
+async def _check_profile(
+    body: BidderIn, user, current: Optional[PydanticObjectId] = None
+) -> Optional[Account]:
+    """The chosen profile's account; a profile the bidder already has is kept even if since archived."""
     if not body.profileId:
         return None
     account = await Account.get(PydanticObjectId(body.profileId))
-    if not can_select_profile(account, user):
+    if body.profileId != str(current) and not can_select_profile(account, user):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=[{"loc": ["body", "profileId"], "msg": "Choose one of your profiles", "type": "value_error"}],
         )
     return account
@@ -100,7 +103,7 @@ async def update_bidder(
     bidder_id: str, body: BidderIn, user: Annotated[UserExtra, Depends(get_current_user)]
 ) -> dict:
     bidder = await _load_owned(bidder_id, user)
-    account = await _check_profile(body, user)
+    account = await _check_profile(body, user, current=bidder.profileId)
     bidder.name = body.name
     bidder.country = body.country
     bidder.profileId = PydanticObjectId(body.profileId) if body.profileId else None

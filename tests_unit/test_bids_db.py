@@ -134,3 +134,149 @@ async def test_owners_and_profile_names(db):
     assert await store.owners([]) == {}
     assert await store.profile_names([account.id]) == {str(account.id): "AI Full-stack"}
     assert await store.profile_names([]) == {}
+
+
+# --- routes ----------------------------------------------------------------------------------
+
+class FakeStorage:
+    """Records one entry per folder listing; every window gets `per_window` screenshots."""
+
+    def __init__(self, per_window=4):
+        self.per_window, self.listings = per_window, []
+
+    async def count_windows(self, folder_url, windows):
+        self.listings.append((folder_url, list(windows)))
+        return [self.per_window for _ in windows]
+
+    async def count_screenshots(self, folder_url, start, end):
+        return (await self.count_windows(folder_url, [(start, end)]))[0]
+
+
+@pytest.fixture
+async def api(db, monkeypatch):
+    """ASGI client for the bidders router; `api.login(user)` switches the current user."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.bids.live_counts import TtlCache
+    from app.deps import get_current_user
+    from app.routers import bidders
+
+    current = {}
+    app = FastAPI()
+    app.include_router(bidders.router)
+    app.dependency_overrides[get_current_user] = lambda: current["user"]
+    storage = FakeStorage()
+    monkeypatch.setattr(bidders, "get_bid_storage", lambda: storage)
+    monkeypatch.setattr(bidders, "CACHE", TtlCache(bidders.CACHE._ttl))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        client.login = lambda user: current.update(user=user)
+        client.storage = storage
+        yield client
+
+
+def body(**over):
+    base = dict(name="Ana Silva", country="br", profileId=None, rate=0.5, screenshotFolderUrl="s3://shots/ana/")
+    base.update(over)
+    return base
+
+
+async def test_create_and_list_bidders(api):
+    me = await make_user()
+    profile = await make_account(me, "AI Full-stack")
+    api.login(me)
+    res = await api.post("/bidders", json=body(profileId=str(profile.id)))
+    assert res.status_code == 200
+    created = res.json()
+    assert (created["name"], created["country"], created["profileName"]) == ("Ana Silva", "BR", "AI Full-stack")
+    assert created["createdAt"].endswith("Z") and created["archivedAt"] is None
+    listed = (await api.get("/bidders")).json()["bidders"]
+    assert [b["_id"] for b in listed] == [created["_id"]] and listed[0]["profileName"] == "AI Full-stack"
+
+
+async def test_create_rejects_someone_elses_profile(api):
+    me, other = await make_user("Pedro"), await make_user("Maria")
+    theirs = await make_account(other)
+    api.login(me)
+    res = await api.post("/bidders", json=body(profileId=str(theirs.id)))
+    assert res.status_code == 422
+    assert res.json()["detail"][0]["loc"] == ["body", "profileId"]
+
+
+async def test_list_active_vs_archived(api):
+    me, other = await make_user("Pedro"), await make_user("Maria")
+    live = await make_bidder(me, "Ana")
+    old = await make_bidder(me, "Old", archived=True)
+    await make_bidder(other, "Theirs")
+    api.login(me)
+    assert [b["_id"] for b in (await api.get("/bidders")).json()["bidders"]] == [str(live.id)]
+    archived = (await api.get("/bidders", params={"archived": "true"})).json()["bidders"]
+    assert [b["_id"] for b in archived] == [str(old.id)] and archived[0]["archivedAt"].endswith("Z")
+
+
+async def test_update_bidder(api):
+    me = await make_user()
+    b = await make_bidder(me, "Ana")
+    api.login(me)
+    res = await api.put(f"/bidders/{b.id}", json=body(name="Ana S.", rate=0.75, country=""))
+    assert res.status_code == 200
+    assert (res.json()["name"], res.json()["rate"], res.json()["country"]) == ("Ana S.", 0.75, None)
+    stored = await Bidder.get(b.id)
+    assert (stored.name, stored.rate) == ("Ana S.", 0.75)
+
+
+async def test_rate_only_update_keeps_an_archived_profile(api):
+    me = await make_user()
+    profile = await make_account(me, "Backend")
+    b = await make_bidder(me, "Ana", profileId=profile.id)
+    profile.archived = True
+    await profile.save()
+    api.login(me)
+    res = await api.put(f"/bidders/{b.id}", json=body(name="Ana", profileId=str(profile.id), rate=0.6))
+    assert res.status_code == 200
+    assert (res.json()["rate"], res.json()["profileId"], res.json()["profileName"]) == (0.6, str(profile.id), "Backend")
+    # Switching to an archived profile is still refused.
+    other = await make_bidder(me, "Raj")
+    res = await api.put(f"/bidders/{other.id}", json=body(name="Raj", profileId=str(profile.id)))
+    assert res.status_code == 422
+
+
+async def test_archive_is_idempotent(api):
+    me = await make_user()
+    b = await make_bidder(me, "Ana")
+    api.login(me)
+    assert (await api.delete(f"/bidders/{b.id}")).status_code == 204
+    first = (await Bidder.get(b.id)).archivedAt
+    assert first is not None
+    assert (await api.delete(f"/bidders/{b.id}")).status_code == 204
+    assert (await Bidder.get(b.id)).archivedAt == first
+
+
+async def test_another_users_bidder_is_not_found(api):
+    me, other = await make_user("Pedro"), await make_user("Maria", role="admin")
+    mine = await make_bidder(me, "Ana")
+    api.login(other)  # admins get no exemption either
+    assert (await api.put(f"/bidders/{mine.id}", json=body())).status_code == 404
+    assert (await api.delete(f"/bidders/{mine.id}")).status_code == 404
+    assert (await api.get(f"/bidders/{mine.id}/reports")).status_code == 404
+    assert (await api.get("/bidders/not-an-id/reports")).status_code == 404
+    assert (await Bidder.get(mine.id)).archivedAt is None
+
+
+async def test_reports_history_is_newest_first_and_limited(api):
+    me = await make_user()
+    b = await make_bidder(me, "Ana")
+    for day in range(1, 6):
+        await BidReport(**report_row(b.id, f"2026-10-0{day}", count=day, owner=me.id).model_dump()).insert()
+    await BidReport(**report_row(b.id, "2026-10-03", kind="weekly", owner=me.id).model_dump()).insert()
+    await BidReport(**report_row(PydanticObjectId(), "2026-10-05", owner=me.id).model_dump()).insert()
+    api.login(me)
+    res = await api.get(f"/bidders/{b.id}/reports", params={"limit": 2})
+    reports = res.json()["reports"]
+    assert [r["periodKey"] for r in reports] == ["2026-10-05", "2026-10-04"]
+    assert reports[0]["periodStart"] == "2026-10-01T23:30:00Z"
+    weekly = (await api.get(f"/bidders/{b.id}/reports", params={"kind": "weekly"})).json()["reports"]
+    assert [r["periodKey"] for r in weekly] == ["2026-10-03"]
+    assert len((await api.get(f"/bidders/{b.id}/reports")).json()["reports"]) == 5
+    assert (await api.get(f"/bidders/{b.id}/reports", params={"limit": 201})).status_code == 422
+    assert (await api.get(f"/bidders/{b.id}/reports", params={"limit": 0})).status_code == 422
