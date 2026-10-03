@@ -249,3 +249,28 @@ async def test_fill_link_ignores_jobs_never_exported(client, staff_user, auth_he
     run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
     job = await _tailor_and_finish(client, h, rows["https://boards.greenhouse.io/acme/jobs/9"]["_id"], str(tharun.id))
     assert await sheet_links.fill_link(job) is False and sheet_cells == []
+
+
+# ---------- Generated Resumes knows which run a tailored resume came from ----------
+
+
+async def test_resume_job_links_to_its_run(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    remote = rows["https://jobs.example.com/remote"]
+    one = (await client.get(f"/resume/jobs/{t['jobId']}", headers=h)).json()
+    assert one["jobApplyRowId"] == remote["_id"] and one["jobApplyRunId"] == run_id and one["jobApplyRunName"] == "jobs.xlsx"
+    listed = (await client.get("/resume/jobs", headers=h)).json()
+    item = next(j for j in listed["jobs"] if j["_id"] == t["jobId"])
+    assert item["jobApplyRunId"] == run_id and item["jobApplyRunName"] == "jobs.xlsx"
+
+
+async def test_resume_job_whose_run_expired(client, staff_user, auth_header, sheets):
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    await JobApplyRow.get_motor_collection().delete_many({"runId": PydanticObjectId(run_id)})
+    await JobApplyRun.get_motor_collection().delete_one({"_id": PydanticObjectId(run_id)})
+    one = (await client.get(f"/resume/jobs/{t['jobId']}", headers=h)).json()
+    assert one["jobApplyRowId"] and one["jobApplyRunId"] is None and one["jobApplyRunName"] is None

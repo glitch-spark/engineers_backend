@@ -466,6 +466,9 @@ async def ask_job_screening(
 # ---------- Job listing / polling / download ---------------------------------
 
 
+_NO_LINK = {"jobApplyRowId": None, "jobApplyRunId": None, "jobApplyRunName": None}
+
+
 def _job_to_dict(job: ResumeApplication) -> dict:
     """Slim projection — never ships pdfData (multi-MB) over the list API.
     Clients call /resume/jobs/{id}/download for the actual bytes."""
@@ -504,6 +507,35 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "completedAt": job.completedAt.isoformat() if job.completedAt else None,
     }
     return d
+
+
+async def _job_apply_links(jobs: list[ResumeApplication]) -> dict[str, dict]:
+    """Per resume tailored from Job Applies: its job row, run and run name (run fields None once the run expired)."""
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    row_ids = list({j.jobApplyRowId for j in jobs if getattr(j, "jobApplyRowId", None)})
+    if not row_ids:
+        return {}
+    rows = {
+        r["_id"]: r["runId"]
+        async for r in JobApplyRow.get_motor_collection().find({"_id": {"$in": row_ids}}, {"runId": 1})
+    }
+    runs = {
+        r["_id"]: r.get("fileName") or "Job Applies run"
+        async for r in JobApplyRun.get_motor_collection().find({"_id": {"$in": list(set(rows.values()))}}, {"fileName": 1})
+    }
+    out = {}
+    for j in jobs:
+        rid = getattr(j, "jobApplyRowId", None)
+        if not rid:
+            continue
+        run_id = rows.get(rid)
+        out[str(j.id)] = {
+            "jobApplyRowId": str(rid),
+            "jobApplyRunId": str(run_id) if run_id in runs else None,
+            "jobApplyRunName": runs.get(run_id),
+        }
+    return out
 
 
 @router.get("/jobs")
@@ -565,8 +597,9 @@ async def list_jobs(
         return out
 
     jobs_out = []
+    links = await _job_apply_links(rows)
     for r in rows:
-        d = _job_to_dict(r)
+        d = {**_job_to_dict(r), **_NO_LINK, **links.get(str(r.id), {})}
         snip = _snippet(r.jobDescription or "")
         if snip:
             d["matchSnippet"] = snip
@@ -594,7 +627,8 @@ async def get_job(
     job = await ResumeApplication.get(to_object_id(job_id))
     if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    return _job_to_dict(job)
+    links = await _job_apply_links([job])
+    return {**_job_to_dict(job), **_NO_LINK, **links.get(str(job.id), {})}
 
 
 _FOLDER_BAD = re.compile(r"[\\/\x00-\x1f<>:\"|?*]+")
