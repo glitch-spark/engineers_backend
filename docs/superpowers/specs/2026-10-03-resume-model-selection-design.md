@@ -70,6 +70,10 @@ Availability filtering: Anthropic models require `ANTHROPIC_API_KEY`; OpenAI mod
 - Frontend: `ModelSelect` component tests; form submission payloads.
 - Manual: compare one JD across three cover-letter models before locking defaults.
 
+## Adjustments made while planning
+
+The implementation plan (`docs/superpowers/plans/2026-10-03-resume-model-selection.md`) refines this spec in five places; where they differ, the plan wins: single `app/llm_anthropic.py` module instead of a `llm_providers/` package; free-first default kept for resume/screening when the user has a saved NVIDIA key; frontend verified by type-check/build/manual check because the app has no test runner; OpenAI prices left unknown (`cost n/a`); `coverLetterHook` added to the generate and regenerate APIs.
+
 ## Out of scope
 
 - Per-user provider API keys for Anthropic/OpenAI (server env only; NVIDIA key stays per user).
