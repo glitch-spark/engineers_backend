@@ -34,6 +34,8 @@ from app.models import (
     AiReviewRun,
     AnalyzeChatLog,
     Application,
+    BidReport,
+    Bidder,
     EmailAccount,
     EmailClassificationCache,
     EmailMessage,
@@ -91,6 +93,8 @@ DOCUMENT_MODELS = [
     JobExtractionCache,
     JobPostingCache,
     JobApplicationLog,
+    Bidder,
+    BidReport,
 ]
 
 
