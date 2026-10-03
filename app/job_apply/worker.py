@@ -177,10 +177,19 @@ async def _cache_description(url: str, text: str) -> None:
 
 async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
     cached = await JobPostingCache.find_one(JobPostingCache.url == row.url)
-    if cached and posting_reusable(cached.fetchedAt, datetime.utcnow()):
+    res = None
+    if not (cached and posting_reusable(cached.fetchedAt, datetime.utcnow())):
+        try:
+            res = await FETCH(row.url, client=client, browser=BROWSER)
+        except fetch_mod.JobClosed:
+            raise
+        except Exception:
+            # A blocked or timed-out refetch keeps the description read earlier (within the cache's life).
+            if not (cached and cached.fetchedAt > datetime.utcnow() - POSTING_TTL):
+                raise
+    if res is None:
         text, source, posted, title, company = cached.text, cached.source, cached.postedDate, cached.title, cached.company
     else:
-        res = await FETCH(row.url, client=client, browser=BROWSER)
         text, source, posted, title, company = res.text, res.source, res.postedDate, res.title, res.company
         coll = JobPostingCache.get_motor_collection()
         await coll.update_one(
@@ -365,12 +374,14 @@ async def run_worker(run_id: PydanticObjectId) -> None:
         user = await UserExtra.get(run.userId)
         check = _Checker(run_id)
         rows = await _rows(run_id)
+        # Fetch and read whatever still needs it (both stages skip finished rows), in either phase: a retry after
+        # scoring started, or a run resumed after a restart, picks its pending rows up here.
+        await _ensure_running(run_id)
+        await _fetch_stage(run, rows, check)
+        await _ensure_running(run_id)
+        await _extract_stage(run, rows, user, check)
+        await _ensure_running(run_id)
         if run.phase == "screen":
-            await _ensure_running(run_id)
-            await _fetch_stage(run, rows, check)
-            await _ensure_running(run_id)
-            await _extract_stage(run, rows, user, check)
-            await _ensure_running(run_id)
             if not run.autoStart:  # wait for the user to pick profiles per location group (POST /start)
                 await _set_run(run_id, status="screened", screenedAt=datetime.utcnow())
                 return

@@ -66,7 +66,10 @@ def profile_fits(key: str, *, country: Optional[str], region: Optional[str]) -> 
     if key == NO_LOCATION or not (country or region):
         return True
     locs = [Location(kind="region" if p in _REGION_LABELS else "country", value=p) for p in key.split("+")]
-    return any(covers(loc, country, region) for loc in locs)
+    known = [loc for loc in locs if (region_key(loc.value) if loc.kind == "region" else normalize_country(loc.value))]
+    if not known:  # the location gate reads these as "unknown", which doesn't block, so the report agrees
+        return True
+    return any(covers(loc, country, region) for loc in known)
 
 
 def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:

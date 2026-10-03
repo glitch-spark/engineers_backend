@@ -1055,3 +1055,99 @@ async def test_rows_list_includes_group(client, staff_user, auth_header):
     await worker.run_worker(PydanticObjectId(run_id))
     rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
     assert rows and all(r["groupKey"] == "US" and r["screen"] for r in rows)
+
+
+# ---------- final review fixes ----------
+
+
+async def _strip_screening_fields(run_id):
+    """Make a run and its rows look like they were created before screening existed."""
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    oid = PydanticObjectId(run_id)
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": oid}, {"$unset": {"phase": "", "autoStart": "", "assignments": "", "screenedAt": ""}}
+    )
+    await JobApplyRow.get_motor_collection().update_many({"runId": oid}, {"$unset": {"screen": "", "groupKey": ""}})
+
+
+async def test_legacy_runs_are_migrated(client, staff_user, auth_header):
+    from app.db import _migrate_job_apply_screening
+    from app.models.job_apply import JobApplyRun
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    done_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(done_id))
+    await _strip_screening_fields(done_id)
+    # a run that was mid-flight when the new code was deployed
+    live_id = (await create_run(client, h, acc)).json()["runId"]
+    await _strip_screening_fields(live_id)
+    await JobApplyRun.get_motor_collection().update_one({"_id": PydanticObjectId(live_id)}, {"$set": {"status": "running"}})
+
+    await _migrate_job_apply_screening(JobApplyRun.get_motor_collection().database)
+
+    done = (await client.get(f"/job-applies/runs/{done_id}", headers=h)).json()
+    assert done["phase"] == "score" and done["autoStart"] is True and done["assignments"] == {"*": [str(acc.id)]}
+    rows = await rows_by_url(client, h, done_id)
+    assert rows["https://jobs.example.com/remote"]["screen"] in ("valid", "check")
+    assert rows["https://jobs.example.com/remote"]["groupKey"] == "US"
+    assert rows["https://jobs.example.com/hybrid"]["screen"] == "onsite"
+
+    await worker.run_worker(PydanticObjectId(live_id))
+    live = (await client.get(f"/job-applies/runs/{live_id}", headers=h)).json()
+    assert live["status"] == "done"
+    assert (await rows_by_url(client, h, live_id))["https://jobs.example.com/remote"]["status"] == "scored"
+
+
+async def test_retry_after_scoring_rescores(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    monkeypatch.setattr(worker, "FETCH", fake_fetch)
+    assert (await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)).json()["reset"] == 1
+    await worker.run_worker(PydanticObjectId(run_id))
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "scored" and gh["screen"] in ("valid", "check")
+
+
+async def test_retry_skips_closed(client, staff_user, auth_header, monkeypatch):
+    async def closed(url, *, client, browser=None):
+        raise JobClosed("job closed (HTTP 404)")
+
+    monkeypatch.setattr(worker, "FETCH", closed)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["counts"]["failed"] == 1 and run["retryable"] == 0
+    assert (await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)).json()["reset"] == 0
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "fetch_failed" and gh["screen"] == "closed"
+
+
+async def test_max_age_patch_writes_only_changed_rows(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    coll = JobApplyRow.get_motor_collection()
+    before = {d["_id"]: d["updatedAt"] async for d in coll.find({"runId": PydanticObjectId(run_id)}, {"updatedAt": 1})}
+    assert (await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 29})).status_code == 200
+    after = {d["_id"]: d["updatedAt"] async for d in coll.find({"runId": PydanticObjectId(run_id)}, {"updatedAt": 1})}
+    assert before == after
+
+
+async def test_stale_cache_used_when_refetch_fails(client, staff_user, auth_header, monkeypatch):
+    from app.models.job_apply import JobPostingCache
+
+    await JobPostingCache(
+        url="https://boards.greenhouse.io/acme/jobs/9", text=REMOTE_JD, source="ats_api",
+        fetchedAt=datetime.utcnow() - timedelta(days=2),
+    ).insert()
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "extracted" and gh["jdSource"] == "ats_api"

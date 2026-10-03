@@ -63,7 +63,10 @@ def test_profile_fits():
     assert profile_fits("none", country="US", region=None)
     assert profile_fits("US", country=None, region=None)
     assert profile_fits("Worldwide", country="BR", region=None)
-    assert not profile_fits("Mars Colony", country="US", region=None)
+    # Locations the gates can't read count as unknown (a pass) at scoring time, so the report agrees.
+    assert profile_fits("Mars Colony", country="US", region=None)
+    assert profile_fits("Remote", country="US", region="US")
+    assert not profile_fits("GB+Remote", country="US", region="US")
 
 
 class _Row:

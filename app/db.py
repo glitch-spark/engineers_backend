@@ -236,6 +236,36 @@ async def _migrate_legacy_payer_to_admin(database) -> None:
         log.warning("legacy payer backfill failed: %s", exc)
 
 
+async def _migrate_job_apply_screening(database) -> None:
+    """Job Applies runs from before screening (no `phase`) keep working: they scored straight through, so they
+    become auto-started score-phase runs with every group assigned to every selected profile, and their rows get
+    the screening bucket and location group from what's already stored."""
+    from app.job_apply.schema import GateResult, Location
+    from app.job_apply.screening import bucket, group_key
+
+    runs, rows = database["job_apply_runs"], database["job_apply_rows"]
+    try:
+        async for run in runs.find({"phase": {"$exists": False}}, {"selection": 1}):
+            ids = [s["accountId"] for s in run.get("selection") or [] if s.get("accountId")]
+            await runs.update_one(
+                {"_id": run["_id"]}, {"$set": {"phase": "score", "autoStart": True, "assignments": {"*": ids}}}
+            )
+            async for row in rows.find(
+                {"runId": run["_id"], "screen": {"$exists": False}},
+                {"status": 1, "statusReason": 1, "gates": 1, "extraction.allowedLocations": 1, "forceInclude": 1},
+            ):
+                ex = row.get("extraction")
+                key = group_key([Location(**loc) for loc in ex.get("allowedLocations") or []]) if ex else None
+                screen = bucket(
+                    status=row.get("status") or "pending", status_reason=row.get("statusReason"),
+                    gates=[GateResult(**g) for g in row.get("gates") or []], group_key=key,
+                    force_include=bool(row.get("forceInclude")),
+                )
+                await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": screen, "groupKey": key}})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("job-apply screening back-fill failed: %s", exc)
+
+
 async def init_db():
     global _client
     uri = os.environ["MONGODB_URI"]
@@ -249,6 +279,7 @@ async def init_db():
     await _migrate_default_leaderboard_optin(database)
     await _migrate_billing_cycle(database)
     await _migrate_legacy_payer_to_admin(database)
+    await _migrate_job_apply_screening(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
     try:
         from app.alerts_service import seed_recurring_charges_from_transactions

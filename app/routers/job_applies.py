@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 from typing import Annotated, Any, Optional
 
 import httpx
+from pymongo import UpdateOne
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ from app.job_apply.screening import FORCEABLE, WORTH, bucket, build_report, resc
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
-from app.job_apply.schema import GateResult, Location
+from app.job_apply.schema import GateResult, JobExtraction, Location
 from app.models.job_apply import (
     AppliedMark,
     file_key,
@@ -40,6 +41,10 @@ FAILED = ("fetch_failed", "llm_failed")
 
 def _can_see(owner_id: PydanticObjectId, user: UserExtra) -> bool:
     return user.role == "admin" or str(owner_id) == str(user.id)
+
+
+def _retryable_query(run_id: PydanticObjectId) -> dict[str, Any]:
+    return {"runId": run_id, "status": {"$in": list(FAILED)}, "screen": {"$ne": "closed"}}
 
 
 async def _owned_run(run_id: str, user: UserExtra) -> JobApplyRun:
@@ -72,6 +77,8 @@ async def _suggested_count(run: JobApplyRun) -> int:
 async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
     out = doc_to_dict(run)
     out["suggested"] = await _suggested_count(run)
+    # Failed jobs a retry can help (a closed job stays closed).
+    out["retryable"] = await JobApplyRow.find(_retryable_query(run.id)).count()
     if with_profiles:
         ids = [s.accountId for s in run.selection]
         accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).to_list()}
@@ -559,18 +566,44 @@ class RunPatch(BaseModel):
     maxAgeDays: Optional[int] = Field(None, ge=1, le=365)
 
 
+class _RescreenView(BaseModel):
+    """What re-applying the job gates reads (not the job text or scores)."""
+
+    id: PydanticObjectId = Field(alias="_id")
+    status: str
+    statusReason: Optional[str] = None
+    extraction: Optional[JobExtraction] = None
+    postedDate: Optional[date] = None
+    gates: list[GateResult] = Field(default_factory=list)
+    screen: Optional[str] = None
+    groupKey: Optional[str] = None
+    forceInclude: bool = False
+
+    class Settings:
+        projection = {
+            "_id": 1, "status": 1, "statusReason": 1, "extraction": 1, "postedDate": 1, "gates": 1, "screen": 1,
+            "groupKey": 1, "forceInclude": 1,
+        }
+
+
 async def _rescreen_rows(run: JobApplyRun) -> None:
-    """Re-apply the job gates to every read row (max age changed). No fetch, no LLM."""
+    """Re-apply the job gates to every read row (max age changed). No fetch, no LLM; one write for the rows
+    whose result changed."""
     run_date = run.runDate.date()
-    coll = JobApplyRow.get_motor_collection()
-    excluded = 0
-    for row in await JobApplyRow.find({"runId": run.id, "extraction": {"$ne": None}}).to_list():
+    ops, excluded = [], 0
+    rows = await JobApplyRow.find({"runId": run.id, "extraction": {"$ne": None}}).project(_RescreenView).to_list()
+    for row in rows:
+        before = (row.status, row.statusReason, row.screen, [g.model_dump() for g in row.gates])
         rescreen(row, run_date=run_date, max_age_days=run.maxAgeDays)
         excluded += row.status == "excluded"
-        await coll.update_one({"_id": row.id}, {"$set": {
-            "gates": [g.model_dump() for g in row.gates], "status": row.status, "statusReason": row.statusReason,
-            "screen": row.screen, "updatedAt": datetime.utcnow(),
-        }})
+        after = (row.status, row.statusReason, row.screen, [g.model_dump() for g in row.gates])
+        if after != before:
+            ops.append(UpdateOne({"_id": row.id}, {"$set": {
+                "gates": after[3], "status": row.status, "statusReason": row.statusReason, "screen": row.screen,
+                "updatedAt": datetime.utcnow(),
+            }}))
+    if ops:
+        await JobApplyRow.get_motor_collection().bulk_write(ops, ordered=False)
     await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$set": {"counts.excluded": excluded}})
 
 
@@ -672,7 +705,7 @@ async def retry_failed(run_id: str, user: Annotated[UserExtra, Depends(get_curre
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Another run is in progress.")
     coll = JobApplyRow.get_motor_collection()
     res = await coll.update_many(
-        {"runId": run.id, "status": {"$in": list(FAILED)}},
+        _retryable_query(run.id),
         {"$set": {"status": "pending", "statusReason": None, "screen": None, "updatedAt": datetime.utcnow()}},
     )
     reset = res.modified_count
