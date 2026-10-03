@@ -191,7 +191,9 @@ async def _run_job(
                 screening_prompt=resolved_screening,
                 owner=owner,
                 use_free_llm=True,
+                model_id=job.screeningModelId,
             )
+            _add_cost(job, screening_result.cost_usd)
             pairs = screening_result.pairs
             job.screeningLlmProvider = screening_result.llm_provider
             job.screeningLlmModel = screening_result.llm_model
@@ -308,6 +310,7 @@ class ScreeningResult:
     llm_model: str
     llm_fallback_used: bool
     llm_fallback_reason: Optional[str] = None
+    cost_usd: Optional[float] = None
 
 
 def _build_screening_prompt(
@@ -364,18 +367,18 @@ async def _run_screening(
     resume_text: Optional[str] = None,
     owner: Optional[UserExtra] = None,
     use_free_llm: bool = False,
+    model_id: Optional[str] = None,
 ) -> ScreeningResult:
-    """Job-linked screening can use free LLM + OpenAI fallback; standalone uses OpenAI only."""
+    """Run screening on `model_id` (or the task default).
+
+    Job-linked screening keeps the free-first default for users with a saved NVIDIA key;
+    standalone does not, unless the user explicitly picked a model."""
     prompt = _build_screening_prompt(
         account, jd, questions, screening_prompt, resume_text=resume_text
     )
 
-    if use_free_llm:
-        llm_result = await complete_screening(prompt, owner, questions)
-    else:
-        from app.llm_router import complete_openai_only
-
-        llm_result = await complete_openai_only(prompt, purpose="screening")
+    router_user = owner if (use_free_llm or model_id) else None
+    llm_result = await complete_screening(prompt, router_user, questions, model_id=model_id)
 
     answers = parse_screening_answers(llm_result.text, questions)
     pairs = [{"question": q, "answer": a} for q, a in zip(questions, answers)]
@@ -385,6 +388,7 @@ async def _run_screening(
         llm_model=llm_result.model,
         llm_fallback_used=llm_result.fallback_used,
         llm_fallback_reason=llm_result.fallback_reason,
+        cost_usd=llm_result.cost_usd,
     )
 
 
@@ -392,6 +396,7 @@ class ScreeningBody(BaseModel):
     accountId: str
     jobDescription: Optional[str] = ""
     questions: List[str]
+    model: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
 @router.post("/screening-answers")
@@ -408,6 +413,7 @@ async def screening_answers(
             detail="At least one non-empty question is required.",
         )
 
+    model_id = require_model("screening", body.model, user)
     account = await _load_owned_account(body.accountId, user)
     if not (account.styleTemplate or "").strip():
         raise HTTPException(
@@ -424,13 +430,16 @@ async def screening_answers(
         jd=body.jobDescription or "",
         questions=questions,
         screening_prompt=screening,
+        owner=user,
         use_free_llm=False,
+        model_id=model_id,
     )
     return {"pairs": result.pairs}
 
 
 class JobAskBody(BaseModel):
     questions: List[str] = Field(min_length=1, max_length=10)
+    model: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
 @router.post("/jobs/{job_id}/ask")
@@ -455,6 +464,7 @@ async def ask_job_screening(
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="profile no longer exists")
     owner = await UserExtra.get(job.userId)
+    model_id = require_model("screening", body.model, owner)
 
     questions = [q.strip() for q in body.questions if q and q.strip()]
     if not questions:
@@ -473,8 +483,10 @@ async def ask_job_screening(
         resume_text=job.plainText or "",
         owner=owner,
         use_free_llm=True,
+        model_id=model_id,
     )
 
+    _add_cost(job, screening_result.cost_usd)
     job.screeningLlmProvider = screening_result.llm_provider
     job.screeningLlmModel = screening_result.llm_model
     job.screeningLlmFallbackUsed = screening_result.llm_fallback_used
