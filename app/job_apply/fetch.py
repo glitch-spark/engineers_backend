@@ -41,7 +41,9 @@ _BOT_MARKERS = ("g-recaptcha", "h-captcha", "cf-chl-", "captcha-delivery.com", "
 _BLOCKING_STATUS = {401, 403, 405, 503, 999}
 # A company careers page that embeds its Greenhouse board (job_url_filter extractors.py): with ?gh_jid=N the job
 # is board X, id N — read it from Greenhouse instead of the page (which lists every opening).
-_GH_EMBED = re.compile(r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/embed/job_board(?:/js)?\?for=([\w-]+)")
+_GH_EMBED = re.compile(
+    r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/embed/(?:job_board(?:/js)?|job_app)\?for=([\w-]+)"
+)
 _GH_JID = re.compile(r"(?:^|&)gh_jid=(\d+)")
 _ZOHO_JOBS = re.compile(r"var\s+jobs\s*=\s*JSON\.parse\('(.*?)'\)\s*;", re.DOTALL)
 _JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.DOTALL)
@@ -454,17 +456,30 @@ _ATS = {
 }
 
 
+def _domain_label(url: str) -> str:
+    """careers.nebius.com -> "nebius", toloka.ai -> "toloka" (the usual Greenhouse board name)."""
+    labels = (urlsplit(url).hostname or "").lower().split(".")
+    return labels[-2] if len(labels) >= 2 else ""
+
+
 async def _embedded_greenhouse(client, url: str, markup: str) -> Optional[FetchResult]:
-    """`?gh_jid=N` on a page that embeds Greenhouse board X: the job is X/N on Greenhouse."""
+    """`?gh_jid=N` on a page that embeds Greenhouse board X: the job is X/N on Greenhouse. When the page names no
+    board (it is embedded by script after load) the board named after the site is tried; a wrong guess just
+    falls through to reading the page, it never closes the job."""
     jid = _GH_JID.search(urlsplit(url).query)
-    board = _GH_EMBED.search(markup or "") if jid else None
+    if not jid:
+        return None
+    named = _GH_EMBED.search(markup or "")
+    board = named.group(1) if named else _domain_label(url)
     if not board:
         return None
     try:
-        res = await _greenhouse(client, {"board": board.group(1), "id": jid.group(1)})
+        res = await _greenhouse(client, {"board": board, "id": jid.group(1)})
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code in _GONE:
+        if named and exc.response.status_code in _GONE:
             raise JobClosed("job closed (the greenhouse API no longer lists it)") from exc
+        return None
+    except (httpx.HTTPError, ValueError):
         return None
     return res if len(res.text) >= MIN_TEXT else None
 

@@ -435,3 +435,33 @@ async def test_workday_hidden_job_says_so():
                        "https://acme.wd3.myworkdayjobs.com/": (200, "<html><body><div id=root></div></body></html>")}) as c:
         with pytest.raises(FetchError, match="Workday doesn't show this job"):
             await fetch_job("https://acme.wd3.myworkdayjobs.com/Careers/job/Remote/Engineer_R1", client=c)
+
+
+GH_JOB = {"title": "Senior Engineer", "content": "&lt;p&gt;" + "Build things in Python. " * 20 + "&lt;/p&gt;",
+          "first_published": "2026-09-15T10:00:00-04:00", "location": {"name": "Remote - Europe"}}
+
+
+async def test_gh_jid_board_guessed_from_the_domain():
+    # the board is only embedded by script after load: try the board named after the site
+    page = "<html><body>" + "<a>Open role</a>" * 60 + "</body></html>"
+    async with client({"https://toloka.ai/": (200, page),
+                       "https://boards-api.greenhouse.io/v1/boards/toloka/jobs/4948089101": (200, GH_JOB)}) as c:
+        res = await fetch_job("https://toloka.ai/careers/info?jid=4948089101&gh_jid=4948089101", client=c)
+    assert res.source == "ats_api" and res.title == "Senior Engineer"
+
+
+async def test_gh_jid_wrong_board_guess_reads_the_page():
+    page = f"<html><body>{LONG}</body></html>"
+    async with client({"https://careers.acme.io/": (200, page),
+                       "https://boards-api.greenhouse.io/v1/boards/acme/jobs/77": (404, {"status": 404})}) as c:
+        res = await fetch_job("https://careers.acme.io/jobs?gh_jid=77", client=c)
+    assert res.source == "html" and "distributed systems" in res.text
+
+
+async def test_gh_jid_job_app_embed():
+    page = "<html><body>" + "<a>Open role</a>" * 60 + \
+        '<iframe src="https://job-boards.eu.greenhouse.io/embed/job_app?for=tolokaai&token=4948089101"></iframe></body></html>'
+    async with client({"https://toloka.ai/": (200, page),
+                       "https://boards-api.greenhouse.io/v1/boards/tolokaai/jobs/4948089101": (200, GH_JOB)}) as c:
+        res = await fetch_job("https://toloka.ai/careers/info?gh_jid=4948089101", client=c)
+    assert res.source == "ats_api"
