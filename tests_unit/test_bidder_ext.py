@@ -262,3 +262,105 @@ async def test_successful_logins_do_not_count_toward_the_ip(ext):
     await register(ext)
     for _ in range(12):
         assert (await _login(ext, "ana", "password1", ip="7.7.7.7")).status_code == 200
+
+
+class _FakeStorage:
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    def presign_put(self, bucket, key):
+        if self.error:
+            raise self.error
+        self.calls.append((bucket, key))
+        return f"https://signed/{bucket}/{key}"
+
+
+def _shot(**over):
+    at = datetime.now(timezone.utc).replace(microsecond=0)
+    return {"job": "acme_1", "step": 1, "trigger": "step", "capturedAt": at.isoformat(), **over}, at
+
+
+@pytest.fixture
+def storage(monkeypatch):
+    from app.routers import bidder_ext
+
+    fake = _FakeStorage()
+    monkeypatch.setattr(bidder_ext, "get_bid_storage", lambda: fake)
+    return fake
+
+
+async def _profile(owner, name):
+    return await Account(name=name, createdBy=owner.id).insert()
+
+
+async def test_upload_url_signs_the_bidders_path(ext, owner, storage):
+    bid, _, body = await register(ext)
+    account = await _profile(owner, "Upwork")
+    b = await Bidder.get(PydanticObjectId(bid))
+    b.profileId = account.id
+    await b.save()
+    payload, at = _shot()
+    r = await ext.post("/ext/upload-url", json=payload, headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    key = f"ana-lima/{at:%Y-%m-%d}/upwork/acme_1/step1_step_{at:%Y-%m-%d}_{at:%H%M%S}.png"
+    assert r.json()["key"] == key
+    assert r.json()["url"] == f"https://signed/bid-screenshots/{key}"
+    assert r.json()["headers"] == {"Content-Type": "image/png"}
+    assert datetime.fromisoformat(r.json()["expiresAt"]) > datetime.now(timezone.utc)
+    assert storage.calls == [("bid-screenshots", key)]
+
+
+async def test_upload_uses_the_current_profile(ext, owner, storage):
+    bid, _, body = await register(ext)
+    first, second = await _profile(owner, "Upwork"), await _profile(owner, "Backend")
+    for account, segment in ((first, "/upwork/"), (second, "/backend/")):
+        r = await ext.put(f"/bidders/{bid}", json={"name": "Ana Lima", "rate": 0.5, "profileId": str(account.id)})
+        assert r.status_code == 200, r.text
+        r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
+        assert segment in r.json()["key"]
+
+
+async def test_upload_url_validation(ext, storage):
+    _, _, body = await register(ext)
+    h = auth(body["token"])
+    naive = datetime.now().replace(microsecond=0).isoformat()
+    for over in ({"step": 0}, {"step": 501}, {"trigger": "click"}, {"capturedAt": naive}, {"job": ""}):
+        r = await ext.post("/ext/upload-url", json=_shot(**over)[0], headers=h)
+        assert r.status_code == 422, over
+    old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    r = await ext.post("/ext/upload-url", json=_shot(capturedAt=old)[0], headers=h)
+    assert r.status_code == 422 and r.json()["detail"] == "capturedAt is not current"
+    assert storage.calls == []
+
+
+async def test_upload_url_requires_a_live_bidder_token(ext, storage):
+    bid, _, body = await register(ext)
+    assert (await ext.post("/ext/upload-url", json=_shot()[0])).status_code == 401
+    await ext.delete(f"/bidders/{bid}")
+    assert (await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))).status_code == 401
+
+
+async def test_upload_url_without_storage_is_503(ext, storage, monkeypatch):
+    from app.config import get_settings
+
+    _, _, body = await register(ext)
+    h = auth(body["token"])
+    monkeypatch.delenv("BID_STORAGE_BUCKET")
+    get_settings.cache_clear()
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=h)
+    assert r.status_code == 503 and r.json()["detail"] == "Uploads are not configured"
+
+
+async def test_upload_url_unsupported_provider_or_storage_error_is_503(ext, monkeypatch):
+    from app.bids.storage import BidStorageError, _UnsupportedStorage
+    from app.routers import bidder_ext
+
+    _, _, body = await register(ext)
+    h = auth(body["token"])
+    monkeypatch.setattr(bidder_ext, "get_bid_storage", lambda: _UnsupportedStorage("gcs"))
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=h)
+    assert r.status_code == 503 and r.json()["detail"] == "Uploads are not configured"
+    monkeypatch.setattr(bidder_ext, "get_bid_storage", lambda: _FakeStorage(BidStorageError("invalid endpoint")))
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=h)
+    assert r.status_code == 503 and r.json()["detail"] == "Uploads are not configured"

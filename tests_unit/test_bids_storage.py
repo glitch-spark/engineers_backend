@@ -286,3 +286,20 @@ def test_any_underscore_file_is_not_a_bid():
             obj("puma/2026-10-03/upwork/_bid_track_connection_test_x.png", utc(2026, 10, 3)),
             obj("puma/2026-10-03/upwork/acme_1/step1_step_x.png", utc(2026, 10, 3))]
     assert list(job_first_seen(objs)) == ["puma/2026-10-03/upwork/acme_1/"]
+
+
+def test_presign_put_is_a_short_lived_png_put_on_backblaze(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(
+        BID_STORAGE_ENDPOINT_URL="https://s3.us-east-005.backblazeb2.com", BID_STORAGE_ACCESS_KEY_ID="005abc",
+        BID_STORAGE_SECRET_ACCESS_KEY="K005secret", BID_STORAGE_REGION=None, AWS_REGION=None,
+        AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None))
+    storage = S3BidStorage()  # real boto3 client; signing is offline
+    url = storage.presign_put("bid-screenshots", "puma/2026-10-03/upwork/acme/step1_step_2026-10-03_093015.png")
+    parts = urlsplit(url)
+    q = parse_qs(parts.query)
+    assert parts.netloc == "s3.us-east-005.backblazeb2.com"
+    assert parts.path == "/bid-screenshots/puma/2026-10-03/upwork/acme/step1_step_2026-10-03_093015.png"
+    assert q["X-Amz-Expires"] == ["300"] and "content-type" in q["X-Amz-SignedHeaders"][0]
+    assert q["X-Amz-Credential"][0].startswith("005abc/") and "/us-east-005/s3/" in q["X-Amz-Credential"][0]

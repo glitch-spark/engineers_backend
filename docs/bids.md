@@ -78,14 +78,15 @@ replies.
 
 ## 3. Storage permissions
 
-The backend only lists keys; it never reads or writes objects.
+The backend lists keys to count bids and, for the Bid Track extension, signs screenshot
+uploads (see "Bidder extension" below); it never reads objects.
 
 **Backblaze B2:** create a separate application key for the backend (do not reuse
-the bidders' upload key) with **read-only** access to the `bid-screenshots` bucket.
-Listing needs the `listBuckets` and `listFiles` capabilities. Put its key ID and
-key in `BID_STORAGE_ACCESS_KEY_ID` / `BID_STORAGE_SECRET_ACCESS_KEY`.
+the bidders' upload key) on the `bid-screenshots` bucket with `listBuckets`,
+`listFiles` and `writeFiles` on the whole bucket (signed uploads need `writeFiles`).
+Put its key ID and key in `BID_STORAGE_ACCESS_KEY_ID` / `BID_STORAGE_SECRET_ACCESS_KEY`.
 
-**AWS S3:** use a read-only identity:
+**AWS S3:** listing needs only a read-only identity (add `s3:PutObject` on the bidder prefixes if the extension uploads through the backend):
 
 ```json
 {
@@ -132,3 +133,22 @@ curl -X POST -H "x-cron-secret: $SLACK_BOT_CRON_SECRET" $APP_BASE_URL/internal/b
 
 The response lists the status per kind: `not-due`, `done`, `no-bidders`, `posted`,
 `saved:slack-not-configured` or `failed:post`.
+
+## 5. Bidder extension
+
+Bidders sign in to the Bid Track Chrome extension; the backend builds each screenshot's
+object path and returns a short-lived signed upload link, so bidders hold no storage keys.
+
+- **Invites.** Creating a bidder returns a one-time invite code (`<TAG>-XXXX-XXXX`, valid
+  7 days, single use). The bidder enters it with a username and password in the extension.
+- **Statuses.** `invited` (code issued, not registered), `active` (registered),
+  `archived` (cannot log in; its folder is kept).
+- **Reset login** invalidates the bidder's tokens and password and issues a new invite code;
+  archiving also invalidates tokens. **New invite code** is for bidders not yet registered.
+- **Backend key.** The backend's application key needs `listBuckets`, `listFiles` and
+  `writeFiles` on the whole bucket (this replaces the earlier read-only advice). `BID_STORAGE_BUCKET`
+  must be set, otherwise uploads answer 503.
+- **Routes** (`/ext`): `POST /ext/register` (invite code, username, password), `POST /ext/login`,
+  `GET /ext/me`, and `POST /ext/upload-url` (`job`, `step`, `trigger`, `capturedAt`) which returns
+  `url`, `key`, `expiresAt` and `headers`; PUT the PNG to `url` within 5 minutes with
+  `Content-Type: image/png`. Failed logins and registrations are rate limited (429).

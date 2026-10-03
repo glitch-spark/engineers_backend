@@ -1,16 +1,20 @@
 """Routes the Bid Track extension calls: register with an invite code, log in, who am I."""
 
-from datetime import datetime, timezone
-from typing import Annotated, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Literal, Optional
 
 from beanie.exceptions import RevisionIdWasChanged
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import AwareDatetime, BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
 from app.bids import rate_limit
 from app.bids.invites import hash_code, invite_is_live
 from app.bids.rate_limit import FailureLimiter, client_ip
 from app.bids.schemas import LoginIn, RegisterIn, bidder_me
+from app.bids.storage import BidStorageError, get_bid_storage
+from app.bids.upload_keys import build_upload_key
+from app.config import get_settings
 from app.deps import get_current_bidder
 from app.models import Account
 from app.models.bidder import Bidder
@@ -124,3 +128,37 @@ async def login(body: LoginIn, request: Request) -> dict:
 @router.get("/me")
 async def me(bidder: Annotated[Bidder, Depends(get_current_bidder)]) -> dict:
     return bidder_me(bidder, await _profile_name(bidder))
+
+
+class UploadUrlIn(BaseModel):
+    job: str = Field(min_length=1, max_length=200)
+    step: int = Field(ge=1, le=500)
+    trigger: Literal["step", "next", "submit"]
+    capturedAt: AwareDatetime
+
+
+@router.post("/upload-url")
+async def upload_url(body: UploadUrlIn, bidder: Annotated[Bidder, Depends(get_current_bidder)]) -> dict:
+    """The backend picks the object path; the extension only PUTs the PNG to the returned link."""
+    unavailable = HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Uploads are not configured")
+    bucket = get_settings().BID_STORAGE_BUCKET
+    storage = get_bid_storage()
+    if not bucket or not hasattr(storage, "presign_put"):
+        raise unavailable
+    try:
+        key = build_upload_key(
+            bidder.folder, await _profile_name(bidder), body.job, body.step, body.trigger,
+            body.capturedAt, datetime.now(timezone.utc),
+        )
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "capturedAt is not current")
+    try:
+        url = storage.presign_put(bucket, key)
+    except BidStorageError:
+        raise unavailable from None
+    return {
+        "url": url,
+        "key": key,
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
+        "headers": {"Content-Type": "image/png"},
+    }

@@ -138,6 +138,16 @@ class S3BidStorage:
                     raise BidStorageError("invalid BID_STORAGE_ENDPOINT_URL") from None
             return self._client
 
+    def presign_put(self, bucket: str, key: str, content_type: str = "image/png", expires: int = 300) -> str:
+        """Short-lived pre-signed PUT link; signing is offline (no network call)."""
+        try:
+            return self._get_client().generate_presigned_url(
+                "put_object", Params={"Bucket": bucket, "Key": key, "ContentType": content_type},
+                ExpiresIn=expires, HttpMethod="PUT",
+            )
+        except ValueError:
+            raise BidStorageError("invalid BID_STORAGE_ENDPOINT_URL") from None
+
     def _count(self, bucket: str, prefix: str, windows: Sequence[Window]) -> list[int]:
         # Pages are fetched lazily, so the whole loop runs inside one worker thread. A job's
         # screenshots can sit on different pages, so first-seen times are gathered before counting.
