@@ -13,8 +13,12 @@ from pymongo import ASCENDING, DESCENDING, IndexModel
 from app.job_apply.schema import GateResult, JobExtraction, ResumeScore
 from app.models.base import TimestampedDocument
 
-RunStatus = Literal["queued", "running", "done", "failed", "cancelled"]
-RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed"]
+RunStatus = Literal["queued", "running", "screened", "done", "failed", "cancelled"]
+RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed", "unassigned"]
+# A run first screens its jobs (fetch, read, job gates), pauses at "screened" for the user to pick profiles per
+# location group, then scores only those job x profile pairs.
+RunPhase = Literal["screen", "score"]
+ScreenBucket = Literal["valid", "check", "closed", "not_fetched", "read_failed", "clearance", "onsite", "too_old"]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
 RUN_RETENTION_DAYS = 3
@@ -47,7 +51,12 @@ class JobApplyRun(TimestampedDocument):
     fileName: str  # uploaded file name, or the Google Sheet's title
     sourceUrl: Optional[str] = None  # Google Sheets link when the run came from one
     status: RunStatus = "queued"
-    selection: List[RunSelection]
+    selection: List[RunSelection] = Field(default_factory=list)  # set when scoring starts
+    phase: RunPhase = "screen"
+    # Location group key -> profiles to score its jobs against; "*" applies to every group.
+    assignments: Dict[str, List[PydanticObjectId]] = Field(default_factory=dict)
+    autoStart: bool = False  # created with profiles up front: score right after screening, no pause
+    screenedAt: Optional[datetime] = None
     threshold: int = 75
     maxAgeDays: int = 30
     # "Today" for the freshness gate and for roles ending "Present"; fixed at upload so a resumed run agrees.
@@ -97,6 +106,9 @@ class JobApplyRow(TimestampedDocument):
     jdSource: Optional[Literal["sheet", "ats_api", "html", "browser"]] = None
     status: RowStatus = "pending"
     statusReason: Optional[str] = None
+    screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
+    groupKey: Optional[str] = None  # normalised allowed locations, e.g. "GB", "EU+US", "none"
+    forceInclude: bool = False  # "Include anyway" for a clearance / on-site / too-old job
     title: str = ""
     company: str = ""
     fetchedPostedDate: Optional[date] = None  # from JSON-LD / ATS API; beats the LLM's date
