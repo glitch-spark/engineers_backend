@@ -89,7 +89,8 @@ def _renewal(auth: BidderAuth) -> dict:
 
 async def register_bidder_row(bidder: Bidder, username: str, password_hash: str) -> bool:
     """Claim the invite in ONE conditional write. False when the code was reused, replaced, or the bidder
-    was archived or registered since it was read (the filter, not our earlier read, is the guard)."""
+    was archived or registered since it was read (the filter, not our earlier read, is the guard). None in the
+    filter matches a missing field and an explicit null alike."""
     now = datetime.now(timezone.utc)
     updates = {"username": username, "passwordHash": password_hash, "registeredAt": now, "updatedAt": now}
     bucket = get_settings().BID_STORAGE_BUCKET
@@ -99,8 +100,8 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
         {
             "_id": bidder.id,
             "inviteCodeHash": bidder.inviteCodeHash,
-            "registeredAt": {"$exists": False},
-            "archivedAt": {"$exists": False},
+            "registeredAt": None,
+            "archivedAt": None,
         },
         {
             "$set": updates,

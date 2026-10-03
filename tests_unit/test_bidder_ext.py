@@ -163,6 +163,20 @@ async def test_register_is_one_conditional_update(ext):
     assert (await ext.post("/ext/register", json=reg(new_code))).status_code == 200
 
 
+async def test_register_treats_stored_nulls_as_unset_but_still_refuses_archived(ext):
+    from app.routers import bidder_ext
+
+    bid, code = await ext.create()
+    coll, oid = Bidder.get_motor_collection(), PydanticObjectId(bid)
+    await coll.update_one({"_id": oid}, {"$set": {"registeredAt": None, "archivedAt": None}})  # explicit nulls
+    stale = await Bidder.get(oid)
+    await coll.update_one({"_id": oid}, {"$set": {"archivedAt": datetime.now(timezone.utc)}})
+    assert await bidder_ext.register_bidder_row(stale, "ana", "hash") is False
+    await coll.update_one({"_id": oid}, {"$set": {"archivedAt": None}})
+    r = await ext.post("/ext/register", json=reg(code))
+    assert r.status_code == 200, r.text
+
+
 async def test_login_wrong_password_and_unknown_user_look_the_same(ext):
     await register(ext)
     wrong_pw = await ext.post("/ext/login", json={"username": "ana", "password": "nope-nope"})
