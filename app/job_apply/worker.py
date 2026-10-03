@@ -17,7 +17,7 @@ from beanie.odm.utils.encoder import Encoder
 
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
-from app.job_apply.gates import blocked, job_gates
+from app.job_apply.gates import blocked, failing_reasons, job_gates
 from app.job_apply.pipeline import ProfileInfo, ResumeInput, score_row
 from app.job_apply.resume_parse import parse_resume
 from app.job_apply.schema import GateResult, JobExtraction
@@ -65,10 +65,6 @@ def needs_stage(status: str, *, has_jd: bool, scored: bool, stage: Stage) -> boo
 
 def posted_for_row(fetched: Optional[date], extracted: Optional[date]) -> Optional[date]:
     return fetched or extracted
-
-
-def failing_reasons(gates: list[GateResult]) -> str:
-    return "; ".join(f"{g.name}: {g.reason}" if g.reason else g.name for g in gates if g.result == "fail")
 
 
 # ---------- persistence helpers ----------

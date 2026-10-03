@@ -179,3 +179,7 @@ def profile_gates(ex: JobExtraction, *, country: Optional[str], region: Optional
 
 def blocked(gates: list[GateResult]) -> bool:
     return any(g.result == "fail" for g in gates)
+
+
+def failing_reasons(gates: list[GateResult]) -> str:
+    return "; ".join(f"{g.name}: {g.reason}" if g.reason else g.name for g in gates if g.result == "fail")
