@@ -9,7 +9,7 @@ import socket
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Awaitable, Callable, Literal, Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 # 2: closed jobs (404/410, redirect to the job list, gone from the ATS) are no longer read as job text.
 # 3: pages that say the job is gone ("no longer active", "job not found", "this job was removed"…).
 # 4: results say whether they came from structured data (job-site API / JobPosting) or page text only.
-FETCHER_VERSION = 4
+FETCHER_VERSION = 5
 MIN_TEXT = 200  # below this there's no usable job text
 THIN_PAGE = 400  # below this a script-rendered page is retried in the browser
 TIMEOUT = 20.0
@@ -46,6 +46,11 @@ _GH_EMBED = re.compile(
     r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/embed/(?:job_board(?:/js)?|job_app)\?for=([\w-]+)"
 )
 _GH_JID = re.compile(r"(?:^|&)gh_jid=(\d+)")
+# Same for an embedded Ashby board: ?ashby_jid=<job id>, the board named in the embed script (or after the site).
+_ASHBY_EMBED = re.compile(r"jobs\.ashbyhq\.com/([\w.-]+)/embed")
+_ASHBY_JID = re.compile(r"(?:^|&)ashby_jid=([\w-]+)")
+# Text of a page whose script never ran: Angular / Vue placeholders still in it ("{{company.name}}").
+_TEMPLATE = re.compile(r"\{\{\s*[\w.$\[\]]+\s*\}\}")
 _ZOHO_JOBS = re.compile(r"var\s+jobs\s*=\s*JSON\.parse\('(.*?)'\)\s*;", re.DOTALL)
 _JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.DOTALL)
 _JS_SIMPLE = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
@@ -227,6 +232,10 @@ def route(url: str) -> tuple[str, dict]:
         return "bamboohr", {"host": host, "id": segs[1]}
     if ".zohorecruit." in host and len(segs) >= 3 and [s.lower() for s in segs[:2]] == ["jobs", "careers"] and segs[2].isdigit():
         return "zoho", {"page": url, "id": segs[2]}
+    domain = parse_qs(parts.query).get("domain")
+    if len(segs) == 3 and segs[:2] == ["careers", "job"] and segs[2].isdigit() and domain:
+        # Eightfold career sites live on the company's domain (careers.deere.com/careers/job/<id>?domain=johndeere.com)
+        return "eightfold", {"host": host, "id": segs[2], "domain": domain[0]}
     return "generic", {}
 
 
@@ -329,10 +338,13 @@ async def _get_json(client: httpx.AsyncClient, url: str) -> Any:
 async def _greenhouse(client, p) -> FetchResult:
     d = await _get_json(client, f"https://boards-api.greenhouse.io/v1/boards/{p['board']}/jobs/{p['id']}")
     body = html_to_text(html_lib.unescape(d.get("content") or ""))
-    loc = (d.get("location") or {}).get("name", "")
+    # "Remote" is often only in the office ("Seesaw US - Remote", location "USA"): keep both
+    offices = [o.get("name") for o in d.get("offices") or [] if isinstance(o, dict) and isinstance(o.get("name"), str)]
+    loc = "; ".join(dict.fromkeys(x for x in [(d.get("location") or {}).get("name", ""), *offices] if x))
+    remote = bool(re.search(r"\bremote\b", loc, re.I))
     title, company = d.get("title", ""), d.get("company_name", "")
     return FetchResult(
-        text=_compose(body, title=title, company=company, location=loc), source="ats_api",
+        text=_compose(body, title=title, company=company, location=loc, remote=remote), source="ats_api",
         postedDate=_date(d.get("first_published")) or _date(d.get("updated_at")), title=title, company=company, location=loc,
     )
 
@@ -454,9 +466,35 @@ async def _zoho(client, p) -> FetchResult:
     )
 
 
+_EIGHTFOLD_MODE = (("remote", "remote"), ("hybrid", "hybrid"), ("on_site", "onsite"), ("onsite", "onsite"),
+                   ("office", "onsite"))
+
+
+async def _eightfold(client, p) -> FetchResult:
+    """Eightfold career sites load the job from this API (the page itself is a script shell plus site config).
+    Its host is the company's own domain, so it gets the same address check as any page."""
+    api = f"https://{p['host']}/api/apply/v2/jobs/{p['id']}?domain={quote(p['domain'])}"
+    await check_url(api)
+    resp = await _send(client, api, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=TIMEOUT,
+                       follow_redirects=False)
+    resp.raise_for_status()
+    d = resp.json()
+    body = html_to_text(html_lib.unescape(d.get("job_description") or ""))
+    title = d.get("posting_name") or d.get("name") or ""
+    loc = "; ".join(x for x in d.get("locations") or [] if isinstance(x, str)) or d.get("location") or ""
+    flex = f"{d.get('work_location_option') or ''} {d.get('location_flexibility') or ''}".lower()
+    workplace = next((mode for key, mode in _EIGHTFOLD_MODE if key in flex), "")
+    created = d.get("t_create")  # epoch seconds
+    return FetchResult(
+        text=_compose(body, title=title, location=loc, workplace=workplace), source="ats_api",
+        postedDate=_date(created * 1000) if isinstance(created, (int, float)) else None, title=title, location=loc,
+    )
+
+
 _ATS = {
     "greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby, "workable": _workable,
     "smartrecruiters": _smartrecruiters, "workday": _workday, "bamboohr": _bamboohr, "zoho": _zoho,
+    "eightfold": _eightfold,
 }
 
 
@@ -488,6 +526,37 @@ async def _embedded_greenhouse(client, url: str, markup: str) -> Optional[FetchR
     return res if len(res.text) >= MIN_TEXT else None
 
 
+async def _embedded_ashby(client, url: str, markup: str) -> Optional[FetchResult]:
+    """`?ashby_jid=<id>` on a page that embeds Ashby board X: the job is on X's board. When the page names no board
+    the one named after the site is tried; a wrong guess falls through to reading the page, it never closes the job."""
+    jid = _ASHBY_JID.search(urlsplit(url).query)
+    if not jid:
+        return None
+    named = _ASHBY_EMBED.search(markup or "")
+    org = named.group(1) if named else _domain_label(url)
+    if not org:
+        return None
+    try:
+        res = await _ashby(client, {"org": org, "id": jid.group(1)})
+    except JobClosed:
+        if named:
+            raise
+        return None
+    except (httpx.HTTPError, ValueError):
+        return None
+    return res if len(res.text) >= MIN_TEXT else None
+
+
+async def _embedded_board(client, url: str, markup: str) -> Optional[FetchResult]:
+    return await _embedded_greenhouse(client, url, markup) or await _embedded_ashby(client, url, markup)
+
+
+def _script_shell(url: str, result: Optional[FetchResult]) -> bool:
+    """The plain page can't be the job, however long: the job is behind a #/ client-side route, or the page's
+    script never ran (template placeholders in the text)."""
+    return urlsplit(url).fragment.startswith("/") or bool(result and _TEMPLATE.search(result.text))
+
+
 # ---------- generic pages ----------
 
 
@@ -495,8 +564,11 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
     """CPU-bound (HTML parsing): callers run it in a thread. The page is parsed once."""
     soup = BeautifulSoup(markup or "", "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    if _BOT_TITLE.search(title) or any(m in (markup or "") for m in _BOT_MARKERS):
+    if _BOT_TITLE.search(title):
         return FetchResult(text="", source=source, bot_check=True)
+    # reCAPTCHA / challenge scripts also sit on real job pages (apply forms): they only mean a bot wall when the
+    # page has nothing else on it
+    marked = any(m in (markup or "") for m in _BOT_MARKERS)
     ld = parse_jsonld(soup)
     closed = _gone_reason(soup, ld)
     if closed:
@@ -516,7 +588,10 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
         posted = _date(ld.get("datePosted"))
     else:
         posted = None
-    return FetchResult(text=html_to_text(soup), source=source, postedDate=posted, structured=False)
+    text = html_to_text(soup)
+    if marked and len(text) < THIN_PAGE:
+        return FetchResult(text="", source=source, bot_check=True)
+    return FetchResult(text=text, source=source, postedDate=posted, structured=False)
 
 
 def _gone_reason(soup: BeautifulSoup, ld: Optional[dict]) -> Optional[str]:
@@ -597,7 +672,7 @@ async def fetch_job(
         if _lands_on_job_list(url, str(resp.url)):
             raise JobClosed("job closed (the link now opens the job list)")
         if resp.status_code < 400:
-            if embedded := await _embedded_greenhouse(client, url, resp.text):
+            if embedded := await _embedded_board(client, url, resp.text):
                 return embedded
             result = await asyncio.to_thread(_from_page, resp.text, "html")
         else:
@@ -611,7 +686,8 @@ async def fetch_job(
     if result is not None and result.bot_check:
         result, problem = None, "blocked by bot protection"
 
-    if browser is not None and (result is None or len(result.text) < THIN_PAGE):
+    shell = _script_shell(url, result)
+    if browser is not None and (result is None or len(result.text) < THIN_PAGE or shell):
         rendered: Optional[FetchResult] = None
         markup: Optional[str] = None
         try:
@@ -619,14 +695,16 @@ async def fetch_job(
         except Exception:  # noqa: BLE001 — browser failure leaves the plain-HTML result
             pass
         if markup is not None:
-            if embedded := await _embedded_greenhouse(client, url, markup):
+            if embedded := await _embedded_board(client, url, markup):
                 return embedded
             rendered = await asyncio.to_thread(_from_page, markup, "browser")
         if rendered is not None and rendered.closed:
             raise JobClosed(f"job closed ({rendered.closed})")
         if rendered is not None and rendered.bot_check:
             rendered, problem = None, problem or "blocked by bot protection"
-        if rendered is not None and (result is None or len(rendered.text) > len(result.text)):
+        if rendered is not None and (
+            result is None or len(rendered.text) > len(result.text) or (shell and len(rendered.text) >= MIN_TEXT)
+        ):
             result = rendered
 
     if result is None:

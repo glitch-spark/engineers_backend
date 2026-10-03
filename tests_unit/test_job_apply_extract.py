@@ -194,3 +194,46 @@ def test_parse_rejects_empty_extraction():
         parse_extraction("{}")
     with pytest.raises(ValueError):
         parse_extraction('{"workMode": "remote"}')
+
+
+# ---------- work mode: on-site / hybrid only when the posting says so (Seesaw, 2026-10-03) ----------
+
+SEESAW = "Software Engineer, Backend\nCompany: Seesaw\nLocation: USA\n\nBuild APIs in Python.\nBenefits: Home Office Setup Stipend."
+
+
+def test_build_prompt_says_unstated_work_mode_is_unknown():
+    p = build_prompt("JD", RUN)
+    assert 'doesn\'t say where the work is done, workMode is "unknown"' in p
+
+
+@pytest.mark.parametrize("mode", ["onsite", "hybrid"])
+async def test_extract_job_drops_an_unsupported_onsite_or_hybrid_guess(mode):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workMode": mode}))
+    ex, _ = await extract_job(SEESAW, user=None, run_date=RUN, llm=llm)
+    assert ex.workMode == "unknown"
+
+
+@pytest.mark.parametrize("mode, wording", [
+    ("onsite", "This is an on-site role in Austin."),
+    ("onsite", "You will work from our London office."),
+    ("onsite", "This role is not remote."),
+    ("hybrid", "Hybrid: 3 days a week in the office."),
+    ("hybrid", "You must live within commuting distance of Berlin."),
+])
+async def test_extract_job_keeps_onsite_or_hybrid_the_posting_states(mode, wording):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workMode": mode}))
+    ex, _ = await extract_job(f"{SEESAW}\n{wording}", user=None, run_date=RUN, llm=llm)
+    assert ex.workMode == mode
+
+
+async def test_extract_job_keeps_remote_and_unknown():
+    for mode in ("remote", "unknown"):
+        llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workMode": mode}))
+        ex, _ = await extract_job(SEESAW, user=None, run_date=RUN, llm=llm)
+        assert ex.workMode == mode
+
+
+def test_prompt_version_bumped_for_the_work_mode_rule():
+    from app.job_apply.extract import PROMPT_VERSION
+
+    assert PROMPT_VERSION == "job-extract-v4"

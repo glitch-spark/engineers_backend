@@ -487,3 +487,153 @@ async def test_jsonld_page_and_ats_api_are_structured():
 
 def test_fetcher_version_bumped_for_structured_flag():
     assert fetch_mod.FETCHER_VERSION >= 4
+
+
+# ---------- reported misreads (2026-10-03): Seesaw, Element451, MDAEdge (JobDiva), John Deere ----------
+
+
+async def test_greenhouse_remote_office_is_kept():
+    # Greenhouse puts "Remote" in the office, not the location: "USA" alone made the reader guess on-site
+    body = {"title": "Software Engineer, Backend", "content": "&lt;p&gt;" + "Build things in Python. " * 20 + "&lt;/p&gt;",
+            "first_published": "2026-08-27T10:00:00-04:00", "location": {"name": "USA"},
+            "offices": [{"name": "Seesaw US - Remote"}], "company_name": "Seesaw"}
+    async with client({"https://boards-api.greenhouse.io/v1/boards/seesaw/jobs/4708763006": (200, body)}) as c:
+        res = await fetch_job("https://job-boards.greenhouse.io/seesaw/jobs/4708763006", client=c)
+    assert "Location: USA; Seesaw US - Remote" in res.text and "Workplace type: remote" in res.text
+
+
+async def test_greenhouse_office_without_remote_adds_no_workplace():
+    body = {"title": "Engineer", "content": "&lt;p&gt;" + "Build things in Python. " * 20 + "&lt;/p&gt;",
+            "location": {"name": "New York"}, "offices": [{"name": "New York"}]}
+    async with client({"https://boards-api.greenhouse.io/v1/boards/acme/jobs/1": (200, body)}) as c:
+        res = await fetch_job("https://boards.greenhouse.io/acme/jobs/1", client=c)
+    assert "Location: New York\n" in res.text and "Workplace type" not in res.text
+
+
+ASHBY_BOARD = {"jobs": [{"id": "5be9f41e", "title": "Senior Backend Engineer", "descriptionPlain": "Build APIs. " * 40,
+                         "publishedAt": "2026-08-31T14:07:06Z", "isRemote": True, "workplaceType": "Remote",
+                         "location": "Belgrade, Serbia"}]}
+CAREERS = "<html><body><h1>Explore Job Opportunities</h1>" + "<p>Submit your resume to jobs@acme.com.</p>" * 20 + "</body></html>"
+
+
+async def test_ashby_jid_board_guessed_from_the_domain():
+    # a careers page that embeds its Ashby board by script: ?ashby_jid= is the job on the board named after the site
+    async with client({"https://element451.com/": (200, CAREERS),
+                       "https://api.ashbyhq.com/posting-api/job-board/element451": (200, ASHBY_BOARD)}) as c:
+        res = await fetch_job("https://element451.com/careers?ashby_jid=5be9f41e&jr_id=6a95", client=c)
+    assert res.source == "ats_api" and res.title == "Senior Backend Engineer" and "Workplace type: remote" in res.text
+
+
+async def test_ashby_jid_named_board_in_the_page():
+    page = CAREERS.replace("</body>", '<script src="https://jobs.ashbyhq.com/acme-labs/embed?version=2"></script></body>')
+    async with client({"https://careers.acme.io/": (200, page),
+                       "https://api.ashbyhq.com/posting-api/job-board/acme-labs": (200, ASHBY_BOARD)}) as c:
+        res = await fetch_job("https://careers.acme.io/?ashby_jid=5be9f41e", client=c)
+    assert res.source == "ats_api" and res.title == "Senior Backend Engineer"
+
+
+async def test_ashby_jid_wrong_guess_reads_the_page():
+    page = f"<html><body>{LONG}</body></html>"
+    async with client({"https://careers.acme.io/": (200, page),
+                       "https://api.ashbyhq.com/posting-api/job-board/acme": (200, {"jobs": []})}) as c:
+        res = await fetch_job("https://careers.acme.io/jobs?ashby_jid=77", client=c)
+    assert res.source == "html" and "distributed systems" in res.text  # a wrong guess never closes the job
+
+
+SHORTER = "<p>" + "Senior Software Engineer, Python full stack, remote in the US. " * 5 + "</p>"
+
+
+async def test_hash_route_link_is_read_in_the_browser():
+    # the job id after #/ never reaches the server: the plain page is the portal's welcome text, however long
+    seen = []
+
+    async def browser(url):
+        seen.append(url)
+        return f"<html><body><h1>Senior Software Engineer</h1>{SHORTER}</body></html>"
+
+    portal = f"<html><body><h1>Candidate Portal</h1>{LONG}</body></html>"
+    async with client({"https://www1.jobdiva.com/": (200, portal)}) as c:
+        res = await fetch_job("https://www1.jobdiva.com/portal?a=x#/jobs/31592707", client=c, browser=browser)
+    assert seen == ["https://www1.jobdiva.com/portal?a=x#/jobs/31592707"]
+    assert res.source == "browser" and "Senior Software Engineer" in res.text
+
+
+async def test_unfilled_template_page_is_read_in_the_browser():
+    shell = "<html><body><h1>{{company.name}}</h1>" + "<p>An error occured. Please try again {{job.title}}</p>" * 20 + "</body></html>"
+
+    async def browser(url):
+        return f"<html><body><h1>Senior Full Stack Engineer</h1>{SHORTER}</body></html>"
+
+    async with client({"https://www.comeet.com/": (200, shell)}) as c:
+        res = await fetch_job("https://www.comeet.com/jobs/acme/E8.007/engineer/AB.F6B", client=c, browser=browser)
+    assert res.source == "browser" and "Senior Full Stack Engineer" in res.text
+
+
+async def test_recaptcha_on_a_real_job_page_is_not_a_bot_wall():
+    # apply forms carry reCAPTCHA: a rendered page with the job on it is the job, not a bot check
+    page = ('<html><head><title>Sr Infrastructure Engineer | John Deere</title></head><body>'
+            f'<h1>Sr Infrastructure Engineer</h1>{LONG}<div class="g-recaptcha"></div></body></html>')
+
+    async def browser(url):
+        return page
+
+    async with client({"https://careers.example.org/": (200, "<html><body><div id=root></div></body></html>")}) as c:
+        res = await fetch_job("https://careers.example.org/jobs/1", client=c, browser=browser)
+    assert res.source == "browser" and "Sr Infrastructure Engineer" in res.text
+
+
+async def test_bot_marker_on_an_empty_page_is_still_a_bot_wall():
+    wall = '<html><head><title>Careers</title></head><body><p>Checking your browser</p><div class="g-recaptcha"></div></body></html>'
+
+    async def browser(url):
+        return wall
+
+    async with client({"https://careers.beta.io/": (200, wall)}) as c:
+        with pytest.raises(FetchError, match="bot protection"):
+            await fetch_job("https://careers.beta.io/jobs/1", client=c, browser=browser)
+
+
+EIGHTFOLD = {"name": "Sr Infrastructure Engineer", "posting_name": "Sr Infrastructure Engineer",
+             "location": "California,United States", "locations": ["California,United States"],
+             "job_description": "<p>Onsite/Remote: Remote Position</p>" + "<p>Own build and release infrastructure.</p>" * 20,
+             "t_create": 1790773862, "location_flexibility": None, "work_location_option": None}
+
+
+def test_route_eightfold():
+    assert route("https://careers.deere.com/careers/job/137483694099?domain=johndeere.com") == (
+        "eightfold", {"host": "careers.deere.com", "id": "137483694099", "domain": "johndeere.com"})
+    assert route("https://careers.deere.com/careers/job/137483694099")[0] == "generic"  # no domain: not Eightfold's shape
+
+
+async def test_eightfold_api():
+    api = "https://careers.deere.com/api/apply/v2/jobs/137483694099?domain=johndeere.com"
+    async with client({api: (200, EIGHTFOLD)}) as c:
+        res = await fetch_job("https://careers.deere.com/careers/job/137483694099?domain=johndeere.com", client=c)
+    assert res.source == "ats_api" and res.title == "Sr Infrastructure Engineer"
+    assert "Location: California,United States" in res.text and "Remote Position" in res.text
+    assert res.postedDate == date(2026, 9, 30)
+
+
+async def test_eightfold_workplace_field():
+    body = {**EIGHTFOLD, "work_location_option": "remote_local"}
+    api = "https://careers.deere.com/api/apply/v2/jobs/1?domain=johndeere.com"
+    async with client({api: (200, body)}) as c:
+        res = await fetch_job("https://careers.deere.com/careers/job/1?domain=johndeere.com", client=c)
+    assert "Workplace type: remote" in res.text
+
+
+async def test_eightfold_missing_job_is_closed():
+    async with client({"https://careers.deere.com/api/apply/v2/jobs/9?domain=johndeere.com": (404, {"error": "not found"})}) as c:
+        with pytest.raises(fetch_mod.JobClosed):
+            await fetch_job("https://careers.deere.com/careers/job/9?domain=johndeere.com", client=c)
+
+
+async def test_eightfold_api_checks_the_address():
+    # the API host is the company's own domain, so it gets the same private-address check as any page
+    with pytest.raises(FetchError):
+        async with client({}) as c:
+            await fetch_job("https://internal.corp/careers/job/1?domain=x.com", client=c)
+
+
+def test_fetcher_version_bumped_for_these_readers():
+    assert fetch_mod.FETCHER_VERSION >= 5

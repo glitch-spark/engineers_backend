@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v3"
+PROMPT_VERSION = "job-extract-v4"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -67,6 +67,8 @@ Rules:
 - workMode: "remote with occasional travel or offsites" is remote. A role with a remote option ("work from our hub
   or remotely within Europe", "onsite, hybrid or remote") is remote. "Remote but must live within commuting distance
   of an office" or "N days in office" is hybrid. In-office/on-site only is onsite.
+  If the posting doesn't say where the work is done, workMode is "unknown": a "Location:" line or a city alone
+  does not make a job onsite.
 - allowedLocations: where a remote hire may live. Take the first of these that the posting has:
   1. Text on where hires may live or be based ("must be based in the US or EU", "can be done globally", "open to
      candidates in the EMEA time zone"). List every country and region it allows. "Global", "globally", "anywhere"
@@ -248,6 +250,8 @@ _HYBRID = re.compile(
 )
 _ONSITE = re.compile(r"\bon[- ]?site\b|\bin[- ]office\b|\bin[- ]person\b|\boffice[- ]based\b", re.I)
 _REMOTE = re.compile(r"\bremote\b|work from (?:home|anywhere)|\bWFH\b|fully distributed|distributed team", re.I)
+# "in our London office", "from the office": where the work happens, not an office stipend
+_OFFICE = re.compile(r"\b(?:in|at|from|to) (?:our|the|one of our) (?:[\w&.,'-]+ ){0,4}offices?\b", re.I)
 _REL_POSTED = re.compile(r"(\d+)\+?\s*(day|week|month)s?\s+ago", re.I)
 # "Archived 1 month ago" / "Updated 2 days ago" are not when the job was posted.
 _NOT_POSTED = re.compile(r"(?:archived|closed|expired|updated|deadline)\W*(?:\w+\W+){0,2}$", re.I)
@@ -320,6 +324,17 @@ def _posted_date(text: str, run_date: date) -> Optional[date]:
         days = n * {"day": 1, "week": 7, "month": 30}[unit]
         return run_date - timedelta(days=days)
     return None
+
+
+def _stated_mode(mode: str, text: str) -> str:
+    """On-site or hybrid only when the posting says so: a model guessing from a bare "Location: USA" would reject a
+    remote job, so an unsupported guess becomes unknown ("Needs a check")."""
+    office = bool(_OFFICE.search(text) or _ONSITE.search(text))
+    if mode == "onsite" and not (office or _NOT_REMOTE.search(text) or _HYBRID.search(text)):
+        return "unknown"
+    if mode == "hybrid" and not (office or _HYBRID.search(text)):
+        return "unknown"
+    return mode
 
 
 def _work_mode(text: str) -> str:
@@ -442,6 +457,7 @@ async def extract_job(
             ex.postedDate = None  # models answer "today" (from the prompt) when the posting gives no date
         if ex.postedDate is None:
             ex.postedDate = _posted_date(jd, run_date)
+        ex.workMode = _stated_mode(ex.workMode, jd)
         return ex, "llm"
     except Exception as exc:  # noqa: BLE001 — any LLM failure falls back to rules
         log.warning("job extraction via LLM failed, using rules: %s", exc)
