@@ -77,3 +77,25 @@ def test_schedule_from_settings_parses_values():
 def test_invalid_schedule_settings_fail_validation(field, value):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a", **{field: value})
+
+
+def _bid_env_values(text: str) -> dict:
+    import io
+
+    from dotenv import dotenv_values
+
+    values = dotenv_values(stream=io.StringIO(text))
+    return {k: v for k, v in values.items() if k.startswith(("BID_", "SLACK_BIDS_"))}
+
+
+def test_env_examples_have_no_inline_comments_in_bid_values():
+    # python-dotenv reads `KEY=   # note` as the value "# note", so comments go on their own lines.
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    example = _bid_env_values((root / ".env.example").read_text(encoding="utf-8"))
+    doc = (root / "docs" / "bids.md").read_text(encoding="utf-8")
+    doc_env = _bid_env_values(doc.split("```env", 1)[1].split("```", 1)[0])
+    assert len(example) == 9 and set(doc_env) == set(example)
+    for values in (example, doc_env):
+        assert all("#" not in (v or "") for v in values.values()), values

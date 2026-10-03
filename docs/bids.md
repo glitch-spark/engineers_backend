@@ -10,20 +10,31 @@ included) whose `LastModified` falls in the report window `[start, end)`.
 
 ```env
 BID_STORAGE_PROVIDER=s3
-BID_STORAGE_ACCESS_KEY_ID=        # optional, falls back to AWS_ACCESS_KEY_ID
-BID_STORAGE_SECRET_ACCESS_KEY=    # optional, falls back to AWS_SECRET_ACCESS_KEY
-BID_STORAGE_REGION=               # optional, falls back to AWS_REGION
+# Optional; blank falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION.
+BID_STORAGE_ACCESS_KEY_ID=
+BID_STORAGE_SECRET_ACCESS_KEY=
+BID_STORAGE_REGION=
 BID_REPORT_TIMEZONE=America/Chicago
-BID_DAILY_REPORT_TIME=18:30       # HH:MM, 24h, in BID_REPORT_TIMEZONE
-BID_WEEKLY_REPORT_DAY=saturday    # monday ... sunday
+# HH:MM, 24h, in BID_REPORT_TIMEZONE.
+BID_DAILY_REPORT_TIME=18:30
+# monday ... sunday
+BID_WEEKLY_REPORT_DAY=saturday
 BID_WEEKLY_REPORT_TIME=16:00
-SLACK_BIDS_CHANNEL_ID=C0123456789 # unset = reports are saved but not posted
-SLACK_BOT_TOKEN=xoxb-...          # same bot as the interview bot
-SLACK_BOT_CRON_SECRET=...         # only needed for the HTTP fallback
+# Unset = reports are saved but not posted.
+SLACK_BIDS_CHANNEL_ID=C0123456789
+# Same bot as the interview bot.
+SLACK_BOT_TOKEN=xoxb-...
+# Only needed for the HTTP fallback.
+SLACK_BOT_CRON_SECRET=...
+# The SPA's origin; the report's "View in app" link points at <FRONTEND_ORIGIN>/bidders.
+FRONTEND_ORIGIN=https://app.example.com
 ```
 
+Keep comments on their own lines: a `KEY=   # note` line sets KEY to the comment text.
 Invalid times, weekday names or timezones fail at startup. Copy the same keys
-onto the cron service (`python -m app.alerts_tick`).
+onto the cron service (`python -m app.alerts_tick`), including `FRONTEND_ORIGIN`:
+it defaults to `http://localhost:5173`, so without it the "View in app" link in
+Slack points at localhost.
 
 ## 2. Slack
 
