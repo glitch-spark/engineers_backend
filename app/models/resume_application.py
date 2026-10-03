@@ -29,6 +29,18 @@ class ScreeningPair(BaseModel):
     answer: str
 
 
+class CoverLetterVersion(BaseModel):
+    """A cover letter that was replaced by a regeneration, kept so it can be compared."""
+
+    text: str
+    provider: str = ""
+    model: str = ""
+    createdAt: datetime
+
+
+COVER_LETTER_HISTORY_MAX = 5
+
+
 class ResumeApplication(TimestampedDocument):
     """Backing record for one resume-generation job — covers the whole lifecycle
     (queued → in_progress → completed/failed). The async worker mutates `status`
@@ -81,6 +93,23 @@ class ResumeApplication(TimestampedDocument):
     # Plain-text cover letter generated alongside the resume (opt-in per
     # submission). Empty when the user didn't request one.
     coverLetterText: Optional[str] = None
+    # Which model wrote the cover letter (same shape as the resume/screening fields).
+    coverLetterLlmProvider: Optional[str] = None  # "free" | "openai" | "anthropic"
+    coverLetterLlmModel: Optional[str] = None
+    coverLetterLlmFallbackUsed: Optional[bool] = None
+    coverLetterLlmFallbackReason: Optional[str] = None
+    # Letters replaced by "regenerate with another model", newest first (max COVER_LETTER_HISTORY_MAX).
+    coverLetterHistory: List[CoverLetterVersion] = []
+
+    # Models the user picked at submit time (catalog ids; None = server default). Kept so
+    # retries and queue restarts reuse the same choice.
+    resumeModelId: Optional[str] = None
+    coverLetterModelId: Optional[str] = None
+    screeningModelId: Optional[str] = None
+    coverLetterHook: Optional[str] = None  # optional one-line angle for the cover letter
+
+    # Running total of model spend for this job (None until a priced model has run).
+    estimatedCostUsd: Optional[float] = None
 
     # Whether this job was submitted with generateCoverLetter=True — retained
     # so a failed-job retry can honor the original opt-in.

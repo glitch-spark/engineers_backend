@@ -24,7 +24,6 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
-from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
@@ -34,7 +33,8 @@ from app.html_sanitize import (
     strip_style_tags,
     wrap_body_for_llm,
 )
-from app.llm_router import LlmResult, complete_openai_only, complete_resume
+from app.llm_router import LlmResult, complete
+from app.model_catalog import cache_lane, fallback_chain
 from app.models import Account, ResumeLLMCache, UserExtra
 
 log = logging.getLogger(__name__)
@@ -304,65 +304,6 @@ def _build_resume_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _resume_model_and_effort() -> tuple[str, str]:
-    """Resolve the resume model and reasoning effort from settings. Used by
-    both the live call and the cache key so a hit reflects exactly the params
-    the output was produced with."""
-    settings = get_settings()
-    model = settings.RESUME_OPENAI_MODEL
-    effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
-    return model, effort
-
-
-async def _openai_call(prompt: str) -> tuple[str, dict]:
-    """Single OpenAI Responses call. Returns (output_text, usage_dict).
-
-    usage_dict shape: {input, output, reasoning}. Empty dict on failure or
-    when the SDK doesn't surface usage.
-
-    gpt-5-mini is a reasoning model — without an explicit effort it defaults
-    to medium and bills heavy hidden reasoning tokens (at output rate). The
-    resume task is a mechanical text-replace inside a fixed template, so it
-    needs little reasoning. Pin effort low to cut hidden-token cost ~5-10x.
-    Override via RESUME_REASONING_EFFORT env if a profile needs more depth."""
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OPENAI_API_KEY not configured",
-        )
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    model, effort = _resume_model_and_effort()
-    kwargs: dict = {"model": model, "input": prompt}
-    # Reasoning param only applies to gpt-5* reasoning models; harmless to
-    # send, but guard so a non-reasoning override model doesn't 400.
-    if model.startswith("gpt-5"):
-        kwargs["reasoning"] = {"effort": effort}
-    response = await client.responses.create(**kwargs)
-
-    usage_out: dict = {}
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        out_details = getattr(usage, "output_tokens_details", None)
-        reasoning_toks = getattr(out_details, "reasoning_tokens", None) if out_details else None
-        input_toks = getattr(usage, "input_tokens", None)
-        output_toks = getattr(usage, "output_tokens", None)
-        log.info(
-            "resume LLM usage: in=%s out=%s reasoning=%s effort=%s",
-            input_toks if input_toks is not None else "?",
-            output_toks if output_toks is not None else "?",
-            reasoning_toks if reasoning_toks is not None else "?",
-            effort,
-        )
-        if input_toks is not None:
-            usage_out["input"] = int(input_toks)
-        if output_toks is not None:
-            usage_out["output"] = int(output_toks)
-        if reasoning_toks is not None:
-            usage_out["reasoning"] = int(reasoning_toks)
-    return (response.output_text or ""), usage_out
-
-
 def _resume_cache_key(prompt: str, lane: str) -> str:
     """Content hash that fully determines the LLM output: lane (provider+model
     params) + the complete prompt."""
@@ -371,98 +312,56 @@ def _resume_cache_key(prompt: str, lane: str) -> str:
     ).hexdigest()
 
 
-def _openai_lane() -> str:
-    model, effort = _resume_model_and_effort()
-    return f"openai:{model}:{effort}"
-
-
-def _free_lane(user: Optional[UserExtra]) -> Optional[str]:
-    from app.llm_router import free_llm_configured, resolve_free_preset
-
-    if not user or not free_llm_configured(user):
-        return None
-    preset, max_tokens, _ = resolve_free_preset(user)
-    if preset is None:
-        return None
-    return f"free:{preset.model}:{max_tokens}"
-
-
 async def _resume_llm_output(
     prompt: str,
     user: Optional[UserExtra],
     template: str,
+    model_id: Optional[str] = None,
 ) -> LlmResult:
-    """Return LLM output with provider metadata. Uses content-hash cache per lane.
+    """Return LLM output with provider metadata. Uses a content-hash cache per model lane.
 
-    Cache lookup order:
-    1. Free-lane cache → hit = return (best case, no API call).
-    2. OpenAI-lane cache → hit = return ONLY when free is not configured.
-       If free IS configured, skip the OpenAI cache so the free tier gets
-       retried — avoids permanently locking out free after one fallback.
-    """
-    openai_lane = _openai_lane()
-    free_lane = _free_lane(user)
+    Only the preferred model's lane is checked, so a fallback entry never shadows the model the
+    user asked for (it gets retried next time). On a miss the router walks its fallback chain
+    and the output is stored under the lane of the model that actually answered."""
 
-    # 1. Check free-lane cache first.
-    if free_lane:
-        cache_key = _resume_cache_key(prompt, free_lane)
+    def _validate(text: str) -> None:
+        _validate_llm_html(_finalize_resume_html(template, text))
+
+    chain = fallback_chain("resume", model_id, user)
+    if chain:
+        preferred = chain[0]
+        cache_key = _resume_cache_key(prompt, cache_lane(preferred, "resume", user))
         cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
         if cached is not None:
-            log.info("resume LLM cache HIT (free) key=%s model=%s", cache_key[:12], cached.model)
+            log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
             return LlmResult(
                 text=cached.output,
-                provider="free",
+                provider=preferred.provider,
                 model=cached.model,
                 usage={"input": 0, "output": 0, "reasoning": 0},
                 fallback_used=False,
+                model_id=preferred.id,
+                cost_usd=0.0,
             )
 
-    # 2. Check OpenAI-lane cache — but only when the user has no free tier.
-    #    When free IS configured we skip this so the free model is retried
-    #    instead of being permanently shadowed by a prior fallback entry.
-    if not free_lane:
-        cache_key = _resume_cache_key(prompt, openai_lane)
-        cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
-        if cached is not None:
-            log.info("resume LLM cache HIT (openai) key=%s model=%s", cache_key[:12], cached.model)
-            return LlmResult(
-                text=cached.output,
-                provider="openai",
-                model=cached.model,
-                usage={"input": 0, "output": 0, "reasoning": 0},
-                fallback_used=False,
-            )
+    result = await complete("resume", prompt, user, model_id=model_id, validate=_validate)
 
-    result = await complete_resume(prompt, user)
-
-    try:
-        out_html = _finalize_resume_html(template, result.text)
-        _validate_llm_html(out_html)
-    except HTTPException:
-        if result.provider == "free":
-            log.warning("free resume output failed HTML validation — retrying OpenAI")
-            result = await complete_openai_only(prompt, purpose="resume")
-            out_html = _finalize_resume_html(template, result.text)
-            _validate_llm_html(out_html)
-        else:
-            raise
-
-    is_fallback = result.fallback_used
-    lane = free_lane if result.provider == "free" else openai_lane
-    cache_key = _resume_cache_key(prompt, lane)
-    try:
-        await ResumeLLMCache(
-            promptHash=cache_key,
-            output=result.text,
-            model=result.model,
-            isFallback=is_fallback,
-            inputTokens=result.usage.get("input"),
-            outputTokens=result.usage.get("output"),
-            reasoningTokens=result.usage.get("reasoning"),
-        ).insert()
-        log.info("resume LLM cache STORE key=%s fallback=%s", cache_key[:12], is_fallback)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("resume LLM cache store skipped (key=%s): %s", cache_key[:12], exc)
+    answered = next((s for s in chain if s.id == result.model_id), None)
+    if answered is not None:
+        cache_key = _resume_cache_key(prompt, cache_lane(answered, "resume", user))
+        try:
+            await ResumeLLMCache(
+                promptHash=cache_key,
+                output=result.text,
+                model=result.model,
+                isFallback=result.fallback_used,
+                inputTokens=result.usage.get("input"),
+                outputTokens=result.usage.get("output"),
+                reasoningTokens=result.usage.get("reasoning"),
+            ).insert()
+            log.info("resume LLM cache STORE key=%s fallback=%s", cache_key[:12], result.fallback_used)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("resume LLM cache store skipped (key=%s): %s", cache_key[:12], exc)
 
     return result
 
@@ -600,6 +499,8 @@ class GeneratedResume:
     llm_model: Optional[str] = None
     llm_fallback_used: Optional[bool] = None
     llm_fallback_reason: Optional[str] = None
+    llm_model_id: Optional[str] = None
+    cost_usd: Optional[float] = None
 
 
 _render_sem: Optional[asyncio.Semaphore] = None
@@ -620,6 +521,7 @@ async def generate_resume(
     prompt_body: Optional[str] = None,
     owner: Optional[UserExtra] = None,
     job_id: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> GeneratedResume:
     """Run the full pipeline: LLM rewrites style-stripped body text (or a
     content-hash cache hit reuses a prior output, skipping the call), the body
@@ -640,7 +542,7 @@ async def generate_resume(
 
     llm_body = wrap_body_for_llm(body_html_for_llm(template))
     prompt = _build_resume_prompt(account, job_description, llm_body, prompt_body=prompt_body)
-    llm_result = await _resume_llm_output(prompt, owner, template)
+    llm_result = await _resume_llm_output(prompt, owner, template, model_id)
     raw = llm_result.text
     usage = llm_result.usage
 
@@ -671,70 +573,6 @@ async def generate_resume(
         llm_model=llm_result.model,
         llm_fallback_used=llm_result.fallback_used,
         llm_fallback_reason=llm_result.fallback_reason,
+        llm_model_id=llm_result.model_id,
+        cost_usd=llm_result.cost_usd,
     )
-
-
-_COVER_LETTER_SYSTEM = (
-    "You write a personalized cover letter for a job application. The "
-    "letter MUST be grounded in two inputs supplied below:\n"
-    "  1. CANDIDATE RESUME — the tailored resume's plain text. Every fact "
-    "the letter cites (experience, companies, years, technologies, "
-    "achievements, metrics) MUST come from this resume. Do NOT invent "
-    "roles, companies, dates, projects, or numbers that are not present.\n"
-    "  2. JOB DESCRIPTION — the role's requirements and priorities. The "
-    "letter must tie the candidate's resume facts to what this specific "
-    "JD asks for (skills, domain, seniority, mission). Do not paste JD "
-    "phrases verbatim.\n"
-    "\n"
-    "Output rules:\n"
-    "- PLAIN TEXT only. No Markdown, no HTML, no code fences, no "
-    "surrounding commentary.\n"
-    "- 3-5 short paragraphs separated by a blank line, unless the custom "
-    "prompt below overrides.\n"
-    "- Address the hiring team naturally; do not invent a recruiter's "
-    "name.\n"
-    "- If the resume lacks evidence for a JD requirement, do not claim "
-    "it — pivot to adjacent strengths.\n"
-    "- Do NOT include personal contact details (phone number, email, "
-    "mailing address, LinkedIn URL, portfolio URL, or similar) unless the "
-    "custom prompt below explicitly asks for them. Candidate name is "
-    "allowed when natural; everything else stays out by default.\n"
-)
-
-
-async def generate_cover_letter(
-    *,
-    candidate_resume_text: str,
-    job_description: str,
-    company: str,
-    prompt_body: str,
-) -> tuple[str, dict]:
-    """Generate a plain-text cover letter using gpt-5-mini (low reasoning).
-    Returns (text, usage_dict). `prompt_body` is the resolved cover-letter
-    prompt (account > user). If empty, the system rules carry the call —
-    output will be generic but coherent."""
-    parts: list[str] = [_COVER_LETTER_SYSTEM]
-    body = (prompt_body or "").strip()
-    if body:
-        parts.append(
-            "CUSTOM PROMPT (candidate's style guidance — follow within the "
-            "absolute rules above):\n" + body
-        )
-    if (company or "").strip():
-        parts.append(f"Target company: {company.strip()}")
-    # Both sources are required for grounded output — log a warning when
-    # either is missing so the caller can fix the upstream pipeline.
-    if not (candidate_resume_text or "").strip():
-        log.warning("cover letter prompt missing resume text — output will be generic")
-    if not (job_description or "").strip():
-        log.warning("cover letter prompt missing job description — output will be generic")
-    parts.append(
-        "=== CANDIDATE RESUME (source of all factual claims) ===\n"
-        + (candidate_resume_text or "(no resume text supplied)").strip()
-    )
-    jd = trim_jd(job_description) or "(no JD supplied)"
-    parts.append(
-        "=== JOB DESCRIPTION (what the letter must address) ===\n" + jd
-    )
-    text, usage = await _openai_call("\n\n".join(parts))
-    return _normalize_dashes(_strip_fences(text)), usage

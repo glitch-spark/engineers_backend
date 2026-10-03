@@ -11,18 +11,30 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
 from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
-from app.models.resume_application import ScreeningPair as ScreeningPairModel
+from app.models.resume_application import (
+    COVER_LETTER_HISTORY_MAX,
+    CoverLetterVersion,
+    ScreeningPair as ScreeningPairModel,
+)
 from app.llm_router import complete_screening, parse_screening_answers
+from app.model_catalog import (
+    PROVIDER_LABEL,
+    Task,
+    available_models,
+    default_model_id,
+    public_view,
+)
 from app.resume_service import (
     generate_resume,
     generate_presigned_get,
     s3_enabled,
     trim_jd,
 )
-from app.routers._util import doc_to_dict, to_object_id
+from app.routers._util import doc_to_dict, require_model, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
 log = logging.getLogger(__name__)
@@ -62,6 +74,12 @@ class GenerateBody(BaseModel):
     promptBody: Optional[str] = None
     # Opt-in cover letter for this submission only.
     generateCoverLetter: bool = False
+    # Catalog model ids (GET /resume/models); omitted/blank = server default for that task.
+    resumeModel: Optional[str] = None
+    coverLetterModel: Optional[str] = None
+    screeningModel: Optional[str] = None
+    # Optional one-line angle for the cover letter.
+    coverLetterHook: Optional[str] = Field(default=None, max_length=500)
 
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -74,6 +92,9 @@ async def generate(
     The queue worker (app/resume_queue.py) runs the LLM + PDF + optional screening/cover-letter steps with
     bounded concurrency. Frontend polls GET /resume/jobs to follow progress.
     """
+    resume_model = require_model("resume", body.resumeModel, user)
+    cover_letter_model = require_model("cover_letter", body.coverLetterModel, user)
+    screening_model = require_model("screening", body.screeningModel, user)
     account = await _load_owned_account(body.accountId, user)
     job = await resume_queue.enqueue_generation(
         user=user,
@@ -84,6 +105,10 @@ async def generate(
         questions=body.questions,
         prompt_body=body.promptBody,
         cover_letter=body.generateCoverLetter,
+        resume_model=resume_model,
+        cover_letter_model=cover_letter_model,
+        screening_model=screening_model,
+        cover_letter_hook=body.coverLetterHook,
     )
     return {"jobId": str(job.id), "status": job.status}
 
@@ -131,8 +156,10 @@ async def _run_job(
         await resume_queue.persist_job(job)
 
         result = await generate_resume(
-            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id)
+            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id),
+            model_id=job.resumeModelId,
         )
+        _add_cost(job, result.cost_usd)
         job.inputTokens = result.input_tokens
         job.outputTokens = result.output_tokens
         job.reasoningTokens = result.reasoning_tokens
@@ -168,9 +195,10 @@ async def _run_job(
                 jd=jd,
                 questions=questions,
                 screening_prompt=resolved_screening,
-                owner=owner,
-                use_free_llm=True,
+                owner=owner,
+                model_id=job.screeningModelId,
             )
+            _add_cost(job, screening_result.cost_usd)
             pairs = screening_result.pairs
             job.screeningLlmProvider = screening_result.llm_provider
             job.screeningLlmModel = screening_result.llm_model
@@ -186,14 +214,21 @@ async def _run_job(
             if not cl_prompt and owner:
                 cl_prompt = (getattr(owner, "coverLetterPromptBody", None) or "").strip()
             try:
-                from app.resume_service import generate_cover_letter as _gen_cover
-                cl_text, _cl_usage = await _gen_cover(
-                    candidate_resume_text=job.plainText or "",
+                cl = await write_cover_letter(
+                    resume_text=job.plainText or "",
                     job_description=jd,
                     company=company,
                     prompt_body=cl_prompt,
+                    user=owner,
+                    model_id=job.coverLetterModelId,
+                    hook=job.coverLetterHook,
                 )
-                job.coverLetterText = cl_text
+                job.coverLetterText = cl.text
+                job.coverLetterLlmProvider = cl.provider
+                job.coverLetterLlmModel = cl.model
+                job.coverLetterLlmFallbackUsed = cl.fallback_used
+                job.coverLetterLlmFallbackReason = cl.fallback_reason
+                _add_cost(job, cl.cost_usd)
             except Exception as exc:  # noqa: BLE001 — non-fatal
                 log.warning("cover-letter generation failed for job %s: %s", job_id, exc)
 
@@ -214,6 +249,12 @@ async def _run_job(
     except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
         log.exception("resume job %s failed", job_id)
         await _mark_failed(job, str(exc), started)
+
+
+def _add_cost(job: ResumeApplication, cost: Optional[float]) -> None:
+    """Add one step's spend to the job's running total (unknown prices add nothing)."""
+    if cost is not None:
+        job.estimatedCostUsd = (job.estimatedCostUsd or 0.0) + cost
 
 
 def run_job_doc(job: ResumeApplication):
@@ -256,6 +297,11 @@ def _reset_failed_job_fields(job: ResumeApplication) -> None:
     job.s3Url = None
     job.plainText = None
     job.coverLetterText = None
+    job.coverLetterLlmProvider = None
+    job.coverLetterLlmModel = None
+    job.coverLetterLlmFallbackUsed = None
+    job.coverLetterLlmFallbackReason = None
+    job.coverLetterHistory = []
     job.screeningPairs = []
     job.inputTokens = None
     job.outputTokens = None
@@ -268,6 +314,7 @@ def _reset_failed_job_fields(job: ResumeApplication) -> None:
     job.screeningLlmModel = None
     job.screeningLlmFallbackUsed = None
     job.screeningLlmFallbackReason = None
+    job.estimatedCostUsd = None
 
 
 # ---------- Screening (extracted helper, reused by job + standalone endpoint) -
@@ -280,6 +327,7 @@ class ScreeningResult:
     llm_model: str
     llm_fallback_used: bool
     llm_fallback_reason: Optional[str] = None
+    cost_usd: Optional[float] = None
 
 
 def _build_screening_prompt(
@@ -335,19 +383,14 @@ async def _run_screening(
     screening_prompt: str,
     resume_text: Optional[str] = None,
     owner: Optional[UserExtra] = None,
-    use_free_llm: bool = False,
+    model_id: Optional[str] = None,
 ) -> ScreeningResult:
-    """Job-linked screening can use free LLM + OpenAI fallback; standalone uses OpenAI only."""
+    """Run screening on `model_id` (or the task default)."""
     prompt = _build_screening_prompt(
         account, jd, questions, screening_prompt, resume_text=resume_text
     )
 
-    if use_free_llm:
-        llm_result = await complete_screening(prompt, owner, questions)
-    else:
-        from app.llm_router import complete_openai_only
-
-        llm_result = await complete_openai_only(prompt, purpose="screening")
+    llm_result = await complete_screening(prompt, owner, questions, model_id=model_id)
 
     answers = parse_screening_answers(llm_result.text, questions)
     pairs = [{"question": q, "answer": a} for q, a in zip(questions, answers)]
@@ -357,6 +400,7 @@ async def _run_screening(
         llm_model=llm_result.model,
         llm_fallback_used=llm_result.fallback_used,
         llm_fallback_reason=llm_result.fallback_reason,
+        cost_usd=llm_result.cost_usd,
     )
 
 
@@ -364,6 +408,7 @@ class ScreeningBody(BaseModel):
     accountId: str
     jobDescription: Optional[str] = ""
     questions: List[str]
+    model: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
 @router.post("/screening-answers")
@@ -380,6 +425,7 @@ async def screening_answers(
             detail="At least one non-empty question is required.",
         )
 
+    model_id = require_model("screening", body.model, user)
     account = await _load_owned_account(body.accountId, user)
     if not (account.styleTemplate or "").strip():
         raise HTTPException(
@@ -396,13 +442,15 @@ async def screening_answers(
         jd=body.jobDescription or "",
         questions=questions,
         screening_prompt=screening,
-        use_free_llm=False,
+        owner=user,
+        model_id=model_id,
     )
     return {"pairs": result.pairs}
 
 
 class JobAskBody(BaseModel):
     questions: List[str] = Field(min_length=1, max_length=10)
+    model: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
 @router.post("/jobs/{job_id}/ask")
@@ -427,6 +475,7 @@ async def ask_job_screening(
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="profile no longer exists")
     owner = await UserExtra.get(job.userId)
+    model_id = require_model("screening", body.model, owner)
 
     questions = [q.strip() for q in body.questions if q and q.strip()]
     if not questions:
@@ -443,10 +492,11 @@ async def ask_job_screening(
         questions=questions,
         screening_prompt=screening_prompt,
         resume_text=job.plainText or "",
-        owner=owner,
-        use_free_llm=True,
+        owner=owner,
+        model_id=model_id,
     )
 
+    _add_cost(job, screening_result.cost_usd)
     job.screeningLlmProvider = screening_result.llm_provider
     job.screeningLlmModel = screening_result.llm_model
     job.screeningLlmFallbackUsed = screening_result.llm_fallback_used
@@ -457,6 +507,109 @@ async def ask_job_screening(
     ]
     await job.save()
     return {"pairs": screening_result.pairs}
+
+
+class CoverLetterRegenBody(BaseModel):
+    model: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
+    hook: Optional[str] = Field(default=None, max_length=500)  # None = keep the job's stored hook
+
+
+@router.post("/jobs/{job_id}/cover-letter")
+async def regenerate_cover_letter(
+    job_id: str,
+    body: CoverLetterRegenBody,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Write the job's cover letter again (optionally on another model). The previous letter is
+    kept in `coverLetterHistory` (newest first, capped). Owner-only (admin too)."""
+    oid = to_object_id(job_id)
+    job = await ResumeApplication.get(oid)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if user.role != "admin" and str(job.userId) != str(user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+    owner = await UserExtra.get(job.userId)
+    model_id = require_model("cover_letter", body.model, owner)
+    if not (job.plainText or "").strip() or not (job.jobDescription or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This job has no resume text or job description to write a letter from.",
+        )
+
+    account = await Account.get(job.accountId) if job.accountId else None
+    prompt_body = (getattr(account, "coverLetterPrompt", None) or "").strip()
+    if not prompt_body and owner:
+        prompt_body = (getattr(owner, "coverLetterPromptBody", None) or "").strip()
+    hook = (body.hook or "").strip() if body.hook is not None else (job.coverLetterHook or "")
+
+    try:
+        cl = await write_cover_letter(
+            resume_text=job.plainText or "",
+            job_description=job.jobDescription or "",
+            company=job.companyName,
+            prompt_body=prompt_body,
+            user=owner,
+            model_id=model_id,
+            hook=hook or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface any provider failure; the job stays as it was
+        log.warning("cover-letter regeneration failed for job %s: %s", job_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Cover letter generation failed: {exc}"
+        )
+
+    history = list(job.coverLetterHistory or [])
+    if (job.coverLetterText or "").strip():
+        history.insert(
+            0,
+            CoverLetterVersion(
+                text=job.coverLetterText,
+                provider=job.coverLetterLlmProvider or "",
+                model=job.coverLetterLlmModel or "",
+                createdAt=datetime.now(timezone.utc),
+            ),
+        )
+    job.coverLetterHistory = history[:COVER_LETTER_HISTORY_MAX]
+    job.coverLetterText = cl.text
+    job.coverLetterLlmProvider = cl.provider
+    job.coverLetterLlmModel = cl.model
+    job.coverLetterLlmFallbackUsed = cl.fallback_used
+    job.coverLetterLlmFallbackReason = cl.fallback_reason
+    if model_id:
+        job.coverLetterModelId = model_id
+    if body.hook is not None:
+        job.coverLetterHook = hook or None
+    _add_cost(job, cl.cost_usd)
+    await job.save()
+    return {
+        "coverLetterText": job.coverLetterText,
+        "coverLetterLlmProvider": job.coverLetterLlmProvider,
+        "coverLetterLlmModel": job.coverLetterLlmModel,
+        "coverLetterLlmFallbackUsed": job.coverLetterLlmFallbackUsed,
+        "coverLetterLlmFallbackReason": job.coverLetterLlmFallbackReason,
+        "estimatedCostUsd": job.estimatedCostUsd,
+        "coverLetterHistory": [v.model_dump(mode="json") for v in job.coverLetterHistory],
+    }
+
+
+# ---------- Model catalog -----------------------------------------------------
+
+
+@router.get("/models")
+async def list_models(
+    task: Task,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Models the caller can pick for `task`, with the default flagged and a typical per-run cost."""
+    default_id = default_model_id(task, user)
+    models = available_models(task, user)
+    providers = list(dict.fromkeys(m.provider for m in models))  # configured providers, in picker order
+    return {
+        "task": task,
+        "defaultId": default_id,
+        "providers": [{"id": p, "label": PROVIDER_LABEL[p]} for p in providers],
+        "models": [public_view(s, task, default_id) for s in models],
+    }
 
 
 # ---------- Job listing / polling / download ---------------------------------
@@ -486,6 +639,16 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "outputTokens": job.outputTokens,
         "reasoningTokens": job.reasoningTokens,
         "coverLetterText": job.coverLetterText,
+        "coverLetterLlmProvider": job.coverLetterLlmProvider,
+        "coverLetterLlmModel": job.coverLetterLlmModel,
+        "coverLetterLlmFallbackUsed": job.coverLetterLlmFallbackUsed,
+        "coverLetterLlmFallbackReason": job.coverLetterLlmFallbackReason,
+        "coverLetterHistory": [v.model_dump(mode="json") for v in job.coverLetterHistory],
+        "resumeModelId": job.resumeModelId,
+        "coverLetterModelId": job.coverLetterModelId,
+        "screeningModelId": job.screeningModelId,
+        "coverLetterHook": job.coverLetterHook,
+        "estimatedCostUsd": job.estimatedCostUsd,
         "resumeLlmProvider": job.resumeLlmProvider,
         "resumeLlmModel": job.resumeLlmModel,
         "resumeLlmFallbackUsed": job.resumeLlmFallbackUsed,

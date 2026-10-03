@@ -143,3 +143,13 @@ def plans_today():
 
     with patch("app.routers.daily_plans._today", return_value=date(2026, 12, 31)):
         yield
+
+
+@pytest.fixture
+def anthropic_key(monkeypatch):
+    """Make the Anthropic models selectable (the catalog hides them without a key); nothing is called."""
+    from app import model_catalog
+    from app.config import get_settings
+
+    patched = get_settings().model_copy(update={"ANTHROPIC_API_KEY": "sk-ant-test"})
+    monkeypatch.setattr(model_catalog, "get_settings", lambda: patched)

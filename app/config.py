@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     # High-quality structured generation: resume HTML, screening answers, scoring.
     # Use a smarter model — output ships to users and judgment matters.
     RESUME_OPENAI_MODEL: str = "gpt-5-mini"
+    # Anthropic key for the selectable Claude models (app/model_catalog.py). Unset hides them.
+    ANTHROPIC_API_KEY: Optional[str] = None
+    # Only for user-level Anthropic keys (sk-ant-usr-...): the workspace every request is billed to.
+    ANTHROPIC_WORKSPACE_ID: Optional[str] = None
+    # Default model per task when the caller doesn't pick one (provider-prefixed ids).
+    RESUME_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
+    COVER_LETTER_DEFAULT_MODEL: str = "anthropic:claude-opus-5-5"
+    SCREENING_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
     # Reasoning effort for the resume rewrite (gpt-5* only). Mechanical
     # text-replace needs little reasoning — "low" cuts hidden reasoning
     # tokens (billed at output rate) ~5-10x vs the medium default.
