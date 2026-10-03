@@ -31,8 +31,12 @@ class FakeStore:
     def __init__(self, bidders):
         self.bidders, self.rows, self.done = bidders, [], set()
 
-    async def is_done(self, key): return key in self.done
-    async def mark_done(self, key): self.done.add(key)
+    async def claim(self, key):
+        if key in self.done:
+            return False
+        self.done.add(key)
+        return True
+    async def release(self, key): self.done.discard(key)
     async def load_rows(self, kind, pk): return [r for r in self.rows if (r.kind, r.periodKey) == (kind, pk)]
     async def save_rows(self, rows): self.rows += rows; return rows
     async def active_bidders(self): return self.bidders
@@ -102,6 +106,13 @@ async def test_no_bidders_marks_done_without_posting():
     store, post = FakeStore([]), Poster()
     got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({}), post)
     assert got["daily"] == "no-bidders" and "bids-daily:2026-10-02" in store.done and post.sent == []
+
+
+async def test_overlapping_tick_does_not_post_twice():
+    store, storage, post = FakeStore([bidder("Ana", "s3://b/ana/")]), FakeStorage({"s3://b/ana/": 3}), Poster()
+    store.done.add("bids-daily:2026-10-02")  # another run already claimed this period
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, storage, post)
+    assert got["daily"] == "done" and post.sent == [] and storage.calls == 0 and store.rows == []
 
 
 async def test_slack_not_configured_saves_but_does_not_mark(monkeypatch):

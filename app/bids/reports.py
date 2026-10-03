@@ -33,8 +33,8 @@ def report_key(kind: Kind, period_key: str) -> str:
 
 
 class ReportStore(Protocol):
-    async def is_done(self, key: str) -> bool: ...
-    async def mark_done(self, key: str) -> None: ...
+    async def claim(self, key: str) -> bool: ...
+    async def release(self, key: str) -> None: ...
     async def load_rows(self, kind: Kind, period_key: str) -> list[BidReportRow]: ...
     async def save_rows(self, rows: list[BidReportRow]) -> list[BidReportRow]: ...
     async def active_bidders(self) -> list: ...
@@ -43,19 +43,20 @@ class ReportStore(Protocol):
 
 
 class BeanieReportStore:
-    async def is_done(self, key: str) -> bool:
-        found = await SlackAlertLog.find_one(
-            SlackAlertLog.userId == CALLER_CHANNEL_SENTINEL, SlackAlertLog.kind == key,
-        )
-        return found is not None
-
-    async def mark_done(self, key: str) -> None:
+    async def claim(self, key: str) -> bool:
+        """Insert the de-dup key; False when another run already holds it."""
         try:
             await SlackAlertLog(
                 userId=CALLER_CHANNEL_SENTINEL, kind=key, sentAt=datetime.now(timezone.utc),
             ).insert()
-        except DuplicateKeyError:  # another run already recorded it
-            pass
+            return True
+        except DuplicateKeyError:
+            return False
+
+    async def release(self, key: str) -> None:
+        await SlackAlertLog.find(
+            SlackAlertLog.userId == CALLER_CHANNEL_SENTINEL, SlackAlertLog.kind == key,
+        ).delete()
 
     async def load_rows(self, kind: Kind, period_key: str) -> list[BidReportRow]:
         return await BidReport.find(BidReport.kind == kind, BidReport.periodKey == period_key).to_list()
@@ -137,31 +138,34 @@ async def _run_kind(
         return "not-due"
     pk = period_key(cutoff)
     key = report_key(kind, pk)
-    if await store.is_done(key):
+    # Claim before doing anything so an overlapping tick (cron + HTTP fallback) cannot also post.
+    if not await store.claim(key):
         return "done"
-
-    start, end = window_for(kind, cutoff, sched)
-    rows = await store.load_rows(kind, pk)
-    if not rows:
-        bidders = await store.active_bidders()
-        if not bidders:
-            await store.mark_done(key)
-            return "no-bidders"
-        names = await store.profile_names([b.profileId for b in bidders if b.profileId])
-        rows = await store.save_rows(await build_rows(kind, start, end, pk, bidders, names, storage))
-
-    if post is None:
-        return "saved:slack-not-configured"
-    owners = await store.owners(list({r.ownerId for r in rows}))
-    text, messages = format_report(
-        kind, start, end, rows, owners, sched.tz, get_settings().FRONTEND_ORIGIN.rstrip("/"),
-    )
+    try:
+        start, end = window_for(kind, cutoff, sched)
+        rows = await store.load_rows(kind, pk)
+        if not rows:
+            bidders = await store.active_bidders()
+            if not bidders:
+                return "no-bidders"  # keep the claim so later ticks skip this period
+            names = await store.profile_names([b.profileId for b in bidders if b.profileId])
+            rows = await store.save_rows(await build_rows(kind, start, end, pk, bidders, names, storage))
+        if post is None:
+            await store.release(key)
+            return "saved:slack-not-configured"
+        owners = await store.owners(list({r.ownerId for r in rows}))
+        text, messages = format_report(
+            kind, start, end, rows, owners, sched.tz, get_settings().FRONTEND_ORIGIN.rstrip("/"),
+        )
+    except Exception:
+        await store.release(key)  # let the next tick retry
+        raise
     try:
         await post(text, messages)
     except Exception as exc:
+        await store.release(key)
         log.warning("bid %s report post failed for %s: %s", kind, pk, exc)
         return "failed:post"
-    await store.mark_done(key)
     return "posted"
 
 

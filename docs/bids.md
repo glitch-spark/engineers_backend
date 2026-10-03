@@ -61,11 +61,13 @@ block the other steps.
 - A report runs when the latest cutoff is less than **6 hours** old. A cron run missed
   at the cutoff is picked up by the next tick; older periods are skipped, so the first
   deploy never posts stale reports.
-- Each period is reported once. Rows are saved first (unique on kind, period, bidder),
-  then posted; `bids-daily:<date>` / `bids-weekly:<date>` in `SlackAlertLog` marks it posted.
+- Each period is reported once. A run first claims `bids-daily:<date>` / `bids-weekly:<date>`
+  in `SlackAlertLog` (an overlapping cron + HTTP run that cannot claim it skips the period),
+  then saves rows (unique on kind, period, bidder) and posts. The claim is released if
+  anything fails before the post succeeds.
 - If the Slack post fails, the saved rows are kept and the post is retried on the next
   tick (counts are not re-fetched).
-- If Slack is not configured, rows are saved and nothing is marked, so the report posts
+- If Slack is not configured, rows are saved and the claim is released, so the report posts
   once the channel and token are set (while still inside the 6 hour window).
 - No active bidders: the period is marked done without posting.
 - Windows are built from local wall-clock times, so a day crossing a DST change is
