@@ -1,4 +1,4 @@
-from typing import Annotated, Optional
+from typing import Annotated, Any, NamedTuple, Optional
 
 from beanie import PydanticObjectId
 from fastapi import Depends, HTTPException, status
@@ -46,9 +46,14 @@ async def require_admin(
     return user
 
 
+class BidderAuth(NamedTuple):
+    bidder: Bidder
+    claims: dict[str, Any]  # the presented token's, e.g. iat for renewal
+
+
 async def get_current_bidder(
     credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(_bearer)],
-) -> Bidder:
+) -> BidderAuth:
     """Extension auth: one message for every failure so a caller learns nothing about why."""
     invalid = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
     if credentials is None or credentials.scheme.lower() != "bearer":
@@ -71,4 +76,4 @@ async def get_current_bidder(
         or payload.get("ver") != bidder.tokenVersion
     ):
         raise invalid
-    return bidder
+    return BidderAuth(bidder, payload)

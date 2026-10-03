@@ -216,6 +216,63 @@ async def test_tokens_do_not_cross(ext, owner):
     assert (await ext.get("/ext/me", headers=auth(app_token))).status_code == 401
 
 
+def _token_issued(bidder_id, version, issued_at=None):
+    """A bidder token issued at `issued_at`; None makes one from before tokens carried `iat`."""
+    from jose import jwt
+
+    from app.config import get_settings
+
+    claims = {"sub": bidder_id, "typ": "bidder", "ver": version, "exp": datetime.now(timezone.utc) + timedelta(days=20)}
+    if issued_at is not None:
+        claims["iat"] = issued_at
+    return jwt.encode(claims, get_settings().AUTH_SECRET, algorithm="HS256")
+
+
+def _claims(token):
+    from app.security import decode_token
+
+    return decode_token(token)
+
+
+def _days_ago(days):
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+async def test_a_week_old_token_is_renewed(ext, storage):
+    bid, _, body = await register(ext)
+    assert "iat" in _claims(body["token"])
+    old = _token_issued(bid, 0, _days_ago(8))
+    me = (await ext.get("/ext/me", headers=auth(old))).json()
+    renewed = me.pop("token")
+    assert me == body["bidder"]
+    claims = _claims(renewed)
+    assert (claims["sub"], claims["typ"], claims["ver"]) == (bid, "bidder", 0)
+    assert claims["exp"] - datetime.now(timezone.utc).timestamp() > 29 * 86400
+    again = await ext.get("/ext/me", headers=auth(renewed))
+    assert again.status_code == 200 and "token" not in again.json()
+    up = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(old))
+    assert up.status_code == 200 and _claims(up.json()["token"])["ver"] == 0
+    up = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(renewed))
+    assert up.status_code == 200 and "token" not in up.json()
+
+
+async def test_fresh_tokens_are_not_renewed_and_tokens_without_iat_are(ext):
+    bid, _, body = await register(ext)
+    assert "token" not in (await ext.get("/ext/me", headers=auth(body["token"]))).json()
+    assert "token" not in (await ext.get("/ext/me", headers=auth(_token_issued(bid, 0, _days_ago(6))))).json()
+    assert "token" in (await ext.get("/ext/me", headers=auth(_token_issued(bid, 0)))).json()
+
+
+async def test_renewal_keeps_the_version_and_never_revives_a_reset_token(ext):
+    bid, _, _ = await register(ext)
+    b = await Bidder.get(PydanticObjectId(bid))
+    b.tokenVersion = 3
+    await b.save()
+    r = await ext.get("/ext/me", headers=auth(_token_issued(bid, 3, _days_ago(8))))
+    assert _claims(r.json()["token"])["ver"] == 3
+    assert (await ext.get("/ext/me", headers=auth(_token_issued(bid, 2, _days_ago(8))))).status_code == 401
+
+
 async def test_eleventh_failed_login_is_429(ext):
     await register(ext)
     for _ in range(10):

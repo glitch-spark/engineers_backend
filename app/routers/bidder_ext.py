@@ -17,10 +17,10 @@ from app.bids.schemas import LoginIn, RegisterIn, bidder_me, credentials_problem
 from app.bids.storage import BidStorageError, get_bid_storage
 from app.bids.upload_keys import build_upload_key
 from app.config import get_settings
-from app.deps import get_current_bidder
+from app.deps import BidderAuth, get_current_bidder
 from app.models import Account
 from app.models.bidder import Bidder
-from app.security import create_bidder_token, hash_password, verify_password
+from app.security import bidder_token_needs_renewal, create_bidder_token, hash_password, verify_password
 
 router = APIRouter(prefix="/ext", tags=["bidder-ext"])
 
@@ -77,6 +77,14 @@ async def _session(bidder: Bidder) -> dict:
         "token": create_bidder_token(str(bidder.id), bidder.tokenVersion),
         "bidder": bidder_me(bidder, await _profile_name(bidder)),
     }
+
+
+def _renewal(auth: BidderAuth) -> dict:
+    """{"token": <fresh>} when the presented token is a week old (same ver, new exp), else {}. The extension
+    stores any token it gets, so a bidder who keeps using it is never logged out by expiry."""
+    if not bidder_token_needs_renewal(auth.claims, datetime.now(timezone.utc)):
+        return {}
+    return {"token": create_bidder_token(str(auth.bidder.id), auth.bidder.tokenVersion)}
 
 
 async def register_bidder_row(bidder: Bidder, username: str, password_hash: str) -> bool:
@@ -142,8 +150,8 @@ async def login(body: LoginIn, request: Request) -> dict:
 
 
 @router.get("/me")
-async def me(bidder: Annotated[Bidder, Depends(get_current_bidder)]) -> dict:
-    return bidder_me(bidder, await _profile_name(bidder))
+async def me(auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
+    return {**bidder_me(auth.bidder, await _profile_name(auth.bidder)), **_renewal(auth)}
 
 
 class UploadUrlIn(BaseModel):
@@ -154,8 +162,9 @@ class UploadUrlIn(BaseModel):
 
 
 @router.post("/upload-url")
-async def upload_url(body: UploadUrlIn, bidder: Annotated[Bidder, Depends(get_current_bidder)]) -> dict:
+async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
     """The backend picks the object path; the extension only PUTs the PNG to the returned link."""
+    bidder = auth.bidder
     unavailable = HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Uploads are not configured")
     bucket = get_settings().BID_STORAGE_BUCKET
     storage = get_bid_storage()
@@ -177,4 +186,5 @@ async def upload_url(body: UploadUrlIn, bidder: Annotated[Bidder, Depends(get_cu
         "key": key,
         "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
         "headers": {"Content-Type": "image/png"},
+        **_renewal(auth),
     }
