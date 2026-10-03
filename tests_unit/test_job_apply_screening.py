@@ -6,7 +6,14 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.job_apply.schema import GateResult, JobExtraction, Location  # noqa: E402
-from app.job_apply.screening import bucket, build_report, group_key, profile_fits, rescreen  # noqa: E402
+from app.job_apply.screening import (  # noqa: E402
+    bucket,
+    build_report,
+    group_key,
+    markets_for,
+    profile_market,
+    rescreen,
+)
 
 RUN = date(2026, 10, 2)
 
@@ -55,20 +62,6 @@ def test_group_key():
     assert group_key([]) == "none"
 
 
-def test_profile_fits():
-    assert profile_fits("GB", country="GB", region="EU")
-    assert not profile_fits("GB", country="US", region="US")
-    assert profile_fits("Europe", country="DE", region=None)
-    assert profile_fits("EU+US", country="US", region=None)
-    assert profile_fits("none", country="US", region=None)
-    assert profile_fits("US", country=None, region=None)
-    assert profile_fits("Worldwide", country="BR", region=None)
-    # Locations the gates can't read count as unknown (a pass) at scoring time, so the report agrees.
-    assert profile_fits("Mars Colony", country="US", region=None)
-    assert profile_fits("Remote", country="US", region="US")
-    assert not profile_fits("GB+Remote", country="US", region="US")
-
-
 class _Row:
     """The fields rescreen reads and writes (a JobApplyRow without Beanie)."""
 
@@ -94,21 +87,56 @@ def test_rescreen_leaves_scored_and_failed_status():
     assert row.status == "fetch_failed"
 
 
+def test_markets_for():
+    assert markets_for("US") == ["US"]
+    assert markets_for("GB") == ["UKEU"] and markets_for("DE+ES+GB") == ["UKEU"]
+    assert markets_for("EMEA") == ["UKEU"] and markets_for("Europe") == ["UKEU"] and markets_for("EU") == ["UKEU"]
+    assert markets_for("BR") == ["LATAM"] and markets_for("Latam") == ["LATAM"]
+    assert markets_for("Americas") == ["US", "LATAM"] and markets_for("North America") == ["US"]
+    assert markets_for("Worldwide") == ["US", "UKEU", "LATAM"]
+    assert markets_for("EU+US") == ["US", "UKEU"]
+    assert markets_for("CA") == [] and markets_for("APAC") == [] and markets_for("IL") == [] and markets_for("Remote") == []
+    assert markets_for("none") == []
+
+
+def test_profile_market():
+    assert profile_market(country="US", region="US") == "US"
+    assert profile_market(country="GB", region=None) == "UKEU"
+    assert profile_market(country=None, region="EU") == "UKEU"
+    assert profile_market(country="BR", region="Latam") == "LATAM"
+    assert profile_market(country="CA", region="Canada") is None
+    assert profile_market(country=None, region=None) is None
+
+
+def test_other_location_bucket():
+    assert b(key="CA") == "other_location"
+    assert b(key="APAC", g=gates(freshness="unknown")) == "other_location"
+    assert b(key="CA", g=gates(freshness="fail")) == "too_old"
+    assert b(key="CA+US") == "valid"
+
+
 def test_build_report():
     sam = {"id": "s", "name": "Sam", "country": "GB", "region": "EU", "resumes": 2}
     alex = {"id": "a", "name": "Alex", "country": "US", "region": "US", "resumes": 1}
     rep = build_report(
-        [("valid", "GB"), ("check", "none"), ("closed", None), ("too_old", "US")], [alex, sam], max_age_days=30
+        [("valid", "GB"), ("check", "none"), ("closed", None), ("too_old", "US"), ("valid", "Worldwide"),
+         ("other_location", "CA"), ("other_location", "CA"), ("other_location", "APAC")],
+        [alex, sam], max_age_days=30,
     )
-    assert rep["total"] == 4 and rep["worth"] == 2 and rep["check"] == 1 and rep["maxAgeDays"] == 30
-    assert rep["buckets"]["closed"] == 1 and rep["buckets"]["not_fetched"] == 0 and len(rep["buckets"]) == 8
+    assert rep["total"] == 8 and rep["worth"] == 3 and rep["check"] == 1 and rep["maxAgeDays"] == 30
+    assert rep["buckets"]["closed"] == 1 and rep["buckets"]["other_location"] == 3 and len(rep["buckets"]) == 9
+    # the three target markets always show, then "not stated"; a Worldwide job is in every market
     assert rep["groups"] == [
-        {"key": "GB", "jobs": 1, "check": 0, "fits": ["s"]},
+        {"key": "US", "jobs": 1, "check": 0, "fits": ["a"]},
+        {"key": "UKEU", "jobs": 2, "check": 0, "fits": ["s"]},
+        {"key": "LATAM", "jobs": 1, "check": 0, "fits": []},
         {"key": "none", "jobs": 1, "check": 1, "fits": ["a", "s"]},
     ]
+    assert rep["others"] == [{"key": "CA", "jobs": 2}, {"key": "APAC", "jobs": 1}]
     assert rep["profiles"] == [alex, sam]
 
 
-def test_build_report_groups_sorted_by_size():
-    rep = build_report([("valid", "US"), ("valid", "GB"), ("valid", "GB")], [], max_age_days=30)
-    assert [g["key"] for g in rep["groups"]] == ["GB", "US"]
+def test_build_report_profile_without_location_fits_every_market():
+    nowhere = {"id": "n", "name": "N", "country": None, "region": None, "resumes": 1}
+    rep = build_report([("valid", "US")], [nowhere], max_age_days=30)
+    assert all(g["fits"] == ["n"] for g in rep["groups"])

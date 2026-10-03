@@ -47,7 +47,10 @@ def test_posting_reusable():
 
 
 def test_assigned_profiles():
-    assert assigned_profiles({"GB": ["a"], "*": ["b"]}, "GB") == {"a", "b"}
-    assert assigned_profiles({"GB": ["a"], "*": ["b"]}, "US") == {"b"}
+    # assignments are per market (US / UKEU / LATAM / none); a job's markets come from its location group
+    assert assigned_profiles({"UKEU": ["a"], "*": ["b"]}, "GB") == {"a", "b"}
+    assert assigned_profiles({"UKEU": ["a"], "*": ["b"]}, "US") == {"b"}
+    assert assigned_profiles({"US": ["a"], "UKEU": ["c"]}, "Worldwide") == {"a", "c"}
     assert assigned_profiles({}, "GB") == set()
     assert assigned_profiles({"none": ["a"]}, None) == {"a"}
+    assert assigned_profiles({"US": ["a"]}, "CA") == set()

@@ -18,7 +18,9 @@ RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fe
 # A run first screens its jobs (fetch, read, job gates), pauses at "screened" for the user to pick profiles per
 # location group, then scores only those job x profile pairs.
 RunPhase = Literal["screen", "score"]
-ScreenBucket = Literal["valid", "check", "closed", "not_fetched", "read_failed", "clearance", "onsite", "too_old"]
+ScreenBucket = Literal[
+    "valid", "check", "closed", "not_fetched", "read_failed", "clearance", "onsite", "too_old", "other_location",
+]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
 RUN_RETENTION_DAYS = 3
@@ -53,7 +55,8 @@ class JobApplyRun(TimestampedDocument):
     status: RunStatus = "queued"
     selection: List[RunSelection] = Field(default_factory=list)  # set when scoring starts
     phase: RunPhase = "screen"
-    # Location group key -> profiles to score its jobs against; "*" applies to every group.
+    # Candidate market (US / UKEU / LATAM, or "none" for no stated location) -> profiles to score its jobs
+    # against; "*" applies to every job.
     assignments: Dict[str, List[PydanticObjectId]] = Field(default_factory=dict)
     autoStart: bool = False  # created with profiles up front: score right after screening, no pause
     screenedAt: Optional[datetime] = None

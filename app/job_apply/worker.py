@@ -18,7 +18,7 @@ from beanie.odm.utils.encoder import Encoder
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
 from app.job_apply.gates import blocked, failing_reasons, job_gates
-from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key
+from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key, markets_for
 from app.job_apply.pipeline import ProfileInfo, ResumeInput, score_row
 from app.job_apply.resume_parse import parse_resume
 from app.job_apply.schema import GateResult, JobExtraction
@@ -72,8 +72,11 @@ def posting_reusable(fetched_at: datetime, now: datetime) -> bool:
 
 
 def assigned_profiles(assignments: dict[str, list], key: Optional[str]) -> set[str]:
-    """Profiles to score a job against: those picked for its location group plus those picked for every group."""
-    return {str(x) for x in assignments.get(key or NO_LOCATION, [])} | {str(x) for x in assignments.get("*", [])}
+    """Profiles to score a job against: those picked for each candidate market its location group is in (or for
+    "none" when it states no location), plus those picked for every job ("*")."""
+    keys = markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else [])
+    picked = {str(x) for k in keys for x in assignments.get(k, [])}
+    return picked | {str(x) for x in assignments.get("*", [])}
 
 
 def _screen(row: JobApplyRow) -> None:

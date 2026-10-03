@@ -1,11 +1,19 @@
 """Screening (spec 2026-10-02): before profiles are chosen, every job gets one bucket saying whether it's worth
-applying to and why not, and a location group; profiles are suggested per group by the same `covers()` rule the
-location gate uses at scoring time, so the report and the results agree."""
+applying to and why not, and a location group (where candidates may live). The report sorts worthwhile jobs into
+the three target candidate markets (US, UK/EU, Latam), suggests each market's profiles, and only counts jobs open
+to candidates elsewhere ("other locations")."""
 from collections import Counter
 from datetime import date
 from typing import Any, Optional, get_args
 
-from app.job_apply.gates import blocked, covers, failing_reasons, job_gates, normalize_country, region_key
+from app.job_apply.gates import (
+    COUNTRY_REGION,
+    blocked,
+    failing_reasons,
+    job_gates,
+    normalize_country,
+    region_key,
+)
 from app.job_apply.schema import GateResult, Location
 from app.models.job_apply import ScreenBucket
 
@@ -21,7 +29,32 @@ _REGION_LABEL = {
     "emea": "EMEA", "europe": "Europe", "eu": "EU", "apac": "APAC", "asia": "Asia",
 }
 _REGION_COUNTRY = {"us": "US", "usa": "US", "united states": "US", "canada": "CA"}
-_REGION_LABELS = frozenset(_REGION_LABEL.values())
+
+# Target candidate markets, in display order. A job is in every market whose candidates it accepts.
+MARKETS: tuple[str, ...] = ("US", "UKEU", "LATAM")
+_LABEL_MARKETS = {
+    "Worldwide": MARKETS, "Americas": ("US", "LATAM"), "North America": ("US",), "Latam": ("LATAM",),
+    "EMEA": ("UKEU",), "Europe": ("UKEU",), "EU": ("UKEU",),
+}
+_PROFILE_REGION_MARKET = {"US": "US", "EU": "UKEU", "Latam": "LATAM"}  # Account.region -> market
+
+
+def markets_for(key: Optional[str]) -> list[str]:
+    """Target markets whose candidates a job with this location group accepts (in MARKETS order)."""
+    found: set[str] = set()
+    for part in (key or NO_LOCATION).split("+"):
+        if part in _LABEL_MARKETS:
+            found.update(_LABEL_MARKETS[part])
+        elif len(part) == 2 and part.isupper():
+            market = _PROFILE_REGION_MARKET.get(COUNTRY_REGION.get(part, ""))
+            if market:
+                found.add(market)
+    return [m for m in MARKETS if m in found]
+
+
+def profile_market(*, country: Optional[str], region: Optional[str]) -> Optional[str]:
+    """The target market a profile's candidate lives in; None when outside the three (or not set)."""
+    return _PROFILE_REGION_MARKET.get(region or "") or _PROFILE_REGION_MARKET.get(COUNTRY_REGION.get((country or "").upper(), ""))
 
 
 def bucket(
@@ -38,6 +71,8 @@ def bucket(
     for gate, name in (("clearance", "clearance"), ("remote", "onsite"), ("freshness", "too_old")):
         if result.get(gate) == "fail":
             return "check" if force_include else name
+    if group_key and group_key != NO_LOCATION and not markets_for(group_key):
+        return "other_location"  # open only to candidates outside the target markets: counted, not scored
     if "unknown" in result.values() or group_key == NO_LOCATION:
         return "check"
     return "valid"
@@ -61,17 +96,6 @@ def group_key(locations: list[Location]) -> str:
     return "+".join(parts) if parts else NO_LOCATION
 
 
-def profile_fits(key: str, *, country: Optional[str], region: Optional[str]) -> bool:
-    """Every profile fits jobs with no stated location, and a profile with no location fits every group."""
-    if key == NO_LOCATION or not (country or region):
-        return True
-    locs = [Location(kind="region" if p in _REGION_LABELS else "country", value=p) for p in key.split("+")]
-    known = [loc for loc in locs if (region_key(loc.value) if loc.kind == "region" else normalize_country(loc.value))]
-    if not known:  # the location gate reads these as "unknown", which doesn't block, so the report agrees
-        return True
-    return any(covers(loc, country, region) for loc in known)
-
-
 def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:
     """Re-apply the job gates (max age changed, or Include anyway) to a row that has already been read."""
     if row.extraction is not None:
@@ -86,24 +110,36 @@ def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:
 
 
 def build_report(rows: list[tuple[Optional[str], Optional[str]]], profiles: list[dict], *, max_age_days: int) -> dict:
-    """`rows` are (screen, groupKey); `profiles` are {"id", "name", "country", "region", "resumes"}."""
+    """`rows` are (screen, groupKey); `profiles` are {"id", "name", "country", "region", "resumes"}.
+
+    `groups`: the three markets (always shown) and, when there are any, jobs with no stated location; each lists the
+    profiles whose candidate market it is (a profile with no location fits all). `others`: job counts per location
+    for jobs open only outside the markets."""
     counts = Counter(screen for screen, _ in rows if screen)
-    groups: dict[str, dict] = {}
+    groups = {k: {"key": k, "jobs": 0, "check": 0} for k in (*MARKETS, NO_LOCATION)}
+    others: Counter = Counter()
     for screen, key in rows:
+        if screen == "other_location":
+            others[key or NO_LOCATION] += 1
         if screen not in WORTH:
             continue
-        g = groups.setdefault(key or NO_LOCATION, {"key": key or NO_LOCATION, "jobs": 0, "check": 0})
-        g["jobs"] += 1
-        g["check"] += screen == "check"
-    ordered = sorted(groups.values(), key=lambda g: (-g["jobs"], g["key"]))
-    for g in ordered:
-        g["fits"] = [p["id"] for p in profiles if profile_fits(g["key"], country=p.get("country"), region=p.get("region"))]
+        for k in markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else []):
+            groups[k]["jobs"] += 1
+            groups[k]["check"] += screen == "check"
+    shown = [groups[m] for m in MARKETS] + ([groups[NO_LOCATION]] if groups[NO_LOCATION]["jobs"] else [])
+    for g in shown:
+        g["fits"] = [
+            p["id"] for p in profiles
+            if g["key"] == NO_LOCATION
+            or profile_market(country=p.get("country"), region=p.get("region")) in (g["key"], None)
+        ]
     return {
         "total": len(rows),
         "worth": counts["valid"] + counts["check"],
         "check": counts["check"],
         "buckets": {b: counts[b] for b in BUCKETS},
         "maxAgeDays": max_age_days,
-        "groups": ordered,
+        "groups": shown,
+        "others": [{"key": k, "jobs": n} for k, n in sorted(others.items(), key=lambda kv: (-kv[1], kv[0]))],
         "profiles": profiles,
     }

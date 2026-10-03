@@ -241,7 +241,7 @@ async def _migrate_job_apply_screening(database) -> None:
     become auto-started score-phase runs with every group assigned to every selected profile, and their rows get
     the screening bucket and location group from what's already stored."""
     from app.job_apply.schema import GateResult, Location
-    from app.job_apply.screening import bucket, group_key
+    from app.job_apply.screening import bucket, group_key, markets_for
 
     runs, rows = database["job_apply_runs"], database["job_apply_rows"]
     try:
@@ -262,6 +262,11 @@ async def _migrate_job_apply_screening(database) -> None:
                     force_include=bool(row.get("forceInclude")),
                 )
                 await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": screen, "groupKey": key}})
+        # Jobs open only to candidates outside the target markets (US, UK/EU, Latam) are counted, not scored.
+        async for row in rows.find({"screen": {"$in": ["valid", "check"]}, "groupKey": {"$nin": [None, "none"]}},
+                                   {"groupKey": 1}):
+            if not markets_for(row["groupKey"]):
+                await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": "other_location"}})
     except Exception as exc:  # noqa: BLE001
         log.warning("job-apply screening back-fill failed: %s", exc)
 

@@ -923,7 +923,9 @@ async def test_screening_report(client, staff_user, auth_header):
     run_id = await screened_run(client, h)
     rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
     assert rep["total"] == 3 and rep["worth"] == 2 and rep["buckets"]["onsite"] == 1 and rep["maxAgeDays"] == 30
-    assert rep["groups"] == [{"key": "US", "jobs": 2, "check": rep["groups"][0]["check"], "fits": [str(us.id)]}]
+    assert [g["key"] for g in rep["groups"]] == ["US", "UKEU", "LATAM"] and rep["others"] == []
+    assert rep["groups"][0]["jobs"] == 2 and rep["groups"][0]["fits"] == [str(us.id)]
+    assert rep["groups"][1]["jobs"] == 0 and rep["groups"][1]["fits"] == []
     assert rep["profiles"][0]["id"] == str(us.id) and rep["profiles"][0]["resumes"] == 2
 
 
@@ -1172,3 +1174,34 @@ async def test_cache_from_older_fetcher_is_refetched(client, staff_user, auth_he
     run_id = await screened_run(client, h)
     gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
     assert gh["screen"] == "closed"
+
+
+async def test_start_market_without_jobs_400(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    gb = await make_account(staff_user, country="GB", name="UK")
+    run_id = await screened_run(client, h)
+    r = await start(client, h, run_id, {"UKEU": [gb]}, [gb])
+    assert r.status_code == 400 and "at least one profile" in r.json()["error"]
+
+
+async def test_rows_carry_markets(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    assert rows["https://jobs.example.com/remote"]["markets"] == ["US"]
+
+
+async def test_other_location_migration(client, staff_user, auth_header):
+    from app.db import _migrate_job_apply_screening
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    coll = JobApplyRow.get_motor_collection()
+    await coll.update_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"},
+                          {"$set": {"groupKey": "CA", "screen": "valid"}})
+    await _migrate_job_apply_screening(JobApplyRun.get_motor_collection().database)
+    row = await coll.find_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"})
+    assert row["screen"] == "other_location"
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["others"] == [{"key": "CA", "jobs": 1}] and rep["buckets"]["other_location"] == 1

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, gsheet, worker
-from app.job_apply.screening import FORCEABLE, WORTH, bucket, build_report, rescreen
+from app.job_apply.screening import FORCEABLE, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
@@ -239,6 +239,7 @@ def _row_summary(
         "statusReason": row.statusReason,
         "screen": row.screen,
         "groupKey": row.groupKey,
+        "markets": markets_for(row.groupKey),
         "forceInclude": row.forceInclude,
         "jdSource": row.jdSource,
         "postedDate": row.postedDate.isoformat() if row.postedDate else None,
@@ -665,7 +666,7 @@ async def start_run(run_id: str, body: StartBody, user: Annotated[UserExtra, Dep
     if any(v not in picked for ids in assignments.values() for v in ids):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick resumes for every assigned profile.")
     worth = await JobApplyRow.find({"runId": run.id, "screen": {"$in": list(WORTH)}}).project(_ScreenView).to_list()
-    keys = {r.groupKey or "none" for r in worth}
+    keys = {k for r in worth for k in (markets_for(r.groupKey) or [NO_LOCATION])}
     if not keys or not ("*" in assignments or keys & set(assignments)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least one profile for a group with jobs.")
     res = await JobApplyRun.get_motor_collection().update_one(
