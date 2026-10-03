@@ -21,11 +21,20 @@ from app.free_llm import (
     clamp_max_tokens,
     get_preset,
 )
+from app.llm_anthropic import anthropic_complete
+from app.model_catalog import (
+    TASK_EFFORT,
+    ModelSpec,
+    Task,
+    fallback_chain,
+    usage_cost,
+    validate_requested,
+)
 from app.models import UserExtra
 
 log = logging.getLogger(__name__)
 
-LlmProvider = Literal["free", "openai"]
+LlmProvider = Literal["free", "openai", "anthropic"]
 
 
 @dataclass
@@ -36,6 +45,8 @@ class LlmResult:
     usage: dict
     fallback_used: bool
     fallback_reason: Optional[str] = None
+    model_id: str = ""  # provider-prefixed catalog id, e.g. "anthropic:claude-sonnet-5-5"
+    cost_usd: Optional[float] = None  # None when the model's price is unknown
 
 
 def free_llm_configured(user: Optional[UserExtra]) -> bool:
@@ -269,8 +280,89 @@ async def complete_with_fallback(
     )
 
 
-async def complete_resume(prompt: str, user: Optional[UserExtra]) -> LlmResult:
-    return await complete_with_fallback(prompt, user, purpose="resume")
+_TASK_PURPOSE = {"resume": "resume", "cover_letter": "resume", "screening": "screening"}
+
+
+async def _call_spec(
+    spec: ModelSpec, prompt: str, task: Task, user: Optional[UserExtra]
+) -> tuple[str, dict]:
+    """One call to one catalog model. Raises on any provider failure."""
+    if spec.provider == "anthropic":
+        effort = TASK_EFFORT[task] if spec.supports_effort else None
+        return await anthropic_complete(spec.api_model, prompt, effort=effort)
+    if spec.provider == "openai":
+        return await _openai_responses(prompt, spec.api_model)
+    preset = get_preset(spec.id.split(":", 1)[1])
+    api_key = (getattr(user, "freeLlmApiKey", None) or "").strip()
+    if preset is None or not api_key:
+        raise RuntimeError(f"{spec.id} is not configured for this user")
+    purpose = _TASK_PURPOSE[task]
+    max_tokens = _free_max_tokens_for_purpose(
+        purpose, clamp_max_tokens(getattr(user, "freeLlmMaxTokens", None), preset)
+    )
+    return await _free_chat_completion(
+        prompt, preset, api_key, max_tokens, timeout=_free_timeout_for_purpose(purpose, preset)
+    )
+
+
+def _failure_reason(spec: ModelSpec, exc: Exception) -> str:
+    if spec.provider == "free":
+        return _free_llm_user_message(exc, timeout_seconds=float(FREE_LLM_RESUME_TIMEOUT_SECONDS))
+    return f"{spec.label}: {str(exc)[:300]}"
+
+
+async def complete(
+    task: Task,
+    prompt: str,
+    user: Optional[UserExtra],
+    *,
+    model_id: Optional[str] = None,
+    validate: Optional[Callable[[str], None]] = None,
+) -> LlmResult:
+    """Run `prompt` on the requested model (or the task default), falling back down the chain.
+
+    Raises ModelNotAvailable for a bad requested id; otherwise re-raises the last model's error
+    when every model in the chain fails."""
+    validate_requested(task, model_id, user)
+    chain = fallback_chain(task, model_id, user)
+    if not chain:
+        raise RuntimeError(f"No model available for {task}: configure an API key")
+    first_reason: Optional[str] = None
+    last_exc: Optional[Exception] = None
+    for index, spec in enumerate(chain):
+        try:
+            text, usage = await _call_spec(spec, prompt, task, user)
+            if not (text or "").strip():
+                raise ValueError("empty model output")
+            if validate:
+                validate(text)
+        except Exception as exc:  # noqa: BLE001 — any failure moves on to the next model
+            last_exc = exc
+            first_reason = first_reason or _failure_reason(spec, exc)
+            log.warning("%s via %s failed: %s", task, spec.id, exc)
+            continue
+        log.info(
+            "%s via %s in=%s out=%s fallback=%s",
+            task, spec.id, usage.get("input", "?"), usage.get("output", "?"), index > 0,
+        )
+        return LlmResult(
+            text=text,
+            provider=spec.provider,
+            model=spec.api_model,
+            usage=usage,
+            fallback_used=index > 0,
+            fallback_reason=first_reason if index > 0 else None,
+            model_id=spec.id,
+            cost_usd=usage_cost(spec, usage),
+        )
+    assert last_exc is not None
+    raise last_exc
+
+
+async def complete_resume(
+    prompt: str, user: Optional[UserExtra], model_id: Optional[str] = None
+) -> LlmResult:
+    return await complete("resume", prompt, user, model_id=model_id)
 
 
 def _coerce_screening_answer(item: object) -> str:
@@ -513,16 +605,16 @@ def _validate_screening_output(raw: str, questions: list[str]) -> None:
         raise ValueError("screening LLM returned unparsed answers JSON wrapper")
 
 
-async def complete_screening(prompt: str, user: Optional[UserExtra], questions: list[str]) -> LlmResult:
+async def complete_screening(
+    prompt: str,
+    user: Optional[UserExtra],
+    questions: list[str],
+    model_id: Optional[str] = None,
+) -> LlmResult:
     def _validate(raw: str) -> None:
         _validate_screening_output(raw, questions)
 
-    return await complete_with_fallback(
-        prompt,
-        user,
-        validate=_validate,
-        purpose="screening",
-    )
+    return await complete("screening", prompt, user, model_id=model_id, validate=_validate)
 
 
 async def test_free_connection(user: UserExtra) -> dict:
