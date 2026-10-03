@@ -24,7 +24,6 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
-from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
@@ -305,65 +304,6 @@ def _build_resume_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _resume_model_and_effort() -> tuple[str, str]:
-    """Resolve the resume model and reasoning effort from settings. Used by
-    both the live call and the cache key so a hit reflects exactly the params
-    the output was produced with."""
-    settings = get_settings()
-    model = settings.RESUME_OPENAI_MODEL
-    effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
-    return model, effort
-
-
-async def _openai_call(prompt: str) -> tuple[str, dict]:
-    """Single OpenAI Responses call. Returns (output_text, usage_dict).
-
-    usage_dict shape: {input, output, reasoning}. Empty dict on failure or
-    when the SDK doesn't surface usage.
-
-    gpt-5-mini is a reasoning model — without an explicit effort it defaults
-    to medium and bills heavy hidden reasoning tokens (at output rate). The
-    resume task is a mechanical text-replace inside a fixed template, so it
-    needs little reasoning. Pin effort low to cut hidden-token cost ~5-10x.
-    Override via RESUME_REASONING_EFFORT env if a profile needs more depth."""
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OPENAI_API_KEY not configured",
-        )
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    model, effort = _resume_model_and_effort()
-    kwargs: dict = {"model": model, "input": prompt}
-    # Reasoning param only applies to gpt-5* reasoning models; harmless to
-    # send, but guard so a non-reasoning override model doesn't 400.
-    if model.startswith("gpt-5"):
-        kwargs["reasoning"] = {"effort": effort}
-    response = await client.responses.create(**kwargs)
-
-    usage_out: dict = {}
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        out_details = getattr(usage, "output_tokens_details", None)
-        reasoning_toks = getattr(out_details, "reasoning_tokens", None) if out_details else None
-        input_toks = getattr(usage, "input_tokens", None)
-        output_toks = getattr(usage, "output_tokens", None)
-        log.info(
-            "resume LLM usage: in=%s out=%s reasoning=%s effort=%s",
-            input_toks if input_toks is not None else "?",
-            output_toks if output_toks is not None else "?",
-            reasoning_toks if reasoning_toks is not None else "?",
-            effort,
-        )
-        if input_toks is not None:
-            usage_out["input"] = int(input_toks)
-        if output_toks is not None:
-            usage_out["output"] = int(output_toks)
-        if reasoning_toks is not None:
-            usage_out["reasoning"] = int(reasoning_toks)
-    return (response.output_text or ""), usage_out
-
-
 def _resume_cache_key(prompt: str, lane: str) -> str:
     """Content hash that fully determines the LLM output: lane (provider+model
     params) + the complete prompt."""
@@ -636,69 +576,3 @@ async def generate_resume(
         llm_model_id=llm_result.model_id,
         cost_usd=llm_result.cost_usd,
     )
-
-
-_COVER_LETTER_SYSTEM = (
-    "You write a personalized cover letter for a job application. The "
-    "letter MUST be grounded in two inputs supplied below:\n"
-    "  1. CANDIDATE RESUME — the tailored resume's plain text. Every fact "
-    "the letter cites (experience, companies, years, technologies, "
-    "achievements, metrics) MUST come from this resume. Do NOT invent "
-    "roles, companies, dates, projects, or numbers that are not present.\n"
-    "  2. JOB DESCRIPTION — the role's requirements and priorities. The "
-    "letter must tie the candidate's resume facts to what this specific "
-    "JD asks for (skills, domain, seniority, mission). Do not paste JD "
-    "phrases verbatim.\n"
-    "\n"
-    "Output rules:\n"
-    "- PLAIN TEXT only. No Markdown, no HTML, no code fences, no "
-    "surrounding commentary.\n"
-    "- 3-5 short paragraphs separated by a blank line, unless the custom "
-    "prompt below overrides.\n"
-    "- Address the hiring team naturally; do not invent a recruiter's "
-    "name.\n"
-    "- If the resume lacks evidence for a JD requirement, do not claim "
-    "it — pivot to adjacent strengths.\n"
-    "- Do NOT include personal contact details (phone number, email, "
-    "mailing address, LinkedIn URL, portfolio URL, or similar) unless the "
-    "custom prompt below explicitly asks for them. Candidate name is "
-    "allowed when natural; everything else stays out by default.\n"
-)
-
-
-async def generate_cover_letter(
-    *,
-    candidate_resume_text: str,
-    job_description: str,
-    company: str,
-    prompt_body: str,
-) -> tuple[str, dict]:
-    """Generate a plain-text cover letter using gpt-5-mini (low reasoning).
-    Returns (text, usage_dict). `prompt_body` is the resolved cover-letter
-    prompt (account > user). If empty, the system rules carry the call —
-    output will be generic but coherent."""
-    parts: list[str] = [_COVER_LETTER_SYSTEM]
-    body = (prompt_body or "").strip()
-    if body:
-        parts.append(
-            "CUSTOM PROMPT (candidate's style guidance — follow within the "
-            "absolute rules above):\n" + body
-        )
-    if (company or "").strip():
-        parts.append(f"Target company: {company.strip()}")
-    # Both sources are required for grounded output — log a warning when
-    # either is missing so the caller can fix the upstream pipeline.
-    if not (candidate_resume_text or "").strip():
-        log.warning("cover letter prompt missing resume text — output will be generic")
-    if not (job_description or "").strip():
-        log.warning("cover letter prompt missing job description — output will be generic")
-    parts.append(
-        "=== CANDIDATE RESUME (source of all factual claims) ===\n"
-        + (candidate_resume_text or "(no resume text supplied)").strip()
-    )
-    jd = trim_jd(job_description) or "(no JD supplied)"
-    parts.append(
-        "=== JOB DESCRIPTION (what the letter must address) ===\n" + jd
-    )
-    text, usage = await _openai_call("\n\n".join(parts))
-    return _normalize_dashes(_strip_fences(text)), usage

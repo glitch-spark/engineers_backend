@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
 from app.deps import get_current_user
 from app.models import Account, ResumeApplication, UserExtra
@@ -209,14 +210,21 @@ async def _run_job(
             if not cl_prompt and owner:
                 cl_prompt = (getattr(owner, "coverLetterPromptBody", None) or "").strip()
             try:
-                from app.resume_service import generate_cover_letter as _gen_cover
-                cl_text, _cl_usage = await _gen_cover(
-                    candidate_resume_text=job.plainText or "",
+                cl = await write_cover_letter(
+                    resume_text=job.plainText or "",
                     job_description=jd,
                     company=company,
                     prompt_body=cl_prompt,
+                    user=owner,
+                    model_id=job.coverLetterModelId,
+                    hook=job.coverLetterHook,
                 )
-                job.coverLetterText = cl_text
+                job.coverLetterText = cl.text
+                job.coverLetterLlmProvider = cl.provider
+                job.coverLetterLlmModel = cl.model
+                job.coverLetterLlmFallbackUsed = cl.fallback_used
+                job.coverLetterLlmFallbackReason = cl.fallback_reason
+                _add_cost(job, cl.cost_usd)
             except Exception as exc:  # noqa: BLE001 — non-fatal
                 log.warning("cover-letter generation failed for job %s: %s", job_id, exc)
 
@@ -285,6 +293,10 @@ def _reset_failed_job_fields(job: ResumeApplication) -> None:
     job.s3Url = None
     job.plainText = None
     job.coverLetterText = None
+    job.coverLetterLlmProvider = None
+    job.coverLetterLlmModel = None
+    job.coverLetterLlmFallbackUsed = None
+    job.coverLetterLlmFallbackReason = None
     job.screeningPairs = []
     job.inputTokens = None
     job.outputTokens = None
@@ -543,6 +555,10 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "outputTokens": job.outputTokens,
         "reasoningTokens": job.reasoningTokens,
         "coverLetterText": job.coverLetterText,
+        "coverLetterLlmProvider": job.coverLetterLlmProvider,
+        "coverLetterLlmModel": job.coverLetterLlmModel,
+        "coverLetterLlmFallbackUsed": job.coverLetterLlmFallbackUsed,
+        "coverLetterLlmFallbackReason": job.coverLetterLlmFallbackReason,
         "resumeModelId": job.resumeModelId,
         "coverLetterModelId": job.coverLetterModelId,
         "screeningModelId": job.screeningModelId,

@@ -81,6 +81,11 @@ class ResumeApplication(TimestampedDocument):
     # Plain-text cover letter generated alongside the resume (opt-in per
     # submission). Empty when the user didn't request one.
     coverLetterText: Optional[str] = None
+    # Which model wrote the cover letter (same shape as the resume/screening fields).
+    coverLetterLlmProvider: Optional[str] = None  # "free" | "openai" | "anthropic"
+    coverLetterLlmModel: Optional[str] = None
+    coverLetterLlmFallbackUsed: Optional[bool] = None
+    coverLetterLlmFallbackReason: Optional[str] = None
 
     # Models the user picked at submit time (catalog ids; None = server default). Kept so
     # retries and queue restarts reuse the same choice.
