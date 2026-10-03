@@ -28,7 +28,7 @@ from app.resume_service import (
     s3_enabled,
     trim_jd,
 )
-from app.routers._util import doc_to_dict, to_object_id
+from app.routers._util import doc_to_dict, require_model, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
 log = logging.getLogger(__name__)
@@ -68,6 +68,12 @@ class GenerateBody(BaseModel):
     promptBody: Optional[str] = None
     # Opt-in cover letter for this submission only.
     generateCoverLetter: bool = False
+    # Catalog model ids (GET /resume/models); omitted/blank = server default for that task.
+    resumeModel: Optional[str] = None
+    coverLetterModel: Optional[str] = None
+    screeningModel: Optional[str] = None
+    # Optional one-line angle for the cover letter.
+    coverLetterHook: Optional[str] = Field(default=None, max_length=500)
 
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -80,6 +86,9 @@ async def generate(
     The queue worker (app/resume_queue.py) runs the LLM + PDF + optional screening/cover-letter steps with
     bounded concurrency. Frontend polls GET /resume/jobs to follow progress.
     """
+    resume_model = require_model("resume", body.resumeModel, user)
+    cover_letter_model = require_model("cover_letter", body.coverLetterModel, user)
+    screening_model = require_model("screening", body.screeningModel, user)
     account = await _load_owned_account(body.accountId, user)
     job = await resume_queue.enqueue_generation(
         user=user,
@@ -90,6 +99,10 @@ async def generate(
         questions=body.questions,
         prompt_body=body.promptBody,
         cover_letter=body.generateCoverLetter,
+        resume_model=resume_model,
+        cover_letter_model=cover_letter_model,
+        screening_model=screening_model,
+        cover_letter_hook=body.coverLetterHook,
     )
     return {"jobId": str(job.id), "status": job.status}
 
@@ -137,8 +150,10 @@ async def _run_job(
         await resume_queue.persist_job(job)
 
         result = await generate_resume(
-            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id)
+            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id),
+            model_id=job.resumeModelId,
         )
+        _add_cost(job, result.cost_usd)
         job.inputTokens = result.input_tokens
         job.outputTokens = result.output_tokens
         job.reasoningTokens = result.reasoning_tokens
@@ -222,6 +237,12 @@ async def _run_job(
         await _mark_failed(job, str(exc), started)
 
 
+def _add_cost(job: ResumeApplication, cost: Optional[float]) -> None:
+    """Add one step's spend to the job's running total (unknown prices add nothing)."""
+    if cost is not None:
+        job.estimatedCostUsd = (job.estimatedCostUsd or 0.0) + cost
+
+
 def run_job_doc(job: ResumeApplication):
     """Run a claimed queue job with the inputs stored on it (used by app/resume_queue.py)."""
     return _run_job(
@@ -274,6 +295,7 @@ def _reset_failed_job_fields(job: ResumeApplication) -> None:
     job.screeningLlmModel = None
     job.screeningLlmFallbackUsed = None
     job.screeningLlmFallbackReason = None
+    job.estimatedCostUsd = None
 
 
 # ---------- Screening (extracted helper, reused by job + standalone endpoint) -
@@ -509,6 +531,11 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "outputTokens": job.outputTokens,
         "reasoningTokens": job.reasoningTokens,
         "coverLetterText": job.coverLetterText,
+        "resumeModelId": job.resumeModelId,
+        "coverLetterModelId": job.coverLetterModelId,
+        "screeningModelId": job.screeningModelId,
+        "coverLetterHook": job.coverLetterHook,
+        "estimatedCostUsd": job.estimatedCostUsd,
         "resumeLlmProvider": job.resumeLlmProvider,
         "resumeLlmModel": job.resumeLlmModel,
         "resumeLlmFallbackUsed": job.resumeLlmFallbackUsed,

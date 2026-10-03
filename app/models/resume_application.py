@@ -82,6 +82,16 @@ class ResumeApplication(TimestampedDocument):
     # submission). Empty when the user didn't request one.
     coverLetterText: Optional[str] = None
 
+    # Models the user picked at submit time (catalog ids; None = server default). Kept so
+    # retries and queue restarts reuse the same choice.
+    resumeModelId: Optional[str] = None
+    coverLetterModelId: Optional[str] = None
+    screeningModelId: Optional[str] = None
+    coverLetterHook: Optional[str] = None  # optional one-line angle for the cover letter
+
+    # Running total of model spend for this job (None until a priced model has run).
+    estimatedCostUsd: Optional[float] = None
+
     # Whether this job was submitted with generateCoverLetter=True — retained
     # so a failed-job retry can honor the original opt-in.
     generateCoverLetter: bool = False
