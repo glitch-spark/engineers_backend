@@ -111,6 +111,7 @@ def create_app() -> FastAPI:
     app.include_router(integrations.outlook_oauth_router)
     app.include_router(slack_bot.router)
     app.include_router(slack_bot.cron_router)
+    app.include_router(bidders.router)
     app.include_router(bidders.cron_router)
 
     return app
