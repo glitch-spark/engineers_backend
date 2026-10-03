@@ -221,6 +221,8 @@ async def complete_with_fallback(
     """Try free NVIDIA tier when configured; fall back to OpenAI on errors/bad output."""
     settings = get_settings()
     preset, max_tokens, api_key = resolve_free_preset(user) if user else (None, 8192, "")
+    if purpose == "job_extract" and (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip():
+        preset = None  # the configured extraction model is the one whose accuracy was measured
     attempted_free = False
     fallback_reason: Optional[str] = None
 

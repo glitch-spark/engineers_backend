@@ -388,3 +388,29 @@ async def test_job_extract_uses_its_own_model_when_set(monkeypatch):
         OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL=""))
     await router.complete_with_fallback("p", None, purpose="job_extract")
     assert seen == ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o-mini"]
+
+
+async def test_job_extract_skips_free_model_when_extract_model_set(monkeypatch):
+    """A configured JOB_EXTRACT_MODEL is the model whose accuracy was measured: use it, not a user's free preset."""
+    import app.llm_router as router
+
+    calls = []
+
+    async def fake_free(*a, **k):
+        calls.append("free")
+        return '{"title":"T"}', {}
+
+    async def fake_responses(prompt, model=None, *, temperature=None):
+        calls.append(model)
+        return '{"title":"T"}', {}
+
+    preset = SimpleNamespace(model="z-ai/glm")
+    monkeypatch.setattr(router, "resolve_free_preset", lambda user: (preset, 4096, "key"))
+    monkeypatch.setattr(router, "_free_chat_completion", fake_free)
+    monkeypatch.setattr(router, "_openai_responses", fake_responses)
+    monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(
+        OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL="gpt-4.1-mini"))
+    user = SimpleNamespace(id="u")
+    await router.complete_with_fallback("p", user, purpose="job_extract")
+    await router.complete_with_fallback("p", user, purpose="resume")
+    assert calls == ["gpt-4.1-mini", "free"]
