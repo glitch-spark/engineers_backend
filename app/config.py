@@ -102,8 +102,9 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
-    # Bidders — screenshot folders are counted in object storage (only "s3" for now). The access
-    # key / secret / region fall back to the AWS_* values above when unset.
+    # Bidders — screenshot folders are counted in object storage (only "s3" for now). Without an
+    # endpoint (AWS S3) the access key / secret / region fall back to the AWS_* values above when
+    # unset; with BID_STORAGE_ENDPOINT_URL set there is no AWS fallback (both BID_STORAGE_* keys needed).
     BID_STORAGE_PROVIDER: str = "s3"
     BID_STORAGE_ACCESS_KEY_ID: Optional[str] = None
     BID_STORAGE_SECRET_ACCESS_KEY: Optional[str] = None

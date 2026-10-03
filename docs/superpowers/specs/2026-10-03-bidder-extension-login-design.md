@@ -70,8 +70,9 @@ Indexes (new): unique sparse `folder`, unique sparse `username`, unique sparse `
 
 `folder_slug(name)`: NFKD-normalize, drop accents, lower-case, replace every run of characters outside
 `[a-z0-9]` with `-`, trim `-`, cut to 40 characters (trim a trailing `-` again), empty → `bidder`.
-If taken by any bidder (archived included), append `-2`, `-3`, … until free. A unique-index race on insert
-retries with the next suffix.
+If taken by any bidder (archived included), append `-2`, `-3`, … until free. The top-level prefix of every
+bidder URL in `BID_STORAGE_BUCKET` also counts as taken (no `bids` while legacy `bids/ana/` exists). A
+unique-index race on insert retries with the next suffix.
 
 The profile path segment uses the same slug function on the bidder's current profile (`Account.name`) at
 upload time; no profile → `no-profile`.
@@ -81,8 +82,10 @@ upload time; no profile → `no-profile`.
 Bidders created before this feature have no `folder`. An idempotent backfill runs at API startup (after
 `init_db`): for each bidder without `folder`, take the prefix of its `screenshotFolderUrl`
 (`parse_folder_url`, trailing `/` removed, e.g. `puma`, `bids/ana`) and slug it the same way (`/` → `-`); on a
-clash append `-2`… Legacy bidders have no invite: status "invited" with no code until the owner clicks
-**New invite code**.
+clash append `-2`… A first pass gives bidders already stored at `<BID_STORAGE_BUCKET>/<slug>/` exactly that
+folder; the rest follow in `_id` order. `python -m app.bids.folders --report` lists (read-only) the active
+bidders whose folder URL changes on registration. Legacy bidders have no invite: status "invited" with no
+code until the owner clicks **New invite code**.
 
 ### 3.3 Status (derived, not stored)
 
@@ -103,7 +106,8 @@ on the whole bucket (`listBuckets`, `listFiles`, `writeFiles`). Bidder tokens ar
 
 - Format: `<TAG>-XXXX-XXXX`, where `TAG` is the first 4 characters of the folder upper-cased (padded with `X`)
   and each `X` is drawn with `secrets` from Crockford base32 (`0-9 A-Z` without `I L O U`). ~40 bits of entropy.
-- Normalization before hashing and comparing: upper-case, remove spaces and `-`, map `O→0`, `I/L→1`.
+- Normalization before hashing and comparing: upper-case, map `O→0`, `I/L→1`, then drop every character outside
+  `[0-9A-Z]` (spaces, `-`, tabs, NBSPs, zero-width spaces).
 - `new_invite(bidder) -> str`: sets `inviteCodeHash`, `inviteExpiresAt = now + 7 days`, returns the code. The code
   itself is never stored.
 - Registration consumes the code: `inviteCodeHash` and `inviteExpiresAt` are cleared in the same update that sets
@@ -126,16 +130,23 @@ on the whole bucket (`listBuckets`, `listFiles`, `writeFiles`). Bidder tokens ar
 
 | Method | Path | Body → result |
 |---|---|---|
-| `POST` | `/ext/register` | `{inviteCode, username, password}` → `{token, bidder: <me>}`. 400 `Invite code is invalid or expired` (wrong, used, expired, archived bidder — one message). 409 `Username is taken`. 422 on rule violations. |
-| `POST` | `/ext/login` | `{username, password}` → `{token, bidder: <me>}`. 401 `Wrong username or password` (also for archived bidders). |
-| `GET` | `/ext/me` | → `<me>` = `{name, folder, profileName, username, status}` |
-| `POST` | `/ext/upload-url` | `{job, step, trigger, capturedAt}` → `{url, key, expiresAt, headers: {"Content-Type": "image/png"}}` |
+| `POST` | `/ext/register` | `{inviteCode, username, password}` → `{token, bidder: <me>}`. 400 `Invite code is invalid or expired` (wrong, used, expired, archived bidder — one message). 409 `Username is taken`. 400 with the rule on rule violations (below). |
+| `POST` | `/ext/login` | `{username, password}` → `{token, bidder: <me>}`. 401 `Wrong username or password` (also for archived bidders). 400 with the rule on rule violations. |
+| `GET` | `/ext/me` | → `<me>` = `{name, folder, profileName, username, status}` (+ `token` when renewed, §6.3) |
+| `POST` | `/ext/upload-url` | `{job, step, trigger, capturedAt}` → `{url, key, expiresAt, headers: {"Content-Type": "image/png"}}` (+ `token` when renewed, §6.3) |
 
 Rules: `username` 3–40 characters `[a-z0-9._-]` (input lower-cased); `password` at least 8 characters.
+The schemas only strip/lower-case the username and cap lengths (username 100, password 1024; past that the
+generic 400 `Invalid request`); the routes check the rules after reserving a limiter slot and answer 400 with
+`Username must be 3–40 characters: lowercase letters, numbers, dots, underscores or dashes`,
+`Password must be at least 8 characters` or (over 72 bytes) `Password is too long`.
+Error bodies are `{"error": "<message>"}` (the app's exception handlers, `app/main.py`).
 
 ### 6.3 Bidder tokens and auth dependency
 
-- JWT HS256 with `AUTH_SECRET`; claims `{sub: <bidder id>, typ: "bidder", ver: <tokenVersion>, exp: now + 30 days}`.
+- JWT HS256 with `AUTH_SECRET`; claims `{sub: <bidder id>, typ: "bidder", ver: <tokenVersion>, iat: now, exp: now + 30 days}`.
+- Renewal: when the presented token is older than 7 days (or has no `iat`), `/ext/me` and `/ext/upload-url` add a
+  fresh `token` (same `ver`, new `exp`) to their response; the extension stores any `token` it receives.
 - `get_current_bidder` (new, `app/deps.py`): bearer token → decode → `typ == "bidder"` → load bidder → refuse
   (401) when missing, archived, not registered, or `ver != tokenVersion`.
 - `get_current_user` (existing) refuses tokens with `typ == "bidder"` (401). App tokens have no `typ` and are
@@ -164,7 +175,8 @@ In-process limiter (`app/bids/rate_limit.py`): failed `/ext/login` and `/ext/reg
 username and per client IP; 10 failures within 15 minutes → 429 with `Retry-After`. A success clears the
 username's counter. Per process only (acceptable: one API process). The client IP is the first entry of
 `X-Forwarded-For` when present (Railway's proxy), else `request.client.host`; otherwise every bidder would share
-the proxy's IP and lock each other out.
+the proxy's IP and lock each other out. The forwarded entry is capped at 64 characters and limiter keys at 100
+(username) / 64 (IP); past 10,000 keys, stale keys are swept on the next attempt.
 
 ## 7. Extension (Bid Track 3.0.0)
 
@@ -181,7 +193,8 @@ Put the folder under git before changing it (local repo; remote chosen by the us
 - Logged out: tabs **Register** (invite code, username, password) and **Log in** (username, password); error
   text from the API is shown under the form.
 - Logged in: header `Puma · Upwork · uploading to puma/`, the existing record list, **Log out**.
-- After a 401: logged-out view with *"Your login was reset — ask your manager for a new invite code."*
+- After a 401 (only if the stored token is still the one that was sent): logged-out view on the **Log in** tab with
+  *"You were logged out — log in again. If your manager reset your login, ask them for a new invite code."*
 
 ### 7.3 Options page
 - Remove the Backblaze section and its Test upload.
@@ -225,9 +238,12 @@ Replaces `buildScreenshotObjectKey` + `uploadPngToB2`:
 2. Create a Backblaze key with write + list on the whole bucket; set `BID_STORAGE_*`, `BID_STORAGE_BUCKET` and the
    endpoint on Railway (API **and** cron services).
 3. Deploy backend, then app. Existing bidders show "Invited · no code yet"; counting continues unchanged.
-4. Issue codes; send each bidder the 3.0.0 zip (load unpacked). Bidders register.
-5. When every bidder is on 3.0.0, revoke the old shared upload keys (`puma-uploader`, …) so only the backend can
-   write. Until then old installs keep uploading with their own key and those uploads still count.
+4. Run `python -m app.bids.folders --report`. Registration switches counting to the new folder for the whole
+   week in progress, so register the listed bidders right after a weekly cutoff, or adjust them by hand.
+5. Issue codes; send each bidder the 3.0.0 zip (load unpacked) with: Remove any older "Bid Track Local" extension
+   first (or unzip this version over its folder and click Reload). Bidders register.
+6. Revoke each old shared upload key (`puma-uploader`, …) as soon as that prefix's bidders have registered, so
+   only the backend can write. Until then old installs keep uploading with their own key and those uploads count.
 
 ## 10. Error handling
 

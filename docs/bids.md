@@ -11,20 +11,22 @@ The extension uploads one screenshot per step of an application, under
 `<member>/<YYYY-MM-DD>/<profile>/<job>/step<n>_<trigger>_<stamp>.png`. A bidder's
 folder is their member prefix, e.g. `s3://bid-screenshots/puma/`.
 
-**Give every bidder their own prefix** (the extension's Settings → prefix; it
-defaults to `puma`). Two bidders writing to the same prefix are each credited
-with both of their bids. Point each bidder at their member folder, not a date
-folder (that would only ever count one day) or a single screenshot (rejected).
+**Folders are automatic.** Creating a bidder gives them their own folder (a slug of
+the name, `-2`, `-3`… on a clash) and sets its URL; once the bidder registers in the
+extension, the backend signs every upload into that folder (section 5). Legacy
+bidders get a folder from their old URL at startup.
 
 - **One bid = one job folder** (the folder that holds the screenshots). step1,
   step2, next and submit screenshots of the same job count once.
 - The job counts in the report window `[start, end)` that holds its **earliest**
   screenshot, so a job whose screenshots straddle the 6:30 PM cutoff counts once,
   on the day it started.
-- Only `.png`, `.jpg`, `.jpeg` and `.webp` (any case) count. The extension's
-  connection-test uploads (`_bid_track_connection_test_*`) are ignored.
+- Only `.png`, `.jpg`, `.jpeg` and `.webp` (any case) count. Files whose name starts
+  with `_` (e.g. old connection-test uploads) are ignored.
 - A job continued after the bidder's local midnight lands in a new date folder and
   counts twice; the extension decides that path.
+- The profile is part of the path, so renaming a profile, or changing a bidder's
+  profile while a job is in progress, splits that job into two folders: it counts twice.
 
 Accepted folder URLs: `s3://<bucket>/<folder>/`, `https://<bucket>.s3.<region>.amazonaws.com/<folder>/`,
 `https://s3.<region>.amazonaws.com/<bucket>/<folder>/`,
@@ -46,6 +48,7 @@ BID_STORAGE_REGION=us-east-005
 # Blank = AWS S3. Backblaze: https://s3.us-east-005.backblazeb2.com (https:// is added if missing)
 BID_STORAGE_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
 # Bucket that bidder screenshot folders live in (new bidders get s3://<bucket>/<folder>/).
+# Never change it once bidders exist (see section 5).
 BID_STORAGE_BUCKET=bid-screenshots
 BID_REPORT_TIMEZONE=America/Chicago
 # HH:MM, 24h, in BID_REPORT_TIMEZONE.
@@ -144,10 +147,40 @@ object path and returns a short-lived signed upload link, so bidders hold no sto
 - **Reset login** invalidates the bidder's tokens and password and issues a new invite code;
   archiving also invalidates tokens. **New invite code** is for bidders not yet registered.
 - **Backend key.** The backend's application key needs `listBuckets`, `listFiles` and
-  `writeFiles` on the whole bucket (this replaces the earlier read-only advice; see section 3). `BID_STORAGE_BUCKET`
-  must be set, otherwise uploads answer 503.
+  `writeFiles` on the whole bucket (section 3). Signing happens locally, so a key without
+  `writeFiles` is not detected when the link is signed: every bidder PUT then fails with 403.
+  `BID_STORAGE_BUCKET` must be set, otherwise uploads answer 503.
+- **Never change `BID_STORAGE_BUCKET`** once bidders exist: registered bidders are counted
+  from `s3://<old bucket>/<folder>/` while their uploads would be signed for the new bucket.
 - **Routes** (`/ext`): `POST /ext/register` (invite code, username, password), `POST /ext/login`,
   `GET /ext/me`, and `POST /ext/upload-url` (`job`, `step`, `trigger`, `capturedAt`) which returns
   `url`, `key`, `expiresAt` and `headers`; PUT the PNG to `url` within 5 minutes with
   `Content-Type: image/png`. Registering switches counting to the bidder's folder
-  (`s3://<bucket>/<folder>/`). Failed logins and registrations are rate limited (429).
+  (`s3://<bucket>/<folder>/`).
+- **Errors** are `{"error": "<message>"}` with the status. A username or password that breaks
+  the rules answers 400 with `Username must be 3–40 characters: lowercase letters, numbers, dots,
+  underscores or dashes`, `Password must be at least 8 characters` or `Password is too long`
+  (over 72 bytes); any other malformed body answers 400 `Invalid request`.
+- **Tokens** last 30 days. `/ext/me` and `/ext/upload-url` add a fresh `token` to the response
+  once the presented one is over 7 days old, and the extension stores it, so a bidder who
+  keeps using the extension is never logged out by expiry; a token left unused for 30 days
+  expires and the bidder logs in again.
+- **Rate limit.** 10 failed logins or registrations (rule violations included) per username
+  and per client IP in 15 minutes answer 429. The client IP is the first `X-Forwarded-For`
+  entry. Verify on Railway whether its proxy overwrites or appends `X-Forwarded-For`; if it
+  appends, switch `client_ip` (`app/bids/rate_limit.py`) to the right-most entry.
+
+## 6. Rollout
+
+1. Set `BID_STORAGE_*` (section 1) and the key from section 3 on the API **and** cron
+   services. Deploy the backend, then the app. Existing bidders show "Invited · no code yet";
+   counting continues from their old folders.
+2. Run `python -m app.bids.folders --report` (read-only, with the production env). It lists
+   every active bidder whose folder URL will change when they register (name, folder,
+   current URL). Registering switches counting to the new folder for the whole week in
+   progress, so register those bidders right after a weekly cutoff, or adjust them by hand.
+3. Issue invite codes and send each bidder the extension zip with the code. Tell them:
+   Remove any older "Bid Track Local" extension first (or unzip this version over its folder
+   and click Reload). Two installs side by side double-count or lose bids.
+4. Revoke each old shared upload key (`puma-uploader`, …) as soon as that prefix's bidders
+   have registered, so only the backend can write there.
