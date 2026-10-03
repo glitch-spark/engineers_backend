@@ -289,10 +289,12 @@ class _AppRowView(BaseModel):
     appliedResumes: list[AppliedMark] = Field(default_factory=list)
     tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
     tailorOnly: list[str] = Field(default_factory=list)
+    exported: dict[str, datetime] = Field(default_factory=dict)
 
     class Settings:
         projection = {
             "_id": 1, "url": 1, "profileGates": 1, "applied": 1, "appliedResumes": 1, "tailored": 1, "tailorOnly": 1,
+            "exported": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1, "bestByProfile.total": 1,
         }
 
@@ -375,11 +377,12 @@ async def _application_counts(run: JobApplyRun) -> dict:
     ctx = await _app_context(run, rows)
     counts = dict.fromkeys(("applied", "ready", "tailoring", "needsResume"), 0)
     per_profile = {str(s.accountId): {"toGo": 0, "ready": 0} for s in run.selection}
-    jobs = 0
+    jobs = to_export = 0
     for row in rows:
         apps = _applications(row, run.threshold, ctx)
         pending = [a for a in apps if a["state"] != "applied"]
         jobs += bool(pending)
+        to_export += sum(a["accountId"] not in row.exported for a in pending)
         for a in apps:
             counts[a["state"]] += 1
         for a in pending:
@@ -390,6 +393,7 @@ async def _application_counts(run: JobApplyRun) -> dict:
     return {
         "jobs": jobs,  # jobs with at least one application to go
         "toGo": counts["ready"] + counts["tailoring"] + counts["needsResume"],
+        "toExport": to_export,  # applications to go not yet in the shared sheet
         **counts,
         "byProfile": [
             {"accountId": acc, "name": names.get(acc, "(deleted profile)"), **n} for acc, n in per_profile.items()
@@ -1207,12 +1211,33 @@ class ExportBody(BaseModel):
 TO_TAILOR, TAILORING, PENDING_KIND = "To tailor", "Tailoring…", "Tailored (pending)"
 
 
+def sheet_text(value):
+    """Text for a USER_ENTERED cell: a leading ' keeps a value that starts like a formula (titles and companies come
+    from job pages and the user's sheet) from being evaluated."""
+    if isinstance(value, str) and value and value[0] in "=+-@\t\r":
+        return "'" + value
+    return value
+
+
 def export_cells(app: dict, link: Optional[str], kind: str) -> tuple[str, str]:
     """(Resume, Resume type) cells: a download link when the resume exists, else a placeholder the app fills in
     when the tailored PDF is ready (app/job_apply/sheet_links.py)."""
     if link:
-        return f'=HYPERLINK("{link}","Download")', kind
+        return f'=HYPERLINK("{link}","Download")', sheet_text(kind)
     return (TAILORING if app["state"] == "tailoring" else TO_TAILOR), PENDING_KIND
+
+
+async def _fill_finished(linkless: list[tuple]) -> None:
+    """A tailored resume that completed while the export was writing ran its fill-in before the row was recorded;
+    fill those links in now (fill_link skips anything not current)."""
+    from app.job_apply import sheet_links
+
+    for row_id, acc in linkless:
+        row = await JobApplyRow.get(row_id)
+        job_id = (row.tailored or {}).get(acc) if row else None
+        job = await ResumeApplication.get(job_id) if job_id else None
+        if job is not None and job.status == "completed":
+            await sheet_links.fill_link(job)
 
 
 def _today_label(user: UserExtra) -> str:
@@ -1245,6 +1270,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
 
     out: list[list] = []
     marks: list[tuple] = []
+    linkless: list[tuple] = []  # exported as "To tailor" / "Tailoring…"
     pending = needs = already = no_file = queued = over = 0
     owner = await UserExtra.get(run.userId) if body.tailorMissing else None
     remaining = await resume_queue.remaining_today(owner) if owner else 0
@@ -1286,8 +1312,10 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                     continue
                 link, kind = file_links.file_url("resume", app["resumeId"], account_id=acc), f"Uploaded · {app['filename']}"
             resume_cell, kind_cell = export_cells(app, link, kind)
+            if not link:
+                linkless.append((row.id, acc))
             out.append([
-                today, accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url,
+                today, *map(sheet_text, (accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url)),
                 resume_cell, kind_cell, app["score"] if app["score"] is not None else "",
                 row.postedDate.isoformat() if row.postedDate else "", False,
             ])
@@ -1317,6 +1345,8 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             if first is not None:
                 fields[f"exportedRows.{acc}"] = {"sheetId": sheet_id, "tab": tab, "row": first + i}
             await coll.update_one({"_id": row_id}, {"$set": fields})
+        if first is not None:
+            await _fill_finished(linkless)
     if url != user.jobApplySheetUrl:
         await UserExtra.get_motor_collection().update_one({"_id": user.id}, {"$set": {"jobApplySheetUrl": url}})
     return {

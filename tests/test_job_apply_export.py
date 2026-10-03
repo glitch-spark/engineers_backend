@@ -274,3 +274,53 @@ async def test_resume_job_whose_run_expired(client, staff_user, auth_header, she
     await JobApplyRun.get_motor_collection().delete_one({"_id": PydanticObjectId(run_id)})
     one = (await client.get(f"/resume/jobs/{t['jobId']}", headers=h)).json()
     assert one["jobApplyRowId"] and one["jobApplyRunId"] is None and one["jobApplyRunName"] is None
+
+
+async def test_link_filled_when_tailoring_finishes_during_export(client, staff_user, auth_header, sheets, sheet_cells, monkeypatch):
+    """The resume completes while the export is writing: its fill-in runs before the row is recorded, so the
+    export itself fills the link in once it has recorded where the row went."""
+    from app.job_apply import sheet_links
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    started = (await client.post(f"/job-applies/rows/{gh['_id']}/tailor", headers=h, json={"accountId": str(tharun.id)})).json()["tailored"]
+    job_id = PydanticObjectId(started["jobId"])
+    append = google_sheets.append_rows
+
+    async def append_while_finishing(http, sid, tab, values):
+        written = await append(http, sid, tab, values)
+        await ResumeApplication.get_motor_collection().update_one(
+            {"_id": job_id}, {"$set": {"status": "completed", "step": "done", "pdfData": "JVBERi0xLjc="}})
+        assert await sheet_links.fill_link(await ResumeApplication.get(job_id)) is False  # not recorded yet
+        return written
+
+    monkeypatch.setattr(google_sheets, "append_rows", append_while_finishing)
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    later = next(r for r in sheets["rows"] if r[1] == "Tharun" and r[4] == gh["url"])
+    assert later[5].startswith('=HYPERLINK("') and later[6] == "Tailored"
+
+
+async def test_export_escapes_text_that_looks_like_a_formula(client, staff_user, auth_header, sheets):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": PydanticObjectId(gh["_id"])},
+        {"$set": {"title": '=HYPERLINK("https://evil.example","Apply here")', "company": "+Acme"}})
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    mine = [r for r in sheets["rows"] if r[4] == gh["url"]]
+    assert mine and all(r[3] == """'=HYPERLINK("https://evil.example","Apply here")""" and r[2] == "'+Acme" for r in mine)
+    assert all(r[5].startswith(("=HYPERLINK(", "To tailor", "Tailoring")) for r in sheets["rows"])  # our own links stay live
+
+
+async def test_counts_say_what_is_left_to_export(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    before = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    assert before["toExport"] == before["toGo"] == 4
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    after = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    assert after["toExport"] == 0 and after["toGo"] == 4
