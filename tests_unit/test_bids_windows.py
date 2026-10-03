@@ -73,6 +73,8 @@ def test_schedule_from_settings_parses_values():
 @pytest.mark.parametrize("value,expected", [
     (None, None), ("", None), ("   ", None),
     (" https://s3.us-east-005.backblazeb2.com/ ", "https://s3.us-east-005.backblazeb2.com"),
+    # Backblaze's console shows the endpoint without a scheme
+    ("s3.us-east-005.backblazeb2.com", "https://s3.us-east-005.backblazeb2.com"),
 ])
 def test_storage_endpoint_url_is_optional_and_trimmed(value, expected):
     s = Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a", BID_STORAGE_ENDPOINT_URL=value)

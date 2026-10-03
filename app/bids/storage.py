@@ -69,7 +69,15 @@ def parse_folder_url(url: str) -> tuple[str, str]:
     prefix = prefix.strip("/")
     if not bucket or not prefix:
         raise ValueError(f"folder URL needs a bucket and a folder: {url!r}")
+    if prefix.lower().endswith(IMAGE_EXTENSIONS):
+        raise ValueError(f"folder URL points at a file, not the bidder's folder: {url!r}")
     return bucket, prefix + "/"
+
+
+def _endpoint_region(endpoint: str) -> Optional[str]:
+    """Region from an S3-compatible endpoint host, e.g. s3.us-east-005.backblazeb2.com -> us-east-005."""
+    m = re.match(r"^s3[.-]([a-z0-9-]+)\.", (urlsplit(endpoint).hostname or "").lower())
+    return m.group(1) if m else None
 
 
 def job_first_seen(objects: Iterable[Mapping], into: Optional[dict[str, datetime]] = None) -> dict[str, datetime]:
@@ -106,21 +114,30 @@ class S3BidStorage:
 
                 s = get_settings()
                 endpoint = s.BID_STORAGE_ENDPOINT_URL
+                if endpoint:
+                    # A non-AWS store must never be sent the AWS_* region or keys.
+                    region = s.BID_STORAGE_REGION or _endpoint_region(endpoint)
+                    key, secret = s.BID_STORAGE_ACCESS_KEY_ID, s.BID_STORAGE_SECRET_ACCESS_KEY
+                else:
+                    region = s.BID_STORAGE_REGION or s.AWS_REGION
+                    key = s.BID_STORAGE_ACCESS_KEY_ID or s.AWS_ACCESS_KEY_ID
+                    secret = s.BID_STORAGE_SECRET_ACCESS_KEY or s.AWS_SECRET_ACCESS_KEY
                 kwargs = {
-                    "region_name": s.BID_STORAGE_REGION or s.AWS_REGION,
+                    "region_name": region,
                     # Path style for custom endpoints (Backblaze): no per-bucket DNS or TLS name needed.
                     "config": Config(signature_version="s3v4",
                                      s3={"addressing_style": "path" if endpoint else "virtual"}),
                 }
                 if endpoint:
                     kwargs["endpoint_url"] = endpoint
-                key = s.BID_STORAGE_ACCESS_KEY_ID or s.AWS_ACCESS_KEY_ID
-                secret = s.BID_STORAGE_SECRET_ACCESS_KEY or s.AWS_SECRET_ACCESS_KEY
                 if key and secret:
                     kwargs["aws_access_key_id"] = key
                     kwargs["aws_secret_access_key"] = secret
-                # Own session: the shared default session is not thread-safe.
-                self._client = boto3.session.Session().client("s3", **kwargs)
+                try:
+                    # Own session: the shared default session is not thread-safe.
+                    self._client = boto3.session.Session().client("s3", **kwargs)
+                except ValueError:  # botocore: "Invalid endpoint: ..."
+                    raise BidStorageError("invalid BID_STORAGE_ENDPOINT_URL") from None
             return self._client
 
     def _count(self, bucket: str, prefix: str, windows: Sequence[Window]) -> list[int]:

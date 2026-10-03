@@ -11,6 +11,11 @@ The extension uploads one screenshot per step of an application, under
 `<member>/<YYYY-MM-DD>/<profile>/<job>/step<n>_<trigger>_<stamp>.png`. A bidder's
 folder is their member prefix, e.g. `s3://bid-screenshots/puma/`.
 
+**Give every bidder their own prefix** (the extension's Settings → prefix; it
+defaults to `puma`). Two bidders writing to the same prefix are each credited
+with both of their bids. Point each bidder at their member folder, not a date
+folder (that would only ever count one day) or a single screenshot (rejected).
+
 - **One bid = one job folder** (the folder that holds the screenshots). step1,
   step2, next and submit screenshots of the same job count once.
 - The job counts in the report window `[start, end)` that holds its **earliest**
@@ -32,13 +37,13 @@ and folder; which service is read comes from `BID_STORAGE_ENDPOINT_URL`.
 
 ```env
 BID_STORAGE_PROVIDER=s3
-# Optional; blank falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION.
-# Backblaze: the application key ID (005...) and application key (K005...).
+# AWS: optional; blank falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION.
+# Backblaze: required, no AWS fallback. The application key ID (005...) and application key (K005...).
 BID_STORAGE_ACCESS_KEY_ID=005...
 BID_STORAGE_SECRET_ACCESS_KEY=K005...
-# Backblaze: us-east-005
+# Backblaze: optional, read from the endpoint (us-east-005).
 BID_STORAGE_REGION=us-east-005
-# Blank = AWS S3. Backblaze: https://s3.us-east-005.backblazeb2.com
+# Blank = AWS S3. Backblaze: https://s3.us-east-005.backblazeb2.com (https:// is added if missing)
 BID_STORAGE_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
 BID_REPORT_TIMEZONE=America/Chicago
 # HH:MM, 24h, in BID_REPORT_TIMEZONE.

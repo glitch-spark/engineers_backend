@@ -54,6 +54,12 @@ def test_folder_url_error_names_every_accepted_form():
     assert "Use an s3://, amazonaws.com or backblazeb2.com folder URL" in exc.value.errors()[0]["msg"]
 
 
+def test_a_pasted_screenshot_url_asks_for_the_folder():
+    with pytest.raises(ValidationError) as exc:
+        BidderIn(**valid(screenshotFolderUrl="https://f005.backblazeb2.com/file/bid-screenshots/puma/d/upwork/acme/step1.png"))
+    assert "Use the bidder's folder, not a single screenshot" in exc.value.errors()[0]["msg"]
+
+
 @pytest.mark.parametrize("rate", [0, 0.1, 0.29, 19.99, 1000])
 def test_two_decimal_rates_accepted(rate):
     assert BidderIn(**valid(rate=rate)).rate == rate

@@ -61,7 +61,9 @@ class BidderIn(BaseModel):
         v = v.strip()
         try:
             parse_folder_url(v)
-        except ValueError:
+        except ValueError as e:
+            if "points at a file" in str(e):
+                raise ValueError("Use the bidder's folder, not a single screenshot (e.g. s3://bid-screenshots/puma/)") from None
             raise ValueError("Use an s3://, amazonaws.com or backblazeb2.com folder URL") from None
         return v
 

@@ -135,7 +135,11 @@ class Settings(BaseSettings):
     def _normalize_bid_endpoint(cls, v: object) -> Optional[str]:
         if v is None:
             return None
-        return str(v).strip().rstrip("/") or None
+        s = str(v).strip().rstrip("/")
+        if not s:
+            return None
+        # Backblaze's console shows the endpoint without a scheme; botocore rejects that.
+        return s if "://" in s else f"https://{s}"
 
     @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
     @classmethod

@@ -47,7 +47,11 @@ def test_parse_folder_url_accepts(url, expected):
                                  "ftp://shots/a/", "not a url",
                                  "https://f005.backblazeb2.com/bid-screenshots/puma/",  # friendly URL needs /file/
                                  "https://f005.backblazeb2.com/file/bid-screenshots/",  # no folder
-                                 "https://s3.us-east-005.notbackblazeb2.com/bid-screenshots/puma/"])
+                                 "https://s3.us-east-005.notbackblazeb2.com/bid-screenshots/puma/",
+                                 "https://s3.us-east-005.backblazeb2.com.evil.com/bid-screenshots/puma/",
+                                 # a single screenshot pasted instead of the bidder's folder
+                                 "https://f005.backblazeb2.com/file/bid-screenshots/puma/2026-10-03/upwork/acme/step1_step.png",
+                                 "s3://bid-screenshots/puma/step1.JPG"])
 def test_parse_folder_url_rejects(url):
     with pytest.raises(ValueError):
         parse_folder_url(url)
@@ -65,6 +69,13 @@ def test_job_first_seen_groups_screenshots_by_job_folder():
         obj(f"{JOB}/_bid_track_connection_test_2026-10-02_090000.png", utc(2026, 10, 2, 9)),  # extension's test upload
     ]
     assert job_first_seen(objs) == {f"{JOB}/acme/": utc(2026, 10, 2, 11), f"{JOB}/beta/": utc(2026, 10, 2, 13)}
+
+
+def test_same_job_slug_under_another_date_or_profile_is_another_bid():
+    objs = [obj("puma/2026-10-02/upwork/acme/step1.png", utc(2026, 10, 2)),
+            obj("puma/2026-10-03/upwork/acme/step1.png", utc(2026, 10, 3)),
+            obj("puma/2026-10-02/linkedin/acme/step1.png", utc(2026, 10, 2))]
+    assert len(job_first_seen(objs)) == 3
 
 
 def test_jobs_count_in_the_window_of_their_first_screenshot():
@@ -247,3 +258,23 @@ def test_without_an_endpoint_the_client_targets_aws(monkeypatch):
     seen = _client_kwargs(monkeypatch)
     assert "endpoint_url" not in seen
     assert seen["config"].s3 == {"addressing_style": "virtual"}
+
+
+def test_backblaze_endpoint_never_falls_back_to_aws_region_or_keys(monkeypatch):
+    seen = _client_kwargs(monkeypatch, BID_STORAGE_ENDPOINT_URL="https://s3.us-east-005.backblazeb2.com",
+                          AWS_REGION="us-east-1", AWS_ACCESS_KEY_ID="AKIAAWS", AWS_SECRET_ACCESS_KEY="awssecret")
+    assert seen["region_name"] == "us-east-005"   # read from the endpoint host
+    assert "aws_access_key_id" not in seen and "aws_secret_access_key" not in seen
+
+
+async def test_a_bad_endpoint_is_a_storage_error_not_a_crash(monkeypatch):
+    class Session:
+        def client(self, name, **kwargs):
+            raise ValueError("Invalid endpoint: nope")
+
+    monkeypatch.setattr("boto3.session.Session", Session)
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(
+        BID_STORAGE_REGION="x", AWS_REGION=None, BID_STORAGE_ACCESS_KEY_ID=None, AWS_ACCESS_KEY_ID=None,
+        BID_STORAGE_SECRET_ACCESS_KEY=None, AWS_SECRET_ACCESS_KEY=None, BID_STORAGE_ENDPOINT_URL="nope"))
+    with pytest.raises(BidStorageError, match="invalid BID_STORAGE_ENDPOINT_URL"):
+        await S3BidStorage().count_bids("s3://shots/a/", START, END)

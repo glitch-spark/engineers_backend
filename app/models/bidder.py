@@ -1,4 +1,4 @@
-"""A bidder whose daily screenshot counts are reported to Slack."""
+"""A bidder whose daily and weekly bid counts are reported to Slack."""
 
 from datetime import datetime
 from typing import Optional

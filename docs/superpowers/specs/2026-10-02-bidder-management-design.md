@@ -6,9 +6,10 @@ Status: approved design, pending spec review
 
 ## 1. Goal
 
-Users manage the bidders who apply to jobs for them. A separate system (outside these repos) saves a
-screenshot each time a bidder submits an application, into one storage folder per bidder. This feature
-counts those screenshots and posts:
+Users manage the bidders who apply to jobs for them. A separate system (the Bid Track browser
+extension, outside these repos) uploads screenshots of each application, step by step, into one
+storage folder per bidder with one subfolder per job. This feature counts those job folders (bids)
+and posts:
 
 - a **daily** bid count per bidder to a Slack channel, and
 - a **weekly** bid count per bidder with the amount to pay them (`bids × rate`).
