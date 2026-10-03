@@ -13,7 +13,8 @@ from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
-from app.job_apply import file_links, gsheet, worker
+from app.job_apply import file_links, gsheet, sheet_checks, worker
+from app.job_apply.sheet_checks import sheet_text
 from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import (
     FORCEABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen,
@@ -1199,7 +1200,11 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
 
 # ---------- export to Google Sheets ----------
 
-EXPORT_HEADER = ["Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied"]
+# "Applied" stays in column J (tick boxes); the check columns follow it, so older tabs keep their layout.
+EXPORT_HEADER = [
+    "Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied",
+    *sheet_checks.APPLY_HEADER,
+]
 
 
 class ExportBody(BaseModel):
@@ -1209,14 +1214,6 @@ class ExportBody(BaseModel):
 
 
 TO_TAILOR, TAILORING, PENDING_KIND = "To tailor", "Tailoring…", "Tailored (pending)"
-
-
-def sheet_text(value):
-    """Text for a USER_ENTERED cell: a leading ' keeps a value that starts like a formula (titles and companies come
-    from job pages and the user's sheet) from being evaluated."""
-    if isinstance(value, str) and value and value[0] in "=+-@\t\r":
-        return "'" + value
-    return value
 
 
 def export_cells(app: dict, link: Optional[str], kind: str) -> tuple[str, str]:
@@ -1240,6 +1237,44 @@ async def _fill_finished(linkless: list[tuple]) -> None:
             await sheet_links.fill_link(job)
 
 
+def _export_target(sheet_url: str, user: UserExtra) -> tuple[str, str]:
+    """(link, spreadsheet id) to export to: the one given, else the one saved from the last export."""
+    url = sheet_url.strip() or (user.jobApplySheetUrl or "")
+    if not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the Google Sheet link to export to.")
+    try:
+        sheet_id, _ = gsheet.parse_gsheet_url(url)
+    except SheetError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return url, sheet_id
+
+
+async def _remember_sheet(url: str, user: UserExtra) -> None:
+    if url != user.jobApplySheetUrl:
+        await UserExtra.get_motor_collection().update_one({"_id": user.id}, {"$set": {"jobApplySheetUrl": url}})
+
+
+async def _checks_rows(run: JobApplyRun) -> list[list]:
+    """The run's Checks tab: every job, in sheet order, with what the checks found."""
+    rows = await JobApplyRow.find({"runId": run.id}).sort("+rowIndex").to_list()
+    ids = {p.accountId for r in rows for p in r.profileGates or []}
+    names = {
+        str(a.id): a.name
+        for a in await Account.find({"_id": {"$in": [PydanticObjectId(i) for i in ids]}}).to_list()
+    } if ids else {}
+    return [sheet_checks.checks_row(r, names) for r in rows]
+
+
+async def _write_checks(http: httpx.AsyncClient, sheet_id: str, run: JobApplyRun, info: dict) -> tuple[str, int]:
+    """Write (or rewrite) the run's own Checks tab; exporting again replaces its rows, never adds to them."""
+    tab = sheet_checks.checks_tab_name(run)
+    values = await _checks_rows(run)
+    await google_sheets.ensure_tab(http, sheet_id, tab, sheet_checks.CHECKS_HEADER, info)
+    await google_sheets.clear_range(http, sheet_id, google_sheets._a1(tab, "A2:Z"))
+    await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [sheet_checks.CHECKS_HEADER, *values])
+    return tab, len(values)
+
+
 def _today_label(user: UserExtra) -> str:
     from app.alerts import local_now
     from app.slack_bot import resolve_user_tz
@@ -1254,13 +1289,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     profile, or still tailoring) are exported too, with "To tailor" / "Tailoring…": their link is filled in when the
     tailored PDF is ready. Rows already exported are skipped."""
     run = await _owned_run(run_id, user)
-    url = body.sheetUrl.strip() or (user.jobApplySheetUrl or "")
-    if not url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the Google Sheet link to export to.")
-    try:
-        sheet_id, _ = gsheet.parse_gsheet_url(url)
-    except SheetError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    url, sheet_id = _export_target(body.sheetUrl, user)
 
     rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
     ctx = await _app_context(run, rows)
@@ -1318,6 +1347,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 today, *map(sheet_text, (accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url)),
                 resume_cell, kind_cell, app["score"] if app["score"] is not None else "",
                 row.postedDate.isoformat() if row.postedDate else "", False,
+                *sheet_checks.apply_cells(row, acc),
             ])
             marks.append((row.id, acc))
 
@@ -1326,7 +1356,9 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             info = await google_sheets.sheet_info(http, sheet_id)
             written = None
             if not body.dryRun and out:
-                await google_sheets.ensure_tab(http, sheet_id, today, EXPORT_HEADER, info)
+                if not await google_sheets.ensure_tab(http, sheet_id, today, EXPORT_HEADER, info, checkbox="Applied"):
+                    # an existing tab may predate the check columns: refresh its header
+                    await google_sheets.update_range(http, sheet_id, google_sheets._a1(today, "A1"), [EXPORT_HEADER])
                 written = await google_sheets.append_rows(http, sheet_id, today, out)
         except google_sheets.SheetsError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -1347,9 +1379,22 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             await coll.update_one({"_id": row_id}, {"$set": fields})
         if first is not None:
             await _fill_finished(linkless)
-    if url != user.jobApplySheetUrl:
-        await UserExtra.get_motor_collection().update_one({"_id": user.id}, {"$set": {"jobApplySheetUrl": url}})
+    # After the application rows are recorded: a Checks tab problem must not leave appended rows unrecorded.
+    checks_tab, checks_jobs, checks_error = sheet_checks.checks_tab_name(run), 0, None
+    if body.dryRun:
+        checks_jobs = await JobApplyRow.find({"runId": run.id}).count()
+    else:
+        try:
+            async with httpx.AsyncClient() as http:
+                checks_tab, checks_jobs = await _write_checks(http, sheet_id, run, info)
+        except google_sheets.SheetsError as exc:
+            checks_error = str(exc)
+            log.warning("checks tab for run %s not written: %s", run.id, exc)
+    await _remember_sheet(url, user)
     return {
+        "checksTab": checks_tab,
+        "checksJobs": checks_jobs,
+        "checksError": checks_error,
         "ready": len(out),
         "added": 0 if body.dryRun else len(out),
         "pending": pending,
@@ -1371,6 +1416,39 @@ def _pdf_name(*parts: str) -> str:
 
     return re.sub(r"[^\w .()-]+", "_", " - ".join(p for p in parts if p)).strip() or "Resume"
 
+
+class ChecksBody(BaseModel):
+    sheetUrl: str = ""  # empty = the link saved from the last export
+    dryRun: bool = False  # count and check access only
+
+
+@router.post("/runs/{run_id}/export-checks")
+async def export_checks(run_id: str, body: ChecksBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Write every job in the run, with what the checks found (result, reason, posted date and where it came from,
+    location, market, work mode, clearance, each check), to the run's own "Checks · …" tab, replacing what an earlier
+    export wrote there. Available once the jobs are checked (step 2 onward); adds no application rows."""
+    run = await _owned_run(run_id, user)
+    if run.phase == "screen" and run.status in ("queued", "running"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The jobs are still being checked.")
+    url, sheet_id = _export_target(body.sheetUrl, user)
+    tab = sheet_checks.checks_tab_name(run)
+    async with httpx.AsyncClient() as http:
+        try:
+            info = await google_sheets.sheet_info(http, sheet_id)
+            if body.dryRun:
+                jobs = await JobApplyRow.find({"runId": run.id}).count()
+            else:
+                tab, jobs = await _write_checks(http, sheet_id, run, info)
+        except google_sheets.SheetsError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    await _remember_sheet(url, user)
+    return {
+        "tab": tab,
+        "jobs": jobs,
+        "sheetTitle": info["title"],
+        "sheetUrl": url,
+        "serviceAccount": google_sheets.service_account_email(),
+    }
 
 @router.get("/files/{token}")
 async def resume_file(token: str):
