@@ -138,6 +138,7 @@ class _RowListView(BaseModel):
     status: str
     statusReason: Optional[str] = None
     jdSource: Optional[str] = None
+    jdStructured: Optional[bool] = None
     postedDate: Optional[date] = None
     extraction: Optional[_ExtractionView] = None
     extractionSource: Optional[str] = None
@@ -159,7 +160,7 @@ class _RowListView(BaseModel):
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
             "screen": 1, "groupKey": 1, "forceInclude": 1,
-            "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
+            "jdSource": 1, "jdStructured": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
             "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
             "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
@@ -242,6 +243,7 @@ def _row_summary(
         "markets": markets_for(row.groupKey),
         "forceInclude": row.forceInclude,
         "jdSource": row.jdSource,
+        "jdStructured": row.jdStructured,
         "postedDate": row.postedDate.isoformat() if row.postedDate else None,
         "workMode": ex.workMode if ex else None,
         "allowedLocations": [l.model_dump() for l in ex.allowedLocations] if ex else [],
@@ -510,6 +512,7 @@ async def create_run(
         JobApplyRow(
             runId=run.id, userId=user.id, rowIndex=r.rowIndex, url=r.url, jdText=r.jdText,
             jdSource="sheet" if r.jdText else None,
+            jdStructured=True if r.jdText else None,
         )
         for r in rows
     ])
@@ -579,11 +582,12 @@ class _RescreenView(BaseModel):
     screen: Optional[str] = None
     groupKey: Optional[str] = None
     forceInclude: bool = False
+    jdStructured: Optional[bool] = None
 
     class Settings:
         projection = {
             "_id": 1, "status": 1, "statusReason": 1, "extraction": 1, "postedDate": 1, "gates": 1, "screen": 1,
-            "groupKey": 1, "forceInclude": 1,
+            "groupKey": 1, "forceInclude": 1, "jdStructured": 1,
         }
 
 
@@ -824,7 +828,7 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     is_job = row.extraction.isJobPosting if row.extraction is not None else True
     base = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
-        is_job=is_job,
+        is_job=is_job, verified=row.jdStructured is not False,
     )
     if base not in FORCEABLE:
         raise HTTPException(
@@ -834,7 +838,7 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     row.forceInclude = body.include
     row.screen = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey,
-        force_include=row.forceInclude, is_job=is_job,
+        force_include=row.forceInclude, is_job=is_job, verified=row.jdStructured is not False,
     )
     await JobApplyRow.get_motor_collection().update_one(
         {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}

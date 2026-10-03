@@ -51,6 +51,14 @@ def test_not_a_job_page():
                   force_include=True, is_job=False) == "not_job"
 
 
+def test_unverified_page_needs_a_check():
+    # read only from page text (no job-site API, no JobPosting data): kept, but flagged
+    assert bucket(status="extracted", status_reason=None, gates=gates(), group_key="GB", force_include=False,
+                  verified=False) == "check"
+    assert bucket(status="excluded", status_reason=None, gates=gates(freshness="fail"), group_key="GB",
+                  force_include=False, verified=False) == "too_old"
+
+
 def test_force_include():
     assert b("excluded", g=gates(freshness="fail"), force=True) == "check"
     assert b("excluded", g=gates(remote="fail", clearance="fail"), force=True) == "check"
@@ -80,6 +88,7 @@ class _Row:
         self.postedDate = posted
         self.status, self.statusReason = status, None
         self.gates, self.screen, self.groupKey, self.forceInclude = [], None, "GB", False
+        self.jdStructured = None
 
 
 def test_rescreen_max_age():

@@ -65,6 +65,7 @@ def bucket(
     group_key: Optional[str],
     force_include: bool,
     is_job: bool = True,
+    verified: bool = True,
 ) -> Optional[ScreenBucket]:
     """The one bucket a job lands in, first match wins (spec §3.1). None while it is still being fetched or read."""
     if status in ("pending", "fetched"):
@@ -81,8 +82,8 @@ def bucket(
             return "check" if force_include else name
     if group_key and group_key != NO_LOCATION and not markets_for(group_key):
         return "other_location"  # open only to candidates outside the target markets: counted, not scored
-    if "unknown" in result.values() or group_key == NO_LOCATION:
-        return "check"
+    if "unknown" in result.values() or group_key == NO_LOCATION or not verified:
+        return "check"  # an unknown, or read from page text only (no job-site API or JobPosting data)
     return "valid"
 
 
@@ -115,6 +116,7 @@ def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:
         status=row.status, status_reason=row.statusReason, gates=row.gates or [],
         group_key=row.groupKey, force_include=row.forceInclude,
         is_job=row.extraction.isJobPosting if row.extraction is not None else True,
+        verified=row.jdStructured is not False,
     )
 
 

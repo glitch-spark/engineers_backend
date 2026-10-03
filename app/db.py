@@ -275,7 +275,7 @@ async def _migrate_job_apply_screening(database) -> None:
             async for row in rows.find(
                 {"runId": run["_id"], "screen": {"$exists": False}},
                 {"status": 1, "statusReason": 1, "gates": 1, "extraction.allowedLocations": 1,
-                 "extraction.isJobPosting": 1, "forceInclude": 1},
+                 "extraction.isJobPosting": 1, "forceInclude": 1, "jdStructured": 1},
             ):
                 ex = row.get("extraction")
                 key = group_key([Location(**loc) for loc in ex.get("allowedLocations") or []]) if ex else None
@@ -284,6 +284,7 @@ async def _migrate_job_apply_screening(database) -> None:
                     gates=[GateResult(**g) for g in row.get("gates") or []], group_key=key,
                     force_include=bool(row.get("forceInclude")),
                     is_job=(ex or {}).get("isJobPosting") is not False,
+                    verified=row.get("jdStructured") is not False,
                 )
                 await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": screen, "groupKey": key}})
         # Jobs open only to candidates outside the target markets (US, UK/EU, Latam) are counted, not scored.

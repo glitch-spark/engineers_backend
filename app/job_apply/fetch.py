@@ -17,7 +17,8 @@ from bs4 import BeautifulSoup
 # Bump when what counts as a usable page changes: cached pages read by an older fetcher are fetched again.
 # 2: closed jobs (404/410, redirect to the job list, gone from the ATS) are no longer read as job text.
 # 3: pages that say the job is gone ("no longer active", "job not found", "this job was removed"…).
-FETCHER_VERSION = 3
+# 4: results say whether they came from structured data (job-site API / JobPosting) or page text only.
+FETCHER_VERSION = 4
 MIN_TEXT = 200  # below this there's no usable job text
 THIN_PAGE = 400  # below this a script-rendered page is retried in the browser
 TIMEOUT = 20.0
@@ -84,6 +85,9 @@ class FetchResult:
     location: str = ""
     closed: Optional[str] = None  # why the page says the job is gone (pages only)
     bot_check: bool = False  # the page is a bot check / captcha, not the site's content
+    # From a job-site API or the page's JobPosting data. False: read from the page's visible text only, which can
+    # be a job list, landing page or anything else; such jobs are kept but flagged "needs a check".
+    structured: bool = True
 
 
 # A page can load fine and still say the posting is gone (Teamtailor, Built In, Recruitee, Zoho, Deel, N-iX…).
@@ -512,7 +516,7 @@ def _from_page(markup: str, source: Literal["html", "browser"]) -> FetchResult:
         posted = _date(ld.get("datePosted"))
     else:
         posted = None
-    return FetchResult(text=html_to_text(soup), source=source, postedDate=posted)
+    return FetchResult(text=html_to_text(soup), source=source, postedDate=posted, structured=False)
 
 
 def _gone_reason(soup: BeautifulSoup, ld: Optional[dict]) -> Optional[str]:

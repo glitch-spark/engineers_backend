@@ -465,3 +465,25 @@ async def test_gh_jid_job_app_embed():
                        "https://boards-api.greenhouse.io/v1/boards/tolokaai/jobs/4948089101": (200, GH_JOB)}) as c:
         res = await fetch_job("https://toloka.ai/careers/info?gh_jid=4948089101", client=c)
     assert res.source == "ats_api"
+
+
+# ---------- structured vs. text-only (job_url_filter's "structured source" rule) ----------
+
+
+async def test_text_only_page_is_not_structured():
+    async with client({"https://careers.beta.io/": (200, f"<html><body>{LONG}</body></html>")}) as c:
+        res = await fetch_job("https://careers.beta.io/jobs/1", client=c)
+    assert res.source == "html" and res.structured is False
+
+
+async def test_jsonld_page_and_ats_api_are_structured():
+    ld = {"@type": "JobPosting", "title": "Data Engineer", "description": LONG}
+    page = f'<html><script type="application/ld+json">{json.dumps(ld)}</script><body>short</body></html>'
+    async with client({"https://careers.beta.io/": (200, page),
+                       "https://boards-api.greenhouse.io/v1/boards/acme/jobs/9": (200, GH_JOB)}) as c:
+        assert (await fetch_job("https://careers.beta.io/jobs/1", client=c)).structured is True
+        assert (await fetch_job("https://boards.greenhouse.io/acme/jobs/9", client=c)).structured is True
+
+
+def test_fetcher_version_bumped_for_structured_flag():
+    assert fetch_mod.FETCHER_VERSION >= 4

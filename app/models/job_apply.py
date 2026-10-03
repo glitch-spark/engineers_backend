@@ -108,6 +108,7 @@ class JobApplyRow(TimestampedDocument):
     url: Optional[str] = None
     jdText: Optional[str] = None
     jdSource: Optional[Literal["sheet", "ats_api", "html", "browser"]] = None
+    jdStructured: Optional[bool] = None  # False: read from page text only (no job-site API / JobPosting data)
     status: RowStatus = "pending"
     statusReason: Optional[str] = None
     screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
@@ -170,6 +171,7 @@ class JobPostingCache(TimestampedDocument):
     title: str = ""
     company: str = ""
     fetchedAt: datetime = Field(default_factory=datetime.utcnow)
+    structured: bool = True  # see FetchResult.structured
     fetcher: int = 0  # fetch.FETCHER_VERSION that read it; pages from an older fetcher are fetched again
 
     class Settings:

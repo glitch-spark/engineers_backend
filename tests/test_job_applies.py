@@ -1237,3 +1237,16 @@ async def test_stored_urls_are_recleaned_once(client, staff_user, auth_header):
     assert await log.count_documents({"urlv": {"$ne": URL_VERSION}}) == 0
     assert await JobPostingCache.get_motor_collection().find_one({"url": clean})
     assert await rows.find_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"})
+
+
+async def test_text_only_page_lands_in_needs_a_check(client, staff_user, auth_header, monkeypatch):
+    async def text_page(url, *, client, browser=None):
+        return FetchResult(text=REMOTE_JD, source="html", structured=False)
+
+    monkeypatch.setattr(worker, "FETCH", text_page)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["screen"] == "check" and gh["jdStructured"] is False
+    remote = (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]
+    assert remote["jdStructured"] is True  # the description came from the sheet

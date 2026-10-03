@@ -84,6 +84,7 @@ def _screen(row: JobApplyRow) -> None:
         status=row.status, status_reason=row.statusReason, gates=row.gates or [],
         group_key=row.groupKey, force_include=row.forceInclude,
         is_job=row.extraction.isJobPosting if row.extraction is not None else True,
+        verified=row.jdStructured is not False,
     )
 
 
@@ -110,7 +111,9 @@ async def _status(run_id: PydanticObjectId) -> Optional[str]:
     return doc.get("status") if doc else None
 
 
-_FETCH_FIELDS = ("jdText", "jdSource", "fetchedPostedDate", "title", "company", "status", "statusReason", "screen")
+_FETCH_FIELDS = (
+    "jdText", "jdSource", "jdStructured", "fetchedPostedDate", "title", "company", "status", "statusReason", "screen",
+)
 _EXTRACT_FIELDS = (
     "extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason", "screen", "groupKey",
 )
@@ -170,7 +173,7 @@ async def _cache_description(url: str, text: str) -> None:
     await JobPostingCache.get_motor_collection().update_one(
         {"url": url},
         {"$set": {"url": url, "text": text, "source": "sheet", "postedDate": None, "title": "", "company": "",
-                  "fetchedAt": now, "updatedAt": now, "fetcher": fetch_mod.FETCHER_VERSION},
+                  "fetchedAt": now, "updatedAt": now, "fetcher": fetch_mod.FETCHER_VERSION, "structured": True},
          "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
@@ -195,8 +198,10 @@ async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
                 raise
     if res is None:
         text, source, posted, title, company = cached.text, cached.source, cached.postedDate, cached.title, cached.company
+        structured = cached.structured
     else:
         text, source, posted, title, company = res.text, res.source, res.postedDate, res.title, res.company
+        structured = res.structured
         coll = JobPostingCache.get_motor_collection()
         await coll.update_one(
             {"url": row.url},
@@ -204,11 +209,11 @@ async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
                 "url": row.url, "text": text, "source": source,
                 "postedDate": datetime.combine(posted, datetime.min.time()) if posted else None,
                 "title": title, "company": company, "fetchedAt": datetime.utcnow(), "updatedAt": datetime.utcnow(),
-                "fetcher": fetch_mod.FETCHER_VERSION,
+                "fetcher": fetch_mod.FETCHER_VERSION, "structured": structured,
             }, "$setOnInsert": {"createdAt": datetime.utcnow()}},
             upsert=True,
         )
-    row.jdText, row.jdSource, row.fetchedPostedDate = text, source, posted
+    row.jdText, row.jdSource, row.fetchedPostedDate, row.jdStructured = text, source, posted, structured
     row.title = row.title or title
     row.company = row.company or company
     row.status = "fetched"
