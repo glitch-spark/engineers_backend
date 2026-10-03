@@ -32,7 +32,10 @@ class BidReportRow(BaseModel):
 class BidReport(TimestampedDocument, BidReportRow):
     class Settings:
         name = "bidreports"
+        # Beanie merges declared indexes by their field-name set, so two indexes on the same three
+        # fields collapse into one. The unique index also serves newest-first history (backward scan);
+        # (kind, periodKey) serves load_rows.
         indexes = [
-            IndexModel([("kind", 1), ("periodKey", 1), ("bidderId", 1)], unique=True),
-            IndexModel([("bidderId", 1), ("kind", 1), ("periodKey", -1)]),
+            IndexModel([("bidderId", 1), ("kind", 1), ("periodKey", 1)], unique=True),
+            IndexModel([("kind", 1), ("periodKey", 1)]),
         ]

@@ -42,6 +42,11 @@ class ReportStore(Protocol):
     async def owners(self, ids: list[PydanticObjectId]) -> dict[str, Owner]: ...
 
 
+def _only_duplicates(e: BulkWriteError) -> bool:
+    errors = (e.details or {}).get("writeErrors") or []
+    return bool(errors) and all(err.get("code") == 11000 for err in errors)
+
+
 class BeanieReportStore:
     async def claim(self, key: str) -> bool:
         """Insert the de-dup key; False when another run already holds it."""
@@ -66,10 +71,14 @@ class BeanieReportStore:
             return []
         try:
             await BidReport.insert_many([BidReport(**r.model_dump()) for r in rows])
-        except (DuplicateKeyError, BulkWriteError):
-            # Another run inserted this period first; use its rows.
-            return await self.load_rows(rows[0].kind, rows[0].periodKey)
-        return rows
+            return rows
+        except DuplicateKeyError:
+            pass
+        except BulkWriteError as e:
+            if not _only_duplicates(e):
+                raise
+        # Another run inserted this period first; use its rows.
+        return await self.load_rows(rows[0].kind, rows[0].periodKey)
 
     async def active_bidders(self) -> list:
         return await Bidder.find(Bidder.archivedAt == None).to_list()  # noqa: E711

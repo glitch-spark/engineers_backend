@@ -48,4 +48,7 @@ def test_collections_and_unique_report_index():
     assert Bidder.Settings.name == "bidders" and BidReport.Settings.name == "bidreports"
     assert Bidder.model_fields["archivedAt"].default is None
     unique = [ix.document for ix in BidReport.Settings.indexes if ix.document.get("unique")]
-    assert [list(ix["key"].items()) for ix in unique] == [[("kind", 1), ("periodKey", 1), ("bidderId", 1)]]
+    assert [list(ix["key"].items()) for ix in unique] == [[("bidderId", 1), ("kind", 1), ("periodKey", 1)]]
+    # No other index may share the unique one's field set, or Beanie silently drops one of them.
+    field_sets = [frozenset(ix.document["key"]) for ix in BidReport.Settings.indexes]
+    assert len(field_sets) == len(set(field_sets))
