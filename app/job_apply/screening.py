@@ -128,15 +128,21 @@ def build_report(rows: list[tuple[Optional[str], Optional[str]]], profiles: list
     for jobs open only outside the markets."""
     counts = Counter(screen for screen, _ in rows if screen)
     groups = {k: {"key": k, "jobs": 0, "check": 0} for k in (*MARKETS, NO_LOCATION)}
+    combos: dict[tuple, dict] = {}
     others: Counter = Counter()
     for screen, key in rows:
         if screen == "other_location":
             others[key or NO_LOCATION] += 1
         if screen not in WORTH:
             continue
-        for k in markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else []):
+        keys = markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else [])
+        for k in keys:
             groups[k]["jobs"] += 1
             groups[k]["check"] += screen == "check"
+        if keys:
+            c = combos.setdefault(tuple(keys), {"markets": list(keys), "jobs": 0, "check": 0})
+            c["jobs"] += 1
+            c["check"] += screen == "check"
     shown = [groups[m] for m in MARKETS] + ([groups[NO_LOCATION]] if groups[NO_LOCATION]["jobs"] else [])
     for g in shown:
         g["fits"] = [
@@ -152,5 +158,7 @@ def build_report(rows: list[tuple[Optional[str], Optional[str]]], profiles: list
         "maxAgeDays": max_age_days,
         "groups": shown,
         "others": [{"key": k, "jobs": n} for k, n in sorted(others.items(), key=lambda kv: (-kv[1], kv[0]))],
+        # Each worthwhile job once, by its set of markets: a profile picked in two of them still counts it once.
+        "combos": sorted(combos.values(), key=lambda c: (c["markets"] == [NO_LOCATION], len(c["markets"]), c["markets"])),
         "profiles": profiles,
     }

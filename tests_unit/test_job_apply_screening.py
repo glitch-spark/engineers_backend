@@ -152,6 +152,12 @@ def test_build_report():
         {"key": "none", "jobs": 1, "check": 1, "fits": ["a", "s"]},
     ]
     assert rep["others"] == [{"key": "CA", "jobs": 2}, {"key": "APAC", "jobs": 1}]
+    # each worthwhile job once, by the set of markets it's in, so a profile's jobs aren't counted twice
+    assert rep["combos"] == [
+        {"markets": ["UKEU"], "jobs": 1, "check": 0},
+        {"markets": ["US", "UKEU", "LATAM"], "jobs": 1, "check": 0},
+        {"markets": ["none"], "jobs": 1, "check": 1},
+    ]
     assert rep["profiles"] == [alex, sam]
 
 
