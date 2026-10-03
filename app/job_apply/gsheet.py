@@ -11,11 +11,11 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 
-from app.job_apply.sheet import MAX_BYTES, SheetError, SheetRow, parse_sheet
+from app.job_apply.sheet import MAX_BYTES, SheetError, SheetRow, parse_sheet, parse_sheet_ex
 
 log = logging.getLogger(__name__)
 
-EXPORT_URL ="https://docs.google.com/spreadsheets/d/{sid}/export"
+EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sid}/export"
 TIMEOUT = 30.0
 DEFAULT_TITLE = "Google Sheet"
 PRIVATE_HINT = (
@@ -79,7 +79,7 @@ async def download_gsheet(url: str, *, client: httpx.AsyncClient) -> tuple[str, 
     csv_resp = await _export(client, sid, "csv", gid)
     title = _title(csv_resp)
     try:
-        return title, parse_sheet("sheet.csv", csv_resp.content)
+        rows, by_column = parse_sheet_ex("sheet.csv", csv_resp.content)
     except SheetError as csv_error:
         if "URL column" not in str(csv_error):
             raise
@@ -88,3 +88,11 @@ async def download_gsheet(url: str, *, client: httpx.AsyncClient) -> tuple[str, 
             return title, parse_sheet("sheet.xlsx", xlsx_resp.content)
         except SheetError:
             raise csv_error
+    if by_column:
+        return title, rows
+    # Only stray links in the CSV: the job links may sit behind text ("Apply"), which only the xlsx keeps.
+    try:
+        xlsx_rows = parse_sheet("sheet.xlsx", (await _export(client, sid, "xlsx", None)).content)
+    except SheetError:
+        return title, rows
+    return title, (xlsx_rows if len(xlsx_rows) > len(rows) else rows)

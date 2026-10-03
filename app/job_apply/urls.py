@@ -206,6 +206,37 @@ def normalize_url(url: str) -> str:
     return result
 
 
+# http(s):// or www. followed by anything up to whitespace, quotes or angle brackets (job_url_filter extract.py).
+_FIND_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.IGNORECASE)
+_TRAILING_PUNCT = ".,;:!?'\""
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _trim(url: str) -> str:
+    """Drop trailing punctuation, and closing brackets that have no opener in the URL."""
+    while url:
+        last = url[-1]
+        if last in _TRAILING_PUNCT:
+            url = url[:-1]
+        elif last in _CLOSERS and url.count(last) > url.count(_CLOSERS[last]):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
+def find_urls(text: str) -> list[str]:
+    """Every URL in free text, in order, without trailing punctuation; "www." links get https://."""
+    if not text or ("://" not in text and "w." not in text and "W." not in text):
+        return []
+    found = []
+    for match in _FIND_RE.findall(text):
+        url = _trim(match)
+        if url:
+            found.append(url if _SCHEME_RE.match(url) else "https://" + url)
+    return found
+
+
 def normalize_all(urls: list[str]) -> tuple[list[str], int]:
     """Normalize every URL in order; return the results and how many changed."""
     cache: dict[str, str] = {}

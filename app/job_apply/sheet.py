@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from app.job_apply.urls import normalize_url
+from app.job_apply.urls import find_urls, normalize_url
 
 MAX_ROWS = 1000
 MAX_BYTES = 5_000_000
@@ -34,11 +34,18 @@ class _Cell:
     link: Optional[str]
 
     @property
+    def urls(self) -> list[str]:
+        """The hyperlink target, then every URL written in the text ("apply at https://…", several per cell)."""
+        out = [self.link.strip()] if self.link and _URL.match(self.link.strip()) else []
+        for u in find_urls(self.text):
+            if u not in out:
+                out.append(u)
+        return out
+
+    @property
     def url(self) -> Optional[str]:
-        for v in (self.link, self.text):
-            if v and _URL.match(v.strip()):
-                return v.strip()
-        return None
+        urls = self.urls
+        return urls[0] if urls else None
 
 
 def _xlsx_cell(value_cell, formula_cell) -> _Cell:
@@ -76,6 +83,11 @@ def _read_csv(data: bytes) -> list[list[_Cell]]:
 
 
 def parse_sheet(filename: str, data: bytes) -> list[SheetRow]:
+    return parse_sheet_ex(filename, data)[0]
+
+
+def parse_sheet_ex(filename: str, data: bytes) -> tuple[list[SheetRow], bool]:
+    """(rows, found_url_column). False when the links were picked up loose from any cell."""
     if len(data) > MAX_BYTES:
         raise SheetError(f"File is larger than {MAX_BYTES // 1_000_000} MB.")
     ext = (filename or "").lower().rsplit(".", 1)[-1]
@@ -103,10 +115,15 @@ def parse_sheet(filename: str, data: bytes) -> list[SheetRow]:
             cells = cells[1:]  # a non-URL first cell is a header candidate; don't count it against the column
         cells = [c for c in cells if c.text or c.link]
         hits = sum(1 for c in cells if c.url)
-        if cells and hits / len(cells) >= 0.5 and hits > best:
+        # One stray link doesn't make a URL column (unless the sheet has a single job row).
+        if cells and hits / len(cells) >= 0.5 and hits >= min(2, len(rows) - 1) and hits > best:
             url_col, best = i, hits
     if url_col is None:
-        raise SheetError("No URL column found. One column must contain job links (http/https).")
+        # No column is mostly links: take every link in the sheet, row by row, left to right (no descriptions).
+        loose = [(n, u) for n, r in zip(numbers, rows) for c in r for u in c.urls]
+        if not loose:
+            raise SheetError("No URL column found. One column must contain job links (http/https).")
+        return _dedupe([SheetRow(rowIndex=n, url=u, jdText=None) for n, u in loose]), False
 
     has_header = col(url_col)[0].url is None
     body = rows[1:] if has_header else rows
@@ -122,17 +139,24 @@ def parse_sheet(filename: str, data: bytes) -> list[SheetRow]:
             jd_col, best_avg = i, avg
 
     out: list[SheetRow] = []
-    seen: set[str] = set()
     for offset, r in enumerate(body):
-        url = r[url_col].url if url_col < len(r) else None
-        if not url:
+        urls = r[url_col].urls if url_col < len(r) else []
+        jd = r[jd_col].text if jd_col is not None and jd_col < len(r) and len(urls) == 1 else ""
+        for url in urls:  # several links in one cell are several jobs; a description can't be split between them
+            out.append(SheetRow(rowIndex=body_numbers[offset], url=url, jdText=jd if len(jd) >= MIN_JD_CELL_CHARS else None))
+    return _dedupe(out), True
+
+
+def _dedupe(rows: list[SheetRow]) -> list[SheetRow]:
+    """Clean each URL (urls.normalize_url) and keep the first row per cleaned URL."""
+    out: list[SheetRow] = []
+    seen: set[str] = set()
+    for row in rows:
+        row.url = normalize_url(row.url)
+        if row.url in seen:
             continue
-        url = normalize_url(url)
-        if url in seen:
-            continue
-        seen.add(url)
-        jd = r[jd_col].text if jd_col is not None and jd_col < len(r) else ""
-        out.append(SheetRow(rowIndex=body_numbers[offset], url=url, jdText=jd if len(jd) >= MIN_JD_CELL_CHARS else None))
+        seen.add(row.url)
+        out.append(row)
     if len(out) > MAX_ROWS:
         raise SheetError(f"Too many rows: {len(out)} (max {MAX_ROWS}).")
     return out
