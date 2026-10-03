@@ -1,5 +1,6 @@
 """Request schema and response shapes for bidders."""
 
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -97,4 +98,61 @@ def report_out(r) -> dict:
         "rate": r.rate,
         "amount": r.amount,
         "error": r.error,
+    }
+
+
+_USERNAME = re.compile(r"^[a-z0-9._-]{3,40}$")
+
+
+def _username(v: str) -> str:
+    v = v.strip().lower()
+    if not _USERNAME.match(v):
+        raise ValueError("Username must be 3-40 characters: letters, digits, . _ -")
+    return v
+
+
+class RegisterIn(BaseModel):
+    inviteCode: str
+    username: str
+    password: str
+
+    @field_validator("inviteCode")
+    @classmethod
+    def _code(cls, v: str) -> str:
+        if len(v) > 100:
+            raise ValueError("Invalid invite code")
+        return v
+
+    @field_validator("username")
+    @classmethod
+    def _user(cls, v: str) -> str:
+        return _username(v)
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if len(v.encode()) > 72:  # bcrypt ignores everything past 72 bytes
+            raise ValueError("Password must be at most 72 bytes")
+        return v
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+    @field_validator("username")
+    @classmethod
+    def _user(cls, v: str) -> str:
+        return v.strip().lower()  # no format rule: a malformed name is just a wrong name
+
+
+def bidder_me(b, profile_name: Optional[str]) -> dict:
+    return {
+        "name": b.name,
+        "folder": b.folder,
+        "profileName": profile_name,
+        "username": b.username,
+        "status": bidder_status(b),
     }

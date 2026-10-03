@@ -18,6 +18,7 @@ from app.routers import (
     ai_review,
     applications,
     auth as auth_router,
+    bidder_ext,
     bidders,
     dashboard,
     global_prompt,
@@ -124,6 +125,7 @@ def create_app() -> FastAPI:
     app.include_router(slack_bot.router)
     app.include_router(slack_bot.cron_router)
     app.include_router(bidders.router)
+    app.include_router(bidder_ext.router)
     app.include_router(bidders.cron_router)
 
     return app

@@ -6,6 +6,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
 from app.models import UserExtra
+from app.models.bidder import Bidder
 from app.security import decode_token
 
 _bearer = HTTPBearer(auto_error=False)
@@ -21,6 +22,8 @@ async def get_current_user(
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
 
+    if payload.get("typ") == "bidder":  # extension tokens never act as app users
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
     sub = payload.get("sub")
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token payload")
@@ -41,3 +44,31 @@ async def require_admin(
     if user.role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
     return user
+
+
+async def get_current_bidder(
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(_bearer)],
+) -> Bidder:
+    """Extension auth: one message for every failure so a caller learns nothing about why."""
+    invalid = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise invalid
+    try:
+        payload = decode_token(credentials.credentials)
+    except JWTError:
+        raise invalid
+    if payload.get("typ") != "bidder":
+        raise invalid
+    try:
+        bidder_id = PydanticObjectId(payload.get("sub"))
+    except Exception:
+        raise invalid
+    bidder = await Bidder.get(bidder_id)
+    if (
+        bidder is None
+        or bidder.archivedAt is not None
+        or bidder.registeredAt is None
+        or payload.get("ver") != bidder.tokenVersion
+    ):
+        raise invalid
+    return bidder
