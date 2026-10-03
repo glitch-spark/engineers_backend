@@ -6,7 +6,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.job_apply.sheet_links import find_row  # noqa: E402
 
-HEADER = ["Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied"]
+HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume"]
 URL = "https://boards.greenhouse.io/acme/jobs/9"
 
 
@@ -15,7 +15,7 @@ def sheet(*rows):
 
 
 def r(profile, url):
-    return ["2026-10-03", profile, "Acme", "Engineer", url, "To tailor", "Tailored (pending)", "", "", "FALSE"]
+    return [profile, "Acme", "Engineer", url, '=HYPERLINK("https://api.example.com/job-applies/files/x","Download")']
 
 
 def test_find_row_same_row():

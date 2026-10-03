@@ -69,9 +69,9 @@ def test_every_status_label():
     assert cells(row(screen=None, extraction=None))["Status"] == "Not checked yet"
 
 
-def test_apply_columns():
-    assert sc.APPLY_HEADER == ["Location", "Security Clearance", "Remote/Hybrid/Onsite"]
-    assert sc.apply_cells(row()) == ["United States, EU", "None", "Remote"]
+def test_no_step3_columns_here():
+    # step 3 rows are just Profile, Company Name, Job Title, Job URL, Download Resume (the router's EXPORT_HEADER)
+    assert not hasattr(sc, "APPLY_HEADER") and not hasattr(sc, "apply_cells")
 
 
 def test_text_that_looks_like_a_formula_is_escaped():

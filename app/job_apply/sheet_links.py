@@ -1,9 +1,9 @@
-"""Fill an exported Google Sheet row's resume link in once its tailored resume is ready.
+"""Point an exported Google Sheet row at a re-tailored resume.
 
-The export (POST /runs/{id}/export-sheet) adds rows for jobs with no resume yet ("To tailor" / "Tailoring…") and
-records where each went (JobApplyRow.exportedRows). When the tailored resume completes, its link goes into that
-row — after checking the row still shows the same job and profile; if the tab was sorted or edited, the row is
-found again by Job URL + Profile, and if it's gone the sheet is left alone. A Sheets problem never fails the
+The export (POST /runs/{id}/export-sheet) records where each row went (JobApplyRow.exportedRows). When a newer
+tailored resume completes for a job and profile already in the sheet, its download link replaces the old one in
+that row — after checking the row still shows the same profile and job; if the tab was sorted or edited, the row
+is found again by Profile + Job URL, and if it's gone the sheet is left alone. A Sheets problem never fails the
 resume job: it is logged and skipped.
 """
 import logging
@@ -17,7 +17,7 @@ from app.job_apply import file_links
 
 log = logging.getLogger(__name__)
 
-_PROFILE, _URL = 1, 4  # columns B (Profile) and E (Job URL) of the export
+_PROFILE, _URL = 0, 3  # columns A (Profile) and D (Job URL) of the export; E is Download Resume
 
 
 def _matches(cells: list[str], url: str, profile: str) -> bool:
@@ -50,14 +50,13 @@ async def fill_link(job) -> bool:
         link = file_links.file_url("tailored", str(job.id))
         tab = where["tab"]
         async with httpx.AsyncClient() as http:
-            values = await google_sheets.read_range(http, where["sheetId"], google_sheets._a1(tab, "A1:J"))
+            values = await google_sheets.read_range(http, where["sheetId"], google_sheets._a1(tab, "A1:E"))
             n = find_row(values, recorded=int(where["row"]), url=row.url, profile=profile)
             if n is None:
                 log.info("exported row for %s / %s is gone from %s; link not filled", row.url, profile, tab)
                 return False
             await google_sheets.update_range(
-                http, where["sheetId"], google_sheets._a1(tab, f"F{n}:G{n}"),
-                [[f'=HYPERLINK("{link}","Download")', "Tailored"]],
+                http, where["sheetId"], google_sheets._a1(tab, f"E{n}"), [[f'=HYPERLINK("{link}","Download")']],
             )
         if n != int(where["row"]):
             await JobApplyRow.get_motor_collection().update_one(

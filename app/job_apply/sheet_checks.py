@@ -1,6 +1,5 @@
-"""Job details as Google Sheet cells: three columns on each exported application row (APPLY_HEADER) and a per-run
-"Checks" tab listing every job with its posting date, location, clearance, work mode and status (CHECKS_HEADER).
-Works on anything shaped like a JobApplyRow."""
+"""The per-run "Checks" tab of the Google Sheet export: every job with its posting date, location, clearance, work
+mode and status (CHECKS_HEADER). Works on anything shaped like a JobApplyRow."""
 import re
 from typing import Any
 
@@ -8,7 +7,6 @@ CHECKS_HEADER = [
     "Company Name", "Job URL", "Job Title", "Posting Date", "Location", "Security Clearance",
     "Remote/Hybrid/Onsite", "Status",
 ]
-APPLY_HEADER = ["Location", "Security Clearance", "Remote/Hybrid/Onsite"]
 
 STATUS_LABEL = {  # same words as the app's screening report
     "valid": "Worth applying", "check": "Needs a check", "closed": "Closed", "not_fetched": "Not fetched",
@@ -61,8 +59,3 @@ def checks_row(row: Any) -> list[Any]:
         STATUS_LABEL.get(row.screen or "", "Not checked yet"),
     ]
     return [sheet_text(c) for c in cells]
-
-
-def apply_cells(row: Any) -> list[Any]:
-    """Location, Security Clearance and Remote/Hybrid/Onsite for an exported application row."""
-    return [sheet_text(c) for c in (_location(row), _clearance(row), _work_mode(row))]

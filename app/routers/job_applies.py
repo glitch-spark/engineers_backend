@@ -383,7 +383,7 @@ async def _application_counts(run: JobApplyRun) -> dict:
         apps = _applications(row, run.threshold, ctx)
         pending = [a for a in apps if a["state"] != "applied"]
         jobs += bool(pending)
-        to_export += sum(a["accountId"] not in row.exported for a in pending)
+        to_export += sum(a["accountId"] not in row.exported and a["state"] == "ready" for a in pending)
         for a in apps:
             counts[a["state"]] += 1
         for a in pending:
@@ -394,7 +394,7 @@ async def _application_counts(run: JobApplyRun) -> dict:
     return {
         "jobs": jobs,  # jobs with at least one application to go
         "toGo": counts["ready"] + counts["tailoring"] + counts["needsResume"],
-        "toExport": to_export,  # applications to go not yet in the shared sheet
+        "toExport": to_export,  # applications with a resume to send, not yet in the shared sheet
         **counts,
         "byProfile": [
             {"accountId": acc, "name": names.get(acc, "(deleted profile)"), **n} for acc, n in per_profile.items()
@@ -1220,41 +1220,18 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
 
 # ---------- export to Google Sheets ----------
 
-# "Applied" stays in column J (tick boxes); the check columns follow it, so older tabs keep their layout.
-EXPORT_HEADER = [
-    "Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied",
-    *sheet_checks.APPLY_HEADER,
-]
+# One row per application with a resume to send. Re-tailoring fills the new link into the row it went to
+# (app/job_apply/sheet_links.py finds it again by Profile and Job URL).
+EXPORT_HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume"]
 
 
 class ExportBody(BaseModel):
     sheetUrl: str = ""  # empty = the link saved from the last export
     dryRun: bool = False  # count and check access only
-    tailorMissing: bool = False  # also queue tailored resumes for the exported jobs that have none yet
 
 
-TO_TAILOR, TAILORING, PENDING_KIND = "To tailor", "Tailoring…", "Tailored (pending)"
-
-
-def export_cells(app: dict, link: Optional[str], kind: str) -> tuple[str, str]:
-    """(Resume, Resume type) cells: a download link when the resume exists, else a placeholder the app fills in
-    when the tailored PDF is ready (app/job_apply/sheet_links.py)."""
-    if link:
-        return f'=HYPERLINK("{link}","Download")', sheet_text(kind)
-    return (TAILORING if app["state"] == "tailoring" else TO_TAILOR), PENDING_KIND
-
-
-async def _fill_finished(linkless: list[tuple]) -> None:
-    """A tailored resume that completed while the export was writing ran its fill-in before the row was recorded;
-    fill those links in now (fill_link skips anything not current)."""
-    from app.job_apply import sheet_links
-
-    for row_id, acc in linkless:
-        row = await JobApplyRow.get(row_id)
-        job_id = (row.tailored or {}).get(acc) if row else None
-        job = await ResumeApplication.get(job_id) if job_id else None
-        if job is not None and job.status == "completed":
-            await sheet_links.fill_link(job)
+def _download_cell(link: str) -> str:
+    return f'=HYPERLINK("{link}","Download")'
 
 
 def _export_target(sheet_url: str, user: UserExtra) -> tuple[str, str]:
@@ -1300,10 +1277,9 @@ def _today_label(user: UserExtra) -> str:
 
 @router.post("/runs/{run_id}/export-sheet")
 async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Append one row per job × profile still to apply to (with that profile's tailored resume if ready, else its
-    matching uploaded resume) to today's tab of the shared Google Sheet. Jobs with no resume yet (tailor-only
-    profile, or still tailoring) are exported too, with "To tailor" / "Tailoring…": their link is filled in when the
-    tailored PDF is ready. Rows already exported are skipped."""
+    """Append one row per job x profile with a resume to send (that profile's tailored resume when it's done, else its
+    matching uploaded one) to today's "Apply · <date>" tab of the shared Google Sheet. Applications waiting for a
+    tailored resume aren't written yet: exporting again after tailoring adds them. Rows already exported are skipped."""
     run = await _owned_run(run_id, user)
     url, sheet_id = _export_target(body.sheetUrl, user)
 
@@ -1311,14 +1287,11 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     ctx = await _app_context(run, rows)
     accounts = {str(a.id): a for a in await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()}
     resumes = {str(r.id): r for a in accounts.values() for r in a.resumes}
-    today = _today_label(user)
+    tab = f"Apply · {_today_label(user)}"
 
     out: list[list] = []
     marks: list[tuple] = []
-    linkless: list[tuple] = []  # exported as "To tailor" / "Tailoring…"
-    pending = needs = already = no_file = queued = over = 0
-    owner = await UserExtra.get(run.userId) if body.tailorMissing else None
-    remaining = await resume_queue.remaining_today(owner) if owner else 0
+    waiting = already = no_file = 0
     for row in rows:
         for app in _applications(row, run.threshold, ctx):
             acc = app["accountId"]
@@ -1327,44 +1300,19 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             if acc in row.exported:
                 already += 1
                 continue
-            link, kind = None, ""
-            if app["state"] == "tailoring":
-                pending += 1
-            elif app["state"] == "needsResume":
-                needs += 1
-                if owner is not None:  # "Tailor the jobs without a resume now"
-                    if remaining <= 0:
-                        over += 1
-                    elif body.dryRun:
-                        queued += 1
-                        remaining -= 1
-                    else:
-                        try:
-                            await _tailor_row(row, run, owner, acc, False)
-                            app = {**app, "state": "tailoring"}
-                            queued += 1
-                            remaining -= 1
-                        except HTTPException as exc:
-                            if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-                                over += 1
-                                remaining = 0
-            elif app.get("tailoredJobId"):
-                link, kind = file_links.file_url("tailored", app["tailoredJobId"]), "Tailored"
+            if app["state"] != "ready":
+                waiting += 1  # tailoring, or needs a tailored resume: exported once it's done
+                continue
+            if app.get("tailoredJobId"):
+                link = file_links.file_url("tailored", app["tailoredJobId"])
             else:
                 resume = resumes.get(app["resumeId"])
                 if not resume or not resume.s3Key:
                     no_file += 1  # the original PDF isn't stored, so there's nothing to link to
                     continue
-                link, kind = file_links.file_url("resume", app["resumeId"], account_id=acc), f"Uploaded · {app['filename']}"
-            resume_cell, kind_cell = export_cells(app, link, kind)
-            if not link:
-                linkless.append((row.id, acc))
-            out.append([
-                today, *map(sheet_text, (accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url)),
-                resume_cell, kind_cell, app["score"] if app["score"] is not None else "",
-                row.postedDate.isoformat() if row.postedDate else "", False,
-                *sheet_checks.apply_cells(row),
-            ])
+                link = file_links.file_url("resume", app["resumeId"], account_id=acc)
+            name = accounts[acc].name if acc in accounts else "Profile"
+            out.append([*map(sheet_text, (name, row.company, row.title, row.url)), _download_cell(link)])
             marks.append((row.id, acc))
 
     async with httpx.AsyncClient() as http:
@@ -1372,56 +1320,34 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             info = await google_sheets.sheet_info(http, sheet_id)
             written = None
             if not body.dryRun and out:
-                if not await google_sheets.ensure_tab(http, sheet_id, today, EXPORT_HEADER, info, checkbox="Applied"):
-                    # an existing tab may predate the check columns: refresh its header
-                    await google_sheets.update_range(http, sheet_id, google_sheets._a1(today, "A1"), [EXPORT_HEADER])
-                written = await google_sheets.append_rows(http, sheet_id, today, out)
+                if not await google_sheets.ensure_tab(http, sheet_id, tab, EXPORT_HEADER, info):
+                    await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [EXPORT_HEADER])
+                written = await google_sheets.append_rows(http, sheet_id, tab, out)
         except google_sheets.SheetsError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    now = datetime.utcnow()
     if not body.dryRun:
-        first = None
+        now, first = datetime.utcnow(), None
         if written:
             try:
-                tab, first, _ = google_sheets.parse_row_span(written)
+                _, first, _ = google_sheets.parse_row_span(written)
             except ValueError:
-                first = None
+                log.warning("export of run %s: unexpected range %r, rows not recorded", run.id, written)
         coll = JobApplyRow.get_motor_collection()
         for i, (row_id, acc) in enumerate(marks):
             fields = {f"exported.{acc}": now, "updatedAt": now}
             if first is not None:
                 fields[f"exportedRows.{acc}"] = {"sheetId": sheet_id, "tab": tab, "row": first + i}
             await coll.update_one({"_id": row_id}, {"$set": fields})
-        if first is not None:
-            await _fill_finished(linkless)
-    # After the application rows are recorded: a Checks tab problem must not leave appended rows unrecorded.
-    checks_tab, checks_jobs, checks_error = sheet_checks.checks_tab_name(run), 0, None
-    if body.dryRun:
-        checks_jobs = await JobApplyRow.find({"runId": run.id}).count()
-    else:
-        try:
-            async with httpx.AsyncClient() as http:
-                checks_tab, checks_jobs = await _write_checks(http, sheet_id, run, info)
-        except google_sheets.SheetsError as exc:
-            checks_error = str(exc)
-            log.warning("checks tab for run %s not written: %s", run.id, exc)
     await _remember_sheet(url, user)
     return {
-        "checksTab": checks_tab,
-        "checksJobs": checks_jobs,
-        "checksError": checks_error,
         "ready": len(out),
         "added": 0 if body.dryRun else len(out),
-        "pending": pending,
-        "needsResume": needs,
-        "pendingLinks": pending + needs,  # rows exported with "To tailor" / "Tailoring…"
-        "tailorQueued": queued,
-        "overLimit": over,  # left as "To tailor": today's tailoring limit is reached
+        "waiting": waiting,  # applications without their tailored resume yet
         "alreadyExported": already,
         "noFile": no_file,
         "sheetTitle": info["title"],
-        "tab": today,
+        "tab": tab,
         "sheetUrl": url,
         "serviceAccount": google_sheets.service_account_email(),
     }
