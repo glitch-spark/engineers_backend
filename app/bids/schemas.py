@@ -6,15 +6,12 @@ from typing import Optional
 from beanie import PydanticObjectId
 from pydantic import BaseModel, field_validator
 
-from app.bids.storage import parse_folder_url
-
 
 class BidderIn(BaseModel):
     name: str
     country: Optional[str] = None
     profileId: Optional[str] = None
     rate: float
-    screenshotFolderUrl: str
 
     @field_validator("name")
     @classmethod
@@ -55,18 +52,6 @@ class BidderIn(BaseModel):
             raise ValueError("Rate must have at most 2 decimals")
         return v
 
-    @field_validator("screenshotFolderUrl")
-    @classmethod
-    def _folder_url(cls, v: str) -> str:
-        v = v.strip()
-        try:
-            parse_folder_url(v)
-        except ValueError as e:
-            if "points at a file" in str(e):
-                raise ValueError("Use the bidder's folder, not a single screenshot (e.g. s3://bid-screenshots/puma/)") from None
-            raise ValueError("Use an s3://, amazonaws.com or backblazeb2.com folder URL") from None
-        return v
-
 
 def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
     """UTC ISO string with a Z suffix (as app/routers/interviews.py:_iso_utc). Motor returns naive UTC."""
@@ -75,6 +60,12 @@ def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.isoformat() + "Z"
+
+
+def bidder_status(b) -> str:
+    if b.archivedAt is not None:
+        return "archived"
+    return "active" if b.registeredAt is not None else "invited"
 
 
 def bidder_out(b, profile_name: Optional[str]) -> dict:
@@ -86,6 +77,11 @@ def bidder_out(b, profile_name: Optional[str]) -> dict:
         "profileName": profile_name,
         "rate": b.rate,
         "screenshotFolderUrl": b.screenshotFolderUrl,
+        "folder": b.folder,
+        "status": bidder_status(b),
+        "username": b.username,
+        "inviteExpiresAt": _iso_utc(b.inviteExpiresAt) if b.inviteCodeHash is not None else None,
+        "registeredAt": _iso_utc(b.registeredAt),
         "archivedAt": _iso_utc(b.archivedAt),
         "createdAt": _iso_utc(b.createdAt),
     }

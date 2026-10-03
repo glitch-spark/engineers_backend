@@ -15,15 +15,14 @@ from app.models.bidder import Bidder
 
 
 def valid(**over):
-    base = dict(name=" Ana Silva ", country="br", profileId=str(PydanticObjectId()), rate=0.5,
-                screenshotFolderUrl=" s3://shots/bids/ana/ ")
+    base = dict(name=" Ana Silva ", country="br", profileId=str(PydanticObjectId()), rate=0.5)
     base.update(over)
     return base
 
 
 def test_bidder_in_normalizes():
     b = BidderIn(**valid())
-    assert (b.name, b.country, b.rate, b.screenshotFolderUrl) == ("Ana Silva", "BR", 0.5, "s3://shots/bids/ana/")
+    assert (b.name, b.country, b.rate) == ("Ana Silva", "BR", 0.5)
 
 
 def test_blank_optional_fields_become_none():
@@ -34,30 +33,11 @@ def test_blank_optional_fields_become_none():
 @pytest.mark.parametrize("field,value", [
     ("name", "   "), ("name", "x" * 101), ("country", "BRA"), ("country", "1A"),
     ("rate", -0.01), ("rate", 1000.01), ("rate", 0.505), ("profileId", "nope"),
-    ("screenshotFolderUrl", "https://example.com/a/"), ("screenshotFolderUrl", "s3://shots"),
 ])
 def test_bidder_in_rejects(field, value):
     with pytest.raises(ValidationError) as exc:
         BidderIn(**valid(**{field: value}))
     assert exc.value.errors()[0]["loc"] == (field,)
-
-
-def test_backblaze_folder_urls_are_accepted():
-    for url in ("https://s3.us-east-005.backblazeb2.com/bid-screenshots/puma/",
-                "https://f005.backblazeb2.com/file/bid-screenshots/puma/"):
-        assert BidderIn(**valid(screenshotFolderUrl=url)).screenshotFolderUrl == url
-
-
-def test_folder_url_error_names_every_accepted_form():
-    with pytest.raises(ValidationError) as exc:
-        BidderIn(**valid(screenshotFolderUrl="https://example.com/a/"))
-    assert "Use an s3://, amazonaws.com or backblazeb2.com folder URL" in exc.value.errors()[0]["msg"]
-
-
-def test_a_pasted_screenshot_url_asks_for_the_folder():
-    with pytest.raises(ValidationError) as exc:
-        BidderIn(**valid(screenshotFolderUrl="https://f005.backblazeb2.com/file/bid-screenshots/puma/d/upwork/acme/step1.png"))
-    assert "Use the bidder's folder, not a single screenshot" in exc.value.errors()[0]["msg"]
 
 
 @pytest.mark.parametrize("rate", [0, 0.1, 0.29, 19.99, 1000])
@@ -79,11 +59,14 @@ NAIVE = datetime(2026, 10, 1, 23, 30)  # how Motor returns stored UTC values (no
 AWARE = datetime(2026, 10, 1, 18, 30, tzinfo=timezone(timedelta(hours=-5)))  # same instant, CDT
 
 
+LOGIN = dict(folder="ana", username=None, registeredAt=None, inviteCodeHash=None, inviteExpiresAt=None)
+
+
 @pytest.mark.parametrize("value", [NAIVE, AWARE])
 def test_bidder_out_emits_utc_datetimes(value):
     pid = PydanticObjectId()
     b = SimpleNamespace(id=PydanticObjectId(), name="Ana", country="BR", profileId=pid, rate=0.5,
-                        screenshotFolderUrl="s3://b/ana/", archivedAt=value, createdAt=value)
+                        screenshotFolderUrl="s3://b/ana/", archivedAt=value, createdAt=value, **LOGIN)
     out = bidder_out(b, "Backend")
     assert out["archivedAt"] == out["createdAt"] == "2026-10-01T23:30:00Z"
     assert out["profileId"] == str(pid) and out["profileName"] == "Backend"
@@ -91,7 +74,7 @@ def test_bidder_out_emits_utc_datetimes(value):
 
 def test_bidder_out_optional_fields():
     b = SimpleNamespace(id=PydanticObjectId(), name="Ana", country=None, profileId=None, rate=0.5,
-                        screenshotFolderUrl="s3://b/ana/", archivedAt=None, createdAt=NAIVE)
+                        screenshotFolderUrl="s3://b/ana/", archivedAt=None, createdAt=NAIVE, **LOGIN)
     out = bidder_out(b, None)
     assert out["archivedAt"] is None and out["profileId"] is None and out["profileName"] is None
 
@@ -110,3 +93,16 @@ def test_report_out_keeps_missing_count_and_amount():
                         count=None, rate=0.5, amount=None, error="AccessDenied")
     out = report_out(r)
     assert out["count"] is None and out["amount"] is None and out["error"] == "AccessDenied"
+
+
+def test_bidder_status_and_login_fields():
+    from app.bids.schemas import bidder_status
+    base = dict(id=PydanticObjectId(), name="Ana", country=None, profileId=None, rate=0.5,
+                screenshotFolderUrl="s3://b/ana/", createdAt=NAIVE, folder="ana", username="ana.s")
+    invited = SimpleNamespace(**base, archivedAt=None, registeredAt=None, inviteCodeHash="h", inviteExpiresAt=AWARE)
+    active = SimpleNamespace(**base, archivedAt=None, registeredAt=NAIVE, inviteCodeHash=None, inviteExpiresAt=AWARE)
+    archived = SimpleNamespace(**base, archivedAt=NAIVE, registeredAt=NAIVE, inviteCodeHash=None, inviteExpiresAt=None)
+    assert [bidder_status(b) for b in (invited, active, archived)] == ["invited", "active", "archived"]
+    out = bidder_out(invited, None)
+    assert (out["folder"], out["username"], out["inviteExpiresAt"]) == ("ana", "ana.s", "2026-10-01T23:30:00Z")
+    assert bidder_out(active, None)["inviteExpiresAt"] is None and bidder_out(active, None)["registeredAt"] == "2026-10-01T23:30:00Z"
