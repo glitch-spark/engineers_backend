@@ -20,19 +20,31 @@ class FailureLimiter:
             self._failures.pop(key, None)
         return live
 
-    def retry_after(self, keys: list[str], now: datetime) -> Optional[int]:
-        """Seconds until the most-blocked key frees a slot; None when no key is at the limit."""
+    def reserve(self, keys: list[str], now: datetime) -> Optional[int]:
+        """Atomically (no await inside) count an attempt on every key, unless one is at the limit.
+
+        Returns the retry-after seconds when blocked (nothing recorded), else None. The reservation IS the
+        recorded failure; call release() when the attempt turns out to be a success.
+        """
         waits = []
         for key in keys:
             live = self._live(key, now)
             if len(live) >= self.limit:
                 waits.append((live[0] + self.window - now).total_seconds())
-        return max(1, math.ceil(max(waits))) if waits else None
-
-    def fail(self, keys: list[str], now: datetime) -> None:
+        if waits:
+            return max(1, math.ceil(max(waits)))
         for key in keys:
-            self._live(key, now)
             self._failures[key].append(now)
+        return None
+
+    def release(self, keys: list[str], now: datetime) -> None:
+        """Undo the reservation made with this exact `now`."""
+        for key in keys:
+            attempts = self._failures.get(key)
+            if attempts and now in attempts:
+                attempts.remove(now)
+                if not attempts:
+                    self._failures.pop(key, None)
 
     def clear(self, key: str) -> None:
         self._failures.pop(key, None)

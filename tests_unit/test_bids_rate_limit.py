@@ -9,16 +9,27 @@ from types import SimpleNamespace
 from app.bids.rate_limit import FailureLimiter, client_ip
 
 
-def test_limits_after_ten_failures_and_recovers():
+def test_limits_after_ten_attempts_and_recovers():
     lim, t0 = FailureLimiter(), datetime(2026, 10, 3, tzinfo=timezone.utc)
     for i in range(9):
-        lim.fail(["user:a", "ip:1"], t0 + timedelta(seconds=i))
-    assert lim.retry_after(["user:a", "ip:1"], t0 + timedelta(seconds=10)) is None
-    lim.fail(["user:a", "ip:1"], t0 + timedelta(seconds=9))
-    assert 0 < lim.retry_after(["user:a"], t0 + timedelta(seconds=10)) <= 900
-    assert lim.retry_after(["ip:1"], t0 + timedelta(minutes=15, seconds=1)) is None
+        assert lim.reserve(["user:a", "ip:1"], t0 + timedelta(seconds=i)) is None
+    assert lim.reserve(["user:a", "ip:1"], t0 + timedelta(seconds=9)) is None  # the 10th is allowed
+    wait = lim.reserve(["user:a"], t0 + timedelta(seconds=10))  # the 11th is blocked and not recorded
+    assert 0 < wait <= 900
+    assert len(lim._failures["user:a"]) == 10
+    assert lim.reserve(["ip:1"], t0 + timedelta(minutes=15, seconds=1)) is None
     lim.clear("user:a")
-    assert lim.retry_after(["user:a"], t0 + timedelta(seconds=10)) is None
+    assert lim.reserve(["user:a"], t0 + timedelta(seconds=10)) is None
+
+
+def test_release_gives_the_attempt_back():
+    lim, t0 = FailureLimiter(), datetime(2026, 10, 3, tzinfo=timezone.utc)
+    for i in range(10):
+        t = t0 + timedelta(seconds=i)
+        assert lim.reserve(["ip:1"], t) is None
+        lim.release(["ip:1"], t)
+    assert lim.reserve(["ip:1"], t0 + timedelta(seconds=11)) is None
+    assert len(lim._failures["ip:1"]) == 1
 
 
 def test_client_ip_prefers_forwarded_for():

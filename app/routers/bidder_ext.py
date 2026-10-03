@@ -31,19 +31,25 @@ def _keys(username: str, request: Request) -> list[str]:
     return [f"user:{username}", f"ip:{client_ip(request)}"]
 
 
-def _check_limit(keys: list[str]) -> None:
-    wait = LIMITER.retry_after(keys, datetime.now(timezone.utc))
+def _reserve(keys: list[str]) -> datetime:
+    """Count this attempt as a failure before any await (concurrent requests can't all slip past the check);
+    a success gives it back. 429 when a key is already at the limit."""
+    now = datetime.now(timezone.utc)
+    wait = LIMITER.reserve(keys, now)
     if wait is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many attempts — try again later",
             headers={"Retry-After": str(wait)},
         )
+    return now
 
 
-def _fail(keys: list[str], status_code: int, detail: str) -> HTTPException:
-    LIMITER.fail(keys, datetime.now(timezone.utc))
-    return HTTPException(status_code=status_code, detail=detail)
+def _succeed(keys: list[str], reserved_at: datetime) -> None:
+    """Successes never count toward the IP limit (many bidders share an office IP); clear the username."""
+    user_key, ip_key = keys
+    LIMITER.release([ip_key], reserved_at)
+    LIMITER.clear(user_key)
 
 
 async def _profile_name(bidder: Bidder) -> Optional[str]:
@@ -82,26 +88,26 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
 @router.post("/register")
 async def register(body: RegisterIn, request: Request) -> dict:
     keys = _keys(body.username, request)
-    _check_limit(keys)
+    reserved_at = _reserve(keys)
     bidder = await Bidder.find_one(Bidder.inviteCodeHash == hash_code(body.inviteCode))
     if bidder is None or not invite_is_live(bidder, datetime.now(timezone.utc)):
-        raise _fail(keys, status.HTTP_400_BAD_REQUEST, _BAD_CODE)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _BAD_CODE)
     if await Bidder.find_one(Bidder.username == body.username) is not None:
-        raise _fail(keys, status.HTTP_409_CONFLICT, _TAKEN)
+        raise HTTPException(status.HTTP_409_CONFLICT, _TAKEN)
     try:
         claimed = await register_bidder_row(bidder, body.username, hash_password(body.password))
     except (DuplicateKeyError, RevisionIdWasChanged):  # a concurrent registration took the username
-        raise _fail(keys, status.HTTP_409_CONFLICT, _TAKEN)
+        raise HTTPException(status.HTTP_409_CONFLICT, _TAKEN)
     if not claimed:
-        raise _fail(keys, status.HTTP_400_BAD_REQUEST, _BAD_CODE)
-    LIMITER.clear(f"user:{body.username}")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _BAD_CODE)
+    _succeed(keys, reserved_at)
     return await _session(await Bidder.get(bidder.id))
 
 
 @router.post("/login")
 async def login(body: LoginIn, request: Request) -> dict:
     keys = _keys(body.username, request)
-    _check_limit(keys)
+    reserved_at = _reserve(keys)
     bidder = await Bidder.find_one(Bidder.username == body.username) if body.username else None
     usable = bidder is not None and bidder.archivedAt is None and bidder.registeredAt is not None
     stored = bidder.passwordHash if usable and bidder.passwordHash else None
@@ -110,8 +116,8 @@ async def login(body: LoginIn, request: Request) -> dict:
     except ValueError:  # e.g. a password bcrypt refuses to hash: just a wrong password
         password_ok = False
     if not (usable and stored and password_ok):
-        raise _fail(keys, status.HTTP_401_UNAUTHORIZED, _BAD_LOGIN)
-    LIMITER.clear(f"user:{body.username}")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, _BAD_LOGIN)
+    _succeed(keys, reserved_at)
     return await _session(bidder)
 
 

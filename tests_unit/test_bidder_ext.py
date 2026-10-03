@@ -214,3 +214,51 @@ async def test_eleventh_failed_login_is_429(ext):
     assert r.status_code == 429
     assert r.json()["detail"] == "Too many attempts — try again later"
     assert int(r.headers["retry-after"]) > 0
+
+
+async def _login(ext, user="ana", pw="wrong-pass", ip=None):
+    return await ext.post(
+        "/ext/login", json={"username": user, "password": pw}, headers={"X-Forwarded-For": ip} if ip else {}
+    )
+
+
+async def test_concurrent_failed_logins_are_capped(ext, monkeypatch):
+    import asyncio
+
+    await register(ext)
+    real = Bidder.find_one.__func__
+
+    async def slow_find_one(cls, *a, **kw):
+        await asyncio.sleep(0)  # real Motor yields here
+        return await real(cls, *a, **kw)
+
+    monkeypatch.setattr(Bidder, "find_one", classmethod(slow_find_one))
+    codes = [r.status_code for r in await asyncio.gather(*[_login(ext) for _ in range(25)])]
+    assert codes.count(401) <= 10 and codes.count(429) >= 15
+
+
+async def test_username_case_shares_one_counter(ext):
+    await register(ext)
+    for user in ["ANA", "ana"] * 5:
+        assert (await _login(ext, user)).status_code == 401
+    assert (await _login(ext, "Ana", "password1")).status_code == 429
+
+
+async def test_ip_limit_spans_usernames(ext):
+    for i in range(10):
+        assert (await _login(ext, f"user{i}", ip="5.5.5.5")).status_code == 401
+    assert (await _login(ext, "someone-new", ip="5.5.5.5")).status_code == 429
+    assert (await _login(ext, "someone-new", ip="6.6.6.6")).status_code == 401
+
+
+async def test_failed_registrations_count(ext):
+    for _ in range(10):
+        r = await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB"))
+        assert r.status_code == 400
+    assert (await ext.post("/ext/register", json=reg("ZZZZ-AAAA-BBBB"))).status_code == 429
+
+
+async def test_successful_logins_do_not_count_toward_the_ip(ext):
+    await register(ext)
+    for _ in range(12):
+        assert (await _login(ext, "ana", "password1", ip="7.7.7.7")).status_code == 200
