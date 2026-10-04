@@ -89,6 +89,10 @@ async def enqueue_generation(
     cover_letter: bool = False,
     source: Literal["generator", "job_applies"] = "generator",
     job_apply_row_id: Optional[PydanticObjectId] = None,
+    resume_model: Optional[str] = None,
+    cover_letter_model: Optional[str] = None,
+    screening_model: Optional[str] = None,
+    cover_letter_hook: Optional[str] = None,
 ) -> ResumeApplication:
     """Validate and queue one generation. The caller has already checked the user may use `account`."""
     if len((jd or "").encode("utf-8")) > MAX_JD_BYTES:
@@ -125,6 +129,10 @@ async def enqueue_generation(
         countsAsBid=False if source == "job_applies" else None,
         promptOverride=(prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None,
         jobApplyRowId=job_apply_row_id,
+        resumeModelId=(resume_model or "").strip() or None,
+        coverLetterModelId=(cover_letter_model or "").strip() or None,
+        screeningModelId=(screening_model or "").strip() or None,
+        coverLetterHook=(cover_letter_hook or "").strip()[:500] or None,
     )
     await job.insert()
     wake()
@@ -137,7 +145,8 @@ _running: set[asyncio.Task] = set()
 
 # Fields the queue (claim, heartbeat, applied marks) owns; the runner never writes them back.
 _QUEUE_OWNED = frozenset({"_id", "id", "createdAt", "leaseAt", "attempts", "countsAsBid", "source", "jobApplyRowId",
-                          "promptOverride"})
+                          "promptOverride", "resumeModelId", "coverLetterModelId", "screeningModelId",
+                          "coverLetterHook"})
 
 
 class Superseded(Exception):

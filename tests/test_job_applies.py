@@ -534,6 +534,29 @@ async def test_tailor_rejects_profile_outside_run(client, staff_user, auth_heade
     assert r.status_code == 400
 
 
+async def test_tailor_forwards_requested_models(client, staff_user, auth_header, anthropic_key):
+    from app.models import ResumeApplication
+
+    h = auth_header(staff_user)
+    _, rows, _, _ = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={
+        "resumeModel": "anthropic:claude-opus-5-5", "coverLetter": True,
+        "coverLetterModel": "anthropic:claude-fable-5-1"})
+    assert r.status_code == 200, r.text
+    job = await ResumeApplication.get(r.json()["tailored"]["jobId"])
+    assert job.resumeModelId == "anthropic:claude-opus-5-5"
+    assert job.coverLetterModelId == "anthropic:claude-fable-5-1"
+
+
+async def test_tailor_unknown_model_is_400(client, staff_user, auth_header, anthropic_key):
+    h = auth_header(staff_user)
+    _, rows, _, _ = await _two_profile_run(client, h, staff_user)
+    row = rows["https://jobs.example.com/remote"]
+    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"resumeModel": "anthropic:nope"})
+    assert r.status_code == 400 and "anthropic:nope" in r.json()["detail"]
+
+
 async def test_retailor_replaces_queued_job(client, staff_user, auth_header):
     from app.models import ResumeApplication
     from app.models.job_apply import JobApplyRow

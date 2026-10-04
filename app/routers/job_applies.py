@@ -33,7 +33,7 @@ from app.models.job_apply import (
     RunCounts,
     RunSelection,
 )
-from app.routers._util import doc_to_dict, to_object_id
+from app.routers._util import doc_to_dict, require_model, to_object_id
 
 log = logging.getLogger(__name__)
 
@@ -1115,7 +1115,13 @@ def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
 
 
 async def _tailor_row(
-    row: JobApplyRow, run: JobApplyRun, owner: UserExtra, account_id: Optional[str], cover_letter: bool
+    row: JobApplyRow,
+    run: JobApplyRun,
+    owner: UserExtra,
+    account_id: Optional[str],
+    cover_letter: bool,
+    resume_model: Optional[str] = None,
+    cover_letter_model: Optional[str] = None,
 ) -> ResumeApplication:
     account_id = account_id or _best_profile(row, run)
     if account_id not in {str(s.accountId) for s in run.selection}:
@@ -1132,6 +1138,8 @@ async def _tailor_row(
         cover_letter=cover_letter,
         source="job_applies",
         job_apply_row_id=row.id,
+        resume_model=resume_model,
+        cover_letter_model=cover_letter_model,
     )
     jobs = ResumeApplication.get_motor_collection()
     # Compare-and-set: only link the new job if the row still points where we read it. A concurrent tailor
@@ -1157,12 +1165,16 @@ async def _tailor_row(
 class TailorBody(BaseModel):
     accountId: Optional[str] = None
     coverLetter: bool = False
+    resumeModel: Optional[str] = None  # catalog ids (GET /resume/models); blank = server default
+    coverLetterModel: Optional[str] = None
 
 
 class TailorAllBody(BaseModel):
     # Profiles to tailor for (default: every profile in the run); each job gets one per chosen profile it's open to.
     accountIds: Optional[list[str]] = None
     coverLetter: bool = False
+    resumeModel: Optional[str] = None
+    coverLetterModel: Optional[str] = None
     dryRun: bool = False  # count what would be queued, queue nothing
 
 
@@ -1174,7 +1186,12 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
     owner = await UserExtra.get(row.userId)
     if run is None or owner is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    job = await _tailor_row(row, run, owner, body.accountId, body.coverLetter)
+    resume_model = require_model("resume", body.resumeModel, owner)
+    cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
+    job = await _tailor_row(
+        row, run, owner, body.accountId, body.coverLetter,
+        resume_model=resume_model, cover_letter_model=cover_letter_model,
+    )
     doc = await ResumeApplication.get_motor_collection().find_one({"_id": job.id}, _TAILORED_PROJECTION)
     return {"tailored": _tailored_out(doc)}
 
@@ -1186,6 +1203,8 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
+    resume_model = require_model("resume", body.resumeModel, owner)
+    cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     chosen = set(body.accountIds or [str(s.accountId) for s in run.selection])
     rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
     ctx = await _app_context(run, rows)
@@ -1206,7 +1225,10 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
                 remaining -= 1
                 continue
             try:
-                await _tailor_row(row, run, owner, acc, body.coverLetter)
+                await _tailor_row(
+                    row, run, owner, acc, body.coverLetter,
+                    resume_model=resume_model, cover_letter_model=cover_letter_model,
+                )
             except HTTPException as exc:
                 if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                     skipped += 1

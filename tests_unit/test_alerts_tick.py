@@ -23,12 +23,17 @@ async def test_run_cron_ticks_runs_slack_before_alerts():
         order.append("alerts")
         return {"card": 0}
 
+    async def bids():
+        order.append("bids")
+        return {"daily": "not-due", "weekly": "not-due"}
+
     with (
         patch("app.slack_bot.run_alert_tick", slack),
         patch("app.alerts_service.run_alerts_tick", alerts),
+        patch("app.bids.reports.run_bid_reports_tick", bids),
     ):
         assert await run_cron_ticks() == 0
-    assert order == ["slack", "alerts"]
+    assert order == ["slack", "alerts", "bids"]
 
 
 @pytest.mark.asyncio
@@ -37,6 +42,21 @@ async def test_run_cron_ticks_still_runs_alerts_if_slack_fails():
     with (
         patch("app.slack_bot.run_alert_tick", AsyncMock(side_effect=RuntimeError("dm"))),
         patch("app.alerts_service.run_alerts_tick", alerts),
+        patch("app.bids.reports.run_bid_reports_tick", AsyncMock(return_value={})),
     ):
         assert await run_cron_ticks() == 1
+    alerts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_cron_ticks_reports_bid_failure_after_other_steps():
+    slack = AsyncMock(return_value={})
+    alerts = AsyncMock(return_value={})
+    with (
+        patch("app.slack_bot.run_alert_tick", slack),
+        patch("app.alerts_service.run_alerts_tick", alerts),
+        patch("app.bids.reports.run_bid_reports_tick", AsyncMock(side_effect=RuntimeError("s3"))),
+    ):
+        assert await run_cron_ticks() == 1
+    slack.assert_awaited_once()
     alerts.assert_awaited_once()

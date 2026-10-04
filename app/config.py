@@ -1,8 +1,14 @@
+import re
 from functools import lru_cache
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
 class Settings(BaseSettings):
@@ -34,6 +40,14 @@ class Settings(BaseSettings):
     # High-quality structured generation: resume HTML, screening answers, scoring.
     # Use a smarter model — output ships to users and judgment matters.
     RESUME_OPENAI_MODEL: str = "gpt-5-mini"
+    # Anthropic key for the selectable Claude models (app/model_catalog.py). Unset hides them.
+    ANTHROPIC_API_KEY: Optional[str] = None
+    # Only for user-level Anthropic keys (sk-ant-usr-...): the workspace every request is billed to.
+    ANTHROPIC_WORKSPACE_ID: Optional[str] = None
+    # Default model per task when the caller doesn't pick one (provider-prefixed ids).
+    RESUME_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
+    COVER_LETTER_DEFAULT_MODEL: str = "anthropic:claude-opus-5-5"
+    SCREENING_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
     # Reasoning effort for the resume rewrite (gpt-5* only). Mechanical
     # text-replace needs little reasoning — "low" cuts hidden reasoning
     # tokens (billed at output rate) ~5-10x vs the medium default.
@@ -98,6 +112,21 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    # Bidders — screenshot folders are counted in object storage (only "s3" for now). The access
+    # key / secret / region fall back to the AWS_* values above when unset.
+    BID_STORAGE_PROVIDER: str = "s3"
+    BID_STORAGE_ACCESS_KEY_ID: Optional[str] = None
+    BID_STORAGE_SECRET_ACCESS_KEY: Optional[str] = None
+    BID_STORAGE_REGION: Optional[str] = None
+    # Report schedule: wall-clock times in BID_REPORT_TIMEZONE (an IANA name). Daily report at
+    # BID_DAILY_REPORT_TIME; weekly report on BID_WEEKLY_REPORT_DAY (monday..sunday) at
+    # BID_WEEKLY_REPORT_TIME. Times are 24h HH:MM; invalid values fail at startup.
+    BID_REPORT_TIMEZONE: str = "America/Chicago"
+    BID_DAILY_REPORT_TIME: str = "18:30"
+    BID_WEEKLY_REPORT_DAY: str = "saturday"
+    BID_WEEKLY_REPORT_TIME: str = "16:00"
+    # Slack channel the bid reports post to. Unset = reports are saved but not posted.
+    SLACK_BIDS_CHANNEL_ID: Optional[str] = None
 
     @field_validator("SLACK_WEBHOOK_URL", mode="before")
     @classmethod
@@ -106,6 +135,32 @@ class Settings(BaseSettings):
             return None
         s = str(v).strip()
         return s or None
+
+    @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
+    @classmethod
+    def _validate_report_time(cls, v: str) -> str:
+        s = str(v).strip()
+        if not _HHMM.match(s):
+            raise ValueError("must be 24h HH:MM, e.g. 18:30")
+        return s
+
+    @field_validator("BID_WEEKLY_REPORT_DAY")
+    @classmethod
+    def _validate_report_day(cls, v: str) -> str:
+        s = str(v).strip().lower()
+        if s not in WEEKDAYS:
+            raise ValueError("must be one of " + ", ".join(WEEKDAYS))
+        return s
+
+    @field_validator("BID_REPORT_TIMEZONE")
+    @classmethod
+    def _validate_report_timezone(cls, v: str) -> str:
+        s = str(v).strip()
+        try:
+            ZoneInfo(s)
+        except Exception as e:  # ZoneInfoNotFoundError, ValueError for malformed keys
+            raise ValueError(f"unknown timezone {s!r}") from e
+        return s
 
 
 @lru_cache

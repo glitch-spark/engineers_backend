@@ -164,6 +164,29 @@ def _normalize_region(raw: Optional[str]) -> Optional[str]:
     return value
 
 
+def _non_blank(field: str) -> dict:
+    """Mongo expression: the string field is present and not just whitespace (like `bool((x or "").strip())`)."""
+    return {"$gt": [{"$strLenCP": {"$trim": {"input": {"$ifNull": [f"${field}", ""]}}}}, 0]}
+
+
+# Profiles carry large HTML templates and resume text, so the lookup computes its flags inside the
+# database and returns only small fields. Downloading whole documents for the dropdown took ~18 s.
+_LOOKUP_PIPELINE = [
+    {
+        "$project": {
+            "name": 1,
+            "country": 1,
+            "region": 1,
+            "createdBy": 1,
+            "showInGenerate": 1,
+            "archived": 1,
+            "hasTemplate": _non_blank("styleTemplate"),
+            "hasPrompt": _non_blank("resumePromptBody"),
+        }
+    }
+]
+
+
 @router.get("/lookup")
 async def lookup_accounts(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -172,19 +195,20 @@ async def lookup_accounts(
     no scoping. `hasTemplate` lets the Resume Generator label / gate accounts
     without a second round-trip — a profile is generation-ready iff it has an
     uploaded template."""
-    rows = await Account.find({}).to_list()
+    rows = await Account.get_motor_collection().aggregate(_LOOKUP_PIPELINE).to_list(None)
     return {
         "accounts": [
             {
-                "_id": str(a.id),
-                "name": a.name,
-                "country": a.country,
-                "region": a.region,
-                "hasTemplate": bool((a.styleTemplate or "").strip()),
-                "hasPrompt": bool((a.resumePromptBody or "").strip()),
-                "createdBy": str(a.createdBy),
-                "showInGenerate": a.showInGenerate,
-                "archived": a.archived,
+                "_id": str(a["_id"]),
+                "name": a.get("name"),
+                "country": a.get("country"),
+                "region": a.get("region"),
+                "hasTemplate": bool(a.get("hasTemplate")),
+                "hasPrompt": bool(a.get("hasPrompt")),
+                "createdBy": str(a.get("createdBy")),
+                # Profiles saved before these fields existed are active and shown.
+                "showInGenerate": a.get("showInGenerate", True),
+                "archived": a.get("archived", False),
             }
             for a in rows
         ]

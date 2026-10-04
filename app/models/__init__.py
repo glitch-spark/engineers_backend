@@ -2,6 +2,8 @@ from app.models.account import Account
 from app.models.ai_review import AiReviewRun, GlobalPrompt, Skill
 from app.models.analyze_chat_log import AnalyzeChatLog
 from app.models.application import Application
+from app.models.bid_report import BidReport
+from app.models.bidder import Bidder
 from app.models.email_account import EmailAccount
 from app.models.email_classification_cache import EmailClassificationCache
 from app.models.email_message import EmailMessage
@@ -26,6 +28,8 @@ __all__ = [
     "AiReviewRun",
     "AnalyzeChatLog",
     "Application",
+    "BidReport",
+    "Bidder",
     "DailyPlan",
     "EmailAccount",
     "EmailClassificationCache",
