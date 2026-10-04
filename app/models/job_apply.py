@@ -13,11 +13,18 @@ from pymongo import ASCENDING, DESCENDING, IndexModel
 from app.job_apply.schema import GateResult, JobExtraction, ResumeScore
 from app.models.base import TimestampedDocument
 
-RunStatus = Literal["queued", "running", "done", "failed", "cancelled"]
-RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed"]
+RunStatus = Literal["queued", "running", "screened", "done", "failed", "cancelled"]
+RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed", "unassigned"]
+# A run first screens its jobs (fetch, read, job gates), pauses at "screened" for the user to pick profiles per
+# location group, then scores only those job x profile pairs.
+RunPhase = Literal["screen", "score"]
+ScreenBucket = Literal[
+    "valid", "check", "closed", "not_fetched", "read_failed", "not_job", "clearance", "onsite", "too_old",
+    "other_location",
+]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
-RUN_RETENTION_DAYS = 3
+RUN_RETENTION_DAYS = 7
 # Job description per URL and LLM reading per description. Matches the default max posting age: anything older
 # is excluded as stale anyway.
 CACHE_DAYS = 30
@@ -47,7 +54,13 @@ class JobApplyRun(TimestampedDocument):
     fileName: str  # uploaded file name, or the Google Sheet's title
     sourceUrl: Optional[str] = None  # Google Sheets link when the run came from one
     status: RunStatus = "queued"
-    selection: List[RunSelection]
+    selection: List[RunSelection] = Field(default_factory=list)  # set when scoring starts
+    phase: RunPhase = "screen"
+    # Candidate market (US / UKEU / LATAM, or "none" for no stated location) -> profiles to score its jobs
+    # against; "*" applies to every job.
+    assignments: Dict[str, List[PydanticObjectId]] = Field(default_factory=dict)
+    autoStart: bool = False  # created with profiles up front: score right after screening, no pause
+    screenedAt: Optional[datetime] = None
     threshold: int = 75
     maxAgeDays: int = 30
     # "Today" for the freshness gate and for roles ending "Present"; fixed at upload so a resumed run agrees.
@@ -95,8 +108,12 @@ class JobApplyRow(TimestampedDocument):
     url: Optional[str] = None
     jdText: Optional[str] = None
     jdSource: Optional[Literal["sheet", "ats_api", "html", "browser"]] = None
+    jdStructured: Optional[bool] = None  # False: read from page text only (no job-site API / JobPosting data)
     status: RowStatus = "pending"
     statusReason: Optional[str] = None
+    screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
+    groupKey: Optional[str] = None  # normalised allowed locations, e.g. "GB", "EU+US", "none"
+    forceInclude: bool = False  # "Include anyway" for a clearance / on-site / too-old job
     title: str = ""
     company: str = ""
     fetchedPostedDate: Optional[date] = None  # from JSON-LD / ATS API; beats the LLM's date
@@ -117,6 +134,8 @@ class JobApplyRow(TimestampedDocument):
     tailored: Dict[str, PydanticObjectId] = Field(default_factory=dict)
     # Profiles whose row for this job was exported to the Google Sheet: accountId → when.
     exported: Dict[str, datetime] = Field(default_factory=dict)
+    # Where that row went (accountId → {sheetId, tab, row}), so a tailored resume finished later fills its link in.
+    exportedRows: Dict[str, dict] = Field(default_factory=dict)
     expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:
@@ -154,6 +173,8 @@ class JobPostingCache(TimestampedDocument):
     title: str = ""
     company: str = ""
     fetchedAt: datetime = Field(default_factory=datetime.utcnow)
+    structured: bool = True  # see FetchResult.structured
+    fetcher: int = 0  # fetch.FETCHER_VERSION that read it; pages from an older fetcher are fetched again
 
     class Settings:
         name = "job_posting_cache"

@@ -240,6 +240,83 @@ async def _migrate_legacy_payer_to_admin(database) -> None:
         log.warning("legacy payer backfill failed: %s", exc)
 
 
+async def _migrate_job_apply_urls(database) -> None:
+    """Re-clean stored Job Applies URLs when the cleaning rules change (app/job_apply/urls.py URL_VERSION), so
+    applied history, the posting cache and run rows keep matching newly read sheets. Each document is marked
+    with the version it was cleaned at, so this runs once per version. Two applied-history records (or cache
+    entries) that become the same URL collapse to the first."""
+    from pymongo.errors import DuplicateKeyError
+
+    from app.job_apply.urls import URL_VERSION, normalize_url
+
+    for name in ("job_application_log", "job_posting_cache", "job_apply_rows"):
+        coll = database[name]
+        try:
+            async for doc in coll.find({"urlv": {"$ne": URL_VERSION}, "url": {"$type": "string"}}, {"url": 1}):
+                clean = normalize_url(doc["url"])
+                try:
+                    await coll.update_one({"_id": doc["_id"]}, {"$set": {"url": clean, "urlv": URL_VERSION}})
+                except DuplicateKeyError:
+                    await coll.delete_one({"_id": doc["_id"]})  # the same job is already recorded in clean form
+        except Exception as exc:  # noqa: BLE001
+            log.warning("job-apply URL re-clean of %s failed: %s", name, exc)
+
+
+async def _migrate_job_apply_screening(database) -> None:
+    """Job Applies runs from before screening (no `phase`) keep working: they scored straight through, so they
+    become auto-started score-phase runs with every group assigned to every selected profile, and their rows get
+    the screening bucket and location group from what's already stored."""
+    from app.job_apply.schema import GateResult, Location
+    from app.job_apply.screening import bucket, group_key, markets_for
+
+    runs, rows = database["job_apply_runs"], database["job_apply_rows"]
+    try:
+        async for run in runs.find({"phase": {"$exists": False}}, {"selection": 1}):
+            ids = [s["accountId"] for s in run.get("selection") or [] if s.get("accountId")]
+            await runs.update_one(
+                {"_id": run["_id"]}, {"$set": {"phase": "score", "autoStart": True, "assignments": {"*": ids}}}
+            )
+            async for row in rows.find(
+                {"runId": run["_id"], "screen": {"$exists": False}},
+                {"status": 1, "statusReason": 1, "gates": 1, "extraction.allowedLocations": 1,
+                 "extraction.isJobPosting": 1, "forceInclude": 1, "jdStructured": 1},
+            ):
+                ex = row.get("extraction")
+                key = group_key([Location(**loc) for loc in ex.get("allowedLocations") or []]) if ex else None
+                screen = bucket(
+                    status=row.get("status") or "pending", status_reason=row.get("statusReason"),
+                    gates=[GateResult(**g) for g in row.get("gates") or []], group_key=key,
+                    force_include=bool(row.get("forceInclude")),
+                    is_job=(ex or {}).get("isJobPosting") is not False,
+                    verified=row.get("jdStructured") is not False,
+                )
+                await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": screen, "groupKey": key}})
+        # Jobs open only to candidates outside the target markets (US, UK/EU, Latam) are counted, not scored.
+        async for row in rows.find({"screen": {"$in": ["valid", "check"]}, "groupKey": {"$nin": [None, "none"]}},
+                                   {"groupKey": 1}):
+            if not markets_for(row["groupKey"]):
+                await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": "other_location"}})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("job-apply screening back-fill failed: %s", exc)
+
+
+async def _migrate_run_retention(database) -> None:
+    """Runs (and their rows) were kept 3 days: give the ones still here RUN_RETENTION_DAYS from their upload.
+    Only ever lengthens; a second start finds nothing to do."""
+    from app.models.job_apply import RUN_RETENTION_DAYS
+
+    keep = RUN_RETENTION_DAYS * 24 * 3600 * 1000
+    target = {"$add": ["$createdAt", keep]}
+    try:
+        for name in ("job_apply_runs", "job_apply_rows"):
+            await database[name].update_many(
+                {"createdAt": {"$type": "date"}, "$expr": {"$lt": ["$expiresAt", target]}},
+                [{"$set": {"expiresAt": target}}],
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("job-apply retention back-fill failed: %s", exc)
+
+
 async def init_db():
     global _client
     uri = os.environ["MONGODB_URI"]
@@ -253,6 +330,9 @@ async def init_db():
     await _migrate_default_leaderboard_optin(database)
     await _migrate_billing_cycle(database)
     await _migrate_legacy_payer_to_admin(database)
+    await _migrate_job_apply_urls(database)
+    await _migrate_job_apply_screening(database)
+    await _migrate_run_retention(database)
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
     try:
         from app.alerts_service import seed_recurring_charges_from_transactions

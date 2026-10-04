@@ -9,7 +9,7 @@ from beanie import PydanticObjectId
 from openpyxl import Workbook
 
 from app.job_apply import worker
-from app.job_apply.fetch import FetchError, FetchResult
+from app.job_apply.fetch import FetchError, FetchResult, JobClosed
 from app.job_apply.schema import JobExtraction, Location, MinYears, Term
 from app.models import Account
 from app.models.account import Resume
@@ -82,6 +82,62 @@ async def create_run(client, headers, acc, *, data=SHEET, threshold=60, resume_i
         files={"file": ("jobs.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         data={"selection": json.dumps(selection), "threshold": str(threshold), "maxAgeDays": "30"},
     )
+
+
+async def create_screen_run(client, headers, *, data=SHEET, max_age=30):
+    """A run created without profiles: it screens the jobs and waits for review."""
+    return await client.post(
+        "/job-applies/runs",
+        headers=headers,
+        files={"file": ("jobs.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"maxAgeDays": str(max_age)},
+    )
+
+
+async def screened_run(client, headers) -> str:
+    r = await create_screen_run(client, headers)
+    assert r.status_code == 202, r.text
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    return run_id
+
+
+async def test_screen_phase_pauses(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "screened" and run["phase"] == "screen" and run["screenedAt"]
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    by_url = {x["url"]: x for x in rows}
+    assert all(x["status"] in ("extracted", "excluded") for x in rows)
+    detail = (await client.get(f"/job-applies/rows/{by_url['https://jobs.example.com/hybrid']['_id']}", headers=h)).json()
+    assert detail["screen"] == "onsite" and detail["groupKey"] == "US"
+    remote = (await client.get(f"/job-applies/rows/{by_url['https://jobs.example.com/remote']['_id']}", headers=h)).json()
+    assert remote["screen"] in ("valid", "check") and remote["groupKey"] == "US" and not remote.get("scoredAt")
+
+
+async def test_closed_fetch_is_bucketed(client, staff_user, auth_header, monkeypatch):
+    async def closed(url, *, client, browser=None):
+        raise JobClosed("job closed (HTTP 404)")
+
+    monkeypatch.setattr(worker, "FETCH", closed)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    gh = next(x for x in rows if "greenhouse" in x["url"])
+    detail = (await client.get(f"/job-applies/rows/{gh['_id']}", headers=h)).json()
+    assert detail["status"] == "fetch_failed" and detail["screen"] == "closed"
+
+
+async def test_create_with_selection_runs_through(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    r = await create_run(client, h, acc)
+    run_id = r.json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["autoStart"] is True and run["phase"] == "score"
+    assert run["assignments"] == {"*": [str(acc.id)]}
 
 
 async def test_create_run_and_results(client, staff_user, auth_header):
@@ -727,7 +783,10 @@ async def test_sheet_preview(client, staff_user, auth_header, monkeypatch):
 
     h = auth_header(staff_user)
     r = await client.post("/job-applies/sheet-preview", headers=h, files={"file": ("jobs.xlsx", SHEET, "application/octet-stream")})
-    assert r.status_code == 200 and r.json() == {"title": "jobs.xlsx", "total": 3, "withDescription": 2, "urlOnly": 1}
+    assert r.status_code == 200 and r.json() == {
+        "title": "jobs.xlsx", "total": 3, "withDescription": 2, "urlOnly": 1,
+        "links": 3, "duplicates": 0, "cleaned": 0, "blocked": 0,
+    }
     bad = await client.post("/job-applies/sheet-preview", headers=h, files={"file": ("x.xlsx", b"nope", "application/octet-stream")})
     assert bad.status_code == 400
 
@@ -864,3 +923,490 @@ async def test_mark_all_marks_every_ready_application(client, staff_user, auth_h
         (str(eric.id), False), (str(tharun.id), True)}
     apps = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
     assert apps["applied"] == 3 and apps["toGo"] == 1 and apps["jobs"] == 1
+
+
+# ---------- screening: report, start, include anyway, max age, retry ----------
+
+
+async def rows_by_url(client, h, run_id, **params):
+    q = "&".join(f"{k}={v}" for k, v in params.items())
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows?{q}", headers=h)).json()["rows"]
+    return {x["url"]: x for x in rows}
+
+
+async def start(client, h, run_id, assignments, accounts, threshold=60):
+    body = {
+        "assignments": {k: [str(a.id) for a in v] for k, v in assignments.items()},
+        "selection": [{"accountId": str(a.id), "resumeIds": []} for a in accounts],
+        "threshold": threshold,
+    }
+    return await client.post(f"/job-applies/runs/{run_id}/start", headers=h, json=body)
+
+
+async def test_screening_report(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["total"] == 3 and rep["worth"] == 2 and rep["buckets"]["onsite"] == 1 and rep["maxAgeDays"] == 30
+    assert [g["key"] for g in rep["groups"]] == ["US", "UKEU", "LATAM"] and rep["others"] == []
+    assert rep["groups"][0]["jobs"] == 2 and rep["groups"][0]["fits"] == [str(us.id)]
+    assert rep["groups"][1]["jobs"] == 0 and rep["groups"][1]["fits"] == []
+    assert rep["profiles"][0]["id"] == str(us.id) and rep["profiles"][0]["resumes"] == 2
+
+
+async def test_start_scores_assigned_only(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user, name="US")
+    gb = await make_account(staff_user, country="GB", name="UK")
+    run_id = await screened_run(client, h)
+    r = await start(client, h, run_id, {"US": [us]}, [us, gb])
+    assert r.status_code == 200, r.text
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["phase"] == "score"
+    rows = await rows_by_url(client, h, run_id)
+    remote = rows["https://jobs.example.com/remote"]
+    assert remote["status"] == "scored"
+    detail = (await client.get(f"/job-applies/rows/{remote['_id']}", headers=h)).json()
+    assert {s["accountId"] for s in detail["scores"]} == {str(us.id)}
+    assert rows["https://jobs.example.com/hybrid"]["status"] == "excluded"
+
+
+async def test_start_unassigned_group(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    r = await start(client, h, run_id, {"GB": [us]}, [us])
+    assert r.status_code == 400 and "at least one profile" in r.json()["error"]
+
+
+async def test_start_twice_409(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    assert (await start(client, h, run_id, {"US": [us]}, [us])).status_code == 200
+    r = await start(client, h, run_id, {"US": [us]}, [us])
+    assert r.status_code == 409 and r.json()["error"] == "The run is still scoring."
+
+
+async def test_start_requires_screened(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    r = await create_screen_run(client, h)
+    assert (await start(client, h, r.json()["runId"], {"US": [us]}, [us])).status_code == 409
+
+
+async def test_start_archived_profile_404(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    us.archived = True
+    await us.save()
+    assert (await start(client, h, run_id, {"US": [us]}, [us])).status_code == 404
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["profiles"] == []
+
+
+async def test_max_age_patch_rescreens(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    r = await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 1})
+    assert r.status_code == 200, r.text
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["maxAgeDays"] == 1 and rep["worth"] == 0 and rep["buckets"]["too_old"] == 2
+    await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 30})
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["worth"] == 2 and rep["buckets"]["too_old"] == 0
+
+
+async def test_max_age_patch_409_when_not_screened(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    await start(client, h, run_id, {"US": [us]}, [us])
+    r = await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 5})
+    assert r.status_code == 409 and r.json()["error"] == "Max age can only change before scoring starts."
+    assert (await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"threshold": 50})).status_code == 200
+
+
+async def test_include_anyway(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    hybrid, gh = rows["https://jobs.example.com/hybrid"], rows["https://boards.greenhouse.io/acme/jobs/9"]
+    r = await client.put(f"/job-applies/rows/{hybrid['_id']}/include", headers=h, json={"include": True})
+    assert r.status_code == 200 and r.json()["screen"] == "check" and r.json()["forceInclude"] is True
+    r = await client.put(f"/job-applies/rows/{gh['_id']}/include", headers=h, json={"include": True})
+    assert r.status_code == 400
+    r = await client.put(f"/job-applies/rows/{hybrid['_id']}/include", headers=h, json={"include": False})
+    assert r.json()["screen"] == "onsite"
+
+
+async def test_retry_from_screened_keeps_force_include(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    await client.put(f"/job-applies/rows/{rows['https://jobs.example.com/hybrid']['_id']}/include", headers=h, json={"include": True})
+    assert rows["https://boards.greenhouse.io/acme/jobs/9"]["screen"] == "not_fetched"
+    monkeypatch.setattr(worker, "FETCH", fake_fetch)
+    r = await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)
+    assert r.status_code == 200 and r.json()["reset"] == 1
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "screened"
+    rows = await rows_by_url(client, h, run_id)
+    assert rows["https://jobs.example.com/hybrid"]["screen"] == "check"
+    assert rows["https://boards.greenhouse.io/acme/jobs/9"]["screen"] in ("valid", "check")
+
+
+async def test_screen_view_projection():
+    from app.routers.job_applies import _ScreenView
+
+    assert set(_ScreenView.model_fields) == {"screen", "groupKey"}
+
+
+async def test_rows_screen_filter(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id, screen="onsite")
+    assert list(rows) == ["https://jobs.example.com/hybrid"]
+
+
+async def test_rows_list_includes_group(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    await start(client, h, run_id, {"US": [us]}, [us])
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    assert rows and all(r["groupKey"] == "US" and r["screen"] for r in rows)
+
+
+# ---------- final review fixes ----------
+
+
+async def _strip_screening_fields(run_id):
+    """Make a run and its rows look like they were created before screening existed."""
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    oid = PydanticObjectId(run_id)
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": oid}, {"$unset": {"phase": "", "autoStart": "", "assignments": "", "screenedAt": ""}}
+    )
+    await JobApplyRow.get_motor_collection().update_many({"runId": oid}, {"$unset": {"screen": "", "groupKey": ""}})
+
+
+async def test_legacy_runs_are_migrated(client, staff_user, auth_header):
+    from app.db import _migrate_job_apply_screening
+    from app.models.job_apply import JobApplyRun
+
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    done_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(done_id))
+    await _strip_screening_fields(done_id)
+    # a run that was mid-flight when the new code was deployed
+    live_id = (await create_run(client, h, acc)).json()["runId"]
+    await _strip_screening_fields(live_id)
+    await JobApplyRun.get_motor_collection().update_one({"_id": PydanticObjectId(live_id)}, {"$set": {"status": "running"}})
+
+    await _migrate_job_apply_screening(JobApplyRun.get_motor_collection().database)
+
+    done = (await client.get(f"/job-applies/runs/{done_id}", headers=h)).json()
+    assert done["phase"] == "score" and done["autoStart"] is True and done["assignments"] == {"*": [str(acc.id)]}
+    rows = await rows_by_url(client, h, done_id)
+    assert rows["https://jobs.example.com/remote"]["screen"] in ("valid", "check")
+    assert rows["https://jobs.example.com/remote"]["groupKey"] == "US"
+    assert rows["https://jobs.example.com/hybrid"]["screen"] == "onsite"
+
+    await worker.run_worker(PydanticObjectId(live_id))
+    live = (await client.get(f"/job-applies/runs/{live_id}", headers=h)).json()
+    assert live["status"] == "done"
+    assert (await rows_by_url(client, h, live_id))["https://jobs.example.com/remote"]["status"] == "scored"
+
+
+async def test_retry_after_scoring_rescores(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    acc = await make_account(staff_user)
+    run_id = (await create_run(client, h, acc)).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    monkeypatch.setattr(worker, "FETCH", fake_fetch)
+    assert (await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)).json()["reset"] == 1
+    await worker.run_worker(PydanticObjectId(run_id))
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "scored" and gh["screen"] in ("valid", "check")
+
+
+async def test_retry_skips_closed(client, staff_user, auth_header, monkeypatch):
+    async def closed(url, *, client, browser=None):
+        raise JobClosed("job closed (HTTP 404)")
+
+    monkeypatch.setattr(worker, "FETCH", closed)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["counts"]["failed"] == 1 and run["retryable"] == 0
+    assert (await client.post(f"/job-applies/runs/{run_id}/retry-failed", headers=h)).json()["reset"] == 0
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "fetch_failed" and gh["screen"] == "closed"
+
+
+async def test_max_age_patch_writes_only_changed_rows(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    coll = JobApplyRow.get_motor_collection()
+    before = {d["_id"]: d["updatedAt"] async for d in coll.find({"runId": PydanticObjectId(run_id)}, {"updatedAt": 1})}
+    assert (await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"maxAgeDays": 29})).status_code == 200
+    after = {d["_id"]: d["updatedAt"] async for d in coll.find({"runId": PydanticObjectId(run_id)}, {"updatedAt": 1})}
+    assert before == after
+
+
+async def test_stale_cache_used_when_refetch_fails(client, staff_user, auth_header, monkeypatch):
+    from app.models.job_apply import JobPostingCache
+
+    from app.job_apply.fetch import FETCHER_VERSION
+
+    await JobPostingCache(
+        url="https://boards.greenhouse.io/acme/jobs/9", text=REMOTE_JD, source="ats_api",
+        fetchedAt=datetime.utcnow() - timedelta(days=2), fetcher=FETCHER_VERSION,
+    ).insert()
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "extracted" and gh["jdSource"] == "ats_api"
+
+
+async def test_cache_from_older_fetcher_is_refetched(client, staff_user, auth_header, monkeypatch):
+    """A page cached before closed-job detection (e.g. a 404 page read as the job) isn't reused, however fresh."""
+    from app.models.job_apply import JobPostingCache
+
+    await JobPostingCache.get_motor_collection().insert_one({
+        "url": "https://boards.greenhouse.io/acme/jobs/9", "text": "We couldn't find this job. " * 20,
+        "source": "browser", "fetchedAt": datetime.utcnow() - timedelta(hours=1), "title": "", "company": "",
+    })
+
+    async def closed(url, *, client, browser=None):
+        raise JobClosed("job closed (HTTP 404)")
+
+    monkeypatch.setattr(worker, "FETCH", closed)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["screen"] == "closed"
+
+
+async def test_start_market_without_jobs_400(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    gb = await make_account(staff_user, country="GB", name="UK")
+    run_id = await screened_run(client, h)
+    r = await start(client, h, run_id, {"UKEU": [gb]}, [gb])
+    assert r.status_code == 400 and "at least one profile" in r.json()["error"]
+
+
+async def test_rows_carry_markets(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    assert rows["https://jobs.example.com/remote"]["markets"] == ["US"]
+
+
+async def test_other_location_migration(client, staff_user, auth_header):
+    from app.db import _migrate_job_apply_screening
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    coll = JobApplyRow.get_motor_collection()
+    await coll.update_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"},
+                          {"$set": {"groupKey": "CA", "screen": "valid"}})
+    await _migrate_job_apply_screening(JobApplyRun.get_motor_collection().database)
+    row = await coll.find_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"})
+    assert row["screen"] == "other_location"
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["others"] == [{"key": "CA", "jobs": 1}] and rep["buckets"]["other_location"] == 1
+
+
+async def test_stored_urls_are_recleaned_once(client, staff_user, auth_header):
+    """Applied history, posting cache and run rows move to the new URL form; two old records that are now the
+    same job collapse to one."""
+    from app.db import _migrate_job_apply_urls
+    from app.job_apply.urls import URL_VERSION
+    from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, JobPostingCache
+
+    log = JobApplicationLog.get_motor_collection()
+    old_apply = "https://jobs.lever.co/acme/1a2b/apply"
+    clean = "https://jobs.lever.co/acme/1a2b"
+    base = {"userId": staff_user.id, "accountId": "a1", "fileKey": "r1", "appliedAt": datetime.utcnow()}
+    await log.insert_one({**base, "url": old_apply})
+    await log.insert_one({**base, "url": clean + "?lever-via=x"})
+    await log.insert_one({**base, "fileKey": "r2", "url": "https://boards.greenhouse.io/acme/jobs/9?gh_jid=9"})
+    await JobPostingCache.get_motor_collection().insert_one(
+        {"url": old_apply, "text": "x" * 300, "source": "html", "fetchedAt": datetime.utcnow()})
+    run_id = await screened_run(client, auth_header(staff_user))
+    rows = JobApplyRow.get_motor_collection()
+    await rows.update_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"},
+                          {"$set": {"url": "https://jobs.example.com/remote?utm_source=sheet"}})
+
+    database = JobApplyRun.get_motor_collection().database
+    await _migrate_job_apply_urls(database)
+    await _migrate_job_apply_urls(database)  # second start: nothing left to do
+
+    logged = sorted(d["url"] for d in await log.find({"userId": staff_user.id}).to_list(None))
+    assert logged == ["https://boards.greenhouse.io/acme/jobs/9", clean]
+    assert await log.count_documents({"urlv": {"$ne": URL_VERSION}}) == 0
+    assert await JobPostingCache.get_motor_collection().find_one({"url": clean})
+    assert await rows.find_one({"runId": PydanticObjectId(run_id), "url": "https://jobs.example.com/remote"})
+
+
+async def test_text_only_page_lands_in_needs_a_check(client, staff_user, auth_header, monkeypatch):
+    async def text_page(url, *, client, browser=None):
+        return FetchResult(text=REMOTE_JD, source="html", structured=False)
+
+    monkeypatch.setattr(worker, "FETCH", text_page)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["screen"] == "check" and gh["jdStructured"] is False
+    remote = (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]
+    assert remote["jdStructured"] is True  # the description came from the sheet
+
+
+async def test_sheet_preview_counts(client, staff_user, auth_header):
+    data = sheet([["URL"], ["https://jobs.lever.co/acme/1a2b/apply"], ["https://jobs.lever.co/acme/1a2b"],
+                  ["https://www.linkedin.com/jobs/view/123"], ["https://a.com/jobs/2?utm_source=x"]])
+    r = await client.post("/job-applies/sheet-preview", headers=auth_header(staff_user),
+                          files={"file": ("jobs.xlsx", data, "application/octet-stream")})
+    body = r.json()
+    assert body["total"] == 3 and body["links"] == 4 and body["duplicates"] == 1 and body["cleaned"] == 2
+    assert body["blocked"] == 1
+
+
+async def test_runs_list_summary(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    screened_id = await screened_run(client, h)
+    scored_id = await screened_run(client, h)
+    await start(client, h, scored_id, {"US": [us]}, [us])
+    await worker.run_worker(PydanticObjectId(scored_id))
+    rows = await rows_by_url(client, h, scored_id, view="suggested")
+    remote = rows["https://jobs.example.com/remote"]
+    r = await client.put(f"/job-applies/rows/{remote['_id']}/applied", headers=h,
+                         json={"accountId": str(us.id), "resumeId": remote["suggestions"][0]["resumeId"], "applied": True})
+    assert r.status_code == 200, r.text
+
+    runs = {x["_id"]: x for x in (await client.get("/job-applies/runs", headers=h)).json()["runs"]}
+    s = runs[screened_id]["summary"]
+    assert s["worth"] == 2 and s["closed"] == 0 and s["markets"] == {"US": 2, "UKEU": 0, "LATAM": 0}
+    t = runs[scored_id]["summary"]
+    assert t["applied"] == 1 and t["toApply"] == len(rows) - 1 and t["tailoring"] == 0
+
+
+async def test_runs_list_survives_a_summary_failure(client, staff_user, auth_header, monkeypatch):
+    from app.routers import job_applies as router_mod
+
+    h = auth_header(staff_user)
+    await screened_run(client, h)
+
+    def boom(key):
+        raise RuntimeError("aggregation trouble")
+
+    monkeypatch.setattr(router_mod, "markets_for", boom)
+    r = await client.get("/job-applies/runs", headers=h)
+    assert r.status_code == 200 and r.json()["runs"][0]["summary"] is None
+
+
+# ---------- back to step 2: change the picks and score again ----------
+
+
+async def scored_run(client, h, assignments, accounts) -> str:
+    run_id = await screened_run(client, h)
+    assert (await start(client, h, run_id, assignments, accounts)).status_code == 200
+    await worker.run_worker(PydanticObjectId(run_id))
+    return run_id
+
+
+async def test_rescore_with_new_picks(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    us = await make_account(staff_user, name="US")
+    us2 = await make_account(staff_user, name="US 2")
+    run_id = await scored_run(client, h, {"US": [us]}, [us])
+    r = await start(client, h, run_id, {"US": [us2]}, [us2])
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "queued" and r.json()["phase"] == "score"
+    await worker.run_worker(PydanticObjectId(run_id))
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["status"] == "done" and run["counts"]["scored"] == 2
+    rows = await rows_by_url(client, h, run_id)
+    detail = (await client.get(f"/job-applies/rows/{rows['https://jobs.example.com/remote']['_id']}", headers=h)).json()
+    assert {s["accountId"] for s in detail["scores"]} == {str(us2.id)}  # the old profile's scores are gone
+    assert rows["https://jobs.example.com/hybrid"]["status"] == "excluded"  # never scored, untouched
+
+
+async def test_rescore_keeps_tailored_applied_and_exported(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplyRow
+
+    h = auth_header(staff_user)
+    us = await make_account(staff_user, name="US")
+    us2 = await make_account(staff_user, name="US 2")
+    run_id = await scored_run(client, h, {"US": [us]}, [us])
+    remote = (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]
+    rid, acc, tailored = PydanticObjectId(remote["_id"]), str(us.id), PydanticObjectId()
+    kept = {
+        "appliedResumes": [{"accountId": acc, "resumeId": str(us.resumes[0].id), "at": datetime.utcnow()}],
+        f"tailored.{acc}": tailored,
+        f"exported.{acc}": datetime.utcnow(),
+        f"exportedRows.{acc}": {"sheetId": "s", "tab": "2026-10-03", "row": 2},
+    }
+    await JobApplyRow.get_motor_collection().update_one({"_id": rid}, {"$set": kept})
+    assert (await start(client, h, run_id, {"US": [us2]}, [us2])).status_code == 200  # `us` is no longer picked
+    await worker.run_worker(PydanticObjectId(run_id))
+    row = await JobApplyRow.get(rid)
+    assert [m.accountId for m in row.appliedResumes] == [acc]
+    assert row.tailored == {acc: tailored} and acc in row.exported and row.exportedRows[acc]["row"] == 2
+
+
+# ---------- runs are kept 7 days ----------
+
+
+async def test_migration_keeps_runs_seven_days(client, staff_user, auth_header):
+    from app.db import _migrate_run_retention
+    from app.models.job_apply import JobApplyRow, JobApplyRun
+
+    h = auth_header(staff_user)
+    rid = PydanticObjectId(await screened_run(client, h))
+    created = datetime.utcnow().replace(microsecond=0) - timedelta(days=2)
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": rid}, {"$set": {"createdAt": created, "expiresAt": created + timedelta(days=3)}})
+    rows = JobApplyRow.get_motor_collection()
+    await rows.update_many({"runId": rid}, {"$set": {"createdAt": created, "expiresAt": created + timedelta(days=3)}})
+    longer = await rows.find_one({"runId": rid})
+    await rows.update_one({"_id": longer["_id"]}, {"$set": {"expiresAt": created + timedelta(days=30)}})
+
+    database = JobApplyRun.get_motor_collection().database
+    await _migrate_run_retention(database)
+    await _migrate_run_retention(database)  # second start: nothing left to do
+
+    week = created + timedelta(days=7)
+    assert (await JobApplyRun.get(rid)).expiresAt == week
+    after = {r["_id"]: r["expiresAt"] for r in await rows.find({"runId": rid}).to_list(None)}
+    assert after.pop(longer["_id"]) == created + timedelta(days=30)  # never shortened
+    assert after and set(after.values()) == {week}
+
+
+async def test_runs_list_goes_back_past_fifty(client, staff_user, auth_header):
+    from app.models.job_apply import JobApplyRun
+
+    h = auth_header(staff_user)
+    rid = PydanticObjectId(await screened_run(client, h))
+    coll = JobApplyRun.get_motor_collection()
+    base = await coll.find_one({"_id": rid})
+    await coll.insert_many([{**base, "_id": PydanticObjectId()} for _ in range(60)])
+    runs = (await client.get("/job-applies/runs", headers=h)).json()["runs"]
+    assert len(runs) == 61

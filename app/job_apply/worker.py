@@ -17,7 +17,8 @@ from beanie.odm.utils.encoder import Encoder
 
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
-from app.job_apply.gates import blocked, job_gates
+from app.job_apply.gates import blocked, failing_reasons, job_gates
+from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key, markets_for
 from app.job_apply.pipeline import ProfileInfo, ResumeInput, score_row
 from app.job_apply.resume_parse import parse_resume
 from app.job_apply.schema import GateResult, JobExtraction
@@ -41,6 +42,9 @@ STALE_AFTER = timedelta(minutes=2)
 SWEEP_SECONDS = 120
 CHECK_EVERY = 25
 POSTING_TTL = timedelta(days=CACHE_DAYS)
+# A cached description is reused only this long, so a job closed since then is noticed (the LLM reading is
+# cached by description, so refetching an unchanged page costs no LLM call).
+POSTING_REUSE = timedelta(hours=24)
 
 Stage = Literal["fetch", "extract", "score"]
 
@@ -63,12 +67,29 @@ def needs_stage(status: str, *, has_jd: bool, scored: bool, stage: Stage) -> boo
     return status in ("extracted", "excluded") and not scored
 
 
+def posting_reusable(fetched_at: datetime, now: datetime) -> bool:
+    return fetched_at > now - POSTING_REUSE
+
+
+def assigned_profiles(assignments: dict[str, list], key: Optional[str]) -> set[str]:
+    """Profiles to score a job against: those picked for each candidate market its location group is in (or for
+    "none" when it states no location), plus those picked for every job ("*")."""
+    keys = markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else [])
+    picked = {str(x) for k in keys for x in assignments.get(k, [])}
+    return picked | {str(x) for x in assignments.get("*", [])}
+
+
+def _screen(row: JobApplyRow) -> None:
+    row.screen = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates or [],
+        group_key=row.groupKey, force_include=row.forceInclude,
+        is_job=row.extraction.isJobPosting if row.extraction is not None else True,
+        verified=row.jdStructured is not False,
+    )
+
+
 def posted_for_row(fetched: Optional[date], extracted: Optional[date]) -> Optional[date]:
     return fetched or extracted
-
-
-def failing_reasons(gates: list[GateResult]) -> str:
-    return "; ".join(f"{g.name}: {g.reason}" if g.reason else g.name for g in gates if g.result == "fail")
 
 
 # ---------- persistence helpers ----------
@@ -90,8 +111,12 @@ async def _status(run_id: PydanticObjectId) -> Optional[str]:
     return doc.get("status") if doc else None
 
 
-_FETCH_FIELDS = ("jdText", "jdSource", "fetchedPostedDate", "title", "company", "status", "statusReason")
-_EXTRACT_FIELDS = ("extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason")
+_FETCH_FIELDS = (
+    "jdText", "jdSource", "jdStructured", "fetchedPostedDate", "title", "company", "status", "statusReason", "screen",
+)
+_EXTRACT_FIELDS = (
+    "extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason", "screen", "groupKey",
+)
 _SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "tailorOnly", "scoredAt", "status")
 
 
@@ -148,7 +173,7 @@ async def _cache_description(url: str, text: str) -> None:
     await JobPostingCache.get_motor_collection().update_one(
         {"url": url},
         {"$set": {"url": url, "text": text, "source": "sheet", "postedDate": None, "title": "", "company": "",
-                  "fetchedAt": now, "updatedAt": now},
+                  "fetchedAt": now, "updatedAt": now, "fetcher": fetch_mod.FETCHER_VERSION, "structured": True},
          "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
@@ -159,11 +184,24 @@ async def _cache_description(url: str, text: str) -> None:
 
 async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
     cached = await JobPostingCache.find_one(JobPostingCache.url == row.url)
-    if cached and cached.fetchedAt > datetime.utcnow() - POSTING_TTL:
+    if cached and cached.fetcher != fetch_mod.FETCHER_VERSION:
+        cached = None  # read before the current rules (e.g. a closed job's 404 page): fetch again
+    res = None
+    if not (cached and posting_reusable(cached.fetchedAt, datetime.utcnow())):
+        try:
+            res = await FETCH(row.url, client=client, browser=BROWSER)
+        except fetch_mod.JobClosed:
+            raise
+        except Exception:
+            # A blocked or timed-out refetch keeps the description read earlier (within the cache's life).
+            if not (cached and cached.fetchedAt > datetime.utcnow() - POSTING_TTL):
+                raise
+    if res is None:
         text, source, posted, title, company = cached.text, cached.source, cached.postedDate, cached.title, cached.company
+        structured = cached.structured
     else:
-        res = await FETCH(row.url, client=client, browser=BROWSER)
         text, source, posted, title, company = res.text, res.source, res.postedDate, res.title, res.company
+        structured = res.structured
         coll = JobPostingCache.get_motor_collection()
         await coll.update_one(
             {"url": row.url},
@@ -171,10 +209,11 @@ async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
                 "url": row.url, "text": text, "source": source,
                 "postedDate": datetime.combine(posted, datetime.min.time()) if posted else None,
                 "title": title, "company": company, "fetchedAt": datetime.utcnow(), "updatedAt": datetime.utcnow(),
+                "fetcher": fetch_mod.FETCHER_VERSION, "structured": structured,
             }, "$setOnInsert": {"createdAt": datetime.utcnow()}},
             upsert=True,
         )
-    row.jdText, row.jdSource, row.fetchedPostedDate = text, source, posted
+    row.jdText, row.jdSource, row.fetchedPostedDate, row.jdStructured = text, source, posted, structured
     row.title = row.title or title
     row.company = row.company or company
     row.status = "fetched"
@@ -198,6 +237,7 @@ async def _fetch_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
                     raise
                 except Exception as exc:  # noqa: BLE001 — a row failure never fails the run
                     row.status, row.statusReason = "fetch_failed", str(exc)[:300] or exc.__class__.__name__
+                    _screen(row)
                     await _save_fields(row, _FETCH_FIELDS)
                     await _inc(run.id, failed=1)
 
@@ -222,12 +262,14 @@ async def _extract_one(row: JobApplyRow, run: JobApplyRun, user: Optional[UserEx
     posted = posted_for_row(row.fetchedPostedDate, ex.postedDate)
     gates = job_gates(ex, run_date=run_date, max_age_days=run.maxAgeDays, posted=posted)
     row.extraction, row.extractionSource, row.gates, row.postedDate = ex, source, gates, posted
+    row.groupKey = group_key(ex.allowedLocations)
     row.title = row.title or ex.title
     row.company = row.company or ex.company
     if blocked(gates):
         row.status, row.statusReason = "excluded", failing_reasons(gates)
     else:
         row.status, row.statusReason = "extracted", None
+    _screen(row)
 
 
 async def _extract_stage(run: JobApplyRun, rows: list[JobApplyRow], user: Optional[UserExtra], check: _Checker) -> None:
@@ -248,6 +290,7 @@ async def _extract_stage(run: JobApplyRun, rows: list[JobApplyRow], user: Option
             except Exception as exc:  # noqa: BLE001
                 log.exception("job extraction failed for row %s", row.id)
                 row.status, row.statusReason = "llm_failed", str(exc)[:300] or exc.__class__.__name__
+                _screen(row)
                 await _save_fields(row, _EXTRACT_FIELDS)
                 await _inc(run.id, failed=1)
 
@@ -281,7 +324,11 @@ async def _load_resumes(run: JobApplyRun) -> tuple[list[ResumeInput], dict[str, 
 
 
 async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checker) -> None:
-    todo = [r for r in rows if needs_stage(r.status, has_jd=bool(r.jdText), scored=bool(r.scoredAt), stage="score")]
+    # Only jobs worth applying to are scored, and only against the profiles picked for their location group.
+    todo = [
+        r for r in rows
+        if needs_stage(r.status, has_jd=bool(r.jdText), scored=bool(r.scoredAt), stage="score") and r.screen in WORTH
+    ]
     if not todo:
         return
     resumes, profiles, notes = await _load_resumes(run)
@@ -292,11 +339,17 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
     run_date = run.runDate.date()
     for row in todo:
         await check.tick()
+        allowed = assigned_profiles(run.assignments, row.groupKey)
+        if not allowed:
+            row.status = "unassigned"
+            await _save_fields(row, ("status",))
+            continue
         ex: JobExtraction = row.extraction
         # CPU-bound: run off the event loop so the API stays responsive during big runs.
         res = await asyncio.to_thread(
-            score_row, ex, row.jdText, job_blocked=row.status == "excluded",
-            resumes=resumes, profiles=profiles, idf=idf, run_date=run_date,
+            score_row, ex, row.jdText, job_blocked=False,
+            resumes=[r for r in resumes if r.account_id in allowed],
+            profiles={k: v for k, v in profiles.items() if k in allowed}, idf=idf, run_date=run_date,
         )
         row.scores = res.scores
         row.profileGates = [ProfileGates(**pg) for pg in res.profile_gates]
@@ -304,8 +357,7 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
         row.topScore = res.top_score
         row.tailorOnly = res.tailor_only
         row.scoredAt = datetime.utcnow()
-        if row.status == "extracted":
-            row.status = "scored"
+        row.status = "scored"  # also a job brought back with "Include anyway"
         await _save_fields(row, _SCORE_FIELDS)
         await _inc(run.id, scored=1)
 
@@ -334,10 +386,19 @@ async def run_worker(run_id: PydanticObjectId) -> None:
         user = await UserExtra.get(run.userId)
         check = _Checker(run_id)
         rows = await _rows(run_id)
+        # Fetch and read whatever still needs it (both stages skip finished rows), in either phase: a retry after
+        # scoring started, or a run resumed after a restart, picks its pending rows up here.
         await _ensure_running(run_id)
         await _fetch_stage(run, rows, check)
         await _ensure_running(run_id)
         await _extract_stage(run, rows, user, check)
+        await _ensure_running(run_id)
+        if run.phase == "screen":
+            if not run.autoStart:  # wait for the user to pick profiles per location group (POST /start)
+                await _set_run(run_id, status="screened", screenedAt=datetime.utcnow())
+                return
+            run.phase = "score"
+            await _set_run(run_id, phase="score", screenedAt=datetime.utcnow())
         await _ensure_running(run_id)
         await _score_stage(run, rows, check)
         if await _status(run_id) != "cancelled":

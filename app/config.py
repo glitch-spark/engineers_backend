@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     # Cheap structured-extraction tasks: parsing Q&A from transcripts, rollup tips.
     # No real reasoning, just JSON shape. Mini saves ~50% per call.
     EXTRACTION_MODEL: str = "gpt-4o-mini"
+    # Job Applies: OpenAI model that reads job postings (locations, work mode, clearance). Empty = RESUME_OPENAI_MODEL.
+    JOB_EXTRACT_MODEL: str = ""
     # Gmail integration — OAuth client + Fernet key for refresh-token storage.
     # If GOOGLE_OAUTH_CLIENT_ID is unset, the gmail router 503s on use so the
     # rest of the app still boots without these. EMAIL_TOKEN_KEY is a 32-byte

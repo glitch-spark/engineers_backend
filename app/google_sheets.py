@@ -5,6 +5,7 @@ rows. Auth is the OAuth 2.0 JWT-bearer flow (an RS256-signed assertion exchanged
 """
 import json
 import os
+import re
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -120,8 +121,11 @@ async def sheet_info(client: httpx.AsyncClient, sheet_id: str) -> dict:
     return {"title": body.get("properties", {}).get("title", ""), "tabs": tabs}
 
 
-async def ensure_tab(client: httpx.AsyncClient, sheet_id: str, title: str, header: list[str], info: dict) -> bool:
-    """Create the tab with a bold, frozen header and an Applied checkbox column if it doesn't exist."""
+async def ensure_tab(
+    client: httpx.AsyncClient, sheet_id: str, title: str, header: list[str], info: dict, checkbox: Optional[str] = None
+) -> bool:
+    """Create the tab with a bold, frozen header if it doesn't exist; `checkbox` names the header column that gets
+    tick boxes (the export's "Applied")."""
     if title in info["tabs"]:
         return False
     added = await _call(
@@ -129,29 +133,67 @@ async def ensure_tab(client: httpx.AsyncClient, sheet_id: str, title: str, heade
     )
     tab_id = added["replies"][0]["addSheet"]["properties"]["sheetId"]
     info["tabs"][title] = tab_id
-    last = len(header) - 1
     await _call(
         client, "PUT", f"{API}/{sheet_id}/values/{quote(_a1(title, 'A1'), safe='')}",
         params={"valueInputOption": "RAW"}, json={"values": [header]},
     )
-    await _call(client, "POST", f"{API}/{sheet_id}:batchUpdate", json={"requests": [
+    requests: list[dict] = [
         {"repeatCell": {"range": {"sheetId": tab_id, "startRowIndex": 0, "endRowIndex": 1},
                         "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                         "fields": "userEnteredFormat.textFormat.bold"}},
         {"updateSheetProperties": {"properties": {"sheetId": tab_id, "gridProperties": {"frozenRowCount": 1}},
                                    "fields": "gridProperties.frozenRowCount"}},
-        {"setDataValidation": {"range": {"sheetId": tab_id, "startRowIndex": 1, "endRowIndex": VALIDATION_ROWS,
-                                         "startColumnIndex": last, "endColumnIndex": last + 1},
-                               "rule": {"condition": {"type": "BOOLEAN"}}}},
-    ]})
+    ]
+    if checkbox in header:
+        col = header.index(checkbox)
+        requests.append(
+            {"setDataValidation": {"range": {"sheetId": tab_id, "startRowIndex": 1, "endRowIndex": VALIDATION_ROWS,
+                                             "startColumnIndex": col, "endColumnIndex": col + 1},
+                                   "rule": {"condition": {"type": "BOOLEAN"}}}}
+        )
+    await _call(client, "POST", f"{API}/{sheet_id}:batchUpdate", json={"requests": requests})
     return True
 
 
-async def append_rows(client: httpx.AsyncClient, sheet_id: str, tab: str, rows: list[list[Any]]) -> None:
-    """Append rows after the tab's data; formulas (=HYPERLINK) are evaluated."""
+async def append_rows(client: httpx.AsyncClient, sheet_id: str, tab: str, rows: list[list[Any]]) -> Optional[str]:
+    """Append rows after the tab's data; formulas (=HYPERLINK) are evaluated. Returns the range written
+    ("'Tab'!A12:J20"), so callers can find those rows again; None when there was nothing to append."""
     if not rows:
-        return
-    await _call(
+        return None
+    body = await _call(
         client, "POST", f"{API}/{sheet_id}/values/{quote(_a1(tab, 'A1'), safe='')}:append",
         params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"}, json={"values": rows},
+    )
+    return (body.get("updates") or {}).get("updatedRange")
+
+
+_SPAN = re.compile(r"^(?:'((?:[^']|'')*)'|([^!]+))!\$?[A-Z]+\$?(\d+)(?::\$?[A-Z]+\$?(\d+))?$")
+
+
+def parse_row_span(a1: str) -> tuple[str, int, int]:
+    """"'2026-10-03'!A12:J20" -> ("2026-10-03", 12, 20)."""
+    m = _SPAN.match((a1 or "").strip())
+    if not m:
+        raise ValueError(f"not a row range: {a1!r}")
+    tab = m.group(1).replace("''", "'") if m.group(1) is not None else m.group(2)
+    first = int(m.group(3))
+    return tab, first, int(m.group(4) or first)
+
+
+async def read_range(client: httpx.AsyncClient, sheet_id: str, a1: str) -> list[list[str]]:
+    """Cell values (as shown) of a range like "'Tab'!A1:J"."""
+    body = await _call(client, "GET", f"{API}/{sheet_id}/values/{quote(a1, safe='')}")
+    return body.get("values") or []
+
+
+async def clear_range(client: httpx.AsyncClient, sheet_id: str, a1: str) -> None:
+    """Empty a range's values (formatting stays)."""
+    await _call(client, "POST", f"{API}/{sheet_id}/values/{quote(a1, safe='')}:clear", json={})
+
+
+async def update_range(client: httpx.AsyncClient, sheet_id: str, a1: str, values: list[list[Any]]) -> None:
+    """Overwrite a range; formulas (=HYPERLINK) are evaluated."""
+    await _call(
+        client, "PUT", f"{API}/{sheet_id}/values/{quote(a1, safe='')}",
+        params={"valueInputOption": "USER_ENTERED"}, json={"values": values},
     )

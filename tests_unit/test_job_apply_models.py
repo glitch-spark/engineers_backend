@@ -21,8 +21,8 @@ def _ttl(model):
     return [ix.document for ix in model.Settings.indexes if "expireAfterSeconds" in ix.document]
 
 
-def test_runs_and_rows_expire_after_three_days():
-    assert RUN_RETENTION_DAYS == 3
+def test_runs_and_rows_expire_after_seven_days():
+    assert RUN_RETENTION_DAYS == 7
     for model in (JobApplyRun, JobApplyRow):
         expires = model.model_fields["expiresAt"].default_factory()
         assert abs((expires - datetime.utcnow()) - timedelta(days=RUN_RETENTION_DAYS)) < timedelta(minutes=1)
@@ -42,3 +42,15 @@ def test_applied_log_is_permanent_and_unique_per_file():
     assert _ttl(JobApplicationLog) == []
     unique = [ix.document for ix in JobApplicationLog.Settings.indexes if ix.document.get("unique")]
     assert [list(ix["key"]) for ix in unique] == [["userId", "url", "fileKey"]]  # resumeId or tailored:<jobId>
+
+
+def test_screening_defaults():
+    from typing import get_args
+
+    from app.models.job_apply import RowStatus, RunStatus
+
+    run, row = JobApplyRun.model_fields, JobApplyRow.model_fields
+    assert run["phase"].default == "screen" and run["autoStart"].default is False and run["screenedAt"].default is None
+    assert run["assignments"].default_factory() == {} and run["selection"].default_factory() == []
+    assert row["screen"].default is None and row["groupKey"].default is None and row["forceInclude"].default is False
+    assert "screened" in get_args(RunStatus) and "unassigned" in get_args(RowStatus)

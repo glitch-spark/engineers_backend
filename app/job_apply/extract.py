@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v2"
+PROMPT_VERSION = "job-extract-v5"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -45,10 +45,12 @@ JSON shape (use null when the posting doesn't say):
   "degree": {{"level": 2, "required": true, "equivalentExperience": false}},
   "workMode": "remote|hybrid|onsite|unknown",
   "allowedLocations": [{{"kind": "country|region", "value": "US"}}],
+  "remoteAreas": ["Austin Metro", "North Carolina"],
   "workAuthorization": {{"restricted": true, "countries": ["US"], "note": "US citizens only"}},
   "timezoneNote": "4h overlap with EST",
   "clearance": {{"level": "required|preferred|none", "note": "Active Secret"}},
-  "postedDate": "YYYY-MM-DD"
+  "postedDate": "YYYY-MM-DD",
+  "isJobPosting": true
 }}
 
 Rules:
@@ -61,14 +63,27 @@ Rules:
 - soft: true for soft skills (communication, leadership, teamwork...).
 - minYears: the minimum years of experience asked. A required figure beats a preferred one.
 - degree.level: 1 associate/diploma, 2 bachelor, 3 master, 4 doctorate; the LOWEST degree accepted.
-- workMode: "remote with occasional travel or offsites" is remote. "Remote but must live within commuting distance
+- isJobPosting: false when the text is not one specific job: an error or "not found" page, a cookie or consent
+  notice, a list of many openings, a careers landing page, or site navigation only. Then the other fields may be empty.
+- workMode: "remote with occasional travel or offsites" is remote. A role with a remote option ("work from our hub
+  or remotely within Europe", "onsite, hybrid or remote") is remote. "Remote but must live within commuting distance
   of an office" or "N days in office" is hybrid. In-office/on-site only is onsite.
+  If the posting doesn't say where the work is done, workMode is "unknown": a "Location:" line or a city alone
+  does not make a job onsite.
+- remoteAreas: when the posting limits where a remote hire may live to particular cities, metro areas, states or
+  provinces ("Remote - Austin Metro", "must reside in the Seattle or Los Angeles metro areas", "remote from Green Bay,
+  Madison, Milwaukee or Chicago only"), list those areas as written; allowedLocations still gets their country.
+  Empty when a whole country or more is open.
 - allowedLocations: where a remote hire may live. Take the first of these that the posting has:
   1. Text on where hires may live or be based ("must be based in the US or EU", "can be done globally", "open to
      candidates in the EMEA time zone"). List every country and region it allows. "Global", "globally", "anywhere"
      and "international" are Worldwide. A time-zone window is the region it covers ("GMT +/-3" or "CET +/-2" is EMEA).
   2. Otherwise the "Location:" line or the title ("Remote - UK" is GB, "Location: Bulgaria" is BG).
   Never use where the company or its offices are. Keep a country a country; don't widen it into a region.
+  Examples: "Remote – USA, Canada, Europe or Australia" -> US, CA, Europe, AU. "Open to North America & Western EU"
+  -> North America, Europe. "Europe and the Americas only" -> Europe, Americas. "Remote Global" or "can be done
+  globally" -> Worldwide. "Location: Europe" with nothing else -> Europe (not Worldwide). "Within UTC to UTC+8"
+  -> EMEA, APAC. "Location: Remote" with nothing else -> empty list.
   Regions: Worldwide, Americas, North America, Latam, EMEA, Europe, EU, APAC, Asia. Countries as ISO-3166 alpha-2
   codes. Empty list only when the posting gives no location at all.
 - workAuthorization.restricted: true for "citizens only", "must be authorized to work in X without sponsorship",
@@ -151,7 +166,8 @@ def parse_extraction(raw: str) -> JobExtraction:
     obj = _try_parse_jsonish(raw or "")
     if not isinstance(obj, dict):
         raise ValueError("job extraction is not a JSON object")
-    if not _str(obj.get("title")) and not obj.get("terms"):
+    # A page that isn't a job (error page, job list) legitimately has no title or terms.
+    if not _str(obj.get("title")) and not obj.get("terms") and obj.get("isJobPosting") is not False:
         raise ValueError("job extraction has neither a title nor terms")
 
     years = obj.get("minYears")
@@ -209,10 +225,12 @@ def parse_extraction(raw: str) -> JobExtraction:
         degree=degree,
         workMode=mode if mode in _WORK_MODES else "unknown",
         allowedLocations=locations,
+        remoteAreas=_str_list(obj.get("remoteAreas")),
         workAuthorization=work_auth,
         timezoneNote=_opt_str(obj.get("timezoneNote")),
         clearance=clearance,
         postedDate=_iso_date(obj.get("postedDate")),
+        isJobPosting=obj.get("isJobPosting") is not False,
     )
 
 
@@ -238,6 +256,8 @@ _HYBRID = re.compile(
 )
 _ONSITE = re.compile(r"\bon[- ]?site\b|\bin[- ]office\b|\bin[- ]person\b|\boffice[- ]based\b", re.I)
 _REMOTE = re.compile(r"\bremote\b|work from (?:home|anywhere)|\bWFH\b|fully distributed|distributed team", re.I)
+# "in our London office", "from the office": where the work happens, not an office stipend
+_OFFICE = re.compile(r"\b(?:in|at|from|to) (?:our|the|one of our) (?:[\w&.,'-]+ ){0,4}offices?\b", re.I)
 _REL_POSTED = re.compile(r"(\d+)\+?\s*(day|week|month)s?\s+ago", re.I)
 # "Archived 1 month ago" / "Updated 2 days ago" are not when the job was posted.
 _NOT_POSTED = re.compile(r"(?:archived|closed|expired|updated|deadline)\W*(?:\w+\W+){0,2}$", re.I)
@@ -310,6 +330,17 @@ def _posted_date(text: str, run_date: date) -> Optional[date]:
         days = n * {"day": 1, "week": 7, "month": 30}[unit]
         return run_date - timedelta(days=days)
     return None
+
+
+def _stated_mode(mode: str, text: str) -> str:
+    """On-site or hybrid only when the posting says so: a model guessing from a bare "Location: USA" would reject a
+    remote job, so an unsupported guess becomes unknown ("Needs a check")."""
+    office = bool(_OFFICE.search(text) or _ONSITE.search(text))
+    if mode == "onsite" and not (office or _NOT_REMOTE.search(text) or _HYBRID.search(text)):
+        return "unknown"
+    if mode == "hybrid" and not (office or _HYBRID.search(text)):
+        return "unknown"
+    return mode
 
 
 def _work_mode(text: str) -> str:
@@ -432,6 +463,7 @@ async def extract_job(
             ex.postedDate = None  # models answer "today" (from the prompt) when the posting gives no date
         if ex.postedDate is None:
             ex.postedDate = _posted_date(jd, run_date)
+        ex.workMode = _stated_mode(ex.workMode, jd)
         return ex, "llm"
     except Exception as exc:  # noqa: BLE001 — any LLM failure falls back to rules
         log.warning("job extraction via LLM failed, using rules: %s", exc)

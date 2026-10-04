@@ -98,3 +98,50 @@ async def test_falls_back_to_xlsx_when_links_are_hidden_behind_text():
     async with client(handler) as c:
         title, rows = await download_gsheet(f"https://docs.google.com/spreadsheets/d/{SID}/edit", client=c)
     assert [r.url for r in rows] == ["https://x.com/a"] and title == "Google Sheet"
+
+
+async def test_hidden_links_win_over_a_stray_url_in_the_csv():
+    # CSV loses the hyperlinks behind "Apply"; one note cell has a URL. The xlsx (with hyperlinks) has the jobs.
+    wb = Workbook()
+    wb.active.append(["Job", "JD", "Notes"])
+    for i in range(3):
+        wb.active.append([f'=HYPERLINK("https://x.com/jobs/{i}","Apply")', JD, "see https://blog.x.com/post" if i == 0 else ""])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    def handler(request):
+        if request.url.params.get("format") == "csv":
+            body = "Job,JD,Notes\n" + "\n".join(
+                f'Apply,"{JD}",{"see https://blog.x.com/post" if i == 0 else ""}' for i in range(3))
+            return httpx.Response(200, content=body.encode(), headers={"content-type": "text/csv"})
+        return httpx.Response(200, content=buf.getvalue(), headers={
+            "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        })
+
+    async with client(handler) as c:
+        _, rows = await download_gsheet(f"https://docs.google.com/spreadsheets/d/{SID}/edit", client=c)
+    assert [r.url for r in rows] == [f"https://x.com/jobs/{i}" for i in range(3)]
+
+
+def test_parse_published_link_and_last_gid():
+    pub = "2PACX-1vAbc_123xyz"
+    assert parse_gsheet_url(f"https://docs.google.com/spreadsheets/d/e/{pub}/pubhtml?gid=7&single=true") == (f"e/{pub}", "7")
+    assert parse_gsheet_url(f"https://docs.google.com/spreadsheets/d/e/{pub}/pub?output=csv") == (f"e/{pub}", None)
+    # the tab in the address bar (#gid=) is the one the user is looking at
+    assert parse_gsheet_url(f"https://docs.google.com/spreadsheets/d/{SID}/edit?gid=0#gid=5") == (SID, "5")
+    assert parse_gsheet_url(f"docs.google.com/spreadsheets/d/{SID}/view") == (SID, None)
+
+
+async def test_download_published_sheet():
+    pub = "2PACX-1vAbc_123xyz"
+    seen = {}
+
+    def handler(request):
+        seen["path"], seen["params"] = request.url.path, dict(request.url.params)
+        return httpx.Response(200, content=f"url,description\nhttps://a.com/1,\"{JD}\"\n".encode(),
+                              headers={"content-type": "text/csv"})
+
+    async with client(handler) as c:
+        _, rows = await download_gsheet(f"https://docs.google.com/spreadsheets/d/e/{pub}/pubhtml?gid=7", client=c)
+    assert seen == {"path": f"/spreadsheets/d/e/{pub}/pub", "params": {"output": "csv", "gid": "7"}}
+    assert [r.url for r in rows] == ["https://a.com/1"]
