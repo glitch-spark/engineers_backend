@@ -44,6 +44,7 @@ from app.models import (  # noqa: E402
     JobApplyRow,
     JobApplyRun,
     JobExtractionCache,
+    JobInfo,
     JobPostingCache,
     Notification,
     RecurringCharge,
@@ -78,7 +79,7 @@ async def client(app) -> AsyncIterator[AsyncClient]:
 async def db_clean(app) -> AsyncIterator[None]:
     for model in (
         UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge,
-        JobApplyRun, JobApplyRow, JobExtractionCache, JobPostingCache, JobApplicationLog, ResumeApplication,
+        JobApplyRun, JobApplyRow, JobExtractionCache, JobInfo, JobPostingCache, JobApplicationLog, ResumeApplication,
     ):
         await model.delete_all()
     yield

@@ -22,13 +22,14 @@ from app.job_apply.screening import (
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
-from app.job_apply.schema import GateResult, JobExtraction, Location
+from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, WorkAuth, WorkMode
 from app.models.job_apply import (
     AppliedMark,
     file_key,
     JobApplicationLog,
     JobApplyRow,
     JobApplyRun,
+    JobInfo,
     ProfileGates,
     RunCounts,
     RunSelection,
@@ -256,6 +257,7 @@ def _row_summary(
         "allowedLocations": [l.model_dump() for l in ex.allowedLocations] if ex else [],
         "timezoneNote": ex.timezoneNote if ex else None,
         "extractionSource": row.extractionSource,
+        "humanEdited": row.extractionSource == "human",
         "gates": [g.model_dump() for g in row.gates],
         "profileGates": [pg.model_dump() for pg in row.profileGates],
         "topScore": row.topScore,
@@ -898,16 +900,22 @@ async def list_rows(
     }
 
 
-@router.get("/rows/{row_id}")
-async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    row = await _owned_row(row_id, user)
+async def _row_detail(row: JobApplyRow) -> dict:
     run = await JobApplyRun.get(row.runId)
     tailored = await _tailored_docs(_tailored_ids(row))
     out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored)
     out["scores"] = [s.model_dump(mode="json") for s in sorted(row.scores, key=lambda s: s.total, reverse=True)]
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None
     out["jdText"] = row.jdText
+    # Who last corrected this URL (a correction is shared by everyone who uses the link).
+    info = await JobInfo.find_one(JobInfo.url == row.url) if row.url else None
+    out["info"] = {"editedBy": info.editedByName, "editedAt": info.editedAt.isoformat() + "Z"} if info else None
     return out
+
+
+@router.get("/rows/{row_id}")
+async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    return await _row_detail(await _owned_row(row_id, user))
 
 
 class IncludeBody(BaseModel):
@@ -940,6 +948,148 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
         {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}
     )
     return _row_summary(row, run.threshold)
+
+
+# ---------- job info corrections ----------
+
+
+class InfoBody(BaseModel):
+    """What a person corrected. Only the fields sent change; the description may be replaced or, for a job that
+    could not be fetched, pasted."""
+
+    title: Optional[str] = Field(default=None, max_length=300)
+    company: Optional[str] = Field(default=None, max_length=300)
+    workMode: Optional[WorkMode] = None
+    allowedLocations: Optional[list[Location]] = None
+    postedDate: Optional[date] = None  # null clears it
+    clearance: Optional[str] = Field(default=None, pattern="^(required|preferred|none)$")
+    workAuthorization: Optional[WorkAuth] = None  # null clears it
+    timezoneNote: Optional[str] = Field(default=None, max_length=300)  # null clears it
+    jdText: Optional[str] = Field(default=None, max_length=60000)
+
+
+_NULLABLE = {"postedDate", "workAuthorization", "timezoneNote"}
+
+
+def _require_editor(user: UserExtra) -> None:
+    if user.role not in ("admin", "staff"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admin and staff can correct jobs.")
+
+
+def _row_counts(row: JobApplyRow) -> dict[str, int]:
+    """What the run's counters hold for this row (the worker's `_inc` calls), to move them when a row is read again."""
+    return {
+        "failed": int(row.status in FAILED),
+        "extracted": int(row.status in ("extracted", "excluded", "scored", "unassigned")),
+        "excluded": int(row.status == "excluded"),
+    }
+
+
+async def _move_counts(run_id: PydanticObjectId, before: dict[str, int], after: dict[str, int]) -> None:
+    inc = {f"counts.{k}": after[k] - before[k] for k in before if after[k] != before[k]}
+    if inc:
+        await JobApplyRun.get_motor_collection().update_one({"_id": run_id}, {"$inc": inc})
+
+
+@router.put("/rows/{row_id}/info")
+async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Correct a job's parsed info and/or description. Saved per URL for everyone; this row is read again now,
+    other runs use it the next time they read the URL."""
+    _require_editor(user)
+    row = await _owned_row(row_id, user)
+    if not row.url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only jobs with a link can be corrected.")
+    run = await JobApplyRun.get(row.runId)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if run.status in ACTIVE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Wait for the run to finish its current step.")
+
+    info = await JobInfo.find_one(JobInfo.url == row.url)
+    sent = {f for f in body.model_fields_set if getattr(body, f) is not None or f in _NULLABLE}
+    current_jd = (info.jdText if info else row.jdText) or ""
+    new_jd = (body.jdText or "").strip() if "jdText" in sent else ""
+    jd = new_jd or current_jd
+    if not jd.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the job description first.")
+    fields = sent - {"jdText"}
+    ex = info.extraction if info else row.extraction
+    if ex is None or (new_jd and new_jd != current_jd and not fields):
+        # No reading yet, or a new description with nothing else corrected: read it (one LLM call).
+        try:
+            ex, _ = await worker.EXTRACT(jd, user=user, run_date=run.runDate.date())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("job info extraction failed: %s", exc)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read that description.") from exc
+    ex = ex.model_copy(deep=True)
+    ex.isJobPosting = True
+    if "title" in fields:
+        ex.title = (body.title or "").strip()
+    elif not ex.title:
+        ex.title = row.title
+    if "company" in fields:
+        ex.company = (body.company or "").strip()
+    elif not ex.company:
+        ex.company = row.company
+    if "workMode" in fields:
+        ex.workMode = body.workMode
+    if "allowedLocations" in fields:
+        ex.allowedLocations = body.allowedLocations
+    if "postedDate" in fields:
+        ex.postedDate = body.postedDate
+    if "clearance" in fields:
+        ex.clearance = Clearance(level=body.clearance, note=ex.clearance.note)
+    if "workAuthorization" in fields:
+        ex.workAuthorization = body.workAuthorization
+    if "timezoneNote" in fields:
+        ex.timezoneNote = (body.timezoneNote or "").strip() or None
+
+    if info is None:
+        info = JobInfo(url=row.url, jdText=jd, extraction=ex)
+    info.jdText, info.extraction, info.postedDate = jd, ex, ex.postedDate
+    info.title, info.company = ex.title, ex.company
+    info.editedBy, info.editedByName, info.editedAt = user.id, user.name or user.email or "", datetime.utcnow()
+    await info.save()
+
+    before = _row_counts(row)
+    await worker.reapply_info(run, row)
+    await _move_counts(run.id, before, _row_counts(row))
+    return await _row_detail(row)
+
+
+@router.delete("/rows/{row_id}/info")
+async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Drop the correction for this job's URL and read the job again with the machine (fetch + LLM)."""
+    _require_editor(user)
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if run.status in ACTIVE or await JobApplyRun.find_one({"userId": run.userId, "status": {"$in": list(ACTIVE)}}):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is in progress.")
+    if row.url:
+        await JobInfo.find(JobInfo.url == row.url).delete()
+    before = _row_counts(row)
+    if row.scoredAt:
+        await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$inc": {"counts.scored": -1}})
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id},
+        {"$set": {
+            "status": "pending", "statusReason": None, "screen": None, "jdText": None, "jdSource": None,
+            "jdStructured": None, "fetchedPostedDate": None, "postedDate": None, "title": "", "company": "",
+            "extraction": None, "extractionSource": None, "gates": [], "groupKey": None, "scoredAt": None,
+            "scores": [], "profileGates": [], "bestByProfile": [], "topScore": None, "tailorOnly": [],
+            "updatedAt": datetime.utcnow(),
+        }},
+    )
+    await _move_counts(run.id, before, {k: 0 for k in before})
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": run.id},
+        {"$set": {"status": "queued", "error": None, "finishedAt": None, "heartbeatAt": None, "updatedAt": datetime.utcnow()}},
+    )
+    if worker.worker_enabled():
+        worker.start_run(run.id)
+    return {"ok": True}
 
 
 # ---------- applied marks ----------
