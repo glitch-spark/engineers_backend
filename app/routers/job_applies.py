@@ -1267,6 +1267,11 @@ def _host(url: Optional[str]) -> str:
     return (urlsplit(url or "").hostname or "").removeprefix("www.")
 
 
+def _company_label(row: JobApplyRow) -> str:
+    """What a job's company is called on its tailored resume and on the zip of its sheet download."""
+    return row.company or _host(row.url) or row.title
+
+
 def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
     """The profile whose resume scored best on this job (even below the threshold); else the run's first."""
     if row.scores:
@@ -1295,7 +1300,7 @@ async def _tailor_row(
         user=owner,
         account=account,
         jd=row.jdText or "",
-        company=row.company or _host(row.url) or row.title,
+        company=_company_label(row),
         job_url=row.url,
         cover_letter=cover_letter,
         source="job_applies",
@@ -1334,13 +1339,13 @@ class TailorBody(BaseModel):
 class TailorAllBody(BaseModel):
     # Profiles to tailor for (default: every profile in the run); each job gets one per chosen profile it's open to.
     accountIds: Optional[list[str]] = None
+    # Only these jobs (the ones ticked in the table), instead of every suggested job.
+    rowIds: Optional[list[str]] = Field(default=None, max_length=1000)
     coverLetter: bool = False
     resumeModel: Optional[str] = None
     coverLetterModel: Optional[str] = None
     dryRun: bool = False  # count what would be queued, queue nothing
 
-    # Only these jobs (the ones ticked in the table), instead of every suggested job.
-    rowIds: Optional[list[str]] = Field(default=None, max_length=1000)
 
 @router.post("/rows/{row_id}/tailor")
 async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
@@ -1501,7 +1506,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 if not resume or not resume.s3Key:
                     no_file += 1  # the original PDF isn't stored, so there's nothing to link to
                     continue
-                link = file_links.file_url("resume", app["resumeId"], account_id=acc)
+                link = file_links.file_url("resume", app["resumeId"], account_id=acc, company=_company_label(row))
             name = accounts[acc].name if acc in accounts else "Profile"
             out.append([*map(sheet_text, (name, row.company, row.title, row.url)), _download_cell(link)])
             marks.append((row.id, acc))
@@ -1544,12 +1549,6 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     }
 
 
-def _pdf_name(*parts: str) -> str:
-    import re
-
-    return re.sub(r"[^\w .()-]+", "_", " - ".join(p for p in parts if p)).strip() or "Resume"
-
-
 class ChecksBody(BaseModel):
     sheetUrl: str = ""  # empty = the link saved from the last export
     dryRun: bool = False  # count and check access only
@@ -1583,12 +1582,24 @@ async def export_checks(run_id: str, body: ChecksBody, user: Annotated[UserExtra
         "serviceAccount": google_sheets.service_account_email(),
     }
 
+async def _stored_file(key: str) -> bytes:
+    """The bytes of a stored resume file; 404 when it's gone, 502 when the storage can't be reached right now."""
+    try:
+        return await resume_files.read_resume_file(key)
+    except resume_files.FileUnavailable:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read resume file %s: %s", key, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not fetch the resume. Try the link again.")
+
+
 @router.get("/files/{token}")
 async def resume_file(token: str):
-    """A resume PDF from an exported sheet's link. No login: the signed, expiring link is the permission."""
+    """A resume from an exported sheet's link, as `<Company>.zip` holding `resume.pdf`. No login: the signed,
+    expiring link is the permission."""
     import base64
 
-    from fastapi.responses import RedirectResponse, Response
+    from fastapi.responses import Response
 
     try:
         ref = file_links.read_token(token)
@@ -1596,21 +1607,25 @@ async def resume_file(token: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This link is invalid or has expired.")
     if ref["kind"] == "tailored":
         doc = await ResumeApplication.get_motor_collection().find_one(
-            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1, "profileName": 1}
+            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1}
         )
         if doc is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume no longer exists.")
-        filename = _pdf_name(f"Resume ({doc.get('companyName') or 'job'})", doc.get("profileName") or "") + ".pdf"
         if doc.get("s3Key"):
-            return RedirectResponse(resume_files.presigned_url(doc["s3Key"], filename))
-        if doc.get("pdfData"):
-            return Response(
-                base64.b64decode(doc["pdfData"]), media_type="application/pdf",
-                headers={"Content-Disposition": f'inline; filename="{filename}"'},
-            )
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
-    acc = await Account.get(to_object_id(ref["accountId"] or ""))
-    resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
-    if resume is None or not resume.s3Key:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
-    return RedirectResponse(resume_files.presigned_url(resume.s3Key, resume.filename))
+            data = await _stored_file(doc["s3Key"])
+        elif doc.get("pdfData"):
+            data = base64.b64decode(doc["pdfData"])
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
+        company, entry = doc.get("companyName") or ref["company"], file_links.entry_name(None)
+    else:
+        acc = await Account.get(to_object_id(ref["accountId"] or ""))
+        resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
+        if resume is None or not resume.s3Key:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+        data, company, entry = await _stored_file(resume.s3Key), ref["company"], file_links.entry_name(resume.filename)
+    return Response(
+        file_links.build_zip(data, entry),
+        media_type="application/zip",
+        headers={"Content-Disposition": file_links.content_disposition(file_links.zip_name(company))},
+    )

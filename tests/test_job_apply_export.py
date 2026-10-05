@@ -1,11 +1,13 @@
 """Export a run to a shared Google Sheet: one row per job × profile with a working resume link (Google stubbed)."""
+import io
 import json
+import zipfile
 
 import pytest
 from beanie import PydanticObjectId
 
 from app import google_sheets, resume_files
-from app.job_apply import worker
+from app.job_apply import file_links, worker
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.account import Resume
 from tests.test_job_applies import GSHEET, SHEET, STRONG, create_screen_run, fake_extract, fake_fetch, screened_run  # noqa: F401  (fixtures reused)
@@ -63,7 +65,12 @@ def sheets(monkeypatch):
     monkeypatch.setattr(google_sheets, "update_range", update)
     monkeypatch.setattr(google_sheets, "clear_range", clear, raising=False)
     monkeypatch.setattr(google_sheets, "service_account_email", lambda: "exporter@proj.iam.gserviceaccount.com")
-    monkeypatch.setattr(resume_files, "presigned_url", lambda key, filename: f"https://s3.example/{key}")
+    async def read(key):  # the stored file: S3 isn't reachable in tests
+        if key.endswith("/gone.pdf"):
+            raise resume_files.FileUnavailable(key)
+        return b"%PDF-1.7 from s3 " + key.encode()
+
+    monkeypatch.setattr(resume_files, "read_resume_file", read)
     return state
 
 
@@ -125,11 +132,53 @@ async def test_resume_links_work_without_login(client, staff_user, auth_header, 
     links = {(row[0], row[3]): row[4].split('"')[1] for row in sheets["rows"]}
     path = lambda url: url[url.index("/job-applies/files/"):]  # noqa: E731
 
-    pdf = await client.get(path(links[("Tharun", "https://jobs.example.com/remote")]))  # no Authorization header
-    assert pdf.status_code == 200 and pdf.headers["content-type"] == "application/pdf" and pdf.content.startswith(b"%PDF")
-    redirect = await client.get(path(links[("Eric", "https://jobs.example.com/remote")]), follow_redirects=False)
-    assert redirect.status_code in (302, 307) and redirect.headers["location"] == "https://s3.example/profiles/e/resumes/r.pdf"
+    def unzip(res):
+        assert res.status_code == 200 and res.headers["content-type"] == "application/zip"
+        z = zipfile.ZipFile(io.BytesIO(res.content))
+        assert z.namelist() == ["resume.pdf"]  # one file, whatever the resume was called
+        return z.read("resume.pdf")
+
+    # The sheet's company column is empty for these jobs, so both zips are named after the job site, as the tailored
+    # resume is. A tailored resume (stored in the database here) and an uploaded one (read from S3) download alike.
+    tailored = await client.get(path(links[("Tharun", "https://jobs.example.com/remote")]))  # no Authorization header
+    assert unzip(tailored).startswith(b"%PDF")
+    assert tailored.headers["content-disposition"].startswith('attachment; filename="jobs.example.com.zip"')
+    uploaded = await client.get(path(links[("Eric", "https://jobs.example.com/remote")]), follow_redirects=False)
+    assert unzip(uploaded) == b"%PDF-1.7 from s3 profiles/e/resumes/r.pdf"
+    assert 'filename="jobs.example.com.zip"' in uploaded.headers["content-disposition"]
+
     assert (await client.get("/job-applies/files/not-a-token")).status_code == 404
+
+
+async def test_resume_link_zip_is_named_after_the_company(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    _, _, _, eric, _ = await _run(client, h, staff_user)
+    resume = eric.resumes[0]
+    path = lambda url: url[url.index("/job-applies/files/"):]  # noqa: E731
+    named = await client.get(path(file_links.file_url("resume", str(resume.id), str(eric.id), company="Acme, Inc.")))
+    assert named.headers["content-disposition"].startswith('attachment; filename="Acme_ Inc.zip"')
+    assert zipfile.ZipFile(io.BytesIO(named.content)).namelist() == ["resume.pdf"]
+    old = await client.get(path(file_links.file_url("resume", str(resume.id), str(eric.id))))  # a link made before names
+    assert old.status_code == 200 and old.headers["content-disposition"].startswith('attachment; filename="Resume.zip"')
+
+
+async def test_resume_link_keeps_the_uploaded_file_type(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    acc = Account(name="Text", country="US", region="US", createdBy=staff_user.id,
+                  resumes=[Resume(filename="cv.txt", markdown=STRONG, s3Key="profiles/t/resumes/r.txt")])
+    await acc.insert()
+    path = lambda url: url[url.index("/job-applies/files/"):]  # noqa: E731
+    res = await client.get(path(file_links.file_url("resume", str(acc.resumes[0].id), str(acc.id), company="Acme")))
+    assert zipfile.ZipFile(io.BytesIO(res.content)).namelist() == ["resume.txt"]
+
+
+async def test_resume_link_when_the_file_is_gone(client, staff_user, auth_header, sheets):
+    acc = Account(name="Gone", country="US", region="US", createdBy=staff_user.id,
+                  resumes=[Resume(filename="x.pdf", markdown=STRONG, s3Key="profiles/g/resumes/gone.pdf")])
+    await acc.insert()
+    path = file_links.file_url("resume", str(acc.resumes[0].id), str(acc.id))
+    res = await client.get(path[path.index("/job-applies/files/"):])
+    assert res.status_code == 404  # not a 500, and no empty zip
 
 
 async def test_export_reports_sharing_problem(client, staff_user, auth_header, sheets):
