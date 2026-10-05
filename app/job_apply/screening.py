@@ -19,7 +19,9 @@ from app.models.job_apply import ScreenBucket
 
 BUCKETS: tuple[str, ...] = get_args(ScreenBucket)
 WORTH: tuple[str, ...] = ("valid", "check")
-FORCEABLE: tuple[str, ...] = ("clearance", "onsite", "too_old")  # "Include anyway" can bring these back
+# A person can approve a job in these buckets: it becomes Worth applying. The others (closed, not fetched, couldn't be
+# read, not a job page) have no readable description to score or tailor from: it has to be pasted in Job info first.
+APPROVABLE: tuple[str, ...] = ("check", "clearance", "onsite", "too_old", "other_location")
 NO_LOCATION = "none"
 
 # region_key() result -> the label used in group keys. US / Canada are countries, so they get ISO-2 codes.
@@ -67,7 +69,9 @@ def bucket(
     is_job: bool = True,
     verified: bool = True,
 ) -> Optional[ScreenBucket]:
-    """The one bucket a job lands in, first match wins (spec §3.1). None while it is still being fetched or read."""
+    """The one bucket a job lands in, first match wins (spec §3.1). None while it is still being fetched or read.
+    `force_include` is a person's approval: a job that has been read (and is a job posting) is then Worth applying,
+    whatever the checks said."""
     if status in ("pending", "fetched"):
         return None
     if status == "fetch_failed":
@@ -76,15 +80,25 @@ def bucket(
         return "read_failed"
     if not is_job:
         return "not_job"  # an error page, cookie notice or job list read in place of a posting
+    if force_include:
+        return "valid"
     result = {g.name: g.result for g in gates}
     for gate, name in (("clearance", "clearance"), ("remote", "onsite"), ("freshness", "too_old")):
         if result.get(gate) == "fail":
-            return "check" if force_include else name
+            return name
     if group_key and group_key != NO_LOCATION and not markets_for(group_key):
         return "other_location"  # open only to candidates outside the target markets: counted, not scored
     if "unknown" in result.values() or group_key == NO_LOCATION or not verified:
         return "check"  # an unknown, or read from page text only (no job-site API or JobPosting data)
     return "valid"
+
+
+def scoring_key(group_key: Optional[str], approved: bool) -> Optional[str]:
+    """The location group a job is scored and reported under. An approved job open only outside the target markets
+    has no market of its own, so it is handled like one that states no location (every profile fits)."""
+    if approved and group_key and group_key != NO_LOCATION and not markets_for(group_key):
+        return NO_LOCATION
+    return group_key
 
 
 def _part(loc: Location) -> str:
@@ -106,7 +120,7 @@ def group_key(locations: list[Location]) -> str:
 
 
 def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:
-    """Re-apply the job gates (max age changed, or Include anyway) to a row that has already been read."""
+    """Re-apply the job gates (max age changed) to a row that has already been read; an approval stays."""
     if row.extraction is not None:
         row.gates = job_gates(row.extraction, run_date=run_date, max_age_days=max_age_days, posted=row.postedDate)
         if row.status in ("extracted", "excluded"):

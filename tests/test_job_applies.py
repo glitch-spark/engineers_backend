@@ -1030,18 +1030,110 @@ async def test_max_age_patch_409_when_not_screened(client, staff_user, auth_head
     assert (await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"threshold": 50})).status_code == 200
 
 
-async def test_include_anyway(client, staff_user, auth_header, monkeypatch):
+async def test_approve_moves_a_job_to_worth_applying(client, staff_user, auth_header, monkeypatch):
     monkeypatch.setattr(worker, "FETCH", failing_fetch)
     h = auth_header(staff_user)
     run_id = await screened_run(client, h)
     rows = await rows_by_url(client, h, run_id)
-    hybrid, gh = rows["https://jobs.example.com/hybrid"], rows["https://boards.greenhouse.io/acme/jobs/9"]
+    remote, hybrid, gh = (rows[f"https://{u}"] for u in (
+        "jobs.example.com/remote", "jobs.example.com/hybrid", "boards.greenhouse.io/acme/jobs/9"))
     r = await client.put(f"/job-applies/rows/{hybrid['_id']}/include", headers=h, json={"include": True})
-    assert r.status_code == 200 and r.json()["screen"] == "check" and r.json()["forceInclude"] is True
+    assert r.status_code == 200 and r.json()["screen"] == "valid" and r.json()["forceInclude"] is True
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["buckets"]["onsite"] == 0 and rep["buckets"]["valid"] == 2 and rep["check"] == 0
+    # nothing to approve: already worth applying, or never read (no description to score or tailor from)
+    r = await client.put(f"/job-applies/rows/{remote['_id']}/include", headers=h, json={"include": True})
+    assert r.status_code == 400 and "already worth applying" in r.json()["error"]
     r = await client.put(f"/job-applies/rows/{gh['_id']}/include", headers=h, json={"include": True})
-    assert r.status_code == 400
+    assert r.status_code == 400 and "job description" in r.json()["error"]
     r = await client.put(f"/job-applies/rows/{hybrid['_id']}/include", headers=h, json={"include": False})
-    assert r.json()["screen"] == "onsite"
+    assert r.json()["screen"] == "onsite" and r.json()["forceInclude"] is False
+
+
+async def _no_location_extract(jd, *, user, run_date, llm=None):
+    ex, source = await fake_extract(jd, user=user, run_date=run_date)
+    ex.allowedLocations = []  # a job that doesn't say where it's open to is Needs a check
+    return ex, source
+
+
+async def test_approve_a_needs_a_check_job(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "EXTRACT", _no_location_extract)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["check"] == 2 and rep["worth"] == 2 and rep["buckets"]["valid"] == 0
+    row = next(iter((await rows_by_url(client, h, run_id, screen="check")).values()))
+    r = await client.put(f"/job-applies/rows/{row['_id']}/include", headers=h, json={"include": True})
+    assert r.status_code == 200 and r.json()["screen"] == "valid"
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert rep["check"] == 1 and rep["worth"] == 2 and rep["buckets"]["valid"] == 1 and rep["buckets"]["check"] == 1
+    r = await client.put(f"/job-applies/rows/{row['_id']}/include", headers=h, json={"include": False})
+    assert r.json()["screen"] == "check"
+
+
+async def test_approved_other_location_job_is_scored_with_the_not_stated_picks(client, staff_user, auth_header, monkeypatch):
+    async def canada_only(jd, *, user, run_date, llm=None):
+        ex, source = await fake_extract(jd, user=user, run_date=run_date)
+        ex.allowedLocations = [Location(kind="country", value="CA")]
+        return ex, source
+
+    monkeypatch.setattr(worker, "EXTRACT", canada_only)
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    remote = (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]
+    assert remote["screen"] == "other_location"
+    assert (await client.put(f"/job-applies/rows/{remote['_id']}/include", headers=h, json={"include": True})).status_code == 200
+    rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
+    assert [g["key"] for g in rep["groups"]] == ["US", "UKEU", "LATAM", "none"] and rep["groups"][-1]["jobs"] == 1
+    assert rep["groups"][-1]["fits"] == [str(us.id)]
+    r = await start(client, h, run_id, {"none": [us]}, [us])
+    assert r.status_code == 200, r.text
+    await worker.run_worker(PydanticObjectId(run_id))
+    assert (await rows_by_url(client, h, run_id))["https://jobs.example.com/remote"]["status"] == "scored"
+
+
+async def test_rescore_sends_an_approved_job_back_by_whether_it_failed_a_check(client, staff_user, auth_header, monkeypatch):
+    from app.models.job_apply import JobApplyRow
+
+    monkeypatch.setattr(worker, "EXTRACT", _no_location_extract)  # remote + greenhouse: Needs a check; hybrid: on-site
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    hybrid, remote = rows["https://jobs.example.com/hybrid"], rows["https://jobs.example.com/remote"]
+    for row in (hybrid, remote):
+        assert (await client.put(f"/job-applies/rows/{row['_id']}/include", headers=h, json={"include": True})).status_code == 200
+    assert (await start(client, h, run_id, {"none": [us]}, [us])).status_code == 200
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = await rows_by_url(client, h, run_id)
+    assert rows["https://jobs.example.com/hybrid"]["status"] == rows["https://jobs.example.com/remote"]["status"] == "scored"
+    assert (await start(client, h, run_id, {"none": [us]}, [us])).status_code == 200  # score again with the same picks
+    # the on-site job failed a check, so until it is scored again it is excluded; the other only needed a check
+    assert (await JobApplyRow.get(PydanticObjectId(hybrid["_id"]))).status == "excluded"
+    assert (await JobApplyRow.get(PydanticObjectId(remote["_id"]))).status == "extracted"
+
+
+async def test_tailor_all_for_chosen_rows_only(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    tharun = await _tailor_only_account(staff_user)
+    run_id = (await _run_with(client, h, [tharun])).json()["runId"]
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
+    mine = [r["_id"] for r in rows if r.get("tailorOnly")][:1]
+    assert mine, "the fixture should give at least one job this profile can be tailored for"
+    body = {"accountIds": [str(tharun.id)], "rowIds": mine}
+    assert (await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={**body, "dryRun": True})).json() == {
+        "queued": 1, "skippedCap": 0, "skipped": 0}
+    r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json=body)
+    assert r.json()["queued"] == 1
+    from app.models import ResumeApplication
+    assert await ResumeApplication.find({"source": "job_applies"}).count() == 1  # not one per suggested job
+    # a row of another run is not reachable by id
+    other = await screened_run(client, h)
+    foreign = next(iter((await rows_by_url(client, h, other)).values()))["_id"]
+    r = await client.post(f"/job-applies/runs/{run_id}/tailor-all", headers=h, json={**body, "rowIds": [foreign], "dryRun": True})
+    assert r.json()["queued"] == 0
 
 
 async def test_retry_from_screened_keeps_force_include(client, staff_user, auth_header, monkeypatch):
@@ -1058,14 +1150,14 @@ async def test_retry_from_screened_keeps_force_include(client, staff_user, auth_
     run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
     assert run["status"] == "screened"
     rows = await rows_by_url(client, h, run_id)
-    assert rows["https://jobs.example.com/hybrid"]["screen"] == "check"
+    assert rows["https://jobs.example.com/hybrid"]["screen"] == "valid"  # still approved
     assert rows["https://boards.greenhouse.io/acme/jobs/9"]["screen"] in ("valid", "check")
 
 
 async def test_screen_view_projection():
     from app.routers.job_applies import _ScreenView
 
-    assert set(_ScreenView.model_fields) == {"screen", "groupKey"}
+    assert set(_ScreenView.model_fields) == {"screen", "groupKey", "forceInclude"}
 
 
 async def test_rows_screen_filter(client, staff_user, auth_header):

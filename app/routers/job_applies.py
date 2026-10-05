@@ -17,7 +17,7 @@ from app.job_apply import file_links, gsheet, sheet_checks, worker
 from app.job_apply.sheet_checks import sheet_text
 from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import (
-    FORCEABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen,
+    APPROVABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen, scoring_key,
 )
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
@@ -708,10 +708,11 @@ async def update_run(run_id: str, body: RunPatch, user: Annotated[UserExtra, Dep
 
 
 class _ScreenView(BaseModel):
-    """The two fields the screening report reads (never the job text: runs have up to ~1,000 rows)."""
+    """The few fields the screening report reads (never the job text: runs have up to ~1,000 rows)."""
 
     screen: Optional[str] = None
     groupKey: Optional[str] = None
+    forceInclude: bool = False
 
 
 @router.get("/runs/{run_id}/screening")
@@ -725,7 +726,9 @@ async def get_screening(run_id: str, user: Annotated[UserExtra, Depends(get_curr
         {"id": str(a.id), "name": a.name, "country": a.country, "region": a.region, "resumes": len(a.resumes)}
         for a in accounts
     ]
-    return build_report([(r.screen, r.groupKey) for r in rows], profiles, max_age_days=run.maxAgeDays)
+    return build_report(
+        [(r.screen, scoring_key(r.groupKey, r.forceInclude)) for r in rows], profiles, max_age_days=run.maxAgeDays
+    )
 
 
 class StartBody(BaseModel):
@@ -743,8 +746,12 @@ async def _clear_scores(run_id: PydanticObjectId) -> None:
     coll = JobApplyRow.get_motor_collection()
     now = datetime.utcnow()
     scored = {"runId": run_id, "status": {"$in": ["scored", "unassigned"]}}
-    # a job brought back with "Include anyway" failed a check, so it goes back to excluded (scoring takes both)
-    await coll.update_many({**scored, "forceInclude": True}, {"$set": {**_SCORE_RESET, "status": "excluded", "updatedAt": now}})
+    # an approved job that failed a check goes back to excluded (scoring takes both); one that only needed a check
+    # goes back to extracted like any other
+    failed = {"gates": {"$elemMatch": {"result": "fail"}}}
+    await coll.update_many(
+        {**scored, "forceInclude": True, **failed}, {"$set": {**_SCORE_RESET, "status": "excluded", "updatedAt": now}}
+    )
     await coll.update_many(scored, {"$set": {**_SCORE_RESET, "status": "extracted", "updatedAt": now}})
 
 
@@ -766,7 +773,7 @@ async def start_run(run_id: str, body: StartBody, user: Annotated[UserExtra, Dep
     if any(v not in picked for ids in assignments.values() for v in ids):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick resumes for every assigned profile.")
     worth = await JobApplyRow.find({"runId": run.id, "screen": {"$in": list(WORTH)}}).project(_ScreenView).to_list()
-    keys = {k for r in worth for k in (markets_for(r.groupKey) or [NO_LOCATION])}
+    keys = {k for r in worth for k in (markets_for(scoring_key(r.groupKey, r.forceInclude)) or [NO_LOCATION])}
     if not keys or not ("*" in assignments or keys & set(assignments)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least one profile for a group with jobs.")
     fields = {
@@ -933,20 +940,26 @@ class IncludeBody(BaseModel):
 
 @router.put("/rows/{row_id}/include")
 async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Include anyway: bring a job dropped for clearance, on-site or age back into the jobs worth applying to."""
+    """Approve a job (or undo it): a person has checked it, so it moves to Worth applying whatever the checks said.
+    Needs a readable description: for a job that could not be fetched or read it has to be pasted in Job info first
+    (saving it reads the job again, and it lands in the bucket its checks give)."""
     row = await _owned_row(row_id, user)
     run = await JobApplyRun.get(row.runId)
     if run is None or run.status != "screened":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Jobs can only be included before scoring starts.")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Jobs can only be approved before scoring starts.")
     is_job = row.extraction.isJobPosting if row.extraction is not None else True
     base = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
         is_job=is_job, verified=row.jdStructured is not False,
     )
-    if base not in FORCEABLE:
+    if body.include and base not in APPROVABLE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only jobs excluded for clearance, on-site or age can be included.",
+            detail=(
+                "This job is already worth applying to."
+                if base == "valid"
+                else "Paste the job description in Job info first: there is nothing to approve until the job has been read."
+            ),
         )
     row.forceInclude = body.include
     row.screen = bucket(
@@ -1254,6 +1267,11 @@ def _host(url: Optional[str]) -> str:
     return (urlsplit(url or "").hostname or "").removeprefix("www.")
 
 
+def _company_label(row: JobApplyRow) -> str:
+    """What a job's company is called on its tailored resume and on the zip of its sheet download."""
+    return row.company or _host(row.url) or row.title
+
+
 def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
     """The profile whose resume scored best on this job (even below the threshold); else the run's first."""
     if row.scores:
@@ -1282,7 +1300,7 @@ async def _tailor_row(
         user=owner,
         account=account,
         jd=row.jdText or "",
-        company=row.company or _host(row.url) or row.title,
+        company=_company_label(row),
         job_url=row.url,
         cover_letter=cover_letter,
         source="job_applies",
@@ -1321,6 +1339,8 @@ class TailorBody(BaseModel):
 class TailorAllBody(BaseModel):
     # Profiles to tailor for (default: every profile in the run); each job gets one per chosen profile it's open to.
     accountIds: Optional[list[str]] = None
+    # Only these jobs (the ones ticked in the table), instead of every suggested job.
+    rowIds: Optional[list[str]] = Field(default=None, max_length=1000)
     coverLetter: bool = False
     resumeModel: Optional[str] = None
     coverLetterModel: Optional[str] = None
@@ -1347,15 +1367,19 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
 
 @router.post("/runs/{run_id}/tailor-all")
 async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Queue a tailored resume for each suggested job × each chosen profile the job is open to and that hasn't
-    applied to it yet, unless that profile already has one (a failed one is redone), up to the daily cap.
-    `dryRun` only counts."""
+    """Queue a tailored resume for each suggested job (or just the `rowIds` given) × each chosen profile the job is
+    open to and that hasn't applied to it yet, unless that profile already has one (a failed one is redone), up to
+    the daily cap. `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
     resume_model = require_model("resume", body.resumeModel, owner)
     cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     chosen = set(body.accountIds or [str(s.accountId) for s in run.selection])
-    rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
+    if body.rowIds is not None:  # the ticked jobs of this run, whatever view they were ticked in
+        query: dict[str, Any] = {"_id": {"$in": [to_object_id(i) for i in body.rowIds]}, "runId": run.id}
+    else:
+        query = await _rows_query(run, view="suggested")
+    rows = await JobApplyRow.find(query).sort("+rowIndex").to_list()
     ctx = await _app_context(run, rows)
     existing = ctx.tailored
     remaining = await resume_queue.remaining_today(owner)
@@ -1482,7 +1506,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 if not resume or not resume.s3Key:
                     no_file += 1  # the original PDF isn't stored, so there's nothing to link to
                     continue
-                link = file_links.file_url("resume", app["resumeId"], account_id=acc)
+                link = file_links.file_url("resume", app["resumeId"], account_id=acc, company=_company_label(row))
             name = accounts[acc].name if acc in accounts else "Profile"
             out.append([*map(sheet_text, (name, row.company, row.title, row.url)), _download_cell(link)])
             marks.append((row.id, acc))
@@ -1525,12 +1549,6 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     }
 
 
-def _pdf_name(*parts: str) -> str:
-    import re
-
-    return re.sub(r"[^\w .()-]+", "_", " - ".join(p for p in parts if p)).strip() or "Resume"
-
-
 class ChecksBody(BaseModel):
     sheetUrl: str = ""  # empty = the link saved from the last export
     dryRun: bool = False  # count and check access only
@@ -1564,12 +1582,24 @@ async def export_checks(run_id: str, body: ChecksBody, user: Annotated[UserExtra
         "serviceAccount": google_sheets.service_account_email(),
     }
 
+async def _stored_file(key: str) -> bytes:
+    """The bytes of a stored resume file; 404 when it's gone, 502 when the storage can't be reached right now."""
+    try:
+        return await resume_files.read_resume_file(key)
+    except resume_files.FileUnavailable:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read resume file %s: %s", key, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not fetch the resume. Try the link again.")
+
+
 @router.get("/files/{token}")
 async def resume_file(token: str):
-    """A resume PDF from an exported sheet's link. No login: the signed, expiring link is the permission."""
+    """A resume from an exported sheet's link, as `<Company>.zip` holding `resume.pdf`. No login: the signed,
+    expiring link is the permission."""
     import base64
 
-    from fastapi.responses import RedirectResponse, Response
+    from fastapi.responses import Response
 
     try:
         ref = file_links.read_token(token)
@@ -1577,21 +1607,25 @@ async def resume_file(token: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This link is invalid or has expired.")
     if ref["kind"] == "tailored":
         doc = await ResumeApplication.get_motor_collection().find_one(
-            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1, "profileName": 1}
+            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1}
         )
         if doc is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume no longer exists.")
-        filename = _pdf_name(f"Resume ({doc.get('companyName') or 'job'})", doc.get("profileName") or "") + ".pdf"
         if doc.get("s3Key"):
-            return RedirectResponse(resume_files.presigned_url(doc["s3Key"], filename))
-        if doc.get("pdfData"):
-            return Response(
-                base64.b64decode(doc["pdfData"]), media_type="application/pdf",
-                headers={"Content-Disposition": f'inline; filename="{filename}"'},
-            )
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
-    acc = await Account.get(to_object_id(ref["accountId"] or ""))
-    resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
-    if resume is None or not resume.s3Key:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
-    return RedirectResponse(resume_files.presigned_url(resume.s3Key, resume.filename))
+            data = await _stored_file(doc["s3Key"])
+        elif doc.get("pdfData"):
+            data = base64.b64decode(doc["pdfData"])
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
+        company, entry = doc.get("companyName") or ref["company"], file_links.entry_name(None)
+    else:
+        acc = await Account.get(to_object_id(ref["accountId"] or ""))
+        resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
+        if resume is None or not resume.s3Key:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+        data, company, entry = await _stored_file(resume.s3Key), ref["company"], file_links.entry_name(resume.filename)
+    return Response(
+        file_links.build_zip(data, entry),
+        media_type="application/zip",
+        headers={"Content-Disposition": file_links.content_disposition(file_links.zip_name(company))},
+    )
