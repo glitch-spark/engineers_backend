@@ -51,15 +51,10 @@ EXPECTED = {
         A + "opus-5-5", A + "fable-5-1", A + "sonnet-5-5", A + "opus-5", A + "opus-4-8",
     ],
     ("screening", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
-    ("resume", "openai"): [
-        O + "gpt-6.1-sol", O + "gpt-5.4-mini", O + "gpt-5-mini", O + "gpt-4o-mini", O + "gpt-6-luna",
-    ],
-    ("cover_letter", "openai"): [
-        O + "gpt-6.1-sol", O + "gpt-6-astra", O + "gpt-5.6-sol", O + "gpt-5.5", O + "gpt-5.6-terra",
-    ],
-    ("screening", "openai"): [
-        O + "gpt-6.1-sol", O + "gpt-6-astra", O + "gpt-5.4-mini", O + "gpt-5-mini", O + "gpt-6-luna",
-    ],
+    # GPT-6.1 Sol is turned off, so it is listed nowhere.
+    ("resume", "openai"): [O + "gpt-5-mini", O + "gpt-5.4-mini", O + "gpt-4o-mini", O + "gpt-6-luna"],
+    ("cover_letter", "openai"): [O + "gpt-5.6-sol", O + "gpt-6-astra", O + "gpt-5.5", O + "gpt-5.6-terra"],
+    ("screening", "openai"): [O + "gpt-5.4-mini", O + "gpt-6-astra", O + "gpt-5-mini", O + "gpt-6-luna"],
 }
 
 
@@ -112,8 +107,9 @@ def test_defaults_per_task(use_settings):
 
 def test_default_falls_back_to_the_openai_recommendation_without_anthropic(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
-    assert mc.default_model_id("resume", None) == O + "gpt-6.1-sol"
-    assert mc.default_model_id("cover_letter", None) == O + "gpt-6.1-sol"
+    assert mc.default_model_id("resume", None) == O + "gpt-5-mini"
+    assert mc.default_model_id("cover_letter", None) == O + "gpt-5.6-sol"
+    assert mc.default_model_id("screening", None) == O + "gpt-5.4-mini"
     use_settings(ANTHROPIC_API_KEY=None, OPENAI_API_KEY=None)
     assert mc.default_model_id("resume", None) is None
 
@@ -157,18 +153,33 @@ def test_validate_requested_returns_spec(use_settings):
 
 def test_fallback_chain_order_and_dedup(use_settings):
     assert ids(mc.fallback_chain("resume", A + "haiku-4-5", None)) == [
-        A + "haiku-4-5", A + "sonnet-5-5", O + "gpt-6.1-sol",
+        A + "haiku-4-5", A + "sonnet-5-5", O + "gpt-5-mini",
     ]
-    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", O + "gpt-6.1-sol"]
-    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [
-        O + "gpt-5-mini", A + "sonnet-5-5", O + "gpt-6.1-sol",
+    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", O + "gpt-5-mini"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-5.4-mini", None)) == [
+        O + "gpt-5.4-mini", A + "sonnet-5-5", O + "gpt-5-mini",
     ]
-    assert ids(mc.fallback_chain("cover_letter", None, None)) == [A + "opus-5-5", O + "gpt-6.1-sol"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [O + "gpt-5-mini", A + "sonnet-5-5"]
+    assert ids(mc.fallback_chain("cover_letter", None, None)) == [A + "opus-5-5", O + "gpt-5.6-sol"]
 
 
 def test_fallback_chain_with_one_provider(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
-    assert ids(mc.fallback_chain("resume", O + "gpt-6-luna", None)) == [O + "gpt-6-luna", O + "gpt-6.1-sol"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-6-luna", None)) == [O + "gpt-6-luna", O + "gpt-5-mini"]
+
+
+def test_turned_off_model_is_never_offered_defaulted_or_fallen_back_to(use_settings):
+    sol = O + "gpt-6.1-sol"
+    assert mc.is_inactive(sol) and not mc.is_inactive(O + "gpt-5-mini")
+    assert not mc.is_inactive("anthropic:nope") and not mc.is_inactive(None)
+    use_settings(ANTHROPIC_API_KEY=None, RESUME_DEFAULT_MODEL=sol)
+    for task in ("resume", "cover_letter", "screening"):
+        assert sol not in ids(mc.available_models(task, None))
+        assert sol not in ids(mc.fallback_chain(task, sol, None))
+        with pytest.raises(mc.ModelNotAvailable, match="GPT-6.1 Sol is turned off"):
+            mc.validate_requested(task, sol, None)
+    assert mc.default_model_id("resume", None) == O + "gpt-5-mini"
+    assert ids(mc.fallback_chain("resume", sol, None)) == [O + "gpt-5-mini"]
 
 
 def test_usage_cost_uses_official_prices(use_settings):
@@ -203,6 +214,6 @@ def test_public_view_has_tag_and_marks_each_providers_recommendation(use_setting
     sonnet = views[A + "sonnet-5-5"]
     assert sonnet["isDefault"] is True and sonnet["recommended"] is True and sonnet["tag"]
     assert set(sonnet) == {"id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault", "recommended", "tag"}
-    assert views[O + "gpt-6.1-sol"]["recommended"] is True and views[O + "gpt-6.1-sol"]["isDefault"] is False
+    assert views[O + "gpt-5-mini"]["recommended"] is True and views[O + "gpt-5-mini"]["isDefault"] is False
     assert views[A + "opus-5-5"]["recommended"] is False
     assert views[O + "gpt-6-luna"]["tag"] == "Cheapest"

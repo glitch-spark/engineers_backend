@@ -27,6 +27,7 @@ from app.model_catalog import (
     ModelSpec,
     Task,
     fallback_chain,
+    is_inactive,
     usage_cost,
     validate_requested,
 )
@@ -335,7 +336,11 @@ async def complete(
     """Run `prompt` on the requested model (or the task default), falling back down the chain.
 
     Raises ModelNotAvailable for a bad requested id; otherwise re-raises the last model's error
-    when every model in the chain fails."""
+    when every model in the chain fails. A model switched off after the request was saved (a queued
+    job) gives way to the task default."""
+    if is_inactive(model_id):
+        log.info("%s: %s is turned off; using the default model", task, model_id)
+        model_id = None
     validate_requested(task, model_id, user)
     chain = fallback_chain(task, model_id, user)
     if not chain:

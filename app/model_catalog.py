@@ -2,7 +2,7 @@
 defaults, fallback order and cost estimates. Pure data + lookups; no network calls.
 
 Two providers (Anthropic, OpenAI). Each task offers an ordered preset list per provider; the first
-entry is that provider's recommendation for the task."""
+active entry is that provider's recommendation for the task."""
 
 from __future__ import annotations
 
@@ -46,11 +46,14 @@ class ModelSpec:
     price_in: float  # USD per 1M input tokens
     price_out: float  # USD per 1M output tokens
     supports_effort: bool = True
+    # Off: never offered, defaulted to or fallen back to; requests saved with it use the task default instead.
+    active: bool = True
 
 
-def _spec(provider, api_model, label, tier, best_for, price_in, price_out, supports_effort=True):
+def _spec(provider, api_model, label, tier, best_for, price_in, price_out, supports_effort=True, active=True):
     return ModelSpec(
-        f"{provider}:{api_model}", provider, api_model, label, tier, best_for, price_in, price_out, supports_effort
+        f"{provider}:{api_model}", provider, api_model, label, tier, best_for, price_in, price_out, supports_effort,
+        active,
     )
 
 
@@ -69,7 +72,7 @@ _SPECS: tuple[ModelSpec, ...] = (
     _spec("anthropic", "claude-opus-4-8", "Opus 4.8", "premium",
           "Older Opus; for comparison or as a fallback", 5, 25),
     _spec("openai", "gpt-6.1-sol", "GPT-6.1 Sol", "balanced",
-          "Near-Astra quality at a fraction of the cost", 2, 10),
+          "Near-Astra quality at a fraction of the cost", 2, 10, active=False),
     _spec("openai", "gpt-6-astra", "GPT-6 Astra", "premium", "OpenAI's most capable model", 10, 50),
     _spec("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "premium", "Older flagship; for comparison", 4, 20),
     _spec("openai", "gpt-5.5", "GPT-5.5", "premium", "Older flagship; for comparison", 5, 30),
@@ -86,7 +89,7 @@ _BY_ID = {s.id: s for s in _SPECS}
 _A = "anthropic:claude-"
 _O = "openai:"
 
-# Ordered presets per (task, provider): (model id, short tag shown in the picker). First = recommended.
+# Ordered presets per (task, provider): (model id, short tag shown in the picker). First active one = recommended.
 PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
     ("resume", "anthropic"): [
         (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
@@ -100,18 +103,19 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
         (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
         (_A + "haiku-4-5", "Cheapest"), (_A + "sonnet-5", "Older generation"),
     ],
+    # GPT-6.1 Sol is off; the entry after it is the recommendation meanwhile.
     ("resume", "openai"): [
-        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.4-mini", "Balanced"),
-        (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-4o-mini", "Older generation"), (_O + "gpt-6-luna", "Cheapest"),
+        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-5.4-mini", "Balanced"),
+        (_O + "gpt-4o-mini", "Older generation"), (_O + "gpt-6-luna", "Cheapest"),
     ],
     ("cover_letter", "openai"): [
-        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-6-astra", "Max quality"),
-        (_O + "gpt-5.6-sol", "Older flagship"), (_O + "gpt-5.5", "Older flagship"),
+        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.6-sol", "Older flagship"),
+        (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5.5", "Older flagship"),
         (_O + "gpt-5.6-terra", "Older mid-tier"),
     ],
     ("screening", "openai"): [
-        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-6-astra", "Max quality"),
-        (_O + "gpt-5.4-mini", "Balanced"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-6-luna", "Cheapest"),
+        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.4-mini", "Balanced"),
+        (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-6-luna", "Cheapest"),
     ],
 }
 
@@ -123,7 +127,13 @@ def _provider_configured(provider: Provider) -> bool:
 
 
 def _preset_ids(task: Task, provider: Provider) -> list[str]:
-    return [model_id for model_id, _tag in PRESETS[(task, provider)]]
+    return [model_id for model_id, _tag in PRESETS[(task, provider)] if _BY_ID[model_id].active]
+
+
+def is_inactive(model_id: Optional[str]) -> bool:
+    """A known model that has been switched off."""
+    spec = _BY_ID.get((model_id or "").strip())
+    return spec is not None and not spec.active
 
 
 def preset_tag(task: Task, model_id: str) -> Optional[str]:
@@ -178,6 +188,8 @@ def validate_requested(task: Task, model_id: Optional[str], user: Optional[UserE
     spec = _BY_ID.get(wanted)
     if spec is None:
         raise ModelNotAvailable(f"Unknown model '{wanted}'.")
+    if not spec.active:
+        raise ModelNotAvailable(f"{spec.label} is turned off; pick another model.")
     if wanted not in _preset_ids(task, spec.provider):
         raise ModelNotAvailable(f"Model '{wanted}' can't be used for {task.replace('_', ' ')}.")
     if not _provider_configured(spec.provider):

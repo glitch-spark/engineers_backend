@@ -76,13 +76,13 @@ async def test_refusal_and_truncation_fall_back(monkeypatch, error):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": error,
-            "openai:gpt-6.1-sol": ("ok", USAGE),
+            "openai:gpt-5-mini": ("ok", USAGE),
         },
     )
     res = await llm_router.complete("resume", "p", None)
-    assert seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-6.1-sol"]
+    assert seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-5-mini"]
     assert res.provider == "openai" and res.fallback_used is True
-    assert res.cost_usd == pytest.approx((1000 * 2 + 500 * 10) / 1e6)
+    assert res.cost_usd == pytest.approx((1000 * 0.25 + 500 * 2) / 1e6)
 
 
 async def test_validate_failure_falls_back(monkeypatch):
@@ -90,7 +90,7 @@ async def test_validate_failure_falls_back(monkeypatch):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": ("bad", USAGE),
-            "openai:gpt-6.1-sol": ("good", USAGE),
+            "openai:gpt-5-mini": ("good", USAGE),
         },
     )
 
@@ -99,14 +99,14 @@ async def test_validate_failure_falls_back(monkeypatch):
             raise ValueError("not good enough")
 
     res = await llm_router.complete("resume", "p", None, validate=validate)
-    assert res.text == "good" and seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-6.1-sol"]
+    assert res.text == "good" and seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-5-mini"]
     assert "not good enough" in (res.fallback_reason or "")
 
 
 async def test_empty_output_counts_as_failure(monkeypatch):
     script(
         monkeypatch,
-        {"anthropic:claude-sonnet-5-5": ("   ", USAGE), "openai:gpt-6.1-sol": ("fine", USAGE)},
+        {"anthropic:claude-sonnet-5-5": ("   ", USAGE), "openai:gpt-5-mini": ("fine", USAGE)},
     )
     res = await llm_router.complete("resume", "p", None)
     assert res.text == "fine"
@@ -117,7 +117,7 @@ async def test_all_fail_raises_last_error(monkeypatch):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": RuntimeError("first"),
-            "openai:gpt-6.1-sol": RuntimeError("last"),
+            "openai:gpt-5-mini": RuntimeError("last"),
         },
     )
     with pytest.raises(RuntimeError, match="last"):
@@ -144,6 +144,13 @@ async def test_unavailable_requested_model_raises_model_not_available(monkeypatc
     script(monkeypatch, {})
     with pytest.raises(mc.ModelNotAvailable):
         await llm_router.complete("resume", "p", None, model_id="anthropic:nope")
+
+
+async def test_turned_off_model_saved_on_a_queued_job_uses_the_default(monkeypatch):
+    seen = script(monkeypatch, {"anthropic:claude-sonnet-5-5": ("answer", USAGE)})
+    res = await llm_router.complete("resume", "p", None, model_id="openai:gpt-6.1-sol")
+    assert seen == ["anthropic:claude-sonnet-5-5"] and res.text == "answer"
+    assert res.fallback_used is False
 
 
 async def test_complete_screening_passes_model_id(monkeypatch):

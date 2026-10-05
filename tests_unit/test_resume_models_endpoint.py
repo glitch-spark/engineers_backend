@@ -83,10 +83,10 @@ async def test_models_list_both_providers_in_preset_order(use_settings, make_cli
         {"id": "anthropic", "label": "Anthropic"}, {"id": "openai", "label": "OpenAI"},
     ]
     assert [m["id"] for m in body["models"] if m["provider"] == "openai"] == [
-        "openai:gpt-6.1-sol", "openai:gpt-6-astra", "openai:gpt-5.4-mini", "openai:gpt-5-mini", "openai:gpt-6-luna",
+        "openai:gpt-5.4-mini", "openai:gpt-6-astra", "openai:gpt-5-mini", "openai:gpt-6-luna",
     ]
     assert [m["id"] for m in body["models"] if m["recommended"]] == [
-        "anthropic:claude-sonnet-5-5", "openai:gpt-6.1-sol",
+        "anthropic:claude-sonnet-5-5", "openai:gpt-5.4-mini",
     ]
 
 
