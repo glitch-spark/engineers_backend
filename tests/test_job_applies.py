@@ -1514,3 +1514,34 @@ async def test_reset_drops_the_correction_and_reads_the_job_again(client, staff_
     detail = (await client.get(f"/job-applies/rows/{row['_id']}", headers=h)).json()
     assert detail["humanEdited"] is False and detail["info"] is None
     assert detail["jdSource"] == "ats_api" and detail["extractionSource"] in ("llm", "cache")
+
+
+async def test_open_run_picks_up_a_correction_made_by_someone_else(
+    client, staff_user, staff_user_2, auth_header, monkeypatch
+):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h1, h2 = auth_header(staff_user), auth_header(staff_user_2)
+    run1 = await screened_run(client, h1)
+    run2 = await screened_run(client, h2)  # read the link before anyone corrected it
+    mine = (await rows_by_url(client, h1, run1))[GH]
+    theirs = (await rows_by_url(client, h2, run2))[GH]
+    assert theirs["screen"] == "not_fetched"
+    assert (await put_info(client, h1, mine["_id"], jdText=REMOTE_JD, title="Fixed By One")).status_code == 200
+
+    stale = (await client.get(f"/job-applies/rows/{theirs['_id']}", headers=h2)).json()
+    assert stale["info"]["applied"] is False  # their row was read before the correction
+
+    async def no_io(*a, **k):
+        raise AssertionError("syncing a correction must not fetch or call the LLM")
+
+    monkeypatch.setattr(worker, "FETCH", no_io)
+    monkeypatch.setattr(worker, "EXTRACT", no_io)
+    res = await client.post(f"/job-applies/runs/{run2}/sync-info", headers=h2)
+    assert res.status_code == 200 and res.json() == {"updated": 1}
+    now = (await client.get(f"/job-applies/rows/{theirs['_id']}", headers=h2)).json()
+    assert now["title"] == "Fixed By One" and now["humanEdited"] is True and now["screen"] in ("valid", "check")
+    assert now["jdText"] == REMOTE_JD and now["info"]["applied"] is True
+    run = (await client.get(f"/job-applies/runs/{run2}", headers=h2)).json()
+    assert run["counts"]["failed"] == 0
+    again = await client.post(f"/job-applies/runs/{run2}/sync-info", headers=h2)
+    assert again.json() == {"updated": 0}

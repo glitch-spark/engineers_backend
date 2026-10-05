@@ -120,6 +120,8 @@ class JobApplyRow(TimestampedDocument):
     postedDate: Optional[date] = None
     extraction: Optional[JobExtraction] = None
     extractionSource: Optional[Literal["llm", "rules", "cache", "human"]] = None
+    # editedAt of the JobInfo correction this row was read from: a newer one means the row is out of date.
+    infoAt: Optional[datetime] = None
     gates: List[GateResult] = Field(default_factory=list)
     scores: List[ResumeScore] = Field(default_factory=list)
     profileGates: List[ProfileGates] = Field(default_factory=list)
