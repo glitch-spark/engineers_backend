@@ -51,7 +51,9 @@ EXPECTED = {
         A + "opus-5-5", A + "fable-5-1", A + "sonnet-5-5", A + "opus-5", A + "opus-4-8",
     ],
     ("screening", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
-    ("resume", "openai"): [O + "gpt-6.1-sol", O + "gpt-5.4-mini", O + "gpt-5-mini", O + "gpt-6-luna"],
+    ("resume", "openai"): [
+        O + "gpt-6.1-sol", O + "gpt-5.4-mini", O + "gpt-5-mini", O + "gpt-4o-mini", O + "gpt-6-luna",
+    ],
     ("cover_letter", "openai"): [
         O + "gpt-6.1-sol", O + "gpt-6-astra", O + "gpt-5.6-sol", O + "gpt-5.5", O + "gpt-5.6-terra",
     ],
@@ -93,6 +95,13 @@ def test_fable_is_cover_letter_only_and_haiku_never_writes_letters(use_settings)
     assert A + "fable-5-1" not in ids(mc.available_models("resume", None))
     assert A + "fable-5-1" not in ids(mc.available_models("screening", None))
     assert A + "haiku-4-5" not in ids(mc.available_models("cover_letter", None))
+
+
+def test_gpt_4o_mini_is_resume_only(use_settings):
+    assert O + "gpt-4o-mini" in ids(mc.available_models("resume", None))
+    for task in ("cover_letter", "screening"):
+        with pytest.raises(mc.ModelNotAvailable):
+            mc.validate_requested(task, O + "gpt-4o-mini", None)
 
 
 def test_defaults_per_task(use_settings):
@@ -169,6 +178,7 @@ def test_usage_cost_uses_official_prices(use_settings):
         A + "opus-5": 30.0, A + "opus-4-8": 30.0, A + "sonnet-5": 12.0,
         O + "gpt-6.1-sol": 12.0, O + "gpt-6-astra": 60.0, O + "gpt-6-luna": 0.6, O + "gpt-5.6-sol": 24.0,
         O + "gpt-5.5": 35.0, O + "gpt-5.6-terra": 14.0, O + "gpt-5.4-mini": 5.25, O + "gpt-5-mini": 2.25,
+        O + "gpt-4o-mini": 0.75,
     }
     for model_id, expected in prices.items():
         assert mc.usage_cost(mc.get_model(model_id, None), one_m) == pytest.approx(expected), model_id
@@ -184,6 +194,7 @@ def test_cache_lane(use_settings):
     assert mc.cache_lane(mc.get_model(O + "gpt-6.1-sol", None), "cover_letter", None) == "openai:gpt-6.1-sol:high"
     assert mc.cache_lane(mc.get_model(A + "sonnet-5-5", None), "resume", None) == "anthropic:claude-sonnet-5-5:low"
     assert mc.cache_lane(mc.get_model(A + "haiku-4-5", None), "resume", None) == "anthropic:claude-haiku-4-5:none"
+    assert mc.cache_lane(mc.get_model(O + "gpt-4o-mini", None), "resume", None) == "openai:gpt-4o-mini:none"
 
 
 def test_public_view_has_tag_and_marks_each_providers_recommendation(use_settings):

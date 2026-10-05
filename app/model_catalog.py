@@ -76,6 +76,8 @@ _SPECS: tuple[ModelSpec, ...] = (
     _spec("openai", "gpt-5.6-terra", "GPT-5.6 Terra", "balanced", "Older mid-tier model", 2, 12),
     _spec("openai", "gpt-5.4-mini", "GPT-5.4 mini", "budget", "Good quality at a low price", 0.75, 4.5),
     _spec("openai", "gpt-5-mini", "GPT-5 mini", "budget", "Low cost; proven for resumes here", 0.25, 2),
+    _spec("openai", "gpt-4o-mini", "GPT-4o mini", "budget",
+          "Older non-reasoning mini; fast and cheap", 0.15, 0.6, supports_effort=False),
     _spec("openai", "gpt-6-luna", "GPT-6 Luna", "budget",
           "Built for focused, high-volume work; cheapest", 0.1, 0.5),
 )
@@ -100,7 +102,7 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
     ],
     ("resume", "openai"): [
         (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.4-mini", "Balanced"),
-        (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-6-luna", "Cheapest"),
+        (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-4o-mini", "Older generation"), (_O + "gpt-6-luna", "Cheapest"),
     ],
     ("cover_letter", "openai"): [
         (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-6-astra", "Max quality"),
