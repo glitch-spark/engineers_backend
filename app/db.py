@@ -294,7 +294,9 @@ async def _migrate_job_apply_screening(database) -> None:
                 )
                 await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": screen, "groupKey": key}})
         # Jobs open only to candidates outside the target markets (US, UK/EU, Latam) are counted, not scored.
-        async for row in rows.find({"screen": {"$in": ["valid", "check"]}, "groupKey": {"$nin": [None, "none"]}},
+        # (a job a person approved stays Worth applying: it is scored with the "location not stated" picks)
+        async for row in rows.find({"screen": {"$in": ["valid", "check"]}, "groupKey": {"$nin": [None, "none"]},
+                                    "forceInclude": {"$ne": True}},
                                    {"groupKey": 1}):
             if not markets_for(row["groupKey"]):
                 await rows.update_one({"_id": row["_id"]}, {"$set": {"screen": "other_location"}})

@@ -7,12 +7,14 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.job_apply.schema import GateResult, JobExtraction, Location  # noqa: E402
 from app.job_apply.screening import (  # noqa: E402
+    APPROVABLE,
     bucket,
     build_report,
     group_key,
     markets_for,
     profile_market,
     rescreen,
+    scoring_key,
 )
 
 RUN = date(2026, 10, 2)
@@ -59,10 +61,35 @@ def test_unverified_page_needs_a_check():
                   force_include=False, verified=False) == "too_old"
 
 
-def test_force_include():
-    assert b("excluded", g=gates(freshness="fail"), force=True) == "check"
-    assert b("excluded", g=gates(remote="fail", clearance="fail"), force=True) == "check"
+def test_approved_job_is_worth_applying():
+    # a person approved it: every check that sent it elsewhere is overruled, and it is Worth applying (not Needs a check)
+    assert b("excluded", g=gates(freshness="fail"), force=True) == "valid"
+    assert b("excluded", g=gates(remote="fail", clearance="fail"), force=True) == "valid"
+    assert b(g=gates(freshness="unknown"), force=True) == "valid"
+    assert b(key="none", force=True) == "valid"
+    assert b(key="CA", force=True) == "valid"
+    assert bucket(status="extracted", status_reason=None, gates=gates(), group_key="GB", force_include=True,
+                  verified=False) == "valid"
+
+
+def test_approval_needs_a_description_to_work_on():
+    # no readable posting yet (fetch / read failed, or not a job page): approval changes nothing until the
+    # description is pasted in Job info and the job is read again
     assert b("fetch_failed", "no job text on the page", [], force=True) == "not_fetched"
+    assert b("fetch_failed", "job closed (HTTP 410)", [], force=True) == "closed"
+    assert b("llm_failed", "boom", [], force=True) == "read_failed"
+
+
+def test_approvable_buckets():
+    assert set(APPROVABLE) == {"check", "clearance", "onsite", "too_old", "other_location"}
+
+
+def test_scoring_key():
+    # an approved job with no target market is scored like one that states no location; anything else keeps its group
+    assert scoring_key("CA", True) == "none" and scoring_key("APAC", True) == "none"
+    assert scoring_key("CA", False) == "CA"
+    assert scoring_key("GB", True) == "GB" and scoring_key("CA+US", True) == "CA+US"
+    assert scoring_key("none", True) == "none" and scoring_key(None, True) is None
 
 
 def test_group_key():
@@ -159,6 +186,21 @@ def test_build_report():
         {"markets": ["none"], "jobs": 1, "check": 1},
     ]
     assert rep["profiles"] == [alex, sam]
+
+
+def test_build_report_after_approval():
+    alex = {"id": "a", "name": "Alex", "country": "US", "region": "US", "resumes": 1}
+    before = build_report([("valid", "US"), ("check", "none"), ("other_location", "CA")], [alex], max_age_days=30)
+    assert before["check"] == 1 and before["worth"] == 2 and before["others"] == [{"key": "CA", "jobs": 1}]
+    # approving the Needs-a-check job and the Canada-only job: both become Worth applying, the Canada one is
+    # counted in the "location not stated" group (scoring_key), and nothing is left needing a check
+    after = build_report(
+        [("valid", "US"), ("valid", scoring_key("none", True)), ("valid", scoring_key("CA", True))], [alex], max_age_days=30
+    )
+    assert after["check"] == 0 and after["worth"] == 3 and after["others"] == []
+    assert after["buckets"]["valid"] == 3 and after["buckets"]["check"] == 0
+    assert [g["key"] for g in after["groups"]] == ["US", "UKEU", "LATAM", "none"]
+    assert after["groups"][-1] == {"key": "none", "jobs": 2, "check": 0, "fits": ["a"]}
 
 
 def test_build_report_profile_without_location_fits_every_market():

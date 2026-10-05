@@ -13,6 +13,7 @@ from app.job_apply.worker import (  # noqa: E402
     posting_reusable,
 )
 from app.job_apply.schema import GateResult  # noqa: E402
+from app.job_apply.screening import scoring_key  # noqa: E402
 
 
 def test_needs_stage_idempotent():
@@ -54,3 +55,12 @@ def test_assigned_profiles():
     assert assigned_profiles({}, "GB") == set()
     assert assigned_profiles({"none": ["a"]}, None) == {"a"}
     assert assigned_profiles({"US": ["a"]}, "CA") == set()
+
+
+def test_approved_other_location_job_uses_the_not_stated_picks():
+    # a job open only outside the target markets has no profile to score against, unless a person approved it:
+    # then it is handled like a job that states no location
+    picks = {"US": ["a"], "none": ["n"]}
+    assert assigned_profiles(picks, scoring_key("CA", False)) == set()
+    assert assigned_profiles(picks, scoring_key("CA", True)) == {"n"}
+    assert assigned_profiles(picks, scoring_key("US", True)) == {"a"}

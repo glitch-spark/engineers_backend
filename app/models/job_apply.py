@@ -113,7 +113,7 @@ class JobApplyRow(TimestampedDocument):
     statusReason: Optional[str] = None
     screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
     groupKey: Optional[str] = None  # normalised allowed locations, e.g. "GB", "EU+US", "none"
-    forceInclude: bool = False  # "Include anyway" for a clearance / on-site / too-old job
+    forceInclude: bool = False  # a person approved this job: it is Worth applying whatever the checks said
     title: str = ""
     company: str = ""
     fetchedPostedDate: Optional[date] = None  # from JSON-LD / ATS API; beats the LLM's date

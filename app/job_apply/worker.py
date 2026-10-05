@@ -18,7 +18,7 @@ from beanie.odm.utils.encoder import Encoder
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
 from app.job_apply.gates import blocked, failing_reasons, job_gates
-from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key, markets_for
+from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key, markets_for, scoring_key
 from app.job_apply.pipeline import ProfileInfo, ResumeInput, score_row
 from app.job_apply.resume_parse import parse_resume
 from app.job_apply.schema import GateResult, JobExtraction
@@ -369,7 +369,7 @@ async def _score_stage(
     run_date = run.runDate.date()
     for row in todo:
         await check.tick()
-        allowed = assigned_profiles(run.assignments, row.groupKey)
+        allowed = assigned_profiles(run.assignments, scoring_key(row.groupKey, row.forceInclude))
         if not allowed:
             row.status = "unassigned"
             await _save_fields(row, ("status",))
@@ -387,7 +387,7 @@ async def _score_stage(
         row.topScore = res.top_score
         row.tailorOnly = res.tailor_only
         row.scoredAt = datetime.utcnow()
-        row.status = "scored"  # also a job brought back with "Include anyway"
+        row.status = "scored"  # also a job a person approved after it failed a check
         await _save_fields(row, _SCORE_FIELDS)
         await _inc(run.id, scored=1)
 
