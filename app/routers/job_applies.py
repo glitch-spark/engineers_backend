@@ -909,7 +909,16 @@ async def _row_detail(row: JobApplyRow) -> dict:
     out["jdText"] = row.jdText
     # Who last corrected this URL (a correction is shared by everyone who uses the link).
     info = await JobInfo.find_one(JobInfo.url == row.url) if row.url else None
-    out["info"] = {"editedBy": info.editedByName, "editedAt": info.editedAt.isoformat() + "Z"} if info else None
+    out["info"] = (
+        {
+            "editedBy": info.editedByName,
+            "editedAt": info.editedAt.isoformat() + "Z",
+            # false: this row was read before the correction (see POST /runs/{id}/sync-info).
+            "applied": worker.same_time(row.infoAt, info.editedAt),
+        }
+        if info
+        else None
+    )
     return out
 
 
@@ -953,6 +962,13 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
 # ---------- job info corrections ----------
 
 
+@router.post("/runs/{run_id}/sync-info")
+async def sync_info(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Re-read this run's jobs whose link was corrected by someone after they were read (no fetch, no LLM)."""
+    run = await _owned_run(run_id, user)
+    return {"updated": await worker.sync_corrections(run)}
+
+
 class InfoBody(BaseModel):
     """What a person corrected. Only the fields sent change; the description may be replaced or, for a job that
     could not be fetched, pasted."""
@@ -974,21 +990,6 @@ _NULLABLE = {"postedDate", "workAuthorization", "timezoneNote"}
 def _require_editor(user: UserExtra) -> None:
     if user.role not in ("admin", "staff"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admin and staff can correct jobs.")
-
-
-def _row_counts(row: JobApplyRow) -> dict[str, int]:
-    """What the run's counters hold for this row (the worker's `_inc` calls), to move them when a row is read again."""
-    return {
-        "failed": int(row.status in FAILED),
-        "extracted": int(row.status in ("extracted", "excluded", "scored", "unassigned")),
-        "excluded": int(row.status == "excluded"),
-    }
-
-
-async def _move_counts(run_id: PydanticObjectId, before: dict[str, int], after: dict[str, int]) -> None:
-    inc = {f"counts.{k}": after[k] - before[k] for k in before if after[k] != before[k]}
-    if inc:
-        await JobApplyRun.get_motor_collection().update_one({"_id": run_id}, {"$inc": inc})
 
 
 @router.put("/rows/{row_id}/info")
@@ -1051,9 +1052,7 @@ async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra
     info.editedBy, info.editedByName, info.editedAt = user.id, user.name or user.email or "", datetime.utcnow()
     await info.save()
 
-    before = _row_counts(row)
-    await worker.reapply_info(run, row)
-    await _move_counts(run.id, before, _row_counts(row))
+    await worker.reapply_info(run, row)  # also moves the run's counters
     return await _row_detail(row)
 
 
@@ -1069,7 +1068,7 @@ async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_cur
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is in progress.")
     if row.url:
         await JobInfo.find(JobInfo.url == row.url).delete()
-    before = _row_counts(row)
+    before = worker.row_counts(row)
     if row.scoredAt:
         await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$inc": {"counts.scored": -1}})
     await JobApplyRow.get_motor_collection().update_one(
@@ -1077,12 +1076,12 @@ async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_cur
         {"$set": {
             "status": "pending", "statusReason": None, "screen": None, "jdText": None, "jdSource": None,
             "jdStructured": None, "fetchedPostedDate": None, "postedDate": None, "title": "", "company": "",
-            "extraction": None, "extractionSource": None, "gates": [], "groupKey": None, "scoredAt": None,
+            "extraction": None, "extractionSource": None, "infoAt": None, "gates": [], "groupKey": None, "scoredAt": None,
             "scores": [], "profileGates": [], "bestByProfile": [], "topScore": None, "tailorOnly": [],
             "updatedAt": datetime.utcnow(),
         }},
     )
-    await _move_counts(run.id, before, {k: 0 for k in before})
+    await worker.move_counts(run.id, before, {k: 0 for k in before})
     await JobApplyRun.get_motor_collection().update_one(
         {"_id": run.id},
         {"$set": {"status": "queued", "error": None, "finishedAt": None, "heartbeatAt": None, "updatedAt": datetime.utcnow()}},

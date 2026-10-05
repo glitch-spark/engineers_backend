@@ -115,9 +115,11 @@ async def _status(run_id: PydanticObjectId) -> Optional[str]:
 
 _FETCH_FIELDS = (
     "jdText", "jdSource", "jdStructured", "fetchedPostedDate", "title", "company", "status", "statusReason", "screen",
+    "infoAt",
 )
 _EXTRACT_FIELDS = (
     "extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason", "screen", "groupKey",
+    "infoAt",
 )
 _SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "tailorOnly", "scoredAt", "status")
 
@@ -191,6 +193,7 @@ def _apply_info(row: JobApplyRow, info: JobInfo) -> None:
     row.jdText, row.jdSource, row.jdStructured = info.jdText, "manual", True
     row.fetchedPostedDate = info.postedDate
     row.title, row.company = info.title, info.company
+    row.infoAt = info.editedAt
 
 
 # ---------- stages ----------
@@ -390,23 +393,94 @@ async def _score_stage(
 
 
 _REREAD_FIELDS = tuple(dict.fromkeys(_FETCH_FIELDS + _EXTRACT_FIELDS + _SCORE_FIELDS))
+_FAILED = ("fetch_failed", "llm_failed")
+_syncing: set[str] = set()
+
+
+def same_time(a: Optional[datetime], b: Optional[datetime]) -> bool:
+    """Equal to the millisecond (MongoDB keeps no more)."""
+    return a is not None and b is not None and abs((a - b).total_seconds()) < 0.002
+
+
+def row_counts(row: JobApplyRow) -> dict[str, int]:
+    """What the run's counters hold for this row (the stages' `_inc` calls), to move them when a row is read again."""
+    return {
+        "failed": int(row.status in _FAILED),
+        "extracted": int(row.status in ("extracted", "excluded", "scored", "unassigned")),
+        "excluded": int(row.status == "excluded"),
+    }
+
+
+async def move_counts(run_id: PydanticObjectId, before: dict[str, int], after: dict[str, int]) -> None:
+    inc = {f"counts.{k}": after[k] - before[k] for k in before if after[k] != before[k]}
+    if inc:
+        await JobApplyRun.get_motor_collection().update_one({"_id": run_id}, {"$inc": inc})
+
+
+async def reread_with_info(run: JobApplyRun, targets: list[JobApplyRow]) -> list[JobApplyRow]:
+    """Read these rows again from their URL's correction (no fetch, no LLM) in a run no worker is processing: gates,
+    bucket and, once scoring has started, their score. Returns the saved rows; one that could not be read is left
+    as it was."""
+    done: list[JobApplyRow] = []
+    for row in targets:
+        had_score = bool(row.scoredAt)
+        row.status, row.statusReason = "fetched", None
+        row.scoredAt, row.scores, row.profileGates, row.bestByProfile, row.topScore, row.tailorOnly = None, [], [], [], None, []
+        try:
+            await _extract_one(row, run, None)
+        except Exception:  # noqa: BLE001
+            log.exception("could not re-read row %s from its correction", row.id)
+            continue
+        if had_score:  # the score stage counts it again
+            await _inc(run.id, scored=-1)
+        await _save_fields(row, _REREAD_FIELDS)
+        done.append(row)
+    if not done:
+        return []
+    if run.phase == "score":
+        await _score_stage(run, await _rows(run.id), _Checker(run.id), only={r.id for r in done})
+    ids = {r.id for r in done}
+    return [r for r in await _rows(run.id) if r.id in ids]
 
 
 async def reapply_info(run: JobApplyRun, row: JobApplyRow) -> None:
-    """Read one row again from its URL's correction, in a run no worker is processing: gates, bucket and, once
-    scoring has started, its score. Other runs pick the correction up when they next read that URL."""
-    if row.scoredAt:  # the score stage counts it again
-        await _inc(run.id, scored=-1)
-    row.status, row.statusReason = "fetched", None
-    row.scoredAt, row.scores, row.profileGates, row.bestByProfile, row.topScore, row.tailorOnly = None, [], [], [], None, []
-    await _extract_one(row, run, None)
-    await _save_fields(row, _REREAD_FIELDS)
-    if run.phase == "score":
-        await _score_stage(run, await _rows(run.id), _Checker(run.id), only={row.id})
-        fresh = await JobApplyRow.get(row.id)
-        if fresh:
-            for f in _REREAD_FIELDS:
-                setattr(row, f, getattr(fresh, f))
+    """After a correction: read this one row again and move the run's counters. Other runs pick the correction up
+    through `sync_corrections` (or when they next read the URL)."""
+    before = row_counts(row)
+    done = await reread_with_info(run, [row])
+    if done:
+        for f in _REREAD_FIELDS:
+            setattr(row, f, getattr(done[0], f))
+        await move_counts(run.id, before, row_counts(row))
+
+
+async def sync_corrections(run: JobApplyRun) -> int:
+    """Re-read the rows of a finished run whose URL was corrected after they were read, so a person with the run
+    already open sees other people's corrections. Rows already applied to are left alone. Returns how many changed."""
+    key = str(run.id)
+    if run.status in ("queued", "running") or key in _syncing:
+        return 0
+    _syncing.add(key)
+    try:
+        rows = await _rows(run.id)
+        urls = sorted({r.url for r in rows if r.url})
+        if not urls:
+            return 0
+        infos = {i.url: i for i in await JobInfo.find({"url": {"$in": urls}}).to_list()}
+        stale = [
+            r for r in rows
+            if r.url in infos and not same_time(r.infoAt, infos[r.url].editedAt)
+            and not r.appliedResumes and r.status not in ("pending", "fetched")
+        ]
+        if not stale:
+            return 0
+        before = {r.id: row_counts(r) for r in stale}
+        done = await reread_with_info(run, stale)
+        for r in done:
+            await move_counts(run.id, before[r.id], row_counts(r))
+        return len(done)
+    finally:
+        _syncing.discard(key)
 
 
 # ---------- run lifecycle ----------
