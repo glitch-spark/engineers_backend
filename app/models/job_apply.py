@@ -107,7 +107,7 @@ class JobApplyRow(TimestampedDocument):
     rowIndex: int
     url: Optional[str] = None
     jdText: Optional[str] = None
-    jdSource: Optional[Literal["sheet", "ats_api", "html", "browser"]] = None
+    jdSource: Optional[Literal["sheet", "ats_api", "html", "browser", "manual"]] = None
     jdStructured: Optional[bool] = None  # False: read from page text only (no job-site API / JobPosting data)
     status: RowStatus = "pending"
     statusReason: Optional[str] = None
@@ -119,7 +119,7 @@ class JobApplyRow(TimestampedDocument):
     fetchedPostedDate: Optional[date] = None  # from JSON-LD / ATS API; beats the LLM's date
     postedDate: Optional[date] = None
     extraction: Optional[JobExtraction] = None
-    extractionSource: Optional[Literal["llm", "rules", "cache"]] = None
+    extractionSource: Optional[Literal["llm", "rules", "cache", "human"]] = None
     gates: List[GateResult] = Field(default_factory=list)
     scores: List[ResumeScore] = Field(default_factory=list)
     profileGates: List[ProfileGates] = Field(default_factory=list)
@@ -183,6 +183,26 @@ class JobPostingCache(TimestampedDocument):
             # Replaces the old 7-day "ttl" index (dropped at startup, see app/db.py STALE_INDEXES).
             IndexModel([("fetchedAt", ASCENDING)], expireAfterSeconds=CACHE_TTL_SECONDS, name="ttl_30d"),
         ]
+
+
+class JobInfo(TimestampedDocument):
+    """A person's correction of one job, per normalised URL and shared by everyone who uses the link. It beats the
+    fetch and the LLM reading in every run (no fetch, no LLM call), never expires, and is never overwritten by a
+    machine reading. Written only by the info endpoint (app/routers/job_applies.py)."""
+
+    url: str
+    jdText: str  # always set: a correction without a description could not be read or scored
+    postedDate: Optional[date] = None
+    title: str = ""
+    company: str = ""
+    extraction: JobExtraction
+    editedBy: Optional[PydanticObjectId] = None
+    editedByName: str = ""
+    editedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "job_info"
+        indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
 
 
 class JobApplicationLog(TimestampedDocument):

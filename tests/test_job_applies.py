@@ -1410,3 +1410,107 @@ async def test_runs_list_goes_back_past_fifty(client, staff_user, auth_header):
     await coll.insert_many([{**base, "_id": PydanticObjectId()} for _ in range(60)])
     runs = (await client.get("/job-applies/runs", headers=h)).json()["runs"]
     assert len(runs) == 61
+
+
+# ---------- shared per-URL corrections (JobInfo) ----------
+
+GH = "https://boards.greenhouse.io/acme/jobs/9"
+
+
+async def put_info(client, h, row_id, **body):
+    return await client.put(f"/job-applies/rows/{row_id}/info", headers=h, json=body)
+
+
+async def test_correction_fixes_a_job_that_could_not_be_fetched(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))[GH]
+    assert gh["screen"] == "not_fetched"
+
+    res = await put_info(client, h, gh["_id"], jdText=REMOTE_JD)
+    assert res.status_code == 200, res.text
+    out = res.json()
+    assert out["screen"] in ("valid", "check") and out["status"] == "extracted"
+    assert out["humanEdited"] is True and out["extractionSource"] == "human" and out["jdSource"] == "manual"
+    assert out["jdText"] == REMOTE_JD and out["info"]["editedBy"] == staff_user.name
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()
+    assert run["counts"]["failed"] == 0
+
+
+async def test_field_correction_moves_the_job_without_an_llm_call(client, staff_user, auth_header, monkeypatch):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    hybrid = (await rows_by_url(client, h, run_id))["https://jobs.example.com/hybrid"]
+    assert hybrid["screen"] == "onsite"
+
+    async def no_llm(*a, **k):
+        raise AssertionError("a field correction must not call the LLM")
+
+    monkeypatch.setattr(worker, "EXTRACT", no_llm)
+    res = await put_info(client, h, hybrid["_id"], workMode="remote", title="Corrected Title", company="Acme")
+    assert res.status_code == 200, res.text
+    out = res.json()
+    assert out["screen"] in ("valid", "check") and out["workMode"] == "remote"
+    assert out["title"] == "Corrected Title" and out["company"] == "Acme" and out["humanEdited"] is True
+
+
+async def test_correction_is_used_by_another_users_run_with_no_fetch_or_llm(
+    client, staff_user, staff_user_2, auth_header, monkeypatch
+):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h1 = auth_header(staff_user)
+    run1 = await screened_run(client, h1)
+    gh = (await rows_by_url(client, h1, run1))[GH]
+    assert (await put_info(client, h1, gh["_id"], jdText=REMOTE_JD, title="Fixed By One")).status_code == 200
+
+    fetched, read = [], []
+
+    async def spy_fetch(url, *, client, browser=None):
+        fetched.append(url)
+        raise FetchError("no job text on the page")
+
+    async def spy_extract(jd, *, user, run_date, llm=None):
+        read.append(jd)
+        return await fake_extract(jd, user=user, run_date=run_date)
+
+    monkeypatch.setattr(worker, "FETCH", spy_fetch)
+    monkeypatch.setattr(worker, "EXTRACT", spy_extract)
+    h2 = auth_header(staff_user_2)
+    run2 = await screened_run(client, h2)
+    row = (await rows_by_url(client, h2, run2))[GH]
+    assert GH not in fetched and read == []  # the corrected link is neither fetched nor read by the LLM again
+    assert row["title"] == "Fixed By One" and row["humanEdited"] is True and row["screen"] in ("valid", "check")
+
+
+async def test_machine_reading_never_overwrites_a_correction(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run1 = await screened_run(client, h)
+    row = (await rows_by_url(client, h, run1))["https://jobs.example.com/remote"]
+    assert (await put_info(client, h, row["_id"], title="Human Title")).status_code == 200
+    run2 = await screened_run(client, h)
+    again = (await rows_by_url(client, h, run2))["https://jobs.example.com/remote"]
+    assert again["title"] == "Human Title" and again["humanEdited"] is True
+
+
+async def test_correction_needs_a_description_and_an_editor_role(client, staff_user, make_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "FETCH", failing_fetch)
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    gh = (await rows_by_url(client, h, run_id))[GH]
+    assert (await put_info(client, h, gh["_id"], title="No JD yet")).status_code == 400
+    accountant = await make_user(name="Acc", email="acc@example.com", role="accountant")
+    assert (await put_info(client, auth_header(accountant), gh["_id"], jdText=REMOTE_JD)).status_code == 403
+    assert (await put_info(client, h, gh["_id"], workMode="sideways", jdText=REMOTE_JD)).status_code == 422
+
+
+async def test_reset_drops_the_correction_and_reads_the_job_again(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    run_id = await screened_run(client, h)
+    row = (await rows_by_url(client, h, run_id))["https://jobs.example.com/hybrid"]
+    assert (await put_info(client, h, row["_id"], workMode="remote")).status_code == 200
+    assert (await client.delete(f"/job-applies/rows/{row['_id']}/info", headers=h)).status_code == 200
+    await worker.run_worker(PydanticObjectId(run_id))
+    detail = (await client.get(f"/job-applies/rows/{row['_id']}", headers=h)).json()
+    assert detail["humanEdited"] is False and detail["info"] is None
+    assert detail["jdSource"] == "ats_api" and detail["extractionSource"] in ("llm", "cache")

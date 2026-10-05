@@ -25,7 +25,9 @@ from app.job_apply.schema import GateResult, JobExtraction
 from app.job_apply.scoring import build_idf
 from app.job_apply.sections import substantive_text
 from app.models.account import Account
-from app.models.job_apply import CACHE_DAYS, JobApplyRow, JobApplyRun, JobExtractionCache, JobPostingCache, ProfileGates
+from app.models.job_apply import (
+    CACHE_DAYS, JobApplyRow, JobApplyRun, JobExtractionCache, JobInfo, JobPostingCache, ProfileGates,
+)
 from app.models.user_extra import UserExtra
 
 log = logging.getLogger(__name__)
@@ -179,10 +181,27 @@ async def _cache_description(url: str, text: str) -> None:
     )
 
 
+async def _human_info(row: JobApplyRow) -> Optional[JobInfo]:
+    """A person's correction of this URL (shared by every user), if there is one."""
+    return await JobInfo.find_one(JobInfo.url == row.url) if row.url else None
+
+
+def _apply_info(row: JobApplyRow, info: JobInfo) -> None:
+    """Take the description and basics from a correction: they beat whatever the sheet or a fetch gave."""
+    row.jdText, row.jdSource, row.jdStructured = info.jdText, "manual", True
+    row.fetchedPostedDate = info.postedDate
+    row.title, row.company = info.title, info.company
+
+
 # ---------- stages ----------
 
 
 async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
+    info = await _human_info(row)
+    if info:  # corrected by a person: no fetch
+        _apply_info(row, info)
+        row.status = "fetched"
+        return
     cached = await JobPostingCache.find_one(JobPostingCache.url == row.url)
     if cached and cached.fetcher != fetch_mod.FETCHER_VERSION:
         cached = None  # read before the current rules (e.g. a closed job's 404 page): fetch again
@@ -246,9 +265,13 @@ async def _fetch_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
 
 async def _extract_one(row: JobApplyRow, run: JobApplyRun, user: Optional[UserExtra]) -> None:
     run_date = run.runDate.date()
+    info = await _human_info(row)
     key = f"{extract_mod.jd_hash(row.jdText)}:{extract_mod.PROMPT_VERSION}"
-    cached = await JobExtractionCache.find_one(JobExtractionCache.key == key)
-    if cached:
+    cached = None if info else await JobExtractionCache.find_one(JobExtractionCache.key == key)
+    if info:  # corrected by a person: no LLM call
+        _apply_info(row, info)
+        ex, source = info.extraction, "human"
+    elif cached:
         ex, source = cached.extraction, "cache"
     else:
         ex, source = await EXTRACT(row.jdText, user=user, run_date=run_date)
@@ -323,11 +346,15 @@ async def _load_resumes(run: JobApplyRun) -> tuple[list[ResumeInput], dict[str, 
     return resumes, profiles, notes
 
 
-async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checker) -> None:
+async def _score_stage(
+    run: JobApplyRun, rows: list[JobApplyRow], check: _Checker, only: Optional[set[PydanticObjectId]] = None
+) -> None:
     # Only jobs worth applying to are scored, and only against the profiles picked for their location group.
+    # `only` limits it to those rows (the IDF still reads every JD in the run).
     todo = [
         r for r in rows
         if needs_stage(r.status, has_jd=bool(r.jdText), scored=bool(r.scoredAt), stage="score") and r.screen in WORTH
+        and (only is None or r.id in only)
     ]
     if not todo:
         return
@@ -360,6 +387,26 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
         row.status = "scored"  # also a job brought back with "Include anyway"
         await _save_fields(row, _SCORE_FIELDS)
         await _inc(run.id, scored=1)
+
+
+_REREAD_FIELDS = tuple(dict.fromkeys(_FETCH_FIELDS + _EXTRACT_FIELDS + _SCORE_FIELDS))
+
+
+async def reapply_info(run: JobApplyRun, row: JobApplyRow) -> None:
+    """Read one row again from its URL's correction, in a run no worker is processing: gates, bucket and, once
+    scoring has started, its score. Other runs pick the correction up when they next read that URL."""
+    if row.scoredAt:  # the score stage counts it again
+        await _inc(run.id, scored=-1)
+    row.status, row.statusReason = "fetched", None
+    row.scoredAt, row.scores, row.profileGates, row.bestByProfile, row.topScore, row.tailorOnly = None, [], [], [], None, []
+    await _extract_one(row, run, None)
+    await _save_fields(row, _REREAD_FIELDS)
+    if run.phase == "score":
+        await _score_stage(run, await _rows(run.id), _Checker(run.id), only={row.id})
+        fresh = await JobApplyRow.get(row.id)
+        if fresh:
+            for f in _REREAD_FIELDS:
+                setattr(row, f, getattr(fresh, f))
 
 
 # ---------- run lifecycle ----------
