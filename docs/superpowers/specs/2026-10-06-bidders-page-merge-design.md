@@ -27,8 +27,8 @@ Changes to counting rules, Slack reports or the extension; analytics beyond the 
 - A **pay week** is the weekly report window (ends at `BID_WEEKLY_REPORT_DAY` `BID_WEEKLY_REPORT_TIME`, default
   Saturday 16:00, `BID_REPORT_TIMEZONE`). It is identified by any date inside it (`?week=YYYY-MM-DD`); the label is
   "Week ending Sat Oct 10".
-- Its **days** are the seven daily report windows (18:30 → 18:30 by default) whose **end** falls inside the pay week,
-  keyed by their period key (Sun … Sat with the defaults).
+- Its **days** are the seven daily report windows (18:30 → 18:30 by default) whose **start** falls inside the pay
+  week, keyed by their period key (Sun … Sat with the defaults; Saturday's window ends after the weekly cutoff).
 - The day that straddles the weekly cutoff (Saturday with the defaults) shows its full daily count; the **week totals
   and pay** use the pay week's own window, so they match the weekly Slack report. That day's cell carries an ⓘ
   explaining the difference.
