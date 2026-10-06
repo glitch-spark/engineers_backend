@@ -12,6 +12,7 @@ from typing import Any, Optional, Protocol
 from beanie import PydanticObjectId
 from pymongo.errors import BulkWriteError, DuplicateKeyError
 
+from app.bids.records import count_by_status, uses_records
 from app.bids.slack_format import Owner, format_report
 from app.bids.storage import BidStorage, count_folders, get_bid_storage
 from app.bids.windows import BidSchedule, Kind, latest_cutoff, period_key, schedule_from_settings, window_for
@@ -104,18 +105,27 @@ async def build_rows(
     bidders: list,
     profile_names: dict[str, str],
     storage: BidStorage,
+    sched: BidSchedule,
 ) -> list[BidReportRow]:
-    counts = await count_folders([(str(b.id), b.screenshotFolderUrl) for b in bidders], start, end, storage)
+    """One row per bidder. A window that ends after BID_RECORDS_START counts approved bid records
+    (pending and rejected reported beside them); an earlier one counts screenshot folders."""
+    if uses_records(end, sched):
+        by_status = await count_by_status([b.id for b in bidders], start, end)
+        counts = {str(b.id): (by_status[str(b.id)][0], None) for b in bidders}
+    else:
+        by_status = None
+        counts = await count_folders([(str(b.id), b.screenshotFolderUrl) for b in bidders], start, end, storage)
     rows = []
     for b in bidders:
         count, error = counts[str(b.id)]
+        _, pending, rejected = by_status[str(b.id)] if by_status else (None, None, None)
         rows.append(BidReportRow(
             kind=kind, periodKey=period_key, periodStart=start, periodEnd=end,
             bidderId=b.id, ownerId=b.createdBy, bidderName=b.name, country=b.country,
             profileName=profile_names.get(str(b.profileId)) if b.profileId else None,
             rate=b.rate, count=count,
             amount=None if count is None else round(count * b.rate, 2),
-            error=error,
+            error=error, pending=pending, rejected=rejected,
         ))
     return rows
 
@@ -158,7 +168,7 @@ async def _run_kind(
             if not bidders:
                 return "no-bidders"  # keep the claim so later ticks skip this period
             names = await store.profile_names([b.profileId for b in bidders if b.profileId])
-            rows = await store.save_rows(await build_rows(kind, start, end, pk, bidders, names, storage))
+            rows = await store.save_rows(await build_rows(kind, start, end, pk, bidders, names, storage, sched))
         if post is None:
             await store.release(key)
             return "saved:slack-not-configured"

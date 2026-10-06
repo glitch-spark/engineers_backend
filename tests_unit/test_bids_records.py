@@ -5,14 +5,22 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from beanie import PydanticObjectId, init_beanie
 from mongomock_motor import AsyncMongoMockClient
+from pydantic import ValidationError
 
-from app.bids.records import confirm_upload, job_key, record_screenshot
+from app.bids import records
+from app.bids.records import (
+    confirm_upload, count_by_status, job_key, record_screenshot, refresh_report_rows, uses_records,
+)
+from app.bids.windows import BidSchedule
+from app.config import Settings, get_settings
 from app.models.bid import Bid
+from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals, not bids code
@@ -31,7 +39,7 @@ def key(step: int, trigger: str, at: datetime) -> str:
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["bid-records-unit"]  # fresh in-memory database per test
-    await init_beanie(database=database, document_models=[Bidder, Bid])
+    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport])
     return database
 
 
@@ -186,3 +194,96 @@ async def test_a_parallel_first_screenshot_is_retried_after_a_duplicate_key(db, 
     bid = await record_screenshot(bidder, key(1, "click", T0), 1, "click", T0, None, None)
     assert len(calls) == 2
     assert len(bid.screenshots) == 1
+
+
+CT = ZoneInfo("America/Chicago")
+SCHED = BidSchedule(tz=CT, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0))
+
+
+def settings_with(start):
+    return get_settings().model_copy(update={"BID_RECORDS_START": start})
+
+
+async def add_bid(bidder: Bidder, name: str, at: datetime, status: str = "pending") -> Bid:
+    naive = at.astimezone(timezone.utc).replace(tzinfo=None)
+    return await Bid(
+        bidderId=bidder.id, ownerId=bidder.createdBy, jobKey=f"{bidder.folder}/2026-10-05/backend/{name}",
+        firstAt=naive, status=status,
+    ).insert()
+
+
+async def test_count_by_status_counts_each_status_in_the_window(db):
+    ana, raj = await make_bidder("Ana", "ana"), await make_bidder("Raj", "raj")
+    start, end = T0, T0 + timedelta(days=1)
+    await add_bid(ana, "a1", start, "approved")                              # [start is included
+    await add_bid(ana, "a2", start + timedelta(hours=1), "approved")
+    await add_bid(ana, "a3", start + timedelta(hours=2), "pending")
+    await add_bid(ana, "a4", start + timedelta(hours=3), "rejected")
+    await add_bid(ana, "a5", end, "approved")                                # end) is excluded
+    await add_bid(ana, "a6", start - timedelta(seconds=1), "approved")       # before the window
+    await add_bid(raj, "r1", start + timedelta(hours=4), "rejected")
+
+    nobody = PydanticObjectId()
+    got = await count_by_status([ana.id, raj.id, nobody], start, end)
+    assert got == {str(ana.id): (2, 1, 1), str(raj.id): (0, 0, 1), str(nobody): (0, 0, 0)}
+
+
+async def test_count_by_status_with_no_bidders_does_no_query(db):
+    assert await count_by_status([], T0, T0 + timedelta(days=1)) == {}
+
+
+def test_uses_records_only_after_the_start_day(monkeypatch):
+    before = datetime(2026, 10, 6, 4, 59, tzinfo=timezone.utc)  # Chicago midnight of 2026-10-06 is 05:00Z (CDT)
+    after = datetime(2026, 10, 6, 5, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(records, "get_settings", lambda: settings_with(None))
+    assert records.records_start_utc(SCHED) is None
+    assert uses_records(after, SCHED) is False
+
+    monkeypatch.setattr(records, "get_settings", lambda: settings_with("2026-10-06"))
+    assert records.records_start_utc(SCHED) == datetime(2026, 10, 6, 5, 0, tzinfo=timezone.utc)
+    assert uses_records(before, SCHED) is False
+    assert uses_records(after, SCHED) is True
+    assert uses_records(after, SCHED, settings_with(None)) is False  # an explicit Settings wins
+
+
+@pytest.mark.parametrize("value, want", [(None, None), ("", None), (" 2026-10-06 ", "2026-10-06")])
+def test_records_start_setting_accepts_a_date_or_nothing(value, want):
+    assert Settings(BID_RECORDS_START=value).BID_RECORDS_START == want
+
+
+@pytest.mark.parametrize("value", ["10/06/2026", "2026-13-01", "2026-10-6", "20261006"])
+def test_records_start_setting_rejects_anything_else(value):
+    with pytest.raises(ValidationError):
+        Settings(BID_RECORDS_START=value)
+
+
+async def test_refresh_report_rows_updates_the_stored_day(db):
+    ana, raj = await make_bidder("Ana", "ana"), await make_bidder("Raj", "raj")
+    start, end = datetime(2026, 10, 4, 23, 30, tzinfo=timezone.utc), datetime(2026, 10, 5, 23, 30, tzinfo=timezone.utc)
+
+    def report(b, kind, s, e, count, pending):
+        return BidReport(
+            kind=kind, periodKey=f"{e:%Y-%m-%d}", periodStart=s, periodEnd=e, bidderId=b.id, ownerId=b.createdBy,
+            bidderName=b.name, rate=0.5, count=count, amount=round(count * 0.5, 2), pending=pending, rejected=None if pending is None else 0,
+        ).insert()
+
+    day = await report(ana, "daily", start, end, 1, 1)
+    week = await report(ana, "weekly", end - timedelta(days=7), end, 1, 1)
+    other_day = await report(ana, "daily", start - timedelta(days=1), start, 0, 0)  # does not contain the bid
+    raj_day = await report(raj, "daily", start, end, 0, 0)
+    folder_day = await report(ana, "daily", end, end + timedelta(days=1), 3, None)  # a folder-counted row is left alone
+
+    first = await add_bid(ana, "a1", start + timedelta(hours=2), "approved")
+    pending = await add_bid(ana, "a2", start + timedelta(hours=3), "pending")
+    await refresh_report_rows(first)
+
+    for stored, want in ((day, (1, 1, 0, 0.5)), (week, (1, 1, 0, 0.5)), (other_day, (0, 0, 0, 0.0)),
+                         (raj_day, (0, 0, 0, 0.0)), (folder_day, (3, None, None, 1.5))):
+        row = await BidReport.get(stored.id)
+        assert (row.count, row.pending, row.rejected, row.amount) == want
+
+    await Bid.find_one(Bid.id == pending.id).update({"$set": {"status": "approved"}})
+    await refresh_report_rows(pending)
+    row = await BidReport.get(day.id)
+    assert (row.count, row.pending, row.rejected, row.amount) == (2, 0, 0, 1.0)

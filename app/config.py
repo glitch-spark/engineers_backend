@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from functools import lru_cache
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -8,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_YMD = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
@@ -132,6 +134,10 @@ class Settings(BaseSettings):
     BID_DAILY_REPORT_TIME: str = "18:30"
     BID_WEEKLY_REPORT_DAY: str = "saturday"
     BID_WEEKLY_REPORT_TIME: str = "16:00"
+    # First day (YYYY-MM-DD, in BID_REPORT_TIMEZONE) counted from approved bid records instead of
+    # screenshot folders: a report window uses records when it ends after that day's local midnight.
+    # Unset = folders everywhere. Set it before bidders start on rollout day.
+    BID_RECORDS_START: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
 
@@ -160,6 +166,22 @@ class Settings(BaseSettings):
         if v is None:
             return None
         return str(v).strip() or None
+
+    @field_validator("BID_RECORDS_START", mode="before")
+    @classmethod
+    def _validate_records_start(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if not _YMD.match(s):
+            raise ValueError("must be YYYY-MM-DD, e.g. 2026-10-06")
+        try:
+            date.fromisoformat(s)
+        except ValueError as e:
+            raise ValueError("not a calendar date, use YYYY-MM-DD") from e
+        return s
 
     @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
     @classmethod

@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 from typing import Any, Optional, Sequence
 
+from app.bids.records import count_by_status, uses_records
 from app.bids.storage import BidStorage, count_folder_windows
 from app.bids.windows import BidSchedule, open_window
 
@@ -35,6 +36,12 @@ async def live_counts(
     bidders: Sequence, now: datetime, sched: BidSchedule, storage: BidStorage, cache: TtlCache
 ) -> dict[str, dict]:
     windows = [open_window(kind, now, sched) for _, kind in _KINDS]
+    if uses_records(now, sched):  # every open window ends at `now`, so all of them are record-backed or none is
+        per_window = [await count_by_status([b.id for b in bidders], start, end) for start, end in windows]
+        return {
+            str(b.id): {"today": per_window[0][str(b.id)][0], "week": per_window[1][str(b.id)][0], "error": None}
+            for b in bidders
+        }
     # bidder id -> one cache key per window, in _KINDS order
     keys = {
         str(b.id): [

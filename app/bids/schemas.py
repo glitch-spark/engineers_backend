@@ -98,6 +98,8 @@ def report_out(r) -> dict:
         "rate": r.rate,
         "amount": r.amount,
         "error": r.error,
+        "pending": r.pending,
+        "rejected": r.rejected,
     }
 
 

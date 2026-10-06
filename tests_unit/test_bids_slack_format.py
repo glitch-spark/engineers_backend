@@ -91,3 +91,21 @@ def test_user_text_is_escaped_but_slack_mentions_are_kept():
 def test_daily_footer_says_bidder_for_one():
     _, messages = format_report("daily", START, END, [row(PEDRO, "Ana", 3)], OWNERS, CT, "https://a")
     assert texts(messages)[-1].startswith("*Total: 3 bids · 1 bidder*")
+
+
+def counted(kind, pending, rejected, count=2):
+    r = row(PEDRO, "Ana Silva", count, country="BR")
+    return r.model_copy(update={"kind": kind, "pending": pending, "rejected": rejected})
+
+
+def test_report_line_shows_pending_and_rejected():
+    _, weekly = format_report("weekly", START, END, [counted("weekly", 1, 1)], OWNERS, CT, "https://app.example")
+    line = texts(weekly)[1].splitlines()[1]
+    assert line == "• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00 (pending 1, rejected 1)"
+    _, daily = format_report("daily", START, END, [counted("daily", 3, 0)], OWNERS, CT, "https://app.example")
+    assert texts(daily)[1].splitlines()[1] == "• 🇧🇷 Ana Silva — 2 (pending 3, rejected 0)"
+
+
+def test_rows_without_pending_keep_the_folder_line():
+    _, weekly = format_report("weekly", START, END, [counted("weekly", None, None)], OWNERS, CT, "https://app.example")
+    assert texts(weekly)[1].splitlines()[1] == "• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00"

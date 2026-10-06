@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Optional
 
 from beanie import PydanticObjectId
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+from app.bids.windows import BidSchedule
+from app.config import Settings, get_settings
 from app.models.bid import Bid
+from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
 
 
@@ -74,3 +77,55 @@ async def confirm_upload(bidder_id: PydanticObjectId, key: str) -> bool:
         {"$set": {"screenshots.$.uploadedAt": datetime.utcnow()}},
     )
     return result.matched_count > 0
+
+
+def records_start_utc(sched: BidSchedule, s: Optional[Settings] = None) -> Optional[datetime]:
+    """Local midnight of BID_RECORDS_START in the report timezone, as an aware UTC datetime; None when unset."""
+    start = (s or get_settings()).BID_RECORDS_START
+    if not start:
+        return None
+    return datetime.combine(date.fromisoformat(start), time.min, tzinfo=sched.tz).astimezone(timezone.utc)
+
+
+def uses_records(end: datetime, sched: BidSchedule, s: Optional[Settings] = None) -> bool:
+    """A window ending at `end` counts bid records (not screenshot folders) once BID_RECORDS_START is set and passed."""
+    start = records_start_utc(sched, s)
+    return start is not None and end > start
+
+
+async def count_by_status(
+    bidder_ids: list[PydanticObjectId], start: datetime, end: datetime
+) -> dict[str, tuple[int, int, int]]:
+    """(approved, pending, rejected) bids of each bidder whose first screenshot is in [start, end).
+
+    Every id is in the result, with zeros when it has no bids."""
+    counts = {str(i): (0, 0, 0) for i in bidder_ids}
+    if not counts:
+        return counts
+    pipeline = [
+        {"$match": {"bidderId": {"$in": list(bidder_ids)}, "firstAt": {"$gte": _naive_utc(start), "$lt": _naive_utc(end)}}},
+        {"$group": {"_id": {"bidderId": "$bidderId", "status": "$status"}, "n": {"$sum": 1}}},
+    ]
+    slot = {"approved": 0, "pending": 1, "rejected": 2}
+    for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None):
+        key, i = str(g["_id"]["bidderId"]), slot[g["_id"]["status"]]
+        counts[key] = counts[key][:i] + (g["n"],) + counts[key][i + 1:]
+    return counts
+
+
+async def refresh_report_rows(bid: Bid) -> None:
+    """Recount the stored daily and weekly report rows of this bid's bidder whose period holds the bid.
+
+    Rows counted from folders (no `pending`) are left as they were."""
+    at = _naive_utc(bid.firstAt)
+    coll = BidReport.get_motor_collection()
+    stale = await coll.find({
+        "bidderId": bid.bidderId, "pending": {"$ne": None}, "periodStart": {"$lte": at}, "periodEnd": {"$gt": at},
+    }).to_list(None)
+    for row in stale:
+        counts = await count_by_status([bid.bidderId], row["periodStart"], row["periodEnd"])
+        approved, pending, rejected = counts[str(bid.bidderId)]
+        await coll.update_one({"_id": row["_id"]}, {"$set": {
+            "count": approved, "pending": pending, "rejected": rejected,
+            "amount": round(approved * row["rate"], 2), "updatedAt": datetime.utcnow(),
+        }})

@@ -82,17 +82,19 @@ def test_bidder_out_optional_fields():
 @pytest.mark.parametrize("value", [NAIVE, AWARE])
 def test_report_out_emits_utc_datetimes(value):
     r = SimpleNamespace(kind="daily", periodKey="2026-10-02", periodStart=value, periodEnd=value + timedelta(days=1),
-                        count=4, rate=0.5, amount=2.0, error=None)
+                        count=4, rate=0.5, amount=2.0, error=None, pending=1, rejected=2)
     out = report_out(r)
     assert out["periodStart"] == "2026-10-01T23:30:00Z" and out["periodEnd"] == "2026-10-02T23:30:00Z"
     assert (out["count"], out["amount"]) == (4, 2.0)
+    assert (out["pending"], out["rejected"]) == (1, 2)
 
 
 def test_report_out_keeps_missing_count_and_amount():
     r = SimpleNamespace(kind="weekly", periodKey="2026-10-03", periodStart=NAIVE, periodEnd=NAIVE,
-                        count=None, rate=0.5, amount=None, error="AccessDenied")
+                        count=None, rate=0.5, amount=None, error="AccessDenied", pending=None, rejected=None)
     out = report_out(r)
     assert out["count"] is None and out["amount"] is None and out["error"] == "AccessDenied"
+    assert out["pending"] is None and out["rejected"] is None
 
 
 def test_bidder_status_and_login_fields():

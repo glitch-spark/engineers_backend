@@ -57,8 +57,12 @@ def _bidder_line(kind: Kind, r: BidReportRow) -> str:
         label += f" · {_slack_escape(r.profileName)}"
     count = r.count or 0
     if kind == "weekly":
-        return f"• {label} — {_bids(count)} × {_fmt_usd(r.rate)} = {_fmt_usd(r.amount or 0)}"
-    return f"• {label} — {count:,}"
+        line = f"• {label} — {_bids(count)} × {_fmt_usd(r.rate)} = {_fmt_usd(r.amount or 0)}"
+    else:
+        line = f"• {label} — {count:,}"
+    if r.pending is not None:  # counted from bid records: say what is not counted yet
+        line += f" (pending {r.pending:,}, rejected {r.rejected or 0:,})"
+    return line
 
 
 def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow]) -> list[str]:

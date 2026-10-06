@@ -56,6 +56,9 @@ BID_DAILY_REPORT_TIME=18:30
 # monday ... sunday
 BID_WEEKLY_REPORT_DAY=saturday
 BID_WEEKLY_REPORT_TIME=16:00
+# YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows ending after that day's local midnight count
+# approved bid records instead of screenshot folders. Blank = folders everywhere (section 6).
+BID_RECORDS_START=
 # Unset = reports are saved but not posted.
 SLACK_BIDS_CHANNEL_ID=C0123456789
 # Same bot as the interview bot.
@@ -184,3 +187,12 @@ object path and returns a short-lived signed upload link, so bidders hold no sto
    and click Reload). Two installs side by side double-count or lose bids.
 4. Revoke each old shared upload key (`puma-uploader`, …) as soon as that prefix's bidders
    have registered, so only the backend can write there.
+5. Switch counting to approved bid records with `BID_RECORDS_START=<YYYY-MM-DD>` (in
+   `BID_REPORT_TIMEZONE`) on the API **and** cron services. Set it **before bidders start on
+   rollout day**, to that day. A report window counts records when it ends after that day's
+   local midnight; earlier windows, and every window while it is unset, keep counting
+   screenshot folders. Only **approved** bids count toward `count` and pay (`count x rate`);
+   pending and rejected bids are reported beside it, e.g. `(pending 1, rejected 1)` in Slack
+   and `pending` / `rejected` in the app's report rows (`null` on folder-counted rows). The
+   live counts switch at the same moment and show the approved count. Bids are counted on
+   the day of their first screenshot.
