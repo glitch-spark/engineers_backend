@@ -625,6 +625,46 @@ async def test_bulk_only_complete_skips_rejected_incomplete_and_unconfirmed(make
     assert (row.count, row.pending, row.rejected) == (1, 2, 1)
 
 
+async def test_bulk_only_complete_rechecks_completeness_in_the_write(make_client, owner, monkeypatch):
+    """A bid that stops being complete between the narrowing read and the write is not approved, and counts as skipped."""
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    stays = await complete(await add_bid(ana, "stays", start + timedelta(hours=1)))
+    rejected_meanwhile = await complete(await add_bid(ana, "rejected-meanwhile", start + timedelta(hours=2)))
+    unsubmitted_meanwhile = await complete(await add_bid(ana, "unsubmitted-meanwhile", start + timedelta(hours=3)))
+    await add_report(ana, owner, pending=3)
+    real = Bid.get_motor_collection()
+    raced = []
+
+    class RacingCollection:
+        """The real collection, except two bids change right before the bulk write (after the route read them as complete)."""
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        async def update_many(self, *args, **kwargs):
+            await real.update_one({"_id": rejected_meanwhile.id}, {"$set": {"status": "rejected", "rejectReason": "duplicate"}})
+            await real.update_one({"_id": unsubmitted_meanwhile.id}, {"$set": {"submittedAt": None}})
+            raced.append(True)
+            return await real.update_many(*args, **kwargs)
+
+    monkeypatch.setattr(Bid, "get_motor_collection", classmethod(lambda cls: RacingCollection()))
+    ids = [str(b.id) for b in (stays, rejected_meanwhile, unsubmitted_meanwhile)]
+    async with make_client(owner) as c:
+        r = await c.post("/bids/review", json={"ids": ids, "status": "approved", "onlyComplete": True})
+    assert r.status_code == 200, r.text
+    assert raced == [True]  # the change really landed between the read and the write
+    assert r.json() == {"updated": 1, "skipped": 2}
+    monkeypatch.undo()
+    assert (await Bid.get(stays.id)).status == "approved"
+    gone = await Bid.get(rejected_meanwhile.id)
+    assert (gone.status, gone.rejectReason, gone.reviewedByName) == ("rejected", "duplicate", None)  # not approved over
+    unsubmitted = await Bid.get(unsubmitted_meanwhile.id)
+    assert (unsubmitted.status, unsubmitted.reviewedByName) == ("pending", None)
+    row = await BidReport.find_one(BidReport.bidderId == ana.id)
+    assert (row.count, row.pending, row.rejected) == (1, 1, 1)
+
+
 async def test_bulk_only_complete_still_skips_foreign_ids_and_refreshes_once_per_period(make_client, owner, monkeypatch):
     from app.routers import bids
 
