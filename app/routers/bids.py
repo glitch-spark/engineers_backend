@@ -14,6 +14,7 @@ from app.bids.live_counts import TtlCache
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
+from app.bids.week import PayWeek, pay_week, week_board
 from app.bids.windows import latest_cutoff, open_window, period_key, schedule_from_settings, window_for
 from app.config import get_settings
 from app.deps import get_current_user
@@ -121,9 +122,15 @@ async def list_bids(
     day: Optional[str] = None,
     bidderId: Optional[str] = None,
     status: Optional[Status] = None,
+    week: Optional[str] = None,
 ) -> dict:
     sched, now = schedule_from_settings(), _now()
-    if day is None:
+    if day is not None and week is not None:
+        raise HTTPException(status_code=400, detail="use day or week, not both")
+    pw = _pay_week_param(week, sched, now) if week is not None else None
+    if pw is not None:
+        cutoff = pw.cutoff
+    elif day is None:
         # The open window: the one that ends at the next daily cutoff, so bids filed after the report are listed.
         opened, _ = open_window("daily", now, sched)
         cutoff = datetime.combine(opened.astimezone(sched.tz).date() + timedelta(days=1), sched.daily_at, tzinfo=sched.tz)
@@ -135,10 +142,9 @@ async def list_bids(
             window_for("daily", cutoff, sched)  # overflows at the edges of the calendar
         except (ValueError, OverflowError):
             raise HTTPException(status_code=400, detail="Invalid day") from None
-    start, end = window_for("daily", cutoff, sched)
+    start, end = (pw.start, pw.end) if pw is not None else window_for("daily", cutoff, sched)
 
-    scope = {} if user.role == "admin" else {"createdBy": user.id}
-    candidates = await Bidder.find(scope).sort("name").to_list()
+    candidates = await _visible_bidders(user)
     if bidderId is not None:
         candidates = [b for b in candidates if str(b.id) == bidderId]
         if not candidates:
@@ -156,7 +162,8 @@ async def list_bids(
 
     folders = await _folders_without_record(shown, counts, start, end, now)
     return {
-        "day": period_key(cutoff),
+        "day": None if pw is not None else period_key(cutoff),
+        "week": period_key(pw.cutoff) if pw is not None else None,
         "start": _iso_utc(start),
         "end": _iso_utc(end),
         "timezone": sched.tz.key,
@@ -190,6 +197,37 @@ async def _folders_without_record(
             bidder = next(b for b in bidders if str(b.id) == bidder_id)
             FOLDER_CACHE.set((bidder_id, bidder.screenshotFolderUrl, start.isoformat()), n, now)
     return {i: None if n is None else max(0, n - sum(counts[i])) for i, n in found.items()}
+
+
+def _pay_week_param(week: Optional[str], sched, now: datetime) -> PayWeek:
+    """The pay week holding the ?week= date (the current one when None); 400 for a malformed or out-of-range date."""
+    try:
+        if week is None:
+            return pay_week(sched, now)
+        if not _DAY.fullmatch(week):
+            raise ValueError(week)
+        return pay_week(sched, now, date.fromisoformat(week))
+    except (ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="invalid week") from None
+
+
+async def _visible_bidders(user) -> list[Bidder]:
+    """The user's bidders (all of them for an admin), archived included, by name."""
+    scope = {} if user.role == "admin" else {"createdBy": user.id}
+    return await Bidder.find(scope).sort("name").to_list()
+
+
+@router.get("/week")
+async def bids_week(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    week: Optional[str] = None,
+    includeArchived: bool = False,
+) -> dict:
+    """The pay-week board: each bidder's approved / pending / rejected per day, and the week's totals and pay."""
+    sched, now = schedule_from_settings(), _now()
+    pw = _pay_week_param(week, sched, now)
+    bidders = [b for b in await _visible_bidders(user) if includeArchived or b.archivedAt is None]
+    return await week_board(bidders, pw, now, sched, get_bid_storage(), FOLDER_CACHE)
 
 
 @router.get("/{bid_id}")
