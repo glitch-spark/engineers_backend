@@ -1296,6 +1296,14 @@ async def _tailor_row(
     account = await Account.get(PydanticObjectId(account_id))
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
+    previous = row.tailored.get(account_id)
+    if previous:  # a failed one is re-run in place, not replaced by another job
+        retried = await resume_queue.requeue_failed(
+            previous, account=account, jd=row.jdText or "", company=_company_label(row), job_url=row.url,
+            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model,
+        )
+        if retried is not None:
+            return retried
     job = await resume_queue.enqueue_generation(
         user=owner,
         account=account,
@@ -1311,7 +1319,6 @@ async def _tailor_row(
     jobs = ResumeApplication.get_motor_collection()
     # Compare-and-set: only link the new job if the row still points where we read it. A concurrent tailor
     # (double click, `t` twice) that got there first wins; ours is dropped so nothing is left orphaned.
-    previous = row.tailored.get(account_id)
     linked = await JobApplyRow.get_motor_collection().update_one(
         {"_id": row.id, f"tailored.{account_id}": previous},
         {"$set": {f"tailored.{account_id}": job.id, "updatedAt": datetime.utcnow()}},
@@ -1368,8 +1375,8 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
 @router.post("/runs/{run_id}/tailor-all")
 async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Queue a tailored resume for each suggested job (or just the `rowIds` given) × each chosen profile the job is
-    open to and that hasn't applied to it yet, unless that profile already has one (a failed one is redone), up to
-    the daily cap. `dryRun` only counts."""
+    open to and that hasn't applied to it yet, unless that profile already has one (a failed one is redone in place),
+    up to the daily cap; redoing a failed one adds no job, so the cap doesn't limit it. `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
     resume_model = require_model("resume", body.resumeModel, owner)
@@ -1390,12 +1397,13 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
             current = existing.get(str(row.tailored.get(acc)))
             if current and current.get("status") != "failed":
                 continue
-            if remaining <= 0:
+            retry = current is not None  # a failed one re-runs in place: no new job, so the cap doesn't apply
+            if not retry and remaining <= 0:
                 skipped += 1
                 continue
             if body.dryRun:
                 queued += 1
-                remaining -= 1
+                remaining -= 0 if retry else 1
                 continue
             try:
                 await _tailor_row(
@@ -1410,7 +1418,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
                     other += 1
                 continue
             queued += 1
-            remaining -= 1
+            remaining -= 0 if retry else 1
     return {"queued": queued, "skippedCap": skipped, "skipped": other}
 
 

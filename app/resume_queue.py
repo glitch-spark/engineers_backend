@@ -77,6 +77,18 @@ async def remaining_today(user: UserExtra) -> int:
     return max(0, _daily_cap() - await daily_count(user))
 
 
+def _check_inputs(jd: str, account: Account) -> None:
+    if len((jd or "").encode("utf-8")) > MAX_JD_BYTES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"jobDescription exceeds {MAX_JD_BYTES} bytes")
+    if not (jd or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This job has no description to tailor to.")
+    if not (account.styleTemplate or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
+        )
+
+
 async def enqueue_generation(
     *,
     user: UserExtra,
@@ -95,15 +107,7 @@ async def enqueue_generation(
     cover_letter_hook: Optional[str] = None,
 ) -> ResumeApplication:
     """Validate and queue one generation. The caller has already checked the user may use `account`."""
-    if len((jd or "").encode("utf-8")) > MAX_JD_BYTES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"jobDescription exceeds {MAX_JD_BYTES} bytes")
-    if not (jd or "").strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This job has no description to tailor to.")
-    if not (account.styleTemplate or "").strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
-        )
+    _check_inputs(jd, account)
     cap = _daily_cap()
     if await daily_count(user) >= cap:
         raise HTTPException(
@@ -135,6 +139,48 @@ async def enqueue_generation(
         coverLetterHook=(cover_letter_hook or "").strip()[:500] or None,
     )
     await job.insert()
+    wake()
+    return job
+
+
+async def requeue_failed(
+    job_id: PydanticObjectId,
+    *,
+    account: Account,
+    jd: str,
+    company: str,
+    job_url: Optional[str] = None,
+    cover_letter: bool = False,
+    resume_model: Optional[str] = None,
+    cover_letter_model: Optional[str] = None,
+) -> Optional[ResumeApplication]:
+    """Re-run a failed Job Applies generation in place with fresh inputs, so a retry keeps one entry in Generated
+    Resumes (and adds nothing to the daily count). None when that profile's job is gone or isn't failed."""
+    from app.routers.resume import _reset_failed_job_fields  # router imports this module; resolve lazily
+
+    job = await ResumeApplication.find_one({"_id": job_id, "accountId": account.id, "status": "failed"})
+    if job is None:
+        return None
+    _check_inputs(jd, account)
+    _reset_failed_job_fields(job)
+    company = (company or "").strip() or "Company"
+    job.profileName = account.name or "profile"
+    job.companyName = company
+    job.companyNameLower = company.lower()
+    job.jobDescription = jd
+    job.jobUrl = (job_url or "").strip() or None
+    job.pdfFilename = build_filename(job.profileName, company)
+    job.generateCoverLetter = bool(cover_letter)
+    job.resumeModelId = (resume_model or "").strip() or None
+    job.coverLetterModelId = (cover_letter_model or "").strip() or None
+    job.attempts = 0
+    job.leaseAt = None
+    job.updatedAt = datetime.utcnow()
+    doc = Encoder(to_db=True).encode(job)
+    fields = {k: v for k, v in doc.items() if k not in ("_id", "id", "createdAt", "revision_id")}
+    res = await _coll().update_one({"_id": job.id, "status": "failed"}, {"$set": fields})
+    if res.matched_count == 0:  # a concurrent retry re-queued it first
+        return await ResumeApplication.get(job.id)
     wake()
     return job
 
