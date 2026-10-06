@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
-from app.job_apply import file_links, gsheet, sheet_checks, worker
+from app.job_apply import file_links, gsheet, sheet_checks, tailored_score, worker
 from app.job_apply.sheet_checks import sheet_text
 from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import (
@@ -207,6 +207,8 @@ def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
         # A completed generation always has its PDF (in S3 or inline).
         "hasPdf": doc.get("status") == "completed",
         "error": doc.get("errorMessage"),
+        # {total, band, knockouts, missing}: the tailored resume scored against this job; null = not scored.
+        "match": doc.get("matchScore"),
     }
 
 
@@ -239,6 +241,8 @@ def _row_summary(
         if s.total >= threshold and (not account_id or s.accountId == account_id)
     ]
     marks = _applied_marks(row, suggestions)
+    uploaded = {s.accountId: s.total for s in row.bestByProfile}
+    tailored = (_tailored_out((tailored_docs or {}).get(str(jid))) for jid in row.tailored.values())
     return {
         "_id": str(row.id),
         "rowIndex": row.rowIndex,
@@ -267,10 +271,9 @@ def _row_summary(
         "applied": bool(marks),
         # Applications to this URL recorded in other runs (permanent applied log).
         "previouslyApplied": previous or [],
-        # One tailored resume per profile: [{jobId, accountId, status, step, hasPdf, error}].
-        "tailored": [
-            t for t in (_tailored_out((tailored_docs or {}).get(str(jid))) for jid in row.tailored.values()) if t
-        ],
+        # One tailored resume per profile: [{jobId, accountId, status, step, hasPdf, error, match, uploadedScore}];
+        # uploadedScore = that profile's best uploaded resume on this job (even below the threshold), to compare.
+        "tailored": [{**t, "uploadedScore": uploaded.get(t["accountId"])} for t in tailored if t],
         # Profiles without uploaded resumes this job is open to (apply with a tailored resume).
         "tailorOnly": row.tailorOnly,
         # Every profile this job is open to (passes its location / work-authorization checks).
@@ -882,6 +885,7 @@ async def list_rows(
         page_ids = ids[(page - 1) * limit : page * limit]
         rows = await JobApplyRow.find({"_id": {"$in": page_ids}}).sort("+rowIndex").project(_RowListView).to_list()
     pages = (total + limit - 1) // limit
+    await tailored_score.backfill(ctx.tailored, [i for r in rows for i in _tailored_ids(r)])
     previous: dict[str, list] = {}
     page_urls = [r.url for r in rows if r.url]
     if page_urls:
@@ -912,6 +916,7 @@ async def list_rows(
 async def _row_detail(row: JobApplyRow) -> dict:
     run = await JobApplyRun.get(row.runId)
     tailored = await _tailored_docs(_tailored_ids(row))
+    await tailored_score.backfill(tailored)
     out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored)
     out["scores"] = [s.model_dump(mode="json") for s in sorted(row.scores, key=lambda s: s.total, reverse=True)]
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None

@@ -232,6 +232,11 @@ async def _run_job(
             except Exception as exc:  # noqa: BLE001 — non-fatal
                 log.warning("cover-letter generation failed for job %s: %s", job_id, exc)
 
+        # ---- match score (Job Applies): the tailored resume against its job, shown beside it ----
+        from app.job_apply import tailored_score
+
+        job.matchScore = await tailored_score.score_job(job)
+
         # ---- done ----
         job.status = "completed"
         job.step = "done"
