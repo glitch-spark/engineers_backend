@@ -545,7 +545,7 @@ async def test_tailor_forwards_requested_models(client, staff_user, auth_header,
         "coverLetterModel": "anthropic:claude-fable-5-1"})
     assert r.status_code == 200, r.text
     job = await ResumeApplication.get(r.json()["tailored"]["jobId"])
-    assert job.resumeModelId == "anthropic:claude-opus-5-5"
+    assert job.resumeModelId == "openai:gpt-4o-mini"  # Job Applies always tailors with GPT-4o mini
     assert job.coverLetterModelId == "anthropic:claude-fable-5-1"
 
 
@@ -553,7 +553,7 @@ async def test_tailor_unknown_model_is_400(client, staff_user, auth_header, anth
     h = auth_header(staff_user)
     _, rows, _, _ = await _two_profile_run(client, h, staff_user)
     row = rows["https://jobs.example.com/remote"]
-    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"resumeModel": "anthropic:nope"})
+    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={"coverLetterModel": "anthropic:nope"})
     assert r.status_code == 400 and "anthropic:nope" in r.json()["detail"]
 
 

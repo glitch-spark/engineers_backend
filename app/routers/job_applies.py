@@ -1336,11 +1336,14 @@ async def _tailor_row(
     return job
 
 
+# Job Applies tailors in bulk, so its resumes always use this cheap model, whatever is picked on other pages.
+JOB_APPLIES_RESUME_MODEL = "openai:gpt-4o-mini"
+
+
 class TailorBody(BaseModel):
     accountId: Optional[str] = None
     coverLetter: bool = False
-    resumeModel: Optional[str] = None  # catalog ids (GET /resume/models); blank = server default
-    coverLetterModel: Optional[str] = None
+    coverLetterModel: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
 class TailorAllBody(BaseModel):
@@ -1349,7 +1352,6 @@ class TailorAllBody(BaseModel):
     # Only these jobs (the ones ticked in the table), instead of every suggested job.
     rowIds: Optional[list[str]] = Field(default=None, max_length=1000)
     coverLetter: bool = False
-    resumeModel: Optional[str] = None
     coverLetterModel: Optional[str] = None
     dryRun: bool = False  # count what would be queued, queue nothing
 
@@ -1362,7 +1364,7 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
     owner = await UserExtra.get(row.userId)
     if run is None or owner is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    resume_model = require_model("resume", body.resumeModel, owner)
+    resume_model = JOB_APPLIES_RESUME_MODEL
     cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     job = await _tailor_row(
         row, run, owner, body.accountId, body.coverLetter,
@@ -1379,7 +1381,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     up to the daily cap; redoing a failed one adds no job, so the cap doesn't limit it. `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
-    resume_model = require_model("resume", body.resumeModel, owner)
+    resume_model = JOB_APPLIES_RESUME_MODEL
     cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     chosen = set(body.accountIds or [str(s.accountId) for s in run.selection])
     if body.rowIds is not None:  # the ticked jobs of this run, whatever view they were ticked in

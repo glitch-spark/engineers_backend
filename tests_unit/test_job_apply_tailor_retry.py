@@ -16,7 +16,7 @@ from mongomock_motor import AsyncMongoMockClient
 from app import resume_queue
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, ProfileGates, RunSelection
-from app.routers.job_applies import TailorAllBody, _tailor_row, tailor_all
+from app.routers.job_applies import TailorAllBody, TailorBody, _tailor_row, tailor_all, tailor_row
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -95,3 +95,22 @@ async def test_tailor_all_at_the_cap_still_retries_failed_ones(db, monkeypatch, 
     if not dry_run:
         assert (await ResumeApplication.get(failed.id)).status == "queued"
         assert await ResumeApplication.find_all().count() == 1
+
+
+async def test_job_applies_always_tailors_with_gpt_4o_mini(db):
+    owner, account, run, _row, _done = await _setup("completed")
+    rows = [
+        await JobApplyRow(
+            runId=run.id, userId=owner.id, rowIndex=i, url=f"https://jobs.example.com/{i}", company="Globex",
+            jdText="We need a frontend engineer.", profileGates=[ProfileGates(accountId=str(account.id))],
+        ).insert()
+        for i in (1, 2)
+    ]
+    other = "anthropic:claude-opus-5-5"  # whatever was picked elsewhere is ignored
+
+    await tailor_row(str(rows[0].id), TailorBody.model_validate({"accountId": str(account.id), "resumeModel": other}), owner)
+    await tailor_all(str(run.id), TailorAllBody.model_validate({"rowIds": [str(rows[1].id)], "resumeModel": other}), owner)
+
+    for row in rows:
+        job = await ResumeApplication.get((await JobApplyRow.get(row.id)).tailored[str(account.id)])
+        assert job.resumeModelId == "openai:gpt-4o-mini"
