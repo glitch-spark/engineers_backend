@@ -22,7 +22,7 @@ the same run goes on to score and tailor only the chosen job × profile pairs.
 |---|---|
 | Flow | A two-step run: screen, pause at a report, then score. Not a separate screening object. |
 | Profile choice | Per location group, pre-filled with the profiles that fit. The user can untick or add any profile. |
-| Unknowns (no date, work mode or location not stated) | Kept as worth applying to, flagged "needs a check". "Location not stated" is its own group. |
+| Unknowns (no date, work mode or location not stated) | Flagged "needs a check": not scored until a person approves it (it then joins worth applying to). "Location not stated" is its own group. |
 | Report layout | Layout A: headline count, a stacked bar of buckets, bucket chips, then one card per location group. |
 | Max age | Set in the report, applied instantly to stored dates (no refetch, no LLM). |
 | Threshold | Set at "Score & continue". |
@@ -70,7 +70,7 @@ Set after extraction (and on fetch failure). Exactly one bucket, first match win
 | 7 | `check` | passed, but any gate is `unknown` or the location group is `none` |
 | 8 | `valid` | passed everything |
 
-`check` and `valid` together are "worth applying to". The row keeps its full gate list, so the detail view
+Only `valid` is "worth applying to" and scored; a `check` job joins it when a person approves it (changed 2026-10-06, it was `valid` + `check`). The row keeps its full gate list, so the detail view
 shows every reason, not only the bucket.
 
 `JobApplyRow.forceInclude: bool = False` ("Include anyway") moves a `clearance`, `onsite` or `too_old` row into
@@ -128,7 +128,7 @@ New `screening.py` (pure, no I/O):
 - `run_worker`: `phase == "screen"` runs fetch + extract and sets `screenedAt`; then, if `autoStart`, it sets
   `phase="score"` and continues, otherwise it sets `status="screened"` and stops. `phase == "score"` runs
   `_score_stage` only.
-- `_score_stage`: for each worthwhile row (`screen` in `valid`/`check`), the resumes considered are those of the
+- `_score_stage`: for each worthwhile row (`screen == "valid"`), the resumes considered are those of the
   profiles in `assignments[row.groupKey]` plus `assignments["*"]`. A row with none gets `status="unassigned"`.
   Rows in other buckets are not scored.
 
@@ -148,11 +148,11 @@ New `screening.py` (pure, no I/O):
 
 ```json
 {
-  "total": 150, "worth": 31, "check": 12,
+  "total": 150, "worth": 19, "check": 12,
   "buckets": {"valid": 19, "check": 12, "closed": 59, "not_fetched": 17, "read_failed": 0,
               "clearance": 1, "onsite": 8, "too_old": 34},
   "maxAgeDays": 30,
-  "groups": [{"key": "GB", "jobs": 9, "check": 2, "fits": ["<accountId>"]}],
+  "groups": [{"key": "GB", "jobs": 9, "fits": ["<accountId>"]}],
   "profiles": [{"id": "<accountId>", "name": "Sam", "country": "GB", "region": null, "resumes": 3}]
 }
 ```
@@ -164,11 +164,11 @@ New `screening.py` (pure, no I/O):
 - **Run page, screening**: progress card ("Checking 64 / 150 · 50 read · 3 closed so far") with Cancel. The
   runs list shows "Checking…", then a "Ready to review" badge when `screened`.
 - **Run page, screened** (Layout A):
-  - headline "31 of 150 jobs worth applying to · 12 need a check";
+  - headline "19 of 150 jobs worth applying to · 12 need a check";
   - stacked bar of buckets; chips per bucket with counts; the Too old chip has the max-age selector;
   - each chip opens a list of its jobs (title, company, link, reason) with "Include anyway" where allowed;
     Not fetched has "Retry N";
-  - one card per location group: label, job count, "needs a check" count, a checkbox per profile (fitting
+  - one card per location group: label, job count, a checkbox per profile (fitting
     ones ticked, others shown with "doesn't fit");
   - footer: per-profile job totals, resume picker per profile (today's), threshold, **Score & continue**
     (disabled when nothing is worth applying to or nothing is assigned).

@@ -1061,14 +1061,34 @@ async def test_approve_a_needs_a_check_job(client, staff_user, auth_header, monk
     h = auth_header(staff_user)
     run_id = await screened_run(client, h)
     rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
-    assert rep["check"] == 2 and rep["worth"] == 2 and rep["buckets"]["valid"] == 0
+    assert rep["check"] == 2 and rep["worth"] == 0 and rep["buckets"]["valid"] == 0
     row = next(iter((await rows_by_url(client, h, run_id, screen="check")).values()))
     r = await client.put(f"/job-applies/rows/{row['_id']}/include", headers=h, json={"include": True})
     assert r.status_code == 200 and r.json()["screen"] == "valid"
     rep = (await client.get(f"/job-applies/runs/{run_id}/screening", headers=h)).json()
-    assert rep["check"] == 1 and rep["worth"] == 2 and rep["buckets"]["valid"] == 1 and rep["buckets"]["check"] == 1
+    assert rep["check"] == 1 and rep["worth"] == 1 and rep["buckets"]["valid"] == 1 and rep["buckets"]["check"] == 1
     r = await client.put(f"/job-applies/rows/{row['_id']}/include", headers=h, json={"include": False})
     assert r.json()["screen"] == "check"
+
+
+async def test_needs_a_check_job_is_scored_only_once_approved(client, staff_user, auth_header, monkeypatch):
+    monkeypatch.setattr(worker, "EXTRACT", _no_location_extract)  # remote + greenhouse: Needs a check
+    h = auth_header(staff_user)
+    us = await make_account(staff_user)
+    run_id = await screened_run(client, h)
+    rows = await rows_by_url(client, h, run_id)
+    remote, gh = rows["https://jobs.example.com/remote"], rows["https://boards.greenhouse.io/acme/jobs/9"]
+    assert remote["screen"] == gh["screen"] == "check"
+    # nothing approved yet: no job is worth applying to, so there is nothing to score
+    assert (await start(client, h, run_id, {"none": [us]}, [us])).status_code == 400
+    assert (await client.put(f"/job-applies/rows/{remote['_id']}/include", headers=h, json={"include": True})).status_code == 200
+    assert (await start(client, h, run_id, {"none": [us]}, [us])).status_code == 200
+    await worker.run_worker(PydanticObjectId(run_id))
+    rows = await rows_by_url(client, h, run_id)
+    assert rows["https://jobs.example.com/remote"]["status"] == "scored"
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    assert gh["status"] == "extracted" and not gh.get("scoredAt") and gh["screen"] == "check"
+    assert "https://boards.greenhouse.io/acme/jobs/9" not in await rows_by_url(client, h, run_id, view="suggested")
 
 
 async def test_approved_other_location_job_is_scored_with_the_not_stated_picks(client, staff_user, auth_header, monkeypatch):

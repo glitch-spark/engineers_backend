@@ -18,7 +18,8 @@ from app.job_apply.schema import GateResult, Location
 from app.models.job_apply import ScreenBucket
 
 BUCKETS: tuple[str, ...] = get_args(ScreenBucket)
-WORTH: tuple[str, ...] = ("valid", "check")
+# Worth applying: the jobs that are scored. A Needs-a-check job joins them only once a person approves it.
+WORTH: tuple[str, ...] = ("valid",)
 # A person can approve a job in these buckets: it becomes Worth applying. The others (closed, not fetched, couldn't be
 # read, not a job page) have no readable description to score or tailor from: it has to be pasted in Job info first.
 APPROVABLE: tuple[str, ...] = ("check", "clearance", "onsite", "too_old", "other_location")
@@ -141,7 +142,7 @@ def build_report(rows: list[tuple[Optional[str], Optional[str]]], profiles: list
     profiles whose candidate market it is (a profile with no location fits all). `others`: job counts per location
     for jobs open only outside the markets."""
     counts = Counter(screen for screen, _ in rows if screen)
-    groups = {k: {"key": k, "jobs": 0, "check": 0} for k in (*MARKETS, NO_LOCATION)}
+    groups = {k: {"key": k, "jobs": 0} for k in (*MARKETS, NO_LOCATION)}
     combos: dict[tuple, dict] = {}
     others: Counter = Counter()
     for screen, key in rows:
@@ -152,11 +153,9 @@ def build_report(rows: list[tuple[Optional[str], Optional[str]]], profiles: list
         keys = markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else [])
         for k in keys:
             groups[k]["jobs"] += 1
-            groups[k]["check"] += screen == "check"
         if keys:
-            c = combos.setdefault(tuple(keys), {"markets": list(keys), "jobs": 0, "check": 0})
+            c = combos.setdefault(tuple(keys), {"markets": list(keys), "jobs": 0})
             c["jobs"] += 1
-            c["check"] += screen == "check"
     shown = [groups[m] for m in MARKETS] + ([groups[NO_LOCATION]] if groups[NO_LOCATION]["jobs"] else [])
     for g in shown:
         g["fits"] = [
@@ -166,8 +165,8 @@ def build_report(rows: list[tuple[Optional[str], Optional[str]]], profiles: list
         ]
     return {
         "total": len(rows),
-        "worth": counts["valid"] + counts["check"],
-        "check": counts["check"],
+        "worth": sum(counts[b] for b in WORTH),
+        "check": counts["check"],  # Needs a check: left out of scoring until approved
         "buckets": {b: counts[b] for b in BUCKETS},
         "maxAgeDays": max_age_days,
         "groups": shown,
