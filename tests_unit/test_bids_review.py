@@ -5,14 +5,14 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 from beanie import PydanticObjectId, init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
 from app.bids.storage import BidStorageError
-from app.bids.windows import latest_cutoff, period_key, schedule_from_settings, window_for
+from app.bids.windows import latest_cutoff, schedule_from_settings, window_for
 from app.models import Account, UserExtra
 from app.models.bid import Bid, Screenshot
 from app.models.bid_report import BidReport
@@ -371,22 +371,26 @@ async def test_invalid_day_is_400(make_client, owner):
             assert r.json()["detail"] == "Invalid day"
 
 
-async def test_day_defaults_to_the_open_window(make_client, owner):
-    sched = schedule_from_settings()
-    before = datetime.now(timezone.utc)
+@pytest.mark.parametrize("now, day, start, end", [
+    # Mon Oct 5 2026 is CDT (UTC-5); the daily cutoff is 18:30 local.
+    ("2026-10-05T15:00:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 10:00 local: the open window
+    ("2026-10-05T23:29:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 18:29 local, still open
+    ("2026-10-05T23:31:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 18:31 local: just reported
+    ("2026-10-06T01:00:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 20:00 local, already Oct 6 UTC
+    ("2026-10-06T06:00:00Z", "2026-10-06", "2026-10-05T23:30:00Z", "2026-10-06T23:30:00Z"),  # 01:00 local Oct 6: next day
+])
+async def test_day_defaults_to_today_in_the_report_timezone(make_client, owner, monkeypatch, now, day, start, end):
+    from zoneinfo import ZoneInfo
+
+    from app.bids.windows import BidSchedule
+    from app.routers import bids
+
+    sched = BidSchedule(tz=ZoneInfo("America/Chicago"), daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0))
+    monkeypatch.setattr(bids, "schedule_from_settings", lambda: sched)
+    monkeypatch.setattr(bids, "_now", lambda: datetime.fromisoformat(now.replace("Z", "+00:00")))
     async with make_client(owner) as c:
         body = (await c.get("/bids")).json()
-    after = datetime.now(timezone.utc)
-    # The open window is [latest cutoff, next cutoff); its report is the one posted at the next cutoff.
-    expected = {
-        period_key(datetime.combine(latest_cutoff("daily", now, sched).date() + timedelta(days=1), sched.daily_at,
-                                    tzinfo=sched.tz))
-        for now in (before, after)
-    }
-    assert body["day"] in expected
-    start, end = day_window(body["day"])
-    assert body["start"] == iso(start)
-    assert start <= before < end
+    assert (body["day"], body["start"], body["end"]) == (day, start, end)
 
 
 async def test_bulk_review_refreshes_both_weekly_rows_when_a_day_straddles_the_weekly_cutoff(make_client, owner):

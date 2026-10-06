@@ -13,7 +13,7 @@ from app.bids.live_counts import TtlCache
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
-from app.bids.windows import BidSchedule, latest_cutoff, open_window, period_key, schedule_from_settings, window_for
+from app.bids.windows import latest_cutoff, period_key, schedule_from_settings, window_for
 from app.config import get_settings
 from app.deps import get_current_user
 from app.models import UserExtra
@@ -73,10 +73,8 @@ def _bid_out(bid: Bid, bidder_name: str) -> dict:
     }
 
 
-def _next_daily_cutoff(at: datetime, sched: BidSchedule) -> datetime:
-    """The cutoff that closes the daily report window holding `at`, in the report timezone."""
-    latest = latest_cutoff("daily", at, sched)
-    return datetime.combine(latest.date() + timedelta(days=1), sched.daily_at, tzinfo=sched.tz)
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _decision(user, new_status: str, note: Optional[str]) -> dict:
@@ -96,9 +94,11 @@ async def list_bids(
     bidderId: Optional[str] = None,
     status: Optional[Status] = None,
 ) -> dict:
-    sched, now = schedule_from_settings(), datetime.now(timezone.utc)
-    if day is None:  # the open daily window; its report is the one posted at the next cutoff
-        cutoff = _next_daily_cutoff(open_window("daily", now, sched)[0], sched)
+    sched, now = schedule_from_settings(), _now()
+    if day is None:
+        # Today's report day in the report timezone: before the daily cutoff that is the open window, after it
+        # the window just reported.
+        cutoff = datetime.combine(now.astimezone(sched.tz).date(), sched.daily_at, tzinfo=sched.tz)
     else:
         try:
             if not _DAY.fullmatch(day):
