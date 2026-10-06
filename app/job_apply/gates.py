@@ -3,6 +3,7 @@
 Job-level gates (remote, clearance, freshness) apply to every profile; profile gates (location,
 workAuth) compare the posting with one profile's country/region. `unknown` counts as a pass.
 """
+import re
 from datetime import date
 from typing import Optional
 
@@ -57,12 +58,32 @@ _COUNTRY_NAMES = {
 }
 
 
+# ISO 3166 alpha-3 codes some boards and models use ("GBR", "DEU"): the countries the regions above cover, plus a
+# few common elsewhere.
+_ALPHA3 = {
+    "USA": "US", "CAN": "CA", "GBR": "GB", "IRL": "IE", "DEU": "DE", "FRA": "FR", "ESP": "ES", "PRT": "PT",
+    "ITA": "IT", "NLD": "NL", "BEL": "BE", "LUX": "LU", "AUT": "AT", "CHE": "CH", "DNK": "DK", "SWE": "SE",
+    "NOR": "NO", "FIN": "FI", "ISL": "IS", "POL": "PL", "CZE": "CZ", "SVK": "SK", "HUN": "HU", "ROU": "RO",
+    "BGR": "BG", "GRC": "GR", "HRV": "HR", "SVN": "SI", "SRB": "RS", "BIH": "BA", "MNE": "ME", "MKD": "MK",
+    "ALB": "AL", "MDA": "MD", "UKR": "UA", "BLR": "BY", "EST": "EE", "LVA": "LV", "LTU": "LT", "MLT": "MT",
+    "CYP": "CY", "TUR": "TR", "MEX": "MX", "BRA": "BR", "ARG": "AR", "COL": "CO", "CHL": "CL", "PER": "PE",
+    "URY": "UY", "PRY": "PY", "BOL": "BO", "ECU": "EC", "VEN": "VE", "CRI": "CR", "PAN": "PA", "GTM": "GT",
+    "HND": "HN", "SLV": "SV", "NIC": "NI", "DOM": "DO", "CUB": "CU", "PRI": "PR", "IND": "IN", "PAK": "PK",
+    "BGD": "BD", "LKA": "LK", "PHL": "PH", "VNM": "VN", "IDN": "ID", "MYS": "MY", "SGP": "SG", "THA": "TH",
+    "CHN": "CN", "JPN": "JP", "KOR": "KR", "TWN": "TW", "HKG": "HK", "AUS": "AU", "NZL": "NZ", "ISR": "IL",
+    "ARE": "AE", "SAU": "SA", "ZAF": "ZA", "EGY": "EG", "NGA": "NG", "KEN": "KE", "MAR": "MA",
+}
+
+
 def normalize_country(value: str) -> Optional[str]:
-    """'United States' / 'USA' / 'us' -> 'US'. None when the value isn't a recognisable country."""
+    """'United States' / 'USA' / 'us' / 'GBR' -> ISO-2. None when the value isn't a recognisable country."""
     v = (value or "").strip()
     if len(v) == 2 and v.isalpha():
         return "GB" if v.upper() == "UK" else v.upper()
-    return _COUNTRY_NAMES.get(v.lower().rstrip(".")) or _COUNTRY_NAMES.get(v.lower())
+    return (
+        _COUNTRY_NAMES.get(v.lower().rstrip(".")) or _COUNTRY_NAMES.get(v.lower())
+        or (_ALPHA3.get(v.upper()) if len(v) == 3 and v.isalpha() else None)
+    )
 
 
 _REGION_NEEDLES = (
@@ -78,6 +99,13 @@ def region_key(value: str) -> Optional[str]:
     v = " ".join((value or "").lower().replace("-", " ").split())
     if v in _REGION_COVER:
         return v
+    if re.search(r"\beu\b", v):  # "Western EU", "EU only"
+        return "europe"
+    # A time-zone window given as the location ("CET +/-2", "GMT±3", "EST hours") means the region around it.
+    if re.search(r"\b(?:gmt|cet|cest|bst|wet|eet|eest)\b", v):
+        return "emea"
+    if re.search(r"\b(?:est|edt|cst|cdt|mst|mdt|pst|pdt|et|pt)\b", v):
+        return "north america"
     return next((key for needle, key in _REGION_NEEDLES if needle in v), None)
 
 
@@ -138,7 +166,10 @@ def job_gates(
             fresh = GateResult(name="freshness", result="fail", reason=f"posted {age} days ago")
         else:
             fresh = GateResult(name="freshness", result="pass", reason=f"posted {max(age, 0)} days ago")
-    return [remote, clearance, fresh]
+    gates = [remote, clearance, fresh]
+    if ex.remoteAreas:  # profiles have a country / region only, so a person checks the city or state
+        gates.append(GateResult(name="area", result="unknown", reason=f"remote only in {', '.join(ex.remoteAreas)}"))
+    return gates
 
 
 def profile_gates(ex: JobExtraction, *, country: Optional[str], region: Optional[str]) -> list[GateResult]:
@@ -179,3 +210,7 @@ def profile_gates(ex: JobExtraction, *, country: Optional[str], region: Optional
 
 def blocked(gates: list[GateResult]) -> bool:
     return any(g.result == "fail" for g in gates)
+
+
+def failing_reasons(gates: list[GateResult]) -> str:
+    return "; ".join(f"{g.name}: {g.reason}" if g.reason else g.name for g in gates if g.result == "fail")

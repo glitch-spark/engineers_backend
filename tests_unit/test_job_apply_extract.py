@@ -128,6 +128,19 @@ def test_build_prompt_location_and_date_rules():
     assert "archived" in p.lower() and "never today's date" in p.lower()
 
 
+def test_parse_is_job_posting_flag():
+    assert parse_extraction('{"title":"T","terms":[{"term":"Python"}]}').isJobPosting is True
+    ex = parse_extraction('{"title":"","terms":[],"isJobPosting":false}')
+    assert ex.isJobPosting is False
+
+
+def test_build_prompt_has_location_and_posting_examples():
+    p = build_prompt("JD", RUN)
+    assert '"isJobPosting"' in p
+    assert "USA, Canada, Europe or Australia" in p and "Remote Global" in p and "UTC" in p
+    assert "remote option" in p.lower()
+
+
 def test_build_prompt_contains_rules():
     p = build_prompt("JD TEXT HERE", RUN)
     assert "JD TEXT HERE" in p and "2026-10-01" in p and '"workMode"' in p and "able to obtain" in p
@@ -181,3 +194,57 @@ def test_parse_rejects_empty_extraction():
         parse_extraction("{}")
     with pytest.raises(ValueError):
         parse_extraction('{"workMode": "remote"}')
+
+
+# ---------- work mode: on-site / hybrid only when the posting says so (Seesaw, 2026-10-03) ----------
+
+SEESAW = "Software Engineer, Backend\nCompany: Seesaw\nLocation: USA\n\nBuild APIs in Python.\nBenefits: Home Office Setup Stipend."
+
+
+def test_build_prompt_says_unstated_work_mode_is_unknown():
+    p = build_prompt("JD", RUN)
+    assert 'doesn\'t say where the work is done, workMode is "unknown"' in p
+
+
+@pytest.mark.parametrize("mode", ["onsite", "hybrid"])
+async def test_extract_job_drops_an_unsupported_onsite_or_hybrid_guess(mode):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workMode": mode}))
+    ex, _ = await extract_job(SEESAW, user=None, run_date=RUN, llm=llm)
+    assert ex.workMode == "unknown"
+
+
+@pytest.mark.parametrize("mode, wording", [
+    ("onsite", "This is an on-site role in Austin."),
+    ("onsite", "You will work from our London office."),
+    ("onsite", "This role is not remote."),
+    ("hybrid", "Hybrid: 3 days a week in the office."),
+    ("hybrid", "You must live within commuting distance of Berlin."),
+])
+async def test_extract_job_keeps_onsite_or_hybrid_the_posting_states(mode, wording):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workMode": mode}))
+    ex, _ = await extract_job(f"{SEESAW}\n{wording}", user=None, run_date=RUN, llm=llm)
+    assert ex.workMode == mode
+
+
+async def test_extract_job_keeps_remote_and_unknown():
+    for mode in ("remote", "unknown"):
+        llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workMode": mode}))
+        ex, _ = await extract_job(SEESAW, user=None, run_date=RUN, llm=llm)
+        assert ex.workMode == mode
+
+
+def test_prompt_version_is_current():
+    from app.job_apply.extract import PROMPT_VERSION
+
+    assert PROMPT_VERSION == "job-extract-v5"  # v4: work mode only when stated; v5: remoteAreas
+
+
+def test_parse_remote_areas():
+    ex = parse_extraction('{"title":"T","terms":[{"term":"Python"}],"remoteAreas":["Austin Metro"," North Carolina ",5,""]}')
+    assert ex.remoteAreas == ["Austin Metro", "North Carolina"]
+    assert parse_extraction('{"title":"T","terms":[{"term":"Python"}]}').remoteAreas == []
+
+
+def test_build_prompt_asks_for_remote_areas():
+    p = build_prompt("JD", RUN)
+    assert '"remoteAreas"' in p and "metro areas" in p

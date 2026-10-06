@@ -13,11 +13,18 @@ from pymongo import ASCENDING, DESCENDING, IndexModel
 from app.job_apply.schema import GateResult, JobExtraction, ResumeScore
 from app.models.base import TimestampedDocument
 
-RunStatus = Literal["queued", "running", "done", "failed", "cancelled"]
-RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed"]
+RunStatus = Literal["queued", "running", "screened", "done", "failed", "cancelled"]
+RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fetch_failed", "llm_failed", "unassigned"]
+# A run first screens its jobs (fetch, read, job gates), pauses at "screened" for the user to pick profiles per
+# location group, then scores only those job x profile pairs.
+RunPhase = Literal["screen", "score"]
+ScreenBucket = Literal[
+    "valid", "check", "closed", "not_fetched", "read_failed", "not_job", "clearance", "onsite", "too_old",
+    "other_location",
+]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
-RUN_RETENTION_DAYS = 3
+RUN_RETENTION_DAYS = 7
 # Job description per URL and LLM reading per description. Matches the default max posting age: anything older
 # is excluded as stale anyway.
 CACHE_DAYS = 30
@@ -47,7 +54,13 @@ class JobApplyRun(TimestampedDocument):
     fileName: str  # uploaded file name, or the Google Sheet's title
     sourceUrl: Optional[str] = None  # Google Sheets link when the run came from one
     status: RunStatus = "queued"
-    selection: List[RunSelection]
+    selection: List[RunSelection] = Field(default_factory=list)  # set when scoring starts
+    phase: RunPhase = "screen"
+    # Candidate market (US / UKEU / LATAM, or "none" for no stated location) -> profiles to score its jobs
+    # against; "*" applies to every job.
+    assignments: Dict[str, List[PydanticObjectId]] = Field(default_factory=dict)
+    autoStart: bool = False  # created with profiles up front: score right after screening, no pause
+    screenedAt: Optional[datetime] = None
     threshold: int = 75
     maxAgeDays: int = 30
     # "Today" for the freshness gate and for roles ending "Present"; fixed at upload so a resumed run agrees.
@@ -94,15 +107,22 @@ class JobApplyRow(TimestampedDocument):
     rowIndex: int
     url: Optional[str] = None
     jdText: Optional[str] = None
-    jdSource: Optional[Literal["sheet", "ats_api", "html", "browser"]] = None
+    jdSource: Optional[Literal["sheet", "ats_api", "html", "browser", "manual"]] = None
+    jdStructured: Optional[bool] = None  # False: read from page text only (no job-site API / JobPosting data)
     status: RowStatus = "pending"
     statusReason: Optional[str] = None
+    screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
+    groupKey: Optional[str] = None  # normalised allowed locations, e.g. "GB", "EU+US", "none"
+    forceInclude: bool = False  # a person approved this job: it is Worth applying whatever the checks said
     title: str = ""
     company: str = ""
+    sheetCompany: str = ""  # the company written in the uploaded sheet: kept over fetched, AI and corrected names
     fetchedPostedDate: Optional[date] = None  # from JSON-LD / ATS API; beats the LLM's date
     postedDate: Optional[date] = None
     extraction: Optional[JobExtraction] = None
-    extractionSource: Optional[Literal["llm", "rules", "cache"]] = None
+    extractionSource: Optional[Literal["llm", "rules", "cache", "human"]] = None
+    # editedAt of the JobInfo correction this row was read from: a newer one means the row is out of date.
+    infoAt: Optional[datetime] = None
     gates: List[GateResult] = Field(default_factory=list)
     scores: List[ResumeScore] = Field(default_factory=list)
     profileGates: List[ProfileGates] = Field(default_factory=list)
@@ -117,6 +137,8 @@ class JobApplyRow(TimestampedDocument):
     tailored: Dict[str, PydanticObjectId] = Field(default_factory=dict)
     # Profiles whose row for this job was exported to the Google Sheet: accountId → when.
     exported: Dict[str, datetime] = Field(default_factory=dict)
+    # Where that row went (accountId → {sheetId, tab, row}), so a tailored resume finished later fills its link in.
+    exportedRows: Dict[str, dict] = Field(default_factory=dict)
     expiresAt: datetime = Field(default_factory=_expires_at)
 
     class Settings:
@@ -154,6 +176,8 @@ class JobPostingCache(TimestampedDocument):
     title: str = ""
     company: str = ""
     fetchedAt: datetime = Field(default_factory=datetime.utcnow)
+    structured: bool = True  # see FetchResult.structured
+    fetcher: int = 0  # fetch.FETCHER_VERSION that read it; pages from an older fetcher are fetched again
 
     class Settings:
         name = "job_posting_cache"
@@ -162,6 +186,40 @@ class JobPostingCache(TimestampedDocument):
             # Replaces the old 7-day "ttl" index (dropped at startup, see app/db.py STALE_INDEXES).
             IndexModel([("fetchedAt", ASCENDING)], expireAfterSeconds=CACHE_TTL_SECONDS, name="ttl_30d"),
         ]
+
+
+class JobInfo(TimestampedDocument):
+    """A person's correction of one job, per normalised URL and shared by everyone who uses the link. It beats the
+    fetch and the LLM reading in every run (no fetch, no LLM call), never expires, and is never overwritten by a
+    machine reading. Written only by the info endpoint (app/routers/job_applies.py)."""
+
+    url: str
+    jdText: str  # always set: a correction without a description could not be read or scored
+    postedDate: Optional[date] = None
+    title: str = ""
+    company: str = ""
+    extraction: JobExtraction
+    editedBy: Optional[PydanticObjectId] = None
+    editedByName: str = ""
+    editedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "job_info"
+        indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
+
+
+class JobApproval(TimestampedDocument):
+    """A person approved this job link into Worth applying, for everyone who uses the link: other runs pick it up
+    when they read the job or, if already read, when opened (`sync_corrections`). Undoing it removes this record."""
+
+    url: str
+    approvedBy: Optional[PydanticObjectId] = None
+    approvedByName: str = ""
+    approvedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "job_approval"
+        indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
 
 
 class JobApplicationLog(TimestampedDocument):

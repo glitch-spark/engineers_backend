@@ -17,14 +17,17 @@ from beanie.odm.utils.encoder import Encoder
 
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
-from app.job_apply.gates import blocked, job_gates
+from app.job_apply.gates import blocked, failing_reasons, job_gates
+from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key, markets_for, scoring_key
 from app.job_apply.pipeline import ProfileInfo, ResumeInput, score_row
 from app.job_apply.resume_parse import parse_resume
 from app.job_apply.schema import GateResult, JobExtraction
 from app.job_apply.scoring import build_idf
 from app.job_apply.sections import substantive_text
 from app.models.account import Account
-from app.models.job_apply import CACHE_DAYS, JobApplyRow, JobApplyRun, JobExtractionCache, JobPostingCache, ProfileGates
+from app.models.job_apply import (
+    CACHE_DAYS, JobApplyRow, JobApplyRun, JobApproval, JobExtractionCache, JobInfo, JobPostingCache, ProfileGates,
+)
 from app.models.user_extra import UserExtra
 
 log = logging.getLogger(__name__)
@@ -41,6 +44,9 @@ STALE_AFTER = timedelta(minutes=2)
 SWEEP_SECONDS = 120
 CHECK_EVERY = 25
 POSTING_TTL = timedelta(days=CACHE_DAYS)
+# A cached description is reused only this long, so a job closed since then is noticed (the LLM reading is
+# cached by description, so refetching an unchanged page costs no LLM call).
+POSTING_REUSE = timedelta(hours=24)
 
 Stage = Literal["fetch", "extract", "score"]
 
@@ -63,12 +69,29 @@ def needs_stage(status: str, *, has_jd: bool, scored: bool, stage: Stage) -> boo
     return status in ("extracted", "excluded") and not scored
 
 
+def posting_reusable(fetched_at: datetime, now: datetime) -> bool:
+    return fetched_at > now - POSTING_REUSE
+
+
+def assigned_profiles(assignments: dict[str, list], key: Optional[str]) -> set[str]:
+    """Profiles to score a job against: those picked for each candidate market its location group is in (or for
+    "none" when it states no location), plus those picked for every job ("*")."""
+    keys = markets_for(key) or ([NO_LOCATION] if (key or NO_LOCATION) == NO_LOCATION else [])
+    picked = {str(x) for k in keys for x in assignments.get(k, [])}
+    return picked | {str(x) for x in assignments.get("*", [])}
+
+
+def _screen(row: JobApplyRow) -> None:
+    row.screen = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates or [],
+        group_key=row.groupKey, force_include=row.forceInclude,
+        is_job=row.extraction.isJobPosting if row.extraction is not None else True,
+        verified=row.jdStructured is not False,
+    )
+
+
 def posted_for_row(fetched: Optional[date], extracted: Optional[date]) -> Optional[date]:
     return fetched or extracted
-
-
-def failing_reasons(gates: list[GateResult]) -> str:
-    return "; ".join(f"{g.name}: {g.reason}" if g.reason else g.name for g in gates if g.result == "fail")
 
 
 # ---------- persistence helpers ----------
@@ -90,8 +113,14 @@ async def _status(run_id: PydanticObjectId) -> Optional[str]:
     return doc.get("status") if doc else None
 
 
-_FETCH_FIELDS = ("jdText", "jdSource", "fetchedPostedDate", "title", "company", "status", "statusReason")
-_EXTRACT_FIELDS = ("extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason")
+_FETCH_FIELDS = (
+    "jdText", "jdSource", "jdStructured", "fetchedPostedDate", "title", "company", "status", "statusReason", "screen",
+    "infoAt",
+)
+_EXTRACT_FIELDS = (
+    "extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason", "screen", "groupKey",
+    "infoAt", "forceInclude",
+)
 _SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "tailorOnly", "scoredAt", "status")
 
 
@@ -148,22 +177,54 @@ async def _cache_description(url: str, text: str) -> None:
     await JobPostingCache.get_motor_collection().update_one(
         {"url": url},
         {"$set": {"url": url, "text": text, "source": "sheet", "postedDate": None, "title": "", "company": "",
-                  "fetchedAt": now, "updatedAt": now},
+                  "fetchedAt": now, "updatedAt": now, "fetcher": fetch_mod.FETCHER_VERSION, "structured": True},
          "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
+
+
+async def _human_info(row: JobApplyRow) -> Optional[JobInfo]:
+    """A person's correction of this URL (shared by every user), if there is one."""
+    return await JobInfo.find_one(JobInfo.url == row.url) if row.url else None
+
+
+def _apply_info(row: JobApplyRow, info: JobInfo) -> None:
+    """Take the description and basics from a correction: they beat whatever the sheet or a fetch gave, except the
+    company name the sheet itself states."""
+    row.jdText, row.jdSource, row.jdStructured = info.jdText, "manual", True
+    row.fetchedPostedDate = info.postedDate
+    row.title, row.company = info.title, row.sheetCompany or info.company
+    row.infoAt = info.editedAt
 
 
 # ---------- stages ----------
 
 
 async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
+    info = await _human_info(row)
+    if info:  # corrected by a person: no fetch
+        _apply_info(row, info)
+        row.status = "fetched"
+        return
     cached = await JobPostingCache.find_one(JobPostingCache.url == row.url)
-    if cached and cached.fetchedAt > datetime.utcnow() - POSTING_TTL:
+    if cached and cached.fetcher != fetch_mod.FETCHER_VERSION:
+        cached = None  # read before the current rules (e.g. a closed job's 404 page): fetch again
+    res = None
+    if not (cached and posting_reusable(cached.fetchedAt, datetime.utcnow())):
+        try:
+            res = await FETCH(row.url, client=client, browser=BROWSER)
+        except fetch_mod.JobClosed:
+            raise
+        except Exception:
+            # A blocked or timed-out refetch keeps the description read earlier (within the cache's life).
+            if not (cached and cached.fetchedAt > datetime.utcnow() - POSTING_TTL):
+                raise
+    if res is None:
         text, source, posted, title, company = cached.text, cached.source, cached.postedDate, cached.title, cached.company
+        structured = cached.structured
     else:
-        res = await FETCH(row.url, client=client, browser=BROWSER)
         text, source, posted, title, company = res.text, res.source, res.postedDate, res.title, res.company
+        structured = res.structured
         coll = JobPostingCache.get_motor_collection()
         await coll.update_one(
             {"url": row.url},
@@ -171,10 +232,11 @@ async def _fetch_one(row: JobApplyRow, client: httpx.AsyncClient) -> None:
                 "url": row.url, "text": text, "source": source,
                 "postedDate": datetime.combine(posted, datetime.min.time()) if posted else None,
                 "title": title, "company": company, "fetchedAt": datetime.utcnow(), "updatedAt": datetime.utcnow(),
+                "fetcher": fetch_mod.FETCHER_VERSION, "structured": structured,
             }, "$setOnInsert": {"createdAt": datetime.utcnow()}},
             upsert=True,
         )
-    row.jdText, row.jdSource, row.fetchedPostedDate = text, source, posted
+    row.jdText, row.jdSource, row.fetchedPostedDate, row.jdStructured = text, source, posted, structured
     row.title = row.title or title
     row.company = row.company or company
     row.status = "fetched"
@@ -198,6 +260,7 @@ async def _fetch_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
                     raise
                 except Exception as exc:  # noqa: BLE001 — a row failure never fails the run
                     row.status, row.statusReason = "fetch_failed", str(exc)[:300] or exc.__class__.__name__
+                    _screen(row)
                     await _save_fields(row, _FETCH_FIELDS)
                     await _inc(run.id, failed=1)
 
@@ -206,9 +269,13 @@ async def _fetch_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
 
 async def _extract_one(row: JobApplyRow, run: JobApplyRun, user: Optional[UserExtra]) -> None:
     run_date = run.runDate.date()
+    info = await _human_info(row)
     key = f"{extract_mod.jd_hash(row.jdText)}:{extract_mod.PROMPT_VERSION}"
-    cached = await JobExtractionCache.find_one(JobExtractionCache.key == key)
-    if cached:
+    cached = None if info else await JobExtractionCache.find_one(JobExtractionCache.key == key)
+    if info:  # corrected by a person: no LLM call
+        _apply_info(row, info)
+        ex, source = info.extraction, "human"
+    elif cached:
         ex, source = cached.extraction, "cache"
     else:
         ex, source = await EXTRACT(row.jdText, user=user, run_date=run_date)
@@ -222,12 +289,16 @@ async def _extract_one(row: JobApplyRow, run: JobApplyRun, user: Optional[UserEx
     posted = posted_for_row(row.fetchedPostedDate, ex.postedDate)
     gates = job_gates(ex, run_date=run_date, max_age_days=run.maxAgeDays, posted=posted)
     row.extraction, row.extractionSource, row.gates, row.postedDate = ex, source, gates, posted
+    row.groupKey = group_key(ex.allowedLocations)
     row.title = row.title or ex.title
     row.company = row.company or ex.company
+    if not row.forceInclude and row.url and await JobApproval.find_one(JobApproval.url == row.url):
+        row.forceInclude = True  # someone approved this link into Worth applying
     if blocked(gates):
         row.status, row.statusReason = "excluded", failing_reasons(gates)
     else:
         row.status, row.statusReason = "extracted", None
+    _screen(row)
 
 
 async def _extract_stage(run: JobApplyRun, rows: list[JobApplyRow], user: Optional[UserExtra], check: _Checker) -> None:
@@ -248,6 +319,7 @@ async def _extract_stage(run: JobApplyRun, rows: list[JobApplyRow], user: Option
             except Exception as exc:  # noqa: BLE001
                 log.exception("job extraction failed for row %s", row.id)
                 row.status, row.statusReason = "llm_failed", str(exc)[:300] or exc.__class__.__name__
+                _screen(row)
                 await _save_fields(row, _EXTRACT_FIELDS)
                 await _inc(run.id, failed=1)
 
@@ -280,8 +352,16 @@ async def _load_resumes(run: JobApplyRun) -> tuple[list[ResumeInput], dict[str, 
     return resumes, profiles, notes
 
 
-async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checker) -> None:
-    todo = [r for r in rows if needs_stage(r.status, has_jd=bool(r.jdText), scored=bool(r.scoredAt), stage="score")]
+async def _score_stage(
+    run: JobApplyRun, rows: list[JobApplyRow], check: _Checker, only: Optional[set[PydanticObjectId]] = None
+) -> None:
+    # Only jobs worth applying to are scored, and only against the profiles picked for their location group.
+    # `only` limits it to those rows (the IDF still reads every JD in the run).
+    todo = [
+        r for r in rows
+        if needs_stage(r.status, has_jd=bool(r.jdText), scored=bool(r.scoredAt), stage="score") and r.screen in WORTH
+        and (only is None or r.id in only)
+    ]
     if not todo:
         return
     resumes, profiles, notes = await _load_resumes(run)
@@ -292,11 +372,17 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
     run_date = run.runDate.date()
     for row in todo:
         await check.tick()
+        allowed = assigned_profiles(run.assignments, scoring_key(row.groupKey, row.forceInclude))
+        if not allowed:
+            row.status = "unassigned"
+            await _save_fields(row, ("status",))
+            continue
         ex: JobExtraction = row.extraction
         # CPU-bound: run off the event loop so the API stays responsive during big runs.
         res = await asyncio.to_thread(
-            score_row, ex, row.jdText, job_blocked=row.status == "excluded",
-            resumes=resumes, profiles=profiles, idf=idf, run_date=run_date,
+            score_row, ex, row.jdText, job_blocked=False,
+            resumes=[r for r in resumes if r.account_id in allowed],
+            profiles={k: v for k, v in profiles.items() if k in allowed}, idf=idf, run_date=run_date,
         )
         row.scores = res.scores
         row.profileGates = [ProfileGates(**pg) for pg in res.profile_gates]
@@ -304,10 +390,104 @@ async def _score_stage(run: JobApplyRun, rows: list[JobApplyRow], check: _Checke
         row.topScore = res.top_score
         row.tailorOnly = res.tailor_only
         row.scoredAt = datetime.utcnow()
-        if row.status == "extracted":
-            row.status = "scored"
+        row.status = "scored"  # also a job a person approved after it failed a check
         await _save_fields(row, _SCORE_FIELDS)
         await _inc(run.id, scored=1)
+
+
+_REREAD_FIELDS = tuple(dict.fromkeys(_FETCH_FIELDS + _EXTRACT_FIELDS + _SCORE_FIELDS))
+_FAILED = ("fetch_failed", "llm_failed")
+_syncing: set[str] = set()
+
+
+def same_time(a: Optional[datetime], b: Optional[datetime]) -> bool:
+    """Equal to the millisecond (MongoDB keeps no more)."""
+    return a is not None and b is not None and abs((a - b).total_seconds()) < 0.002
+
+
+def row_counts(row: JobApplyRow) -> dict[str, int]:
+    """What the run's counters hold for this row (the stages' `_inc` calls), to move them when a row is read again."""
+    return {
+        "failed": int(row.status in _FAILED),
+        "extracted": int(row.status in ("extracted", "excluded", "scored", "unassigned")),
+        "excluded": int(row.status == "excluded"),
+    }
+
+
+async def move_counts(run_id: PydanticObjectId, before: dict[str, int], after: dict[str, int]) -> None:
+    inc = {f"counts.{k}": after[k] - before[k] for k in before if after[k] != before[k]}
+    if inc:
+        await JobApplyRun.get_motor_collection().update_one({"_id": run_id}, {"$inc": inc})
+
+
+async def reread_with_info(run: JobApplyRun, targets: list[JobApplyRow]) -> list[JobApplyRow]:
+    """Read these rows again from their URL's correction (no fetch, no LLM) in a run no worker is processing: gates,
+    bucket and, once scoring has started, their score. Returns the saved rows; one that could not be read is left
+    as it was."""
+    done: list[JobApplyRow] = []
+    for row in targets:
+        had_score = bool(row.scoredAt)
+        row.status, row.statusReason = "fetched", None
+        row.scoredAt, row.scores, row.profileGates, row.bestByProfile, row.topScore, row.tailorOnly = None, [], [], [], None, []
+        try:
+            await _extract_one(row, run, None)
+        except Exception:  # noqa: BLE001
+            log.exception("could not re-read row %s from its correction", row.id)
+            continue
+        if had_score:  # the score stage counts it again
+            await _inc(run.id, scored=-1)
+        await _save_fields(row, _REREAD_FIELDS)
+        done.append(row)
+    if not done:
+        return []
+    if run.phase == "score":
+        await _score_stage(run, await _rows(run.id), _Checker(run.id), only={r.id for r in done})
+    ids = {r.id for r in done}
+    return [r for r in await _rows(run.id) if r.id in ids]
+
+
+async def reapply_info(run: JobApplyRun, row: JobApplyRow) -> None:
+    """After a correction: read this one row again and move the run's counters. Other runs pick the correction up
+    through `sync_corrections` (or when they next read the URL)."""
+    before = row_counts(row)
+    done = await reread_with_info(run, [row])
+    if done:
+        for f in _REREAD_FIELDS:
+            setattr(row, f, getattr(done[0], f))
+        await move_counts(run.id, before, row_counts(row))
+
+
+async def sync_corrections(run: JobApplyRun) -> int:
+    """Re-read the rows of a finished run whose URL was corrected or approved after they were read, so a person with
+    the run already open sees other people's corrections and approvals. Rows already applied to are left alone.
+    Returns how many changed."""
+    key = str(run.id)
+    if run.status in ("queued", "running") or key in _syncing:
+        return 0
+    _syncing.add(key)
+    try:
+        rows = await _rows(run.id)
+        urls = sorted({r.url for r in rows if r.url})
+        if not urls:
+            return 0
+        infos = {i.url: i for i in await JobInfo.find({"url": {"$in": urls}}).to_list()}
+        approved = {a.url for a in await JobApproval.find({"url": {"$in": urls}}).to_list()}
+        stale = [
+            r for r in rows
+            if not r.appliedResumes and r.status not in ("pending", "fetched") and (
+                (r.url in infos and not same_time(r.infoAt, infos[r.url].editedAt))
+                or (r.url in approved and not r.forceInclude and r.jdText)
+            )
+        ]
+        if not stale:
+            return 0
+        before = {r.id: row_counts(r) for r in stale}
+        done = await reread_with_info(run, stale)
+        for r in done:
+            await move_counts(run.id, before[r.id], row_counts(r))
+        return len(done)
+    finally:
+        _syncing.discard(key)
 
 
 # ---------- run lifecycle ----------
@@ -334,10 +514,19 @@ async def run_worker(run_id: PydanticObjectId) -> None:
         user = await UserExtra.get(run.userId)
         check = _Checker(run_id)
         rows = await _rows(run_id)
+        # Fetch and read whatever still needs it (both stages skip finished rows), in either phase: a retry after
+        # scoring started, or a run resumed after a restart, picks its pending rows up here.
         await _ensure_running(run_id)
         await _fetch_stage(run, rows, check)
         await _ensure_running(run_id)
         await _extract_stage(run, rows, user, check)
+        await _ensure_running(run_id)
+        if run.phase == "screen":
+            if not run.autoStart:  # wait for the user to pick profiles per location group (POST /start)
+                await _set_run(run_id, status="screened", screenedAt=datetime.utcnow())
+                return
+            run.phase = "score"
+            await _set_run(run_id, phase="score", screenedAt=datetime.utcnow())
         await _ensure_running(run_id)
         await _score_stage(run, rows, check)
         if await _status(run_id) != "cancelled":

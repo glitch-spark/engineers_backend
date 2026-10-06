@@ -215,3 +215,42 @@ async def test_heartbeat_survives_a_failed_write(staff_user, monkeypatch):
     await asyncio.sleep(0.1)
     assert not hb.done() and calls["n"] >= 2
     hb.cancel()
+
+
+async def test_generate_stores_requested_models(client, staff_user, auth_header, ran, anthropic_key):
+    acc = await make_account(staff_user)
+    r = await client.post("/resume/generate", headers=auth_header(staff_user), json={
+        "accountId": str(acc.id), "company": "Acme", "jobDescription": JD, "generateCoverLetter": True,
+        "resumeModel": "anthropic:claude-opus-5-5", "coverLetterModel": "anthropic:claude-fable-5-1",
+        "screeningModel": "anthropic:claude-haiku-4-5", "coverLetterHook": "  loves your mission  ",
+    })
+    assert r.status_code == 202, r.text
+    job = await ResumeApplication.get(r.json()["jobId"])
+    assert job.resumeModelId == "anthropic:claude-opus-5-5"
+    assert job.coverLetterModelId == "anthropic:claude-fable-5-1"
+    assert job.screeningModelId == "anthropic:claude-haiku-4-5"
+    assert job.coverLetterHook == "loves your mission"
+
+
+async def test_generate_rejects_unknown_model_with_400(client, staff_user, auth_header, ran, anthropic_key):
+    acc = await make_account(staff_user)
+    r = await client.post("/resume/generate", headers=auth_header(staff_user), json={
+        "accountId": str(acc.id), "company": "Acme", "jobDescription": JD, "resumeModel": "anthropic:nope",
+    })
+    assert r.status_code == 400 and "anthropic:nope" in r.json()["detail"]
+    assert await ResumeApplication.count() == 0
+
+
+async def test_retry_keeps_requested_models(client, staff_user, auth_header, ran):
+    acc = await make_account(staff_user)
+    job = ResumeApplication(userId=staff_user.id, accountId=acc.id, companyName="Acme", companyNameLower="acme",
+                            jobDescription=JD, status="failed", step="queued", errorMessage="boom",
+                            resumeModelId="anthropic:claude-opus-5-5", coverLetterModelId="anthropic:claude-fable-5-1",
+                            screeningModelId="anthropic:claude-haiku-4-5", estimatedCostUsd=0.4)
+    await job.insert()
+    r = await client.post(f"/resume/jobs/{job.id}/retry", headers=auth_header(staff_user))
+    assert r.status_code == 202, r.text
+    fresh = await ResumeApplication.get(job.id)
+    assert fresh.status == "queued" and fresh.estimatedCostUsd is None
+    assert (fresh.resumeModelId, fresh.coverLetterModelId, fresh.screeningModelId) == (
+        "anthropic:claude-opus-5-5", "anthropic:claude-fable-5-1", "anthropic:claude-haiku-4-5")

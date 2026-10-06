@@ -44,6 +44,7 @@ from app.models import (  # noqa: E402
     JobApplyRow,
     JobApplyRun,
     JobExtractionCache,
+    JobInfo,
     JobPostingCache,
     Notification,
     RecurringCharge,
@@ -78,7 +79,7 @@ async def client(app) -> AsyncIterator[AsyncClient]:
 async def db_clean(app) -> AsyncIterator[None]:
     for model in (
         UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge,
-        JobApplyRun, JobApplyRow, JobExtractionCache, JobPostingCache, JobApplicationLog, ResumeApplication,
+        JobApplyRun, JobApplyRow, JobExtractionCache, JobInfo, JobPostingCache, JobApplicationLog, ResumeApplication,
     ):
         await model.delete_all()
     yield
@@ -143,3 +144,13 @@ def plans_today():
 
     with patch("app.routers.daily_plans._today", return_value=date(2026, 12, 31)):
         yield
+
+
+@pytest.fixture
+def anthropic_key(monkeypatch):
+    """Make the Anthropic models selectable (the catalog hides them without a key); nothing is called."""
+    from app import model_catalog
+    from app.config import get_settings
+
+    patched = get_settings().model_copy(update={"ANTHROPIC_API_KEY": "sk-ant-test"})
+    monkeypatch.setattr(model_catalog, "get_settings", lambda: patched)

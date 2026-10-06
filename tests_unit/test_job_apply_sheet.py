@@ -45,7 +45,7 @@ def test_dedupe_urls():
 
 
 def test_normalize_url():
-    assert normalize_url("HTTPS://Boards.Greenhouse.io/acme/jobs/1?gh_src=abc&gh_jid=1/") == "https://boards.greenhouse.io/acme/jobs/1?gh_jid=1/"
+    assert normalize_url("HTTPS://Boards.Greenhouse.io/acme/jobs/1?gh_src=abc&gh_jid=1/") == "https://boards.greenhouse.io/acme/jobs/1"
     assert normalize_url(" https://a.com/x/?ref=foo&lever-source=bar ") == "https://a.com/x"
 
 
@@ -95,3 +95,54 @@ def test_row_index_matches_sheet_rows_with_blank_rows():
 def test_hash_routed_urls_stay_distinct():
     rows = parse_sheet("j.xlsx", xlsx([["https://c.com/careers#/job/1"], ["https://c.com/careers#/job/2"], ["https://c.com/careers#/job/2"]]))
     assert [r.url for r in rows] == ["https://c.com/careers#/job/1", "https://c.com/careers#/job/2"]
+
+
+# ---------- messy cells (ported from job_url_filter's extract.py behaviour) ----------
+
+
+def test_url_inside_prose_is_found_and_trimmed():
+    rows = parse_sheet("j.xlsx", xlsx([["Job"], ["Senior dev - apply at https://jobs.lever.co/acme/1a2b."],
+                                       ["(https://jobs.lever.co/acme/3c4d)"]]))
+    assert [r.url for r in rows] == ["https://jobs.lever.co/acme/1a2b", "https://jobs.lever.co/acme/3c4d"]
+
+
+def test_www_url_without_scheme():
+    rows = parse_sheet("j.xlsx", xlsx([["Job"], ["www.acme.com/jobs/1"]]))
+    assert [r.url for r in rows] == ["https://www.acme.com/jobs/1"]
+
+
+def test_several_urls_in_one_cell_become_several_jobs():
+    rows = parse_sheet("j.xlsx", xlsx([["Jobs", "JD"],
+                                       ["https://a.com/jobs/1 https://a.com/jobs/2", JD],
+                                       ["https://a.com/jobs/3", JD]]))
+    assert [(r.rowIndex, r.url) for r in rows] == [(2, "https://a.com/jobs/1"), (2, "https://a.com/jobs/2"),
+                                                    (3, "https://a.com/jobs/3")]
+    # a description can't be split between two links, so those two are fetched
+    assert [r.jdText is not None for r in rows] == [False, False, True]
+
+
+def test_urls_scattered_across_columns_are_all_collected():
+    # no column is mostly links: every cell is scanned, row by row, left to right
+    rows = parse_sheet("j.xlsx", xlsx([["Company", "Notes", "Other"],
+                                       ["Acme", "see https://a.com/jobs/1", ""],
+                                       ["Beta", "", "https://b.com/jobs/2 and https://b.com/jobs/3"],
+                                       ["Gamma", "phone screen", ""],
+                                       ["Delta", "n/a", ""]]))
+    assert [r.url for r in rows] == ["https://a.com/jobs/1", "https://b.com/jobs/2", "https://b.com/jobs/3"]
+
+
+def test_sheet_counts_links_cleaned_and_duplicates():
+    rows = parse_sheet("j.xlsx", xlsx([["URL"], ["https://jobs.lever.co/acme/1a2b/apply?utm_source=x"],
+                                       ["https://jobs.lever.co/acme/1a2b"], ["https://a.com/jobs/2"]]))
+    assert len(rows) == 2 and rows.links == 3 and rows.cleaned == 1 and rows.duplicates == 1
+
+
+def test_company_column_is_read_from_its_header():
+    data = xlsx([["Company Name", "Job URL", "Description"], ["Acme Corp", "https://jobs.acme.com/1", JD], ["  Beta  ", "https://beta.io/j/2", None], [None, "https://gamma.io/3", None]])
+    rows = parse_sheet("jobs.xlsx", data)
+    assert [r.company for r in rows] == ["Acme Corp", "Beta", None]
+
+
+def test_no_company_without_a_company_header():
+    data = xlsx([["Link", "Description"], ["https://jobs.acme.com/1", JD]])
+    assert parse_sheet("jobs.xlsx", data)[0].company is None

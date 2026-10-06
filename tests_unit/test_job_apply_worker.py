@@ -1,12 +1,19 @@
 """Unit tests for the worker's pure stage-selection helpers (no database)."""
 import os
-from datetime import date
+from datetime import date, datetime, timedelta
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from app.job_apply.worker import failing_reasons, needs_stage, posted_for_row  # noqa: E402
+from app.job_apply.worker import (  # noqa: E402
+    assigned_profiles,
+    failing_reasons,
+    needs_stage,
+    posted_for_row,
+    posting_reusable,
+)
 from app.job_apply.schema import GateResult  # noqa: E402
+from app.job_apply.screening import scoring_key  # noqa: E402
 
 
 def test_needs_stage_idempotent():
@@ -32,3 +39,28 @@ def test_posted_priority():
 def test_failing_reasons():
     gates = [GateResult(name="remote", result="fail", reason="hybrid"), GateResult(name="freshness", result="unknown", reason="date unknown")]
     assert failing_reasons(gates) == "remote: hybrid"
+
+
+def test_posting_reusable():
+    now = datetime(2026, 10, 2, 12)
+    assert posting_reusable(now - timedelta(hours=23), now)
+    assert not posting_reusable(now - timedelta(hours=25), now)
+
+
+def test_assigned_profiles():
+    # assignments are per market (US / UKEU / LATAM / none); a job's markets come from its location group
+    assert assigned_profiles({"UKEU": ["a"], "*": ["b"]}, "GB") == {"a", "b"}
+    assert assigned_profiles({"UKEU": ["a"], "*": ["b"]}, "US") == {"b"}
+    assert assigned_profiles({"US": ["a"], "UKEU": ["c"]}, "Worldwide") == {"a", "c"}
+    assert assigned_profiles({}, "GB") == set()
+    assert assigned_profiles({"none": ["a"]}, None) == {"a"}
+    assert assigned_profiles({"US": ["a"]}, "CA") == set()
+
+
+def test_approved_other_location_job_uses_the_not_stated_picks():
+    # a job open only outside the target markets has no profile to score against, unless a person approved it:
+    # then it is handled like a job that states no location
+    picks = {"US": ["a"], "none": ["n"]}
+    assert assigned_profiles(picks, scoring_key("CA", False)) == set()
+    assert assigned_profiles(picks, scoring_key("CA", True)) == {"n"}
+    assert assigned_profiles(picks, scoring_key("US", True)) == {"a"}

@@ -1,32 +1,43 @@
 """Job Applies: upload a sheet of job postings, score selected resumes, suggest one resume per profile."""
 import asyncio
 import json
+import logging
 from datetime import date, datetime, timezone
 from typing import Annotated, Any, Optional
 
 import httpx
+from pymongo import UpdateOne
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
-from app.job_apply import file_links, gsheet, worker
+from app.job_apply import file_links, gsheet, sheet_checks, worker
+from app.job_apply.sheet_checks import sheet_text
+from app.job_apply.fetch import route as fetch_route
+from app.job_apply.screening import (
+    APPROVABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen, scoring_key,
+)
 from app.job_apply.resume_parse import health
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
-from app.job_apply.schema import GateResult, Location
+from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, WorkAuth, WorkMode
 from app.models.job_apply import (
     AppliedMark,
     file_key,
     JobApplicationLog,
     JobApplyRow,
     JobApplyRun,
+    JobInfo,
+    JobApproval,
     ProfileGates,
     RunCounts,
     RunSelection,
 )
-from app.routers._util import doc_to_dict, to_object_id
+from app.routers._util import doc_to_dict, require_model, to_object_id
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/job-applies", tags=["job-applies"])
 
@@ -39,6 +50,10 @@ FAILED = ("fetch_failed", "llm_failed")
 
 def _can_see(owner_id: PydanticObjectId, user: UserExtra) -> bool:
     return user.role == "admin" or str(owner_id) == str(user.id)
+
+
+def _retryable_query(run_id: PydanticObjectId) -> dict[str, Any]:
+    return {"runId": run_id, "status": {"$in": list(FAILED)}, "screen": {"$ne": "closed"}}
 
 
 async def _owned_run(run_id: str, user: UserExtra) -> JobApplyRun:
@@ -71,6 +86,8 @@ async def _suggested_count(run: JobApplyRun) -> int:
 async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
     out = doc_to_dict(run)
     out["suggested"] = await _suggested_count(run)
+    # Failed jobs a retry can help (a closed job stays closed).
+    out["retryable"] = await JobApplyRow.find(_retryable_query(run.id)).count()
     if with_profiles:
         ids = [s.accountId for s in run.selection]
         accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).to_list()}
@@ -130,6 +147,7 @@ class _RowListView(BaseModel):
     status: str
     statusReason: Optional[str] = None
     jdSource: Optional[str] = None
+    jdStructured: Optional[bool] = None
     postedDate: Optional[date] = None
     extraction: Optional[_ExtractionView] = None
     extractionSource: Optional[str] = None
@@ -143,11 +161,15 @@ class _RowListView(BaseModel):
     tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
     exported: dict[str, datetime] = Field(default_factory=dict)
     tailorOnly: list[str] = Field(default_factory=list)
+    screen: Optional[str] = None
+    groupKey: Optional[str] = None
+    forceInclude: bool = False
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
-            "jdSource": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
+            "screen": 1, "groupKey": 1, "forceInclude": 1,
+            "jdSource": 1, "jdStructured": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
             "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
             "extraction.workMode": 1, "extraction.allowedLocations": 1, "extraction.timezoneNote": 1,
@@ -225,12 +247,18 @@ def _row_summary(
         "company": row.company,
         "status": row.status,
         "statusReason": row.statusReason,
+        "screen": row.screen,
+        "groupKey": row.groupKey,
+        "markets": markets_for(row.groupKey),
+        "forceInclude": row.forceInclude,
         "jdSource": row.jdSource,
+        "jdStructured": row.jdStructured,
         "postedDate": row.postedDate.isoformat() if row.postedDate else None,
         "workMode": ex.workMode if ex else None,
         "allowedLocations": [l.model_dump() for l in ex.allowedLocations] if ex else [],
         "timezoneNote": ex.timezoneNote if ex else None,
         "extractionSource": row.extractionSource,
+        "humanEdited": row.extractionSource == "human",
         "gates": [g.model_dump() for g in row.gates],
         "profileGates": [pg.model_dump() for pg in row.profileGates],
         "topScore": row.topScore,
@@ -265,10 +293,12 @@ class _AppRowView(BaseModel):
     appliedResumes: list[AppliedMark] = Field(default_factory=list)
     tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
     tailorOnly: list[str] = Field(default_factory=list)
+    exported: dict[str, datetime] = Field(default_factory=dict)
 
     class Settings:
         projection = {
             "_id": 1, "url": 1, "profileGates": 1, "applied": 1, "appliedResumes": 1, "tailored": 1, "tailorOnly": 1,
+            "exported": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1, "bestByProfile.total": 1,
         }
 
@@ -351,11 +381,12 @@ async def _application_counts(run: JobApplyRun) -> dict:
     ctx = await _app_context(run, rows)
     counts = dict.fromkeys(("applied", "ready", "tailoring", "needsResume"), 0)
     per_profile = {str(s.accountId): {"toGo": 0, "ready": 0} for s in run.selection}
-    jobs = 0
+    jobs = to_export = 0
     for row in rows:
         apps = _applications(row, run.threshold, ctx)
         pending = [a for a in apps if a["state"] != "applied"]
         jobs += bool(pending)
+        to_export += sum(a["accountId"] not in row.exported and a["state"] == "ready" for a in pending)
         for a in apps:
             counts[a["state"]] += 1
         for a in pending:
@@ -366,6 +397,7 @@ async def _application_counts(run: JobApplyRun) -> dict:
     return {
         "jobs": jobs,  # jobs with at least one application to go
         "toGo": counts["ready"] + counts["tailoring"] + counts["needsResume"],
+        "toExport": to_export,  # applications with a resume to send, not yet in the shared sheet
         **counts,
         "byProfile": [
             {"accountId": acc, "name": names.get(acc, "(deleted profile)"), **n} for acc, n in per_profile.items()
@@ -385,7 +417,7 @@ async def _parse_selection(raw: str, user: UserExtra) -> list[RunSelection]:
         if not isinstance(it, dict):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid selection")
         acc = await Account.get(to_object_id(str(it.get("accountId", ""))))
-        if acc is None or not _can_see(acc.createdBy, user):
+        if acc is None or acc.archived or not _can_see(acc.createdBy, user):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
         have = {str(r.id) for r in acc.resumes}
         wanted = [str(x) for x in it.get("resumeIds") or []]
@@ -455,22 +487,30 @@ async def sheet_preview(
     """Read a job sheet without starting a run, so problems (not shared, no URL column, empty) show up early."""
     title, rows = await _read_sheet(file, sheetUrl.strip() or None)
     with_jd = sum(1 for r in rows if r.jdText)
-    return {"title": title, "total": len(rows), "withDescription": with_jd, "urlOnly": len(rows) - with_jd}
+    counts = {
+        "links": getattr(rows, "links", len(rows)), "duplicates": getattr(rows, "duplicates", 0),
+        "cleaned": getattr(rows, "cleaned", 0),
+        # LinkedIn, Indeed, Glassdoor…: never fetched, so they need a description in the sheet or another link
+        "blocked": sum(1 for r in rows if not r.jdText and fetch_route(r.url)[0] == "blocked"),
+    }
+    return {"title": title, "total": len(rows), "withDescription": with_jd, "urlOnly": len(rows) - with_jd, **counts}
 
 
 @router.post("/runs", status_code=status.HTTP_202_ACCEPTED)
 async def create_run(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    selection: str = Form(...),
+    selection: str = Form(""),
     file: Optional[UploadFile] = File(None),
     sheetUrl: str = Form(""),
     threshold: int = Form(75),
     maxAgeDays: int = Form(30),
 ) -> dict:
-    """The job sheet comes either as an uploaded file or as a link-shared Google Sheet (`sheetUrl`)."""
+    """The job sheet comes either as an uploaded file or as a link-shared Google Sheet (`sheetUrl`). Without a
+    `selection` the run screens the jobs and waits at "screened" for profiles per location group (POST /start);
+    with one it scores straight after screening, every group against every selected profile."""
     if await JobApplyRun.find_one({"userId": user.id, "status": {"$in": list(ACTIVE)}}):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is already in progress. Wait for it or cancel it.")
-    sel = await _parse_selection(selection, user)
+    sel = await _parse_selection(selection, user) if selection.strip() else []
     source_url = sheetUrl.strip() or None
     file_name, rows = await _read_sheet(file, source_url)
     if not rows:
@@ -481,6 +521,8 @@ async def create_run(
         fileName=file_name[:200],
         sourceUrl=source_url,
         selection=sel,
+        autoStart=bool(sel),
+        assignments={"*": [s.accountId for s in sel]} if sel else {},
         threshold=max(0, min(100, threshold)),
         maxAgeDays=max(1, min(365, maxAgeDays)),
         counts=RunCounts(total=len(rows)),
@@ -489,7 +531,9 @@ async def create_run(
     await JobApplyRow.insert_many([
         JobApplyRow(
             runId=run.id, userId=user.id, rowIndex=r.rowIndex, url=r.url, jdText=r.jdText,
+            company=r.company or "", sheetCompany=r.company or "",
             jdSource="sheet" if r.jdText else None,
+            jdStructured=True if r.jdText else None,
         )
         for r in rows
     ])
@@ -498,10 +542,69 @@ async def create_run(
     return {"runId": str(run.id), "status": run.status, "total": len(rows)}
 
 
+async def _run_summaries(runs: list[JobApplyRun]) -> dict[str, Optional[dict]]:
+    """Per run, the numbers its card shows: jobs worth applying to, closed, per candidate market, and (scored runs)
+    jobs still to apply to / applied, tailored resumes in progress. Counts are per job. Two aggregations for the
+    whole list; on failure every summary is None and the cards show without numbers."""
+    ids = [r.id for r in runs]
+    out: dict[str, dict] = {
+        str(i): {"worth": 0, "closed": 0, "markets": {m: 0 for m in MARKETS}, "toApply": 0, "applied": 0, "tailoring": 0}
+        for i in ids
+    }
+    if not ids:
+        return out
+    try:
+        pipeline = [
+            {"$match": {"runId": {"$in": ids}}},
+            {"$lookup": {"from": "job_apply_runs", "localField": "runId", "foreignField": "_id", "as": "run",
+                         "pipeline": [{"$project": {"threshold": 1}}]}},
+            {"$set": {
+                "thr": {"$first": "$run.threshold"},
+                "isApplied": {"$or": [{"$eq": ["$applied", True]}, {"$gt": [{"$size": {"$ifNull": ["$appliedResumes", []]}}, 0]}]},
+            }},
+            {"$set": {"isSuggested": {"$or": [
+                {"$and": [{"$ne": ["$topScore", None]}, {"$gte": ["$topScore", "$thr"]}]},
+                {"$gt": [{"$size": {"$ifNull": ["$tailorOnly", []]}}, 0]},
+            ]}}},
+            {"$group": {
+                "_id": {"run": "$runId", "screen": "$screen", "key": "$groupKey"},
+                "n": {"$sum": 1},
+                "toApply": {"$sum": {"$cond": [{"$and": ["$isSuggested", {"$not": ["$isApplied"]}]}, 1, 0]}},
+                "applied": {"$sum": {"$cond": ["$isApplied", 1, 0]}},
+            }},
+        ]
+        async for g in JobApplyRow.get_motor_collection().aggregate(pipeline):
+            s = out[str(g["_id"]["run"])]
+            screen = g["_id"].get("screen")
+            if screen in WORTH:
+                s["worth"] += g["n"]
+                for m in markets_for(g["_id"].get("key")):
+                    s["markets"][m] += g["n"]
+            elif screen == "closed":
+                s["closed"] += g["n"]
+            s["toApply"] += g["toApply"]
+            s["applied"] += g["applied"]
+        tailoring = [
+            {"$match": {"userId": runs[0].userId, "jobApplyRowId": {"$ne": None}, "status": {"$in": ["queued", "in_progress"]}}},
+            {"$lookup": {"from": "job_apply_rows", "localField": "jobApplyRowId", "foreignField": "_id", "as": "row",
+                         "pipeline": [{"$project": {"runId": 1}}]}},
+            {"$group": {"_id": {"$first": "$row.runId"}, "n": {"$sum": 1}}},
+        ]
+        async for g in ResumeApplication.get_motor_collection().aggregate(tailoring):
+            if g["_id"] is not None and str(g["_id"]) in out:
+                out[str(g["_id"])]["tailoring"] = g["n"]
+    except Exception as exc:  # noqa: BLE001 — the list still loads; cards show without numbers
+        log.warning("job-apply run summaries failed: %s", exc)
+        return {str(i): None for i in ids}
+    return out
+
+
 @router.get("/runs")
 async def list_runs(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    runs = await JobApplyRun.find({"userId": user.id}).sort("-createdAt").limit(50).to_list()
-    return {"runs": [await _run_out(r) for r in runs]}
+    # every run still kept (RUN_RETENTION_DAYS): the page filters and pages them
+    runs = await JobApplyRun.find({"userId": user.id}).sort("-createdAt").limit(200).to_list()
+    summaries = await _run_summaries(runs)
+    return {"runs": [{**await _run_out(r), "summary": summaries.get(str(r.id))} for r in runs]}
 
 
 def _naive_utc(value: str) -> datetime:
@@ -543,18 +646,153 @@ async def get_run(
 
 
 class RunPatch(BaseModel):
-    threshold: int = Field(ge=0, le=100)
+    threshold: Optional[int] = Field(None, ge=0, le=100)
+    maxAgeDays: Optional[int] = Field(None, ge=1, le=365)
+
+
+class _RescreenView(BaseModel):
+    """What re-applying the job gates reads (not the job text or scores)."""
+
+    id: PydanticObjectId = Field(alias="_id")
+    status: str
+    statusReason: Optional[str] = None
+    extraction: Optional[JobExtraction] = None
+    postedDate: Optional[date] = None
+    gates: list[GateResult] = Field(default_factory=list)
+    screen: Optional[str] = None
+    groupKey: Optional[str] = None
+    forceInclude: bool = False
+    jdStructured: Optional[bool] = None
+
+    class Settings:
+        projection = {
+            "_id": 1, "status": 1, "statusReason": 1, "extraction": 1, "postedDate": 1, "gates": 1, "screen": 1,
+            "groupKey": 1, "forceInclude": 1, "jdStructured": 1,
+        }
+
+
+async def _rescreen_rows(run: JobApplyRun) -> None:
+    """Re-apply the job gates to every read row (max age changed). No fetch, no LLM; one write for the rows
+    whose result changed."""
+    run_date = run.runDate.date()
+    ops, excluded = [], 0
+    rows = await JobApplyRow.find({"runId": run.id, "extraction": {"$ne": None}}).project(_RescreenView).to_list()
+    for row in rows:
+        before = (row.status, row.statusReason, row.screen, [g.model_dump() for g in row.gates])
+        rescreen(row, run_date=run_date, max_age_days=run.maxAgeDays)
+        excluded += row.status == "excluded"
+        after = (row.status, row.statusReason, row.screen, [g.model_dump() for g in row.gates])
+        if after != before:
+            ops.append(UpdateOne({"_id": row.id}, {"$set": {
+                "gates": after[3], "status": row.status, "statusReason": row.statusReason, "screen": row.screen,
+                "updatedAt": datetime.utcnow(),
+            }}))
+    if ops:
+        await JobApplyRow.get_motor_collection().bulk_write(ops, ordered=False)
+    await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$set": {"counts.excluded": excluded}})
 
 
 @router.patch("/runs/{run_id}")
 async def update_run(run_id: str, body: RunPatch, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     run = await _owned_run(run_id, user)
+    if body.maxAgeDays is not None and run.status != "screened":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Max age can only change before scoring starts.")
+    fields: dict[str, Any] = {k: v for k, v in body.model_dump().items() if v is not None}
     # Targeted $set: a full save() would overwrite counts/status the worker is updating meanwhile.
     await JobApplyRun.get_motor_collection().update_one(
-        {"_id": run.id}, {"$set": {"threshold": body.threshold, "updatedAt": datetime.utcnow()}}
+        {"_id": run.id}, {"$set": {**fields, "updatedAt": datetime.utcnow()}}
     )
-    run.threshold = body.threshold
+    for k, v in fields.items():
+        setattr(run, k, v)
+    if body.maxAgeDays is not None:
+        await _rescreen_rows(run)
     return await _run_out(run, with_profiles=True)
+
+
+class _ScreenView(BaseModel):
+    """The few fields the screening report reads (never the job text: runs have up to ~1,000 rows)."""
+
+    screen: Optional[str] = None
+    groupKey: Optional[str] = None
+    forceInclude: bool = False
+
+
+@router.get("/runs/{run_id}/screening")
+async def get_screening(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """How many jobs are worth applying to and why the others aren't, plus the worthwhile jobs grouped by location
+    with the run owner's profiles that fit each group."""
+    run = await _owned_run(run_id, user)
+    rows = await JobApplyRow.find({"runId": run.id}).project(_ScreenView).to_list()
+    accounts = await Account.find({"createdBy": run.userId, "archived": {"$ne": True}}).sort("+name").to_list()
+    profiles = [
+        {"id": str(a.id), "name": a.name, "country": a.country, "region": a.region, "resumes": len(a.resumes)}
+        for a in accounts
+    ]
+    return build_report(
+        [(r.screen, scoring_key(r.groupKey, r.forceInclude)) for r in rows], profiles, max_age_days=run.maxAgeDays
+    )
+
+
+class StartBody(BaseModel):
+    assignments: dict[str, list[str]]
+    selection: list[dict[str, Any]]
+    threshold: int = Field(75, ge=0, le=100)
+
+
+# Scoring results on a row; cleared when the run is scored again with new picks. Applied marks, tailored resumes
+# and sheet exports belong to a job x profile, not to a score, so they stay.
+_SCORE_RESET = {"scores": [], "profileGates": [], "bestByProfile": [], "topScore": None, "tailorOnly": [], "scoredAt": None}
+
+
+async def _clear_scores(run_id: PydanticObjectId) -> None:
+    coll = JobApplyRow.get_motor_collection()
+    now = datetime.utcnow()
+    scored = {"runId": run_id, "status": {"$in": ["scored", "unassigned"]}}
+    # an approved job that failed a check goes back to excluded (scoring takes both); one that only needed a check
+    # goes back to extracted like any other
+    failed = {"gates": {"$elemMatch": {"result": "fail"}}}
+    await coll.update_many(
+        {**scored, "forceInclude": True, **failed}, {"$set": {**_SCORE_RESET, "status": "excluded", "updatedAt": now}}
+    )
+    await coll.update_many(scored, {"$set": {**_SCORE_RESET, "status": "extracted", "updatedAt": now}})
+
+
+@router.post("/runs/{run_id}/start")
+async def start_run(run_id: str, body: StartBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Score a screened run: each location group's jobs against the profiles picked for it. A run that has finished
+    scoring can be scored again with new picks (back to step 2): its scores are replaced."""
+    run = await _owned_run(run_id, user)
+    rescore = run.phase == "score" and run.status in ("done", "failed", "cancelled")
+    if run.phase == "score" and run.status in ACTIVE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The run is still scoring.")
+    if run.status != "screened" and not rescore:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not waiting for review.")
+    if await JobApplyRun.find_one({"userId": run.userId, "status": {"$in": list(ACTIVE)}}):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Another run is in progress.")
+    sel = await _parse_selection(json.dumps(body.selection), user)
+    picked = {str(s.accountId) for s in sel}
+    assignments = {k: list(dict.fromkeys(ids)) for k, ids in body.assignments.items() if ids}
+    if any(v not in picked for ids in assignments.values() for v in ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick resumes for every assigned profile.")
+    worth = await JobApplyRow.find({"runId": run.id, "screen": {"$in": list(WORTH)}}).project(_ScreenView).to_list()
+    keys = {k for r in worth for k in (markets_for(scoring_key(r.groupKey, r.forceInclude)) or [NO_LOCATION])}
+    if not keys or not ("*" in assignments or keys & set(assignments)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least one profile for a group with jobs.")
+    fields = {
+        "assignments": {k: [PydanticObjectId(v) for v in ids] for k, ids in assignments.items()},
+        "selection": [s.model_dump() for s in sel], "threshold": body.threshold,
+        "phase": "score", "status": "queued", "updatedAt": datetime.utcnow(),
+    }
+    if rescore:
+        fields.update({"counts.scored": 0, "error": None, "finishedAt": None, "heartbeatAt": None})
+    res = await JobApplyRun.get_motor_collection().update_one({"_id": run.id, "status": run.status}, {"$set": fields})
+    if not res.modified_count:  # a second click got here first
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not waiting for review.")
+    if rescore:
+        await _clear_scores(run.id)
+    if worker.worker_enabled():
+        worker.start_run(run.id)
+    return await _run_out(await JobApplyRun.get(run.id), with_profiles=True)
 
 
 @router.post("/runs/{run_id}/cancel")
@@ -579,8 +817,8 @@ async def retry_failed(run_id: str, user: Annotated[UserExtra, Depends(get_curre
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Another run is in progress.")
     coll = JobApplyRow.get_motor_collection()
     res = await coll.update_many(
-        {"runId": run.id, "status": {"$in": list(FAILED)}},
-        {"$set": {"status": "pending", "statusReason": None, "updatedAt": datetime.utcnow()}},
+        _retryable_query(run.id),
+        {"$set": {"status": "pending", "statusReason": None, "screen": None, "updatedAt": datetime.utcnow()}},
     )
     reset = res.modified_count
     await JobApplyRun.get_motor_collection().update_one(
@@ -621,9 +859,12 @@ async def list_rows(
     applied: str = Query("any", pattern="^(any|yes|no)$"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    screen: str = Query(""),
 ) -> dict:
     run = await _owned_run(run_id, user)
     q = await _rows_query(run, view=view, account_id=accountId, min_score=minScore)
+    if screen:
+        q["screen"] = screen
 
     if applied == "any":
         total = await JobApplyRow.find(q).count()
@@ -668,16 +909,212 @@ async def list_rows(
     }
 
 
-@router.get("/rows/{row_id}")
-async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    row = await _owned_row(row_id, user)
+async def _row_detail(row: JobApplyRow) -> dict:
     run = await JobApplyRun.get(row.runId)
     tailored = await _tailored_docs(_tailored_ids(row))
     out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored)
     out["scores"] = [s.model_dump(mode="json") for s in sorted(row.scores, key=lambda s: s.total, reverse=True)]
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None
     out["jdText"] = row.jdText
+    # Who last corrected this URL (a correction is shared by everyone who uses the link).
+    info = await JobInfo.find_one(JobInfo.url == row.url) if row.url else None
+    out["info"] = (
+        {
+            "editedBy": info.editedByName,
+            "editedAt": info.editedAt.isoformat() + "Z",
+            # false: this row was read before the correction (see POST /runs/{id}/sync-info).
+            "applied": worker.same_time(row.infoAt, info.editedAt),
+        }
+        if info
+        else None
+    )
     return out
+
+
+@router.get("/rows/{row_id}")
+async def get_row(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    return await _row_detail(await _owned_row(row_id, user))
+
+
+class IncludeBody(BaseModel):
+    include: bool
+
+
+@router.put("/rows/{row_id}/include")
+async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Approve a job (or undo it): a person has checked it, so it moves to Worth applying whatever the checks said.
+    Needs a readable description: for a job that could not be fetched or read it has to be pasted in Job info first
+    (saving it reads the job again, and it lands in the bucket its checks give)."""
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    if run is None or run.status != "screened":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Jobs can only be approved before scoring starts.")
+    is_job = row.extraction.isJobPosting if row.extraction is not None else True
+    base = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
+        is_job=is_job, verified=row.jdStructured is not False,
+    )
+    if body.include and base not in APPROVABLE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This job is already worth applying to."
+                if base == "valid"
+                else "Paste the job description in Job info first: there is nothing to approve until the job has been read."
+            ),
+        )
+    row.forceInclude = body.include
+    row.screen = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey,
+        force_include=row.forceInclude, is_job=is_job, verified=row.jdStructured is not False,
+    )
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}
+    )
+    if row.url:  # shared per link: other runs of it are approved too (see worker.sync_corrections)
+        if body.include:
+            await JobApproval.get_motor_collection().update_one(
+                {"url": row.url},
+                {"$set": {"url": row.url, "approvedBy": user.id, "approvedByName": user.name or user.email or "",
+                          "approvedAt": datetime.utcnow(), "updatedAt": datetime.utcnow()},
+                 "$setOnInsert": {"createdAt": datetime.utcnow()}},
+                upsert=True,
+            )
+        else:
+            await JobApproval.find(JobApproval.url == row.url).delete()
+    return _row_summary(row, run.threshold)
+
+
+# ---------- job info corrections ----------
+
+
+@router.post("/runs/{run_id}/sync-info")
+async def sync_info(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Re-read this run's jobs whose link was corrected by someone after they were read (no fetch, no LLM)."""
+    run = await _owned_run(run_id, user)
+    return {"updated": await worker.sync_corrections(run)}
+
+
+class InfoBody(BaseModel):
+    """What a person corrected. Only the fields sent change; the description may be replaced or, for a job that
+    could not be fetched, pasted."""
+
+    title: Optional[str] = Field(default=None, max_length=300)
+    company: Optional[str] = Field(default=None, max_length=300)
+    workMode: Optional[WorkMode] = None
+    allowedLocations: Optional[list[Location]] = None
+    postedDate: Optional[date] = None  # null clears it
+    clearance: Optional[str] = Field(default=None, pattern="^(required|preferred|none)$")
+    workAuthorization: Optional[WorkAuth] = None  # null clears it
+    timezoneNote: Optional[str] = Field(default=None, max_length=300)  # null clears it
+    jdText: Optional[str] = Field(default=None, max_length=60000)
+
+
+_NULLABLE = {"postedDate", "workAuthorization", "timezoneNote"}
+
+
+def _require_editor(user: UserExtra) -> None:
+    if user.role not in ("admin", "staff"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admin and staff can correct jobs.")
+
+
+@router.put("/rows/{row_id}/info")
+async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Correct a job's parsed info and/or description. Saved per URL for everyone; this row is read again now,
+    other runs use it the next time they read the URL."""
+    _require_editor(user)
+    row = await _owned_row(row_id, user)
+    if not row.url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only jobs with a link can be corrected.")
+    run = await JobApplyRun.get(row.runId)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if run.status in ACTIVE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Wait for the run to finish its current step.")
+
+    info = await JobInfo.find_one(JobInfo.url == row.url)
+    sent = {f for f in body.model_fields_set if getattr(body, f) is not None or f in _NULLABLE}
+    current_jd = (info.jdText if info else row.jdText) or ""
+    new_jd = (body.jdText or "").strip() if "jdText" in sent else ""
+    jd = new_jd or current_jd
+    if not jd.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the job description first.")
+    fields = sent - {"jdText"}
+    ex = info.extraction if info else row.extraction
+    if ex is None or (new_jd and new_jd != current_jd and not fields):
+        # No reading yet, or a new description with nothing else corrected: read it (one LLM call).
+        try:
+            ex, _ = await worker.EXTRACT(jd, user=user, run_date=run.runDate.date())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("job info extraction failed: %s", exc)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read that description.") from exc
+    ex = ex.model_copy(deep=True)
+    ex.isJobPosting = True
+    if "title" in fields:
+        ex.title = (body.title or "").strip()
+    elif not ex.title:
+        ex.title = row.title
+    if "company" in fields:
+        ex.company = (body.company or "").strip()
+    elif not ex.company:
+        ex.company = row.company
+    if "workMode" in fields:
+        ex.workMode = body.workMode
+    if "allowedLocations" in fields:
+        ex.allowedLocations = body.allowedLocations
+    if "postedDate" in fields:
+        ex.postedDate = body.postedDate
+    if "clearance" in fields:
+        ex.clearance = Clearance(level=body.clearance, note=ex.clearance.note)
+    if "workAuthorization" in fields:
+        ex.workAuthorization = body.workAuthorization
+    if "timezoneNote" in fields:
+        ex.timezoneNote = (body.timezoneNote or "").strip() or None
+
+    if info is None:
+        info = JobInfo(url=row.url, jdText=jd, extraction=ex)
+    info.jdText, info.extraction, info.postedDate = jd, ex, ex.postedDate
+    info.title, info.company = ex.title, ex.company
+    info.editedBy, info.editedByName, info.editedAt = user.id, user.name or user.email or "", datetime.utcnow()
+    await info.save()
+
+    await worker.reapply_info(run, row)  # also moves the run's counters
+    return await _row_detail(row)
+
+
+@router.delete("/rows/{row_id}/info")
+async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Drop the correction for this job's URL and read the job again with the machine (fetch + LLM)."""
+    _require_editor(user)
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if run.status in ACTIVE or await JobApplyRun.find_one({"userId": run.userId, "status": {"$in": list(ACTIVE)}}):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A run is in progress.")
+    if row.url:
+        await JobInfo.find(JobInfo.url == row.url).delete()
+    before = worker.row_counts(row)
+    if row.scoredAt:
+        await JobApplyRun.get_motor_collection().update_one({"_id": run.id}, {"$inc": {"counts.scored": -1}})
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id},
+        {"$set": {
+            "status": "pending", "statusReason": None, "screen": None, "jdText": None, "jdSource": None,
+            "jdStructured": None, "fetchedPostedDate": None, "postedDate": None, "title": "", "company": row.sheetCompany,
+            "extraction": None, "extractionSource": None, "infoAt": None, "gates": [], "groupKey": None, "scoredAt": None,
+            "scores": [], "profileGates": [], "bestByProfile": [], "topScore": None, "tailorOnly": [],
+            "updatedAt": datetime.utcnow(),
+        }},
+    )
+    await worker.move_counts(run.id, before, {k: 0 for k in before})
+    await JobApplyRun.get_motor_collection().update_one(
+        {"_id": run.id},
+        {"$set": {"status": "queued", "error": None, "finishedAt": None, "heartbeatAt": None, "updatedAt": datetime.utcnow()}},
+    )
+    if worker.worker_enabled():
+        worker.start_run(run.id)
+    return {"ok": True}
 
 
 # ---------- applied marks ----------
@@ -843,6 +1280,11 @@ def _host(url: Optional[str]) -> str:
     return (urlsplit(url or "").hostname or "").removeprefix("www.")
 
 
+def _company_label(row: JobApplyRow) -> str:
+    """What a job's company is called on its tailored resume and on the zip of its sheet download."""
+    return row.company or _host(row.url) or row.title
+
+
 def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
     """The profile whose resume scored best on this job (even below the threshold); else the run's first."""
     if row.scores:
@@ -853,7 +1295,13 @@ def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
 
 
 async def _tailor_row(
-    row: JobApplyRow, run: JobApplyRun, owner: UserExtra, account_id: Optional[str], cover_letter: bool
+    row: JobApplyRow,
+    run: JobApplyRun,
+    owner: UserExtra,
+    account_id: Optional[str],
+    cover_letter: bool,
+    resume_model: Optional[str] = None,
+    cover_letter_model: Optional[str] = None,
 ) -> ResumeApplication:
     account_id = account_id or _best_profile(row, run)
     if account_id not in {str(s.accountId) for s in run.selection}:
@@ -861,20 +1309,29 @@ async def _tailor_row(
     account = await Account.get(PydanticObjectId(account_id))
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
+    previous = row.tailored.get(account_id)
+    if previous:  # a failed one is re-run in place, not replaced by another job
+        retried = await resume_queue.requeue_failed(
+            previous, account=account, jd=row.jdText or "", company=_company_label(row), job_url=row.url,
+            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model,
+        )
+        if retried is not None:
+            return retried
     job = await resume_queue.enqueue_generation(
         user=owner,
         account=account,
         jd=row.jdText or "",
-        company=row.company or _host(row.url) or row.title,
+        company=_company_label(row),
         job_url=row.url,
         cover_letter=cover_letter,
         source="job_applies",
         job_apply_row_id=row.id,
+        resume_model=resume_model,
+        cover_letter_model=cover_letter_model,
     )
     jobs = ResumeApplication.get_motor_collection()
     # Compare-and-set: only link the new job if the row still points where we read it. A concurrent tailor
     # (double click, `t` twice) that got there first wins; ours is dropped so nothing is left orphaned.
-    previous = row.tailored.get(account_id)
     linked = await JobApplyRow.get_motor_collection().update_one(
         {"_id": row.id, f"tailored.{account_id}": previous},
         {"$set": {f"tailored.{account_id}": job.id, "updatedAt": datetime.utcnow()}},
@@ -892,15 +1349,23 @@ async def _tailor_row(
     return job
 
 
+# Job Applies tailors in bulk, so its resumes always use this cheap model, whatever is picked on other pages.
+JOB_APPLIES_RESUME_MODEL = "openai:gpt-4o-mini"
+
+
 class TailorBody(BaseModel):
     accountId: Optional[str] = None
     coverLetter: bool = False
+    coverLetterModel: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
 class TailorAllBody(BaseModel):
     # Profiles to tailor for (default: every profile in the run); each job gets one per chosen profile it's open to.
     accountIds: Optional[list[str]] = None
+    # Only these jobs (the ones ticked in the table), instead of every suggested job.
+    rowIds: Optional[list[str]] = Field(default=None, max_length=1000)
     coverLetter: bool = False
+    coverLetterModel: Optional[str] = None
     dryRun: bool = False  # count what would be queued, queue nothing
 
 
@@ -912,20 +1377,31 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
     owner = await UserExtra.get(row.userId)
     if run is None or owner is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    job = await _tailor_row(row, run, owner, body.accountId, body.coverLetter)
+    resume_model = JOB_APPLIES_RESUME_MODEL
+    cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
+    job = await _tailor_row(
+        row, run, owner, body.accountId, body.coverLetter,
+        resume_model=resume_model, cover_letter_model=cover_letter_model,
+    )
     doc = await ResumeApplication.get_motor_collection().find_one({"_id": job.id}, _TAILORED_PROJECTION)
     return {"tailored": _tailored_out(doc)}
 
 
 @router.post("/runs/{run_id}/tailor-all")
 async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Queue a tailored resume for each suggested job × each chosen profile the job is open to and that hasn't
-    applied to it yet, unless that profile already has one (a failed one is redone), up to the daily cap.
-    `dryRun` only counts."""
+    """Queue a tailored resume for each suggested job (or just the `rowIds` given) × each chosen profile the job is
+    open to and that hasn't applied to it yet, unless that profile already has one (a failed one is redone in place),
+    up to the daily cap; redoing a failed one adds no job, so the cap doesn't limit it. `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
+    resume_model = JOB_APPLIES_RESUME_MODEL
+    cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     chosen = set(body.accountIds or [str(s.accountId) for s in run.selection])
-    rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
+    if body.rowIds is not None:  # the ticked jobs of this run, whatever view they were ticked in
+        query: dict[str, Any] = {"_id": {"$in": [to_object_id(i) for i in body.rowIds]}, "runId": run.id}
+    else:
+        query = await _rows_query(run, view="suggested")
+    rows = await JobApplyRow.find(query).sort("+rowIndex").to_list()
     ctx = await _app_context(run, rows)
     existing = ctx.tailored
     remaining = await resume_queue.remaining_today(owner)
@@ -936,15 +1412,19 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
             current = existing.get(str(row.tailored.get(acc)))
             if current and current.get("status") != "failed":
                 continue
-            if remaining <= 0:
+            retry = current is not None  # a failed one re-runs in place: no new job, so the cap doesn't apply
+            if not retry and remaining <= 0:
                 skipped += 1
                 continue
             if body.dryRun:
                 queued += 1
-                remaining -= 1
+                remaining -= 0 if retry else 1
                 continue
             try:
-                await _tailor_row(row, run, owner, acc, body.coverLetter)
+                await _tailor_row(
+                    row, run, owner, acc, body.coverLetter,
+                    resume_model=resume_model, cover_letter_model=cover_letter_model,
+                )
             except HTTPException as exc:
                 if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                     skipped += 1
@@ -953,18 +1433,58 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
                     other += 1
                 continue
             queued += 1
-            remaining -= 1
+            remaining -= 0 if retry else 1
     return {"queued": queued, "skippedCap": skipped, "skipped": other}
 
 
 # ---------- export to Google Sheets ----------
 
-EXPORT_HEADER = ["Date", "Profile", "Company", "Title", "Job URL", "Resume", "Resume type", "Score", "Posted", "Applied"]
+# One row per application with a resume to send. Re-tailoring fills the new link into the row it went to
+# (app/job_apply/sheet_links.py finds it again by Profile and Job URL).
+EXPORT_HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume"]
 
 
 class ExportBody(BaseModel):
     sheetUrl: str = ""  # empty = the link saved from the last export
     dryRun: bool = False  # count and check access only
+
+
+def _download_cell(link: str) -> str:
+    return f'=HYPERLINK("{link}","Download")'
+
+
+def _export_target(sheet_url: str, user: UserExtra) -> tuple[str, str]:
+    """(link, spreadsheet id) to export to: the one given, else the one saved from the last export."""
+    url = sheet_url.strip() or (user.jobApplySheetUrl or "")
+    if not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the Google Sheet link to export to.")
+    try:
+        sheet_id, _ = gsheet.parse_gsheet_url(url)
+    except SheetError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return url, sheet_id
+
+
+async def _remember_sheet(url: str, user: UserExtra) -> None:
+    if url != user.jobApplySheetUrl:
+        await UserExtra.get_motor_collection().update_one({"_id": user.id}, {"$set": {"jobApplySheetUrl": url}})
+
+
+async def _checks_rows(run: JobApplyRun) -> list[list]:
+    """The run's Checks tab: every job, in sheet order, with its details and status."""
+    rows = await JobApplyRow.find({"runId": run.id}).sort("+rowIndex").to_list()
+    return [sheet_checks.checks_row(r) for r in rows]
+
+
+async def _write_checks(http: httpx.AsyncClient, sheet_id: str, run: JobApplyRun, info: dict) -> tuple[str, int]:
+    """Write (or rewrite) the run's own Checks tab; exporting again replaces it, never adds to it."""
+    tab = sheet_checks.checks_tab_name(run)
+    values = await _checks_rows(run)
+    await google_sheets.ensure_tab(http, sheet_id, tab, sheet_checks.CHECKS_HEADER, info)
+    # only the export's own columns: notes typed beside them stay next to the same jobs (same order each time)
+    await google_sheets.clear_range(http, sheet_id, google_sheets._a1(tab, "A1:H"))
+    await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [sheet_checks.CHECKS_HEADER, *values])
+    return tab, len(values)
 
 
 def _today_label(user: UserExtra) -> str:
@@ -976,26 +1496,21 @@ def _today_label(user: UserExtra) -> str:
 
 @router.post("/runs/{run_id}/export-sheet")
 async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Append one row per job × profile still to apply to (with that profile's tailored resume if ready, else its
-    matching uploaded resume) to today's tab of the shared Google Sheet. Rows already exported are skipped."""
+    """Append one row per job x profile with a resume to send (that profile's tailored resume when it's done, else its
+    matching uploaded one) to today's "Apply · <date>" tab of the shared Google Sheet. Applications waiting for a
+    tailored resume aren't written yet: exporting again after tailoring adds them. Rows already exported are skipped."""
     run = await _owned_run(run_id, user)
-    url = body.sheetUrl.strip() or (user.jobApplySheetUrl or "")
-    if not url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the Google Sheet link to export to.")
-    try:
-        sheet_id, _ = gsheet.parse_gsheet_url(url)
-    except SheetError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    url, sheet_id = _export_target(body.sheetUrl, user)
 
     rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
     ctx = await _app_context(run, rows)
     accounts = {str(a.id): a for a in await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()}
     resumes = {str(r.id): r for a in accounts.values() for r in a.resumes}
-    today = _today_label(user)
+    tab = f"Apply · {_today_label(user)}"
 
     out: list[list] = []
     marks: list[tuple] = []
-    pending = needs = already = no_file = 0
+    waiting = already = no_file = 0
     for row in rows:
         for app in _applications(row, run.threshold, ctx):
             acc = app["accountId"]
@@ -1004,69 +1519,110 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             if acc in row.exported:
                 already += 1
                 continue
-            if app["state"] == "tailoring":
-                pending += 1
-                continue
-            if app["state"] == "needsResume":
-                needs += 1  # nothing to apply with yet: tailor it first
+            if app["state"] != "ready":
+                waiting += 1  # tailoring, or needs a tailored resume: exported once it's done
                 continue
             if app.get("tailoredJobId"):
-                link, kind = file_links.file_url("tailored", app["tailoredJobId"]), "Tailored"
+                link = file_links.file_url("tailored", app["tailoredJobId"])
             else:
                 resume = resumes.get(app["resumeId"])
                 if not resume or not resume.s3Key:
                     no_file += 1  # the original PDF isn't stored, so there's nothing to link to
                     continue
-                link, kind = file_links.file_url("resume", app["resumeId"], account_id=acc), f"Uploaded · {app['filename']}"
-            out.append([
-                today, accounts[acc].name if acc in accounts else "Profile", row.company, row.title, row.url,
-                f'=HYPERLINK("{link}","Download")', kind, app["score"] if app["score"] is not None else "",
-                row.postedDate.isoformat() if row.postedDate else "", False,
-            ])
+                link = file_links.file_url("resume", app["resumeId"], account_id=acc, company=_company_label(row))
+            name = accounts[acc].name if acc in accounts else "Profile"
+            out.append([*map(sheet_text, (name, row.company, row.title, row.url)), _download_cell(link)])
             marks.append((row.id, acc))
 
     async with httpx.AsyncClient() as http:
         try:
             info = await google_sheets.sheet_info(http, sheet_id)
+            written = None
             if not body.dryRun and out:
-                await google_sheets.ensure_tab(http, sheet_id, today, EXPORT_HEADER, info)
-                await google_sheets.append_rows(http, sheet_id, today, out)
+                if not await google_sheets.ensure_tab(http, sheet_id, tab, EXPORT_HEADER, info):
+                    await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [EXPORT_HEADER])
+                written = await google_sheets.append_rows(http, sheet_id, tab, out)
         except google_sheets.SheetsError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    now = datetime.utcnow()
     if not body.dryRun:
+        now, first = datetime.utcnow(), None
+        if written:
+            try:
+                _, first, _ = google_sheets.parse_row_span(written)
+            except ValueError:
+                log.warning("export of run %s: unexpected range %r, rows not recorded", run.id, written)
         coll = JobApplyRow.get_motor_collection()
-        for row_id, acc in marks:
-            await coll.update_one({"_id": row_id}, {"$set": {f"exported.{acc}": now, "updatedAt": now}})
-    if url != user.jobApplySheetUrl:
-        await UserExtra.get_motor_collection().update_one({"_id": user.id}, {"$set": {"jobApplySheetUrl": url}})
+        for i, (row_id, acc) in enumerate(marks):
+            fields = {f"exported.{acc}": now, "updatedAt": now}
+            if first is not None:
+                fields[f"exportedRows.{acc}"] = {"sheetId": sheet_id, "tab": tab, "row": first + i}
+            await coll.update_one({"_id": row_id}, {"$set": fields})
+    await _remember_sheet(url, user)
     return {
         "ready": len(out),
         "added": 0 if body.dryRun else len(out),
-        "pending": pending,
-        "needsResume": needs,
+        "waiting": waiting,  # applications without their tailored resume yet
         "alreadyExported": already,
         "noFile": no_file,
         "sheetTitle": info["title"],
-        "tab": today,
+        "tab": tab,
         "sheetUrl": url,
         "serviceAccount": google_sheets.service_account_email(),
     }
 
 
-def _pdf_name(*parts: str) -> str:
-    import re
+class ChecksBody(BaseModel):
+    sheetUrl: str = ""  # empty = the link saved from the last export
+    dryRun: bool = False  # count and check access only
 
-    return re.sub(r"[^\w .()-]+", "_", " - ".join(p for p in parts if p)).strip() or "Resume"
+
+@router.post("/runs/{run_id}/export-checks")
+async def export_checks(run_id: str, body: ChecksBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Write every job in the run (company, URL, title, posting date, location, security clearance, remote / hybrid /
+    on-site, status) to the run's own "Checks · …" tab, replacing what an earlier export wrote there. Available once
+    the jobs are checked (step 2 onward); adds no application rows."""
+    run = await _owned_run(run_id, user)
+    if run.phase == "screen" and run.status in ("queued", "running"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The jobs are still being checked.")
+    url, sheet_id = _export_target(body.sheetUrl, user)
+    tab = sheet_checks.checks_tab_name(run)
+    async with httpx.AsyncClient() as http:
+        try:
+            info = await google_sheets.sheet_info(http, sheet_id)
+            if body.dryRun:
+                jobs = await JobApplyRow.find({"runId": run.id}).count()
+            else:
+                tab, jobs = await _write_checks(http, sheet_id, run, info)
+        except google_sheets.SheetsError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    await _remember_sheet(url, user)
+    return {
+        "tab": tab,
+        "jobs": jobs,
+        "sheetTitle": info["title"],
+        "sheetUrl": url,
+        "serviceAccount": google_sheets.service_account_email(),
+    }
+
+async def _stored_file(key: str) -> bytes:
+    """The bytes of a stored resume file; 404 when it's gone, 502 when the storage can't be reached right now."""
+    try:
+        return await resume_files.read_resume_file(key)
+    except resume_files.FileUnavailable:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read resume file %s: %s", key, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not fetch the resume. Try the link again.")
 
 
 @router.get("/files/{token}")
 async def resume_file(token: str):
-    """A resume PDF from an exported sheet's link. No login: the signed, expiring link is the permission."""
+    """A resume from an exported sheet's link, as `<Company>.zip` holding `resume.pdf`. No login: the signed,
+    expiring link is the permission."""
     import base64
 
-    from fastapi.responses import RedirectResponse, Response
+    from fastapi.responses import Response
 
     try:
         ref = file_links.read_token(token)
@@ -1074,21 +1630,25 @@ async def resume_file(token: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This link is invalid or has expired.")
     if ref["kind"] == "tailored":
         doc = await ResumeApplication.get_motor_collection().find_one(
-            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1, "profileName": 1}
+            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1}
         )
         if doc is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume no longer exists.")
-        filename = _pdf_name(f"Resume ({doc.get('companyName') or 'job'})", doc.get("profileName") or "") + ".pdf"
         if doc.get("s3Key"):
-            return RedirectResponse(resume_files.presigned_url(doc["s3Key"], filename))
-        if doc.get("pdfData"):
-            return Response(
-                base64.b64decode(doc["pdfData"]), media_type="application/pdf",
-                headers={"Content-Disposition": f'inline; filename="{filename}"'},
-            )
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
-    acc = await Account.get(to_object_id(ref["accountId"] or ""))
-    resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
-    if resume is None or not resume.s3Key:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
-    return RedirectResponse(resume_files.presigned_url(resume.s3Key, resume.filename))
+            data = await _stored_file(doc["s3Key"])
+        elif doc.get("pdfData"):
+            data = base64.b64decode(doc["pdfData"])
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
+        company, entry = doc.get("companyName") or ref["company"], file_links.entry_name(None)
+    else:
+        acc = await Account.get(to_object_id(ref["accountId"] or ""))
+        resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
+        if resume is None or not resume.s3Key:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+        data, company, entry = await _stored_file(resume.s3Key), ref["company"], file_links.entry_name(resume.filename)
+    return Response(
+        file_links.build_zip(data, entry),
+        media_type="application/zip",
+        headers={"Content-Disposition": file_links.content_disposition(file_links.zip_name(company))},
+    )

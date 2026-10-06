@@ -21,11 +21,21 @@ from app.free_llm import (
     clamp_max_tokens,
     get_preset,
 )
+from app.llm_anthropic import anthropic_complete
+from app.model_catalog import (
+    TASK_EFFORT,
+    ModelSpec,
+    Task,
+    fallback_chain,
+    is_inactive,
+    usage_cost,
+    validate_requested,
+)
 from app.models import UserExtra
 
 log = logging.getLogger(__name__)
 
-LlmProvider = Literal["free", "openai"]
+LlmProvider = Literal["free", "openai", "anthropic"]
 
 
 @dataclass
@@ -36,6 +46,8 @@ class LlmResult:
     usage: dict
     fallback_used: bool
     fallback_reason: Optional[str] = None
+    model_id: str = ""  # provider-prefixed catalog id, e.g. "anthropic:claude-sonnet-5-5"
+    cost_usd: Optional[float] = None  # None when the model's price is unknown
 
 
 def free_llm_configured(user: Optional[UserExtra]) -> bool:
@@ -122,9 +134,12 @@ async def _free_chat_completion(
     max_tokens: int,
     *,
     timeout: float = FREE_LLM_RESUME_TIMEOUT_SECONDS,
+    temperature: Optional[float] = None,
 ) -> tuple[str, dict]:
     client = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=timeout)
     kwargs = build_free_chat_kwargs(preset, prompt, max_tokens)
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     response = await client.chat.completions.create(**kwargs)
     text = ""
     if response.choices:
@@ -146,16 +161,40 @@ def _free_error_retryable(exc: Exception) -> bool:
     return True
 
 
-async def _openai_responses(prompt: str, model: Optional[str] = None) -> tuple[str, dict]:
+# Purposes whose output must not vary between runs of the same input (structured extraction, not writing).
+DETERMINISTIC_PURPOSES = frozenset({"job_extract"})
+
+
+def _temperature_for(purpose: str) -> Optional[float]:
+    return 0.0 if purpose in DETERMINISTIC_PURPOSES else None
+
+
+def _openai_model_for(purpose: str, settings) -> str:
+    if purpose == "job_extract" and (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip():
+        return settings.JOB_EXTRACT_MODEL.strip()
+    return settings.RESUME_OPENAI_MODEL
+
+
+_REASONING_FAMILIES = ("gpt-5", "gpt-6")
+
+
+async def _openai_responses(
+    prompt: str, model: Optional[str] = None, effort: Optional[str] = None, *, temperature: Optional[float] = None
+) -> tuple[str, dict]:
+    """One OpenAI Responses call. Reasoning effort goes only to the gpt-5/gpt-6 families; `effort`
+    defaults to the RESUME_REASONING_EFFORT setting (legacy callers pass none). `temperature` goes to other
+    models (o-series reasoning models reject it)."""
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     resolved = model or settings.RESUME_OPENAI_MODEL
     kwargs: dict = {"model": resolved, "input": prompt}
-    if resolved.startswith("gpt-5"):
-        effort = (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
-        kwargs["reasoning"] = {"effort": effort}
+    if resolved.startswith(_REASONING_FAMILIES):
+        resolved_effort = effort or (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
+        kwargs["reasoning"] = {"effort": resolved_effort}
+    elif temperature is not None and not resolved.startswith(("o1", "o3", "o4")):  # reasoning models reject it
+        kwargs["temperature"] = temperature
     response = await client.responses.create(**kwargs)
     usage_out: dict = {}
     usage = getattr(response, "usage", None)
@@ -200,6 +239,8 @@ async def complete_with_fallback(
     """Try free NVIDIA tier when configured; fall back to OpenAI on errors/bad output."""
     settings = get_settings()
     preset, max_tokens, api_key = resolve_free_preset(user) if user else (None, 8192, "")
+    if purpose == "job_extract" and (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip():
+        preset = None  # the configured extraction model is the one whose accuracy was measured
     attempted_free = False
     fallback_reason: Optional[str] = None
 
@@ -214,6 +255,7 @@ async def complete_with_fallback(
                 api_key,
                 free_max_tokens,
                 timeout=free_timeout,
+                temperature=_temperature_for(purpose),
             )
             if not text.strip():
                 raise ValueError("empty free LLM output")
@@ -247,8 +289,8 @@ async def complete_with_fallback(
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured and free LLM unavailable")
 
-    openai_model = settings.RESUME_OPENAI_MODEL
-    text, usage = await _openai_responses(prompt, openai_model)
+    openai_model = _openai_model_for(purpose, settings)
+    text, usage = await _openai_responses(prompt, openai_model, temperature=_temperature_for(purpose))
     if validate:
         validate(text)
     log.info(
@@ -269,8 +311,76 @@ async def complete_with_fallback(
     )
 
 
-async def complete_resume(prompt: str, user: Optional[UserExtra]) -> LlmResult:
-    return await complete_with_fallback(prompt, user, purpose="resume")
+async def _call_spec(
+    spec: ModelSpec, prompt: str, task: Task, user: Optional[UserExtra]
+) -> tuple[str, dict]:
+    """One call to one catalog model. Raises on any provider failure."""
+    if spec.provider == "anthropic":
+        effort = TASK_EFFORT[task] if spec.supports_effort else None
+        return await anthropic_complete(spec.api_model, prompt, effort=effort)
+    return await _openai_responses(prompt, spec.api_model, effort=TASK_EFFORT[task])
+
+
+def _failure_reason(spec: ModelSpec, exc: Exception) -> str:
+    return f"{spec.label}: {str(exc)[:300]}"
+
+
+async def complete(
+    task: Task,
+    prompt: str,
+    user: Optional[UserExtra],
+    *,
+    model_id: Optional[str] = None,
+    validate: Optional[Callable[[str], None]] = None,
+) -> LlmResult:
+    """Run `prompt` on the requested model (or the task default), falling back down the chain.
+
+    Raises ModelNotAvailable for a bad requested id; otherwise re-raises the last model's error
+    when every model in the chain fails. A model switched off after the request was saved (a queued
+    job) gives way to the task default."""
+    if is_inactive(model_id):
+        log.info("%s: %s is turned off; using the default model", task, model_id)
+        model_id = None
+    validate_requested(task, model_id, user)
+    chain = fallback_chain(task, model_id, user)
+    if not chain:
+        raise RuntimeError(f"No model available for {task}: configure an API key")
+    first_reason: Optional[str] = None
+    last_exc: Optional[Exception] = None
+    for index, spec in enumerate(chain):
+        try:
+            text, usage = await _call_spec(spec, prompt, task, user)
+            if not (text or "").strip():
+                raise ValueError("empty model output")
+            if validate:
+                validate(text)
+        except Exception as exc:  # noqa: BLE001 — any failure moves on to the next model
+            last_exc = exc
+            first_reason = first_reason or _failure_reason(spec, exc)
+            log.warning("%s via %s failed: %s", task, spec.id, exc)
+            continue
+        log.info(
+            "%s via %s in=%s out=%s fallback=%s",
+            task, spec.id, usage.get("input", "?"), usage.get("output", "?"), index > 0,
+        )
+        return LlmResult(
+            text=text,
+            provider=spec.provider,
+            model=spec.api_model,
+            usage=usage,
+            fallback_used=index > 0,
+            fallback_reason=first_reason if index > 0 else None,
+            model_id=spec.id,
+            cost_usd=usage_cost(spec, usage),
+        )
+    assert last_exc is not None
+    raise last_exc
+
+
+async def complete_resume(
+    prompt: str, user: Optional[UserExtra], model_id: Optional[str] = None
+) -> LlmResult:
+    return await complete("resume", prompt, user, model_id=model_id)
 
 
 def _coerce_screening_answer(item: object) -> str:
@@ -513,16 +623,16 @@ def _validate_screening_output(raw: str, questions: list[str]) -> None:
         raise ValueError("screening LLM returned unparsed answers JSON wrapper")
 
 
-async def complete_screening(prompt: str, user: Optional[UserExtra], questions: list[str]) -> LlmResult:
+async def complete_screening(
+    prompt: str,
+    user: Optional[UserExtra],
+    questions: list[str],
+    model_id: Optional[str] = None,
+) -> LlmResult:
     def _validate(raw: str) -> None:
         _validate_screening_output(raw, questions)
 
-    return await complete_with_fallback(
-        prompt,
-        user,
-        validate=_validate,
-        purpose="screening",
-    )
+    return await complete("screening", prompt, user, model_id=model_id, validate=_validate)
 
 
 async def test_free_connection(user: UserExtra) -> dict:

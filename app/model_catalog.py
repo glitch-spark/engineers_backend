@@ -1,0 +1,240 @@
+"""Selectable LLM catalog: providers, the suggested models per task, which are usable right now,
+defaults, fallback order and cost estimates. Pure data + lookups; no network calls.
+
+Two providers (Anthropic, OpenAI). Each task offers an ordered preset list per provider; the first
+active entry is that provider's recommendation for the task."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+from app.config import get_settings
+from app.models import UserExtra
+
+Task = Literal["resume", "cover_letter", "screening"]
+Tier = Literal["budget", "balanced", "premium"]
+Provider = Literal["anthropic", "openai"]
+
+PROVIDER_ORDER: tuple[Provider, ...] = ("anthropic", "openai")
+PROVIDER_LABEL: dict[Provider, str] = {"anthropic": "Anthropic", "openai": "OpenAI"}
+
+# Reasoning/thinking depth per task (Anthropic output_config.effort, OpenAI reasoning.effort).
+TASK_EFFORT: dict[Task, str] = {"resume": "low", "cover_letter": "high", "screening": "low"}
+
+# Typical (input, output) tokens for one task run, for the UI cost estimate. Cover letter covers
+# the whole draft + critique + revise pipeline.
+TASK_TOKEN_PROFILE: dict[Task, tuple[int, int]] = {
+    "resume": (6000, 5000),
+    "cover_letter": (21000, 1700),
+    "screening": (4000, 800),
+}
+
+
+class ModelNotAvailable(ValueError):
+    """The requested model id is unknown, not offered for the task, or its provider isn't configured."""
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    id: str
+    provider: Provider
+    api_model: str
+    label: str
+    tier: Tier
+    best_for: str
+    price_in: float  # USD per 1M input tokens
+    price_out: float  # USD per 1M output tokens
+    supports_effort: bool = True
+    # Off: never offered, defaulted to or fallen back to; requests saved with it use the task default instead.
+    active: bool = True
+
+
+def _spec(provider, api_model, label, tier, best_for, price_in, price_out, supports_effort=True, active=True):
+    return ModelSpec(
+        f"{provider}:{api_model}", provider, api_model, label, tier, best_for, price_in, price_out, supports_effort,
+        active,
+    )
+
+
+# Prices: Anthropic from the Claude API price table, OpenAI from OpenAI's pricing page (standard tier).
+_SPECS: tuple[ModelSpec, ...] = (
+    _spec("anthropic", "claude-sonnet-5-5", "Sonnet 5.5", "balanced",
+          "Best value: precise template edits and solid prose", 2, 10),
+    _spec("anthropic", "claude-opus-5-5", "Opus 5.5", "premium", "Top quality writing and judgment", 4, 20),
+    _spec("anthropic", "claude-haiku-4-5", "Haiku 4.5", "budget",
+          "Cheapest Claude; fine for simple, mechanical work", 1, 5, supports_effort=False),
+    _spec("anthropic", "claude-fable-5-1", "Fable 5.1", "premium", "Maximum quality, most expensive", 10, 50),
+    _spec("anthropic", "claude-sonnet-5", "Sonnet 5", "balanced",
+          "Previous-generation Sonnet at the same price; a fallback", 2, 10),
+    _spec("anthropic", "claude-opus-5", "Opus 5", "premium",
+          "Previous-generation Opus; for comparison or as a fallback", 5, 25),
+    _spec("anthropic", "claude-opus-4-8", "Opus 4.8", "premium",
+          "Older Opus; for comparison or as a fallback", 5, 25),
+    _spec("openai", "gpt-6.1-sol", "GPT-6.1 Sol", "balanced",
+          "Near-Astra quality at a fraction of the cost", 2, 10, active=False),
+    _spec("openai", "gpt-6-astra", "GPT-6 Astra", "premium", "OpenAI's most capable model", 10, 50),
+    _spec("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "premium", "Older flagship; for comparison", 4, 20),
+    _spec("openai", "gpt-5.5", "GPT-5.5", "premium", "Older flagship; for comparison", 5, 30),
+    _spec("openai", "gpt-5.6-terra", "GPT-5.6 Terra", "balanced", "Older mid-tier model", 2, 12),
+    _spec("openai", "gpt-5.4-mini", "GPT-5.4 mini", "budget", "Good quality at a low price", 0.75, 4.5),
+    _spec("openai", "gpt-5-mini", "GPT-5 mini", "budget", "Low cost; proven for resumes here", 0.25, 2),
+    _spec("openai", "gpt-4o-mini", "GPT-4o mini", "budget",
+          "Older non-reasoning mini; fast and cheap", 0.15, 0.6, supports_effort=False),
+    _spec("openai", "gpt-6-luna", "GPT-6 Luna", "budget",
+          "Built for focused, high-volume work; cheapest", 0.1, 0.5),
+)
+_BY_ID = {s.id: s for s in _SPECS}
+
+_A = "anthropic:claude-"
+_O = "openai:"
+
+# Ordered presets per (task, provider): (model id, short tag shown in the picker). First active one = recommended.
+PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
+    ("resume", "anthropic"): [
+        (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
+        (_A + "haiku-4-5", "Cheapest"), (_A + "sonnet-5", "Older generation"),
+    ],
+    ("cover_letter", "anthropic"): [
+        (_A + "opus-5-5", "Recommended"), (_A + "fable-5-1", "Max quality"), (_A + "sonnet-5-5", "Lower cost"),
+        (_A + "opus-5", "Older generation"), (_A + "opus-4-8", "Older generation"),
+    ],
+    ("screening", "anthropic"): [
+        (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
+        (_A + "haiku-4-5", "Cheapest"), (_A + "sonnet-5", "Older generation"),
+    ],
+    # GPT-6.1 Sol is off; the entry after it is the recommendation meanwhile.
+    ("resume", "openai"): [
+        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-5.4-mini", "Balanced"),
+        (_O + "gpt-4o-mini", "Older generation"), (_O + "gpt-6-luna", "Cheapest"),
+    ],
+    ("cover_letter", "openai"): [
+        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.6-sol", "Older flagship"),
+        (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5.5", "Older flagship"),
+        (_O + "gpt-5.6-terra", "Older mid-tier"),
+    ],
+    ("screening", "openai"): [
+        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.4-mini", "Balanced"),
+        (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-6-luna", "Cheapest"),
+    ],
+}
+
+
+def _provider_configured(provider: Provider) -> bool:
+    settings = get_settings()
+    key = settings.ANTHROPIC_API_KEY if provider == "anthropic" else settings.OPENAI_API_KEY
+    return bool((key or "").strip())
+
+
+def _preset_ids(task: Task, provider: Provider) -> list[str]:
+    return [model_id for model_id, _tag in PRESETS[(task, provider)] if _BY_ID[model_id].active]
+
+
+def is_inactive(model_id: Optional[str]) -> bool:
+    """A known model that has been switched off."""
+    spec = _BY_ID.get((model_id or "").strip())
+    return spec is not None and not spec.active
+
+
+def preset_tag(task: Task, model_id: str) -> Optional[str]:
+    for provider in PROVIDER_ORDER:
+        for preset_id, tag in PRESETS[(task, provider)]:
+            if preset_id == model_id:
+                return tag
+    return None
+
+
+def available_models(task: Task, user: Optional[UserExtra] = None) -> list[ModelSpec]:
+    """Presets for `task` whose provider is configured, Anthropic first, in preset order."""
+    return [
+        _BY_ID[model_id]
+        for provider in PROVIDER_ORDER
+        if _provider_configured(provider)
+        for model_id in _preset_ids(task, provider)
+    ]
+
+
+def get_model(model_id: str, user: Optional[UserExtra] = None) -> Optional[ModelSpec]:
+    """Any known model whose provider is usable right now (regardless of task)."""
+    spec = _BY_ID.get(model_id)
+    return spec if spec is not None and _provider_configured(spec.provider) else None
+
+
+def _configured_default(task: Task) -> str:
+    settings = get_settings()
+    return {
+        "resume": settings.RESUME_DEFAULT_MODEL,
+        "cover_letter": settings.COVER_LETTER_DEFAULT_MODEL,
+        "screening": settings.SCREENING_DEFAULT_MODEL,
+    }[task]
+
+
+def _openai_recommendation(task: Task) -> str:
+    return _preset_ids(task, "openai")[0]
+
+
+def default_model_id(task: Task, user: Optional[UserExtra] = None) -> Optional[str]:
+    usable = [s.id for s in available_models(task)]
+    configured = _configured_default(task)
+    if configured in usable:
+        return configured
+    return usable[0] if usable else None
+
+
+def validate_requested(task: Task, model_id: Optional[str], user: Optional[UserExtra] = None) -> Optional[ModelSpec]:
+    wanted = (model_id or "").strip()
+    if not wanted:
+        return None
+    spec = _BY_ID.get(wanted)
+    if spec is None:
+        raise ModelNotAvailable(f"Unknown model '{wanted}'.")
+    if not spec.active:
+        raise ModelNotAvailable(f"{spec.label} is turned off; pick another model.")
+    if wanted not in _preset_ids(task, spec.provider):
+        raise ModelNotAvailable(f"Model '{wanted}' can't be used for {task.replace('_', ' ')}.")
+    if not _provider_configured(spec.provider):
+        raise ModelNotAvailable(f"Model '{wanted}' is not configured on this server.")
+    return spec
+
+
+def fallback_chain(task: Task, requested_id: Optional[str], user: Optional[UserExtra] = None) -> list[ModelSpec]:
+    """Preferred model, then the task default, then OpenAI's recommendation; usable ones only."""
+    usable = {s.id: s for s in available_models(task)}
+    wanted = (requested_id or "").strip() or default_model_id(task)
+    chain: list[ModelSpec] = []
+    for model_id in (wanted, _configured_default(task), _openai_recommendation(task)):
+        spec = usable.get(model_id or "")
+        if spec is not None and spec not in chain:
+            chain.append(spec)
+    return chain
+
+
+def cache_lane(spec: ModelSpec, task: Task, user: Optional[UserExtra] = None) -> str:
+    """Key part for the resume LLM output cache: the model plus the reasoning effort it ran with."""
+    effort = TASK_EFFORT[task] if spec.supports_effort else "none"
+    return f"{spec.provider}:{spec.api_model}:{effort}"
+
+
+def usage_cost(spec: ModelSpec, usage: dict) -> float:
+    return (
+        (usage.get("input") or 0) * spec.price_in + (usage.get("output") or 0) * spec.price_out
+    ) / 1_000_000
+
+
+def estimate_call_cost(spec: ModelSpec, task: Task) -> float:
+    tokens_in, tokens_out = TASK_TOKEN_PROFILE[task]
+    return usage_cost(spec, {"input": tokens_in, "output": tokens_out})
+
+
+def public_view(spec: ModelSpec, task: Task, default_id: Optional[str]) -> dict:
+    return {
+        "id": spec.id,
+        "label": spec.label,
+        "provider": spec.provider,
+        "tier": spec.tier,
+        "bestFor": spec.best_for,
+        "estCostUsd": estimate_call_cost(spec, task),
+        "isDefault": spec.id == default_id,
+        "recommended": _preset_ids(task, spec.provider)[0] == spec.id,
+        "tag": preset_tag(task, spec.id) or "",
+    }
