@@ -1,25 +1,65 @@
 # Bidder bid reports (Slack channel)
 
-Users manage bidders on the Bidders page. Each bidder points at a screenshot
-folder in S3. The 5-minute cron counts the screenshots in each folder and posts
-a **daily** bid count and a **weekly** count + pay report to one shared Slack
-channel. A bid is one `.png`, `.jpg`, `.jpeg` or `.webp` object (any case, subfolders
-included) whose `LastModified` falls in the report window `[start, end)`.
+Users manage bidders on the Bidders page. Each bidder points at the screenshot
+folder the Bid Track browser extension uploads to (Backblaze B2 or AWS S3). The
+5-minute cron counts each folder's bids and posts a **daily** bid count and a
+**weekly** count + pay report to one shared Slack channel.
+
+## What counts as a bid
+
+The extension uploads one screenshot per step of an application, under
+`<member>/<YYYY-MM-DD>/<profile>/<job>/step<n>_<trigger>_<stamp>.png`. A bidder's
+folder is their member prefix, e.g. `s3://bid-screenshots/puma/`.
+
+**Folders are automatic.** Creating a bidder gives them their own folder (a slug of
+the name, `-2`, `-3`… on a clash) and sets its URL; once the bidder registers in the
+extension, the backend signs every upload into that folder (section 5). Legacy
+bidders get a folder from their old URL at startup.
+
+- **One bid = one job folder** (the folder that holds the screenshots). step1,
+  step2, next and submit screenshots of the same job count once.
+- The job counts in the report window `[start, end)` that holds its **earliest**
+  screenshot, so a job whose screenshots straddle the 6:30 PM cutoff counts once,
+  on the day it started.
+- Only `.png`, `.jpg`, `.jpeg` and `.webp` (any case) count. Files whose name starts
+  with `_` (e.g. old connection-test uploads) are ignored.
+- A job continued after the bidder's local midnight lands in a new date folder and
+  counts twice; the extension decides that path.
+- The profile is part of the path, so renaming a profile, or changing a bidder's
+  profile while a job is in progress, splits that job into two folders: it counts twice.
+
+Accepted folder URLs: `s3://<bucket>/<folder>/`, `https://<bucket>.s3.<region>.amazonaws.com/<folder>/`,
+`https://s3.<region>.amazonaws.com/<bucket>/<folder>/`,
+`https://s3.us-east-005.backblazeb2.com/<bucket>/<folder>/`,
+`https://<bucket>.s3.us-east-005.backblazeb2.com/<folder>/` and the Backblaze console's
+`https://f005.backblazeb2.com/file/<bucket>/<folder>/`. The URL only names the bucket
+and folder; which service is read comes from `BID_STORAGE_ENDPOINT_URL`.
 
 ## 1. Backend env
 
 ```env
 BID_STORAGE_PROVIDER=s3
-# Optional; blank falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION.
-BID_STORAGE_ACCESS_KEY_ID=
-BID_STORAGE_SECRET_ACCESS_KEY=
-BID_STORAGE_REGION=
+# AWS: optional; blank falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION.
+# Backblaze: required, no AWS fallback. The application key ID (005...) and application key (K005...).
+BID_STORAGE_ACCESS_KEY_ID=005...
+BID_STORAGE_SECRET_ACCESS_KEY=K005...
+# Backblaze: optional, read from the endpoint (us-east-005).
+BID_STORAGE_REGION=us-east-005
+# Blank = AWS S3. Backblaze: https://s3.us-east-005.backblazeb2.com (https:// is added if missing)
+BID_STORAGE_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
+# Bucket that bidder screenshot folders live in (new bidders get s3://<bucket>/<folder>/).
+# Never change it once bidders exist (see section 5).
+BID_STORAGE_BUCKET=bid-screenshots
 BID_REPORT_TIMEZONE=America/Chicago
 # HH:MM, 24h, in BID_REPORT_TIMEZONE.
 BID_DAILY_REPORT_TIME=18:30
 # monday ... sunday
 BID_WEEKLY_REPORT_DAY=saturday
 BID_WEEKLY_REPORT_TIME=16:00
+# YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows starting on or after that day's local midnight
+# count approved bid records instead of screenshot folders. Blank = folders everywhere (section 6).
+# Set it on the API service (the same service runs the report cron).
+BID_RECORDS_START=
 # Unset = reports are saved but not posted.
 SLACK_BIDS_CHANNEL_ID=C0123456789
 # Same bot as the interview bot.
@@ -43,24 +83,30 @@ bot to the bids channel** (`/invite @<bot>`) or posts fail with `not_in_channel`
 The report is one channel post per run; a long report continues as thread
 replies.
 
-## 3. S3 permissions
+## 3. Storage permissions
 
-Use a read-only identity. It only lists keys, it never reads objects:
+The backend lists keys to count bids and signs the Bid Track extension's screenshot
+uploads (section 5), so its key needs write access as well as listing, on the whole
+bucket. Bidders hold no storage keys of their own.
+
+**Backblaze B2:** create an application key for the backend on the `bid-screenshots`
+bucket with `listBuckets`, `listFiles` and `writeFiles`. Put its key ID and key in
+`BID_STORAGE_ACCESS_KEY_ID` / `BID_STORAGE_SECRET_ACCESS_KEY` (both are required when
+`BID_STORAGE_ENDPOINT_URL` is set; AWS_* keys are never used for Backblaze).
+
+**AWS S3:** use an identity that can list and write the bucket:
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "s3:ListBucket",
-    "Resource": "arn:aws:s3:::<bucket>",
-    "Condition": {"StringLike": {"s3:prefix": ["<bidder-prefix-1>/*", "<bidder-prefix-2>/*"]}}
-  }]
+  "Statement": [
+    {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::<bucket>"},
+    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::<bucket>/*"}
+  ]
 }
 ```
 
-List the bidders' prefixes, or `*` if one bucket holds only screenshots. A folder
-that cannot be read does not stop the report: that bidder shows a warning in Slack
+A folder that cannot be read does not stop the report: that bidder shows a warning in Slack
 and on the page, and the rest are reported normally.
 
 ## 4. Cron and catch-up
@@ -92,3 +138,67 @@ curl -X POST -H "x-cron-secret: $SLACK_BOT_CRON_SECRET" $APP_BASE_URL/internal/b
 
 The response lists the status per kind: `not-due`, `done`, `no-bidders`, `posted`,
 `saved:slack-not-configured` or `failed:post`.
+
+## 5. Bidder extension
+
+Bidders sign in to the Bid Track Chrome extension; the backend builds each screenshot's
+object path and returns a short-lived signed upload link, so bidders hold no storage keys.
+
+- **Invites.** Creating a bidder returns a one-time invite code (`<TAG>-XXXX-XXXX`, valid
+  7 days, single use). The bidder enters it with a username and password in the extension.
+- **Statuses.** `invited` (code issued, not registered), `active` (registered),
+  `archived` (cannot log in; its folder is kept).
+- **Reset login** invalidates the bidder's tokens and password and issues a new invite code;
+  archiving also invalidates tokens. **New invite code** is for bidders not yet registered.
+- **Backend key.** The backend's application key needs `listBuckets`, `listFiles` and
+  `writeFiles` on the whole bucket (section 3). Signing happens locally, so a key without
+  `writeFiles` is not detected when the link is signed: every bidder PUT then fails with 403.
+  `BID_STORAGE_BUCKET` must be set, otherwise uploads answer 503.
+- **Never change `BID_STORAGE_BUCKET`** once bidders exist: registered bidders are counted
+  from `s3://<old bucket>/<folder>/` while their uploads would be signed for the new bucket.
+- **Routes** (`/ext`): `POST /ext/register` (invite code, username, password), `POST /ext/login`,
+  `GET /ext/me`, and `POST /ext/upload-url` (`job`, `step`, `trigger`, `capturedAt`) which returns
+  `url`, `key`, `expiresAt` and `headers`; PUT the PNG to `url` within 5 minutes with
+  `Content-Type: image/png`. Registering switches counting to the bidder's folder
+  (`s3://<bucket>/<folder>/`).
+- **Errors** are `{"error": "<message>"}` with the status. A username or password that breaks
+  the rules answers 400 with `Username must be 3–40 characters: lowercase letters, numbers, dots,
+  underscores or dashes`, `Password must be at least 8 characters` or `Password is too long`
+  (over 72 bytes); any other malformed body answers 400 `Invalid request`.
+- **Tokens** last 30 days. `/ext/me` and `/ext/upload-url` add a fresh `token` to the response
+  once the presented one is over 7 days old, and the extension stores it, so a bidder who
+  keeps using the extension is never logged out by expiry; a token left unused for 30 days
+  expires and the bidder logs in again.
+- **Rate limit.** 10 failed logins or registrations (rule violations included) per username
+  and per client IP in 15 minutes answer 429. The client IP is the first `X-Forwarded-For`
+  entry. Verify on Railway whether its proxy overwrites or appends `X-Forwarded-For`; if it
+  appends, switch `client_ip` (`app/bids/rate_limit.py`) to the right-most entry.
+
+## 6. Rollout
+
+1. Set `BID_STORAGE_*` (section 1) and the key from section 3 on the API **and** cron
+   services. Deploy the backend, then the app. Existing bidders show "Invited · no code yet";
+   counting continues from their old folders.
+2. Run `python -m app.bids.folders --report` (read-only, with the production env). It lists
+   every active bidder whose folder URL will change when they register (name, folder,
+   current URL). Registering switches counting to the new folder for the whole week in
+   progress, so register those bidders right after a weekly cutoff, or adjust them by hand.
+3. Issue invite codes and send each bidder the extension zip (version **3.1.0** only: a 3.0.0 build
+   does not confirm uploads, so its bids' screenshots would show as missing) with the code. Tell them:
+   Remove any older "Bid Track Local" extension first (or unzip this version over its folder
+   and click Reload). Two installs side by side double-count or lose bids.
+4. Revoke each old shared upload key (`puma-uploader`, …) as soon as that prefix's bidders
+   have registered, so only the backend can write there.
+5. Switch counting to approved bid records with `BID_RECORDS_START=<YYYY-MM-DD>` (in
+   `BID_REPORT_TIMEZONE`) on the API service (it also runs the report cron). Set it **before
+   bidders start on rollout day**, to that day. A report window counts records only when it
+   **starts** on or after that day's local midnight; a window that starts earlier, including
+   one that straddles it, and every window while it is unset, keep counting screenshot
+   folders. So the first day counted from records is the first full daily window starting on
+   or after it, and the first weekly window counted from records is the first one starting
+   on or after it. Only **approved** bids count toward `count` and pay (`count x rate`);
+   pending and rejected bids are reported beside it, e.g. `(pending 1, rejected 1)` in Slack
+   and `pending` / `rejected` in the app's report rows (`null` on folder-counted rows). The
+   live counts judge each open window by its own start in the same way, so for a while after
+   rollout "today" can come from records and "this week" from folders. Bids are counted on
+   the day of their first screenshot.

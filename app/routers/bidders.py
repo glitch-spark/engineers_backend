@@ -5,10 +5,13 @@ from typing import Annotated, Literal, Optional
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from pymongo.errors import DuplicateKeyError
 
+from app.bids.folders import folder_url, unique_folder
+from app.bids.invites import clear_invite, issue_invite
 from app.bids.live_counts import CACHE, live_counts
 from app.bids.reports import run_bid_reports_tick
-from app.bids.schemas import BidderIn, bidder_out, report_out
+from app.bids.schemas import BidderIn, _iso_utc, bidder_out, report_out
 from app.bids.storage import get_bid_storage
 from app.bids.windows import schedule_from_settings
 from app.config import get_settings
@@ -19,6 +22,8 @@ from app.models.bidder import Bidder
 
 router = APIRouter(prefix="/bidders", tags=["bidders"])
 cron_router = APIRouter(prefix="/internal/bids", tags=["bids-cron"])
+
+MAX_FOLDER_ATTEMPTS = 5
 
 
 def ensure_owner(bidder, user):
@@ -72,21 +77,37 @@ async def list_bidders(
     return {"bidders": [bidder_out(b, names.get(b.profileId)) for b in bidders]}
 
 
+def _invite_out(code: str, bidder: Bidder) -> dict:
+    return {"code": code, "expiresAt": _iso_utc(bidder.inviteExpiresAt)}
+
+
 @router.post("")
 async def create_bidder(
     body: BidderIn, user: Annotated[UserExtra, Depends(get_current_user)]
 ) -> dict:
+    bucket = get_settings().BID_STORAGE_BUCKET
+    if not bucket:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BID_STORAGE_BUCKET is not set")
     account = await _check_profile(body, user)
-    bidder = Bidder(
-        createdBy=user.id,
-        name=body.name,
-        country=body.country,
-        profileId=PydanticObjectId(body.profileId) if body.profileId else None,
-        rate=body.rate,
-        screenshotFolderUrl=body.screenshotFolderUrl,
-    )
-    await bidder.insert()
-    return bidder_out(bidder, account.name if account else None)
+    for attempt in range(MAX_FOLDER_ATTEMPTS):
+        folder = await unique_folder(body.name)
+        bidder = Bidder(
+            createdBy=user.id,
+            name=body.name,
+            country=body.country,
+            profileId=PydanticObjectId(body.profileId) if body.profileId else None,
+            rate=body.rate,
+            folder=folder,
+            screenshotFolderUrl=folder_url(bucket, folder),
+        )
+        code = issue_invite(bidder, datetime.now(timezone.utc))
+        try:
+            await bidder.insert()
+            break
+        except DuplicateKeyError:  # another request took the folder (or, rarely, the code) first
+            if attempt == MAX_FOLDER_ATTEMPTS - 1:
+                raise
+    return {"bidder": bidder_out(bidder, account.name if account else None), "invite": _invite_out(code, bidder)}
 
 
 # Declared before "/{bidder_id}" routes so "live-counts" is not read as an id.
@@ -108,7 +129,6 @@ async def update_bidder(
     bidder.country = body.country
     bidder.profileId = PydanticObjectId(body.profileId) if body.profileId else None
     bidder.rate = body.rate
-    bidder.screenshotFolderUrl = body.screenshotFolderUrl
     await bidder.save()
     return bidder_out(bidder, account.name if account else None)
 
@@ -120,8 +140,38 @@ async def archive_bidder(
     bidder = await _load_owned(bidder_id, user)
     if bidder.archivedAt is None:
         bidder.archivedAt = datetime.now(timezone.utc)
+        bidder.tokenVersion += 1
+        clear_invite(bidder)
         await bidder.save()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{bidder_id}/invite")
+async def new_invite(bidder_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    bidder = await _load_owned(bidder_id, user)
+    if bidder.archivedAt is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bidder is archived")
+    if bidder.registeredAt is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already registered — use Reset login")
+    code = issue_invite(bidder, datetime.now(timezone.utc))
+    await bidder.save()
+    return _invite_out(code, bidder)
+
+
+@router.post("/{bidder_id}/reset-login")
+async def reset_login(bidder_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    bidder = await _load_owned(bidder_id, user)
+    if bidder.archivedAt is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bidder is archived")
+    if bidder.registeredAt is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Not registered yet — use New invite code")
+    bidder.username = None
+    bidder.passwordHash = None
+    bidder.registeredAt = None
+    bidder.tokenVersion += 1
+    code = issue_invite(bidder, datetime.now(timezone.utc))
+    await bidder.save()
+    return _invite_out(code, bidder)
 
 
 @router.get("/{bidder_id}/reports")

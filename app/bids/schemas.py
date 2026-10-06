@@ -1,12 +1,11 @@
 """Request schema and response shapes for bidders."""
 
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, field_validator
-
-from app.bids.storage import parse_folder_url
+from pydantic import BaseModel, Field, field_validator
 
 
 class BidderIn(BaseModel):
@@ -14,7 +13,6 @@ class BidderIn(BaseModel):
     country: Optional[str] = None
     profileId: Optional[str] = None
     rate: float
-    screenshotFolderUrl: str
 
     @field_validator("name")
     @classmethod
@@ -55,16 +53,6 @@ class BidderIn(BaseModel):
             raise ValueError("Rate must have at most 2 decimals")
         return v
 
-    @field_validator("screenshotFolderUrl")
-    @classmethod
-    def _folder_url(cls, v: str) -> str:
-        v = v.strip()
-        try:
-            parse_folder_url(v)
-        except ValueError:
-            raise ValueError("Use an s3:// or amazonaws.com folder URL") from None
-        return v
-
 
 def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
     """UTC ISO string with a Z suffix (as app/routers/interviews.py:_iso_utc). Motor returns naive UTC."""
@@ -73,6 +61,12 @@ def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.isoformat() + "Z"
+
+
+def bidder_status(b) -> str:
+    if b.archivedAt is not None:
+        return "archived"
+    return "active" if b.registeredAt is not None else "invited"
 
 
 def bidder_out(b, profile_name: Optional[str]) -> dict:
@@ -84,6 +78,11 @@ def bidder_out(b, profile_name: Optional[str]) -> dict:
         "profileName": profile_name,
         "rate": b.rate,
         "screenshotFolderUrl": b.screenshotFolderUrl,
+        "folder": b.folder,
+        "status": bidder_status(b),
+        "username": b.username,
+        "inviteExpiresAt": _iso_utc(b.inviteExpiresAt) if b.inviteCodeHash is not None else None,
+        "registeredAt": _iso_utc(b.registeredAt),
         "archivedAt": _iso_utc(b.archivedAt),
         "createdAt": _iso_utc(b.createdAt),
     }
@@ -99,4 +98,59 @@ def report_out(r) -> dict:
         "rate": r.rate,
         "amount": r.amount,
         "error": r.error,
+        "pending": r.pending,
+        "rejected": r.rejected,
+    }
+
+
+_USERNAME = re.compile(r"[a-z0-9._-]{3,40}")
+USERNAME_RULE = "Username must be 3–40 characters: lowercase letters, numbers, dots, underscores or dashes"
+PASSWORD_TOO_SHORT = "Password must be at least 8 characters"
+PASSWORD_TOO_LONG = "Password is too long"
+
+
+def credentials_problem(username: str, password: str) -> Optional[str]:
+    """The first username/password rule broken, as a message for the bidder; None when both are fine.
+
+    Checked in the route, not the schema: the app's validation handler turns schema errors into a bare
+    "Invalid request", and the bidder needs to see the rule."""
+    if not _USERNAME.fullmatch(username):
+        return USERNAME_RULE
+    if len(password) < 8:
+        return PASSWORD_TOO_SHORT
+    if len(password.encode()) > 72:  # bcrypt ignores everything past 72 bytes
+        return PASSWORD_TOO_LONG
+    return None
+
+
+class LoginIn(BaseModel):
+    """Length caps only bound memory (past them: the generic 400); the rules are credentials_problem()."""
+
+    username: str = Field(max_length=100)
+    password: str = Field(max_length=1024)
+
+    @field_validator("username")
+    @classmethod
+    def _user(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class RegisterIn(LoginIn):
+    inviteCode: str
+
+    @field_validator("inviteCode")
+    @classmethod
+    def _code(cls, v: str) -> str:
+        if len(v) > 100:
+            raise ValueError("Invalid invite code")
+        return v
+
+
+def bidder_me(b, profile_name: Optional[str]) -> dict:
+    return {
+        "name": b.name,
+        "folder": b.folder,
+        "profileName": profile_name,
+        "username": b.username,
+        "status": bidder_status(b),
     }

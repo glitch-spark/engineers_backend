@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from functools import lru_cache
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -8,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_YMD = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
@@ -112,12 +114,19 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
-    # Bidders — screenshot folders are counted in object storage (only "s3" for now). The access
-    # key / secret / region fall back to the AWS_* values above when unset.
+    # Bidders — screenshot folders are counted in object storage (only "s3" for now). Without an
+    # endpoint (AWS S3) the access key / secret / region fall back to the AWS_* values above when
+    # unset; with BID_STORAGE_ENDPOINT_URL set there is no AWS fallback (both BID_STORAGE_* keys needed).
     BID_STORAGE_PROVIDER: str = "s3"
     BID_STORAGE_ACCESS_KEY_ID: Optional[str] = None
     BID_STORAGE_SECRET_ACCESS_KEY: Optional[str] = None
     BID_STORAGE_REGION: Optional[str] = None
+    # S3-compatible endpoint for non-AWS storage, e.g. Backblaze B2:
+    # https://s3.us-east-005.backblazeb2.com (with the B2 key ID / application key above).
+    # Unset = AWS S3.
+    BID_STORAGE_ENDPOINT_URL: Optional[str] = None
+    # Bucket for bidder screenshot folders (s3://<bucket>/<folder>/); blank = unset.
+    BID_STORAGE_BUCKET: Optional[str] = None
     # Report schedule: wall-clock times in BID_REPORT_TIMEZONE (an IANA name). Daily report at
     # BID_DAILY_REPORT_TIME; weekly report on BID_WEEKLY_REPORT_DAY (monday..sunday) at
     # BID_WEEKLY_REPORT_TIME. Times are 24h HH:MM; invalid values fail at startup.
@@ -125,6 +134,10 @@ class Settings(BaseSettings):
     BID_DAILY_REPORT_TIME: str = "18:30"
     BID_WEEKLY_REPORT_DAY: str = "saturday"
     BID_WEEKLY_REPORT_TIME: str = "16:00"
+    # First day (YYYY-MM-DD, in BID_REPORT_TIMEZONE) counted from approved bid records instead of
+    # screenshot folders: a report window uses records when it ends after that day's local midnight.
+    # Unset = folders everywhere. Set it before bidders start on rollout day.
+    BID_RECORDS_START: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
 
@@ -135,6 +148,40 @@ class Settings(BaseSettings):
             return None
         s = str(v).strip()
         return s or None
+
+    @field_validator("BID_STORAGE_ENDPOINT_URL", mode="before")
+    @classmethod
+    def _normalize_bid_endpoint(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().rstrip("/")
+        if not s:
+            return None
+        # Backblaze's console shows the endpoint without a scheme; botocore rejects that.
+        return s if "://" in s else f"https://{s}"
+
+    @field_validator("BID_STORAGE_BUCKET", mode="before")
+    @classmethod
+    def _normalize_bid_bucket(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        return str(v).strip() or None
+
+    @field_validator("BID_RECORDS_START", mode="before")
+    @classmethod
+    def _validate_records_start(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if not _YMD.match(s):
+            raise ValueError("must be YYYY-MM-DD, e.g. 2026-10-06")
+        try:
+            date.fromisoformat(s)
+        except ValueError as e:
+            raise ValueError("not a calendar date, use YYYY-MM-DD") from e
+        return s
 
     @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
     @classmethod
