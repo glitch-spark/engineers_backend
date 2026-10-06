@@ -24,6 +24,7 @@ from app.models.bidder import Bidder
 router = APIRouter(prefix="/bids", tags=["bids"])
 
 Status = Literal["pending", "approved", "rejected"]
+RejectReason = Literal["no_submission", "wrong_profile", "not_job_page", "duplicate", "incomplete", "other"]
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # A folder listing reads the bidder's whole bucket prefix, and the review page reloads after every decision.
@@ -75,7 +76,7 @@ def _bid_out(bid: Bid, bidder_name: str, evidence: dict) -> dict:
         "jobDomain": job_domain(bid.jobUrl),
         "durationSec": duration_sec(bid),
         **evidence,
-        "rejectReason": None,
+        "rejectReason": bid.rejectReason,
     }
 
 
@@ -87,14 +88,31 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _decision(user, new_status: str, note: Optional[str]) -> dict:
+def _decision(user, new_status: str, note: Optional[str], reason: Optional[str] = None) -> dict:
     """Fields of one decision. Clearing changedSinceReview in the same update keeps a screenshot that arrives
-    mid-review from being flagged and unflagged out of order."""
+    mid-review from being flagged and unflagged out of order. The reject reason is kept only for a rejection."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     return {
         "status": new_status, "reviewedBy": user.id, "reviewedByName": user.name or user.email or "",
-        "reviewedAt": now, "note": note, "changedSinceReview": False, "updatedAt": now,
+        "reviewedAt": now, "note": note, "rejectReason": reason if new_status == "rejected" else None,
+        "changedSinceReview": False, "updatedAt": now,
     }
+
+
+def _check_reason(new_status: str, reason: Optional[str], note: Optional[str]) -> None:
+    """A reason belongs to a rejection, and Other has to be explained in the note."""
+    if reason is not None and new_status != "rejected":
+        raise HTTPException(status_code=400, detail="A reason only goes with a rejection")
+    if reason == "other" and not note:
+        raise HTTPException(status_code=400, detail="A note is required for Other")
+
+
+# Complete = ready to approve without a look at the gaps: still pending, Submit captured, no unconfirmed upload.
+_COMPLETE = {
+    "status": "pending",
+    "submittedAt": {"$ne": None},
+    "screenshots": {"$not": {"$elemMatch": {"uploadedAt": None}}},
+}
 
 
 @router.get("")
@@ -208,6 +226,7 @@ async def bid_screenshots(bid_id: str, user: Annotated[UserExtra, Depends(get_cu
 class ReviewIn(BaseModel):
     status: Status
     note: Optional[str] = Field(default=None, max_length=500)
+    reason: Optional[RejectReason] = None
 
     @field_validator("note")
     @classmethod
@@ -218,12 +237,17 @@ class ReviewIn(BaseModel):
 class BulkReviewIn(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=500)
     status: Status
+    reason: Optional[RejectReason] = None
+    onlyComplete: bool = False
 
 
 @router.put("/{bid_id}/review")
 async def review_bid(bid_id: str, body: ReviewIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     bid, bidder = await _load_reviewable(bid_id, user)
-    await Bid.get_motor_collection().update_one({"_id": bid.id}, {"$set": _decision(user, body.status, body.note)})
+    _check_reason(body.status, body.reason, body.note)
+    await Bid.get_motor_collection().update_one(
+        {"_id": bid.id}, {"$set": _decision(user, body.status, body.note, body.reason)}
+    )
     bid = await Bid.get(bid.id)
     # Write first, then recount. The recount is not atomic with other reviews: two reviews of the same day
     # finishing together can each count before the other's write, leaving the stored row one decision behind
@@ -234,16 +258,27 @@ async def review_bid(bid_id: str, body: ReviewIn, user: Annotated[UserExtra, Dep
 
 @router.post("/review")
 async def review_bids(body: BulkReviewIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    """Approve all shown: every id is access-checked; foreign, unknown and malformed ids are skipped."""
+    """Decide many bids at once: every id is access-checked; foreign, unknown and malformed ids are skipped. With
+    onlyComplete (approving only) a bid is also skipped unless it is complete when the write happens."""
+    _check_reason(body.status, body.reason, None)  # a bulk decision has no note, so Other is refused
+    if body.onlyComplete and body.status != "approved":
+        raise HTTPException(status_code=400, detail="onlyComplete only goes with approved")
     wanted = set(body.ids)
     ids = [PydanticObjectId(i) for i in wanted if PydanticObjectId.is_valid(i)]
     bids = await Bid.find({"_id": {"$in": ids}}).to_list()
     bidders = {b.id: b for b in await Bidder.find({"_id": {"$in": list({b.bidderId for b in bids})}}).to_list()}
     allowed = [b for b in bids if _can_review(bidders.get(b.bidderId), user)]
+    only = _COMPLETE if body.onlyComplete else {}
+    if allowed and only:  # narrow to the complete ones now so the recount below skips untouched bidders and days
+        allowed = await Bid.find({"_id": {"$in": [b.id for b in allowed]}, **only}).to_list()
+    updated = 0
     if allowed:
-        await Bid.get_motor_collection().update_many(
-            {"_id": {"$in": [b.id for b in allowed]}}, {"$set": _decision(user, body.status, None)}
+        # The completeness test rides along in the write itself: a bid that changed since the read is not touched.
+        result = await Bid.get_motor_collection().update_many(
+            {"_id": {"$in": [b.id for b in allowed]}, **only},
+            {"$set": _decision(user, body.status, None, body.reason)},
         )
+        updated = result.matched_count
         # One recount per bidder, daily window and weekly window, after all the writes (same race as the single
         # review). refresh_report_rows takes both rows from one bid's firstAt; the weekly cutoff falls inside a
         # daily window (Saturday's), so bids of one day can belong to two weekly rows.
@@ -255,4 +290,4 @@ async def review_bids(body: BulkReviewIn, user: Annotated[UserExtra, Depends(get
             per_period.setdefault(key, b)
         for b in per_period.values():
             await refresh_report_rows(b)
-    return {"updated": len(allowed), "skipped": len(wanted) - len(allowed)}
+    return {"updated": updated, "skipped": len(wanted) - updated}

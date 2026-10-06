@@ -36,6 +36,7 @@ class Bid(TimestampedDocument):
     reviewedByName: Optional[str] = None
     reviewedAt: Optional[datetime] = None
     note: Optional[str] = None
+    rejectReason: Optional[str] = None  # why it was rejected; only set while status is "rejected"
     changedSinceReview: bool = False  # a screenshot was added after a decision
 
     class Settings:

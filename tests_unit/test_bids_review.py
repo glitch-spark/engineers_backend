@@ -488,3 +488,186 @@ async def test_bulk_review_refreshes_both_weekly_rows_when_a_day_straddles_the_w
     assert r.json() == {"updated": 2, "skipped": 0}
     rows = {x.periodKey: (x.count, x.pending, x.amount) for x in await BidReport.find({"bidderId": ana.id}).to_list()}
     assert rows == {"d": (2, 0, 1.0), "w1": (1, 0, 0.5), "w2": (1, 0, 0.5)}
+
+
+async def complete(bid: Bid) -> Bid:
+    """Make a bid complete: Submit captured and every screenshot confirmed uploaded."""
+    at = bid.firstAt
+    await Bid.get_motor_collection().update_one(
+        {"_id": bid.id},
+        {"$set": {"submittedAt": at, "screenshots.0.uploadedAt": at, "screenshots.1.uploadedAt": at}},
+    )
+    return await Bid.get(bid.id)
+
+
+async def test_reject_with_reason_is_stored_and_returned(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
+    async with make_client(owner) as c:
+        r = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": "wrong_profile", "note": " not mine "})
+        listed = (await c.get("/bids", params={"day": DAY})).json()["bids"]
+        one = (await c.get(f"/bids/{bid.id}")).json()
+    assert r.status_code == 200, r.text
+    assert (r.json()["status"], r.json()["rejectReason"], r.json()["note"]) == ("rejected", "wrong_profile", "not mine")
+    assert r.json()["jobDomain"] == "jobs.example"  # still the evidence-bearing BidOut
+    assert (await Bid.get(bid.id)).rejectReason == "wrong_profile"
+    assert [b["rejectReason"] for b in listed] == ["wrong_profile"] and one["rejectReason"] == "wrong_profile"
+
+
+@pytest.mark.parametrize("reason", ["no_submission", "wrong_profile", "not_job_page", "duplicate", "incomplete"])
+async def test_reasons_other_than_other_do_not_need_a_note(make_client, owner, reason):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
+    async with make_client(owner) as c:
+        r = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": reason})
+    assert r.status_code == 200, r.text
+    assert (r.json()["rejectReason"], r.json()["note"]) == (reason, None)
+
+
+async def test_reject_without_a_reason_is_allowed_and_clears_the_old_one(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1), "rejected", rejectReason="duplicate")
+    assert (await Bid.get(bid.id)).rejectReason == "duplicate"  # the field is stored at all
+    async with make_client(owner) as c:
+        r = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected"})
+    assert (r.status_code, r.json()["rejectReason"]) == (200, None)
+
+
+async def test_other_needs_a_note(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
+    async with make_client(owner) as c:
+        missing = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": "other"})
+        blank = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": "other", "note": "   "})
+        empty = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": "other", "note": ""})
+        assert [r.status_code for r in (missing, blank, empty)] == [400] * 3
+        assert {r.json()["detail"] for r in (missing, blank, empty)} == {"A note is required for Other"}
+        stored = await Bid.get(bid.id)
+        assert (stored.status, stored.rejectReason, stored.reviewedBy) == ("pending", None, None)
+        ok = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": "other", "note": "spam site"})
+    assert (ok.status_code, ok.json()["rejectReason"], ok.json()["note"]) == (200, "other", "spam site")
+
+
+async def test_approve_clears_reject_reason(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1), "rejected", rejectReason="duplicate")
+    assert (await Bid.get(bid.id)).rejectReason == "duplicate"  # the field is stored at all
+    async with make_client(owner) as c:
+        r = await c.put(f"/bids/{bid.id}/review", json={"status": "approved"})
+    assert (r.status_code, r.json()["status"], r.json()["rejectReason"]) == (200, "approved", None)
+    assert (await Bid.get(bid.id)).rejectReason is None
+
+
+async def test_pending_clears_reject_reason(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1), "rejected", rejectReason="incomplete")
+    assert (await Bid.get(bid.id)).rejectReason == "incomplete"  # the field is stored at all
+    async with make_client(owner) as c:
+        r = await c.put(f"/bids/{bid.id}/review", json={"status": "pending"})
+    assert (r.status_code, r.json()["status"], r.json()["rejectReason"]) == (200, "pending", None)
+    assert (await Bid.get(bid.id)).rejectReason is None
+
+
+async def test_reason_without_rejection_is_400(make_client, owner):
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    bid = await add_bid(ana, "one", start + timedelta(hours=1))
+    async with make_client(owner) as c:
+        responses = [
+            await c.put(f"/bids/{bid.id}/review", json={"status": status, "reason": "duplicate"})
+            for status in ("approved", "pending")
+        ]
+        responses.append(await c.post("/bids/review", json={"ids": [str(bid.id)], "status": "approved", "reason": "duplicate"}))
+        unknown = await c.put(f"/bids/{bid.id}/review", json={"status": "rejected", "reason": "because"})
+    assert [r.status_code for r in responses] == [400] * 3
+    assert {r.json()["detail"] for r in responses} == {"A reason only goes with a rejection"}
+    assert unknown.status_code == 422  # not one of the reasons; the real app maps validation errors to 400
+    stored = await Bid.get(bid.id)
+    assert (stored.status, stored.rejectReason) == ("pending", None)
+
+
+async def test_bulk_reject_stores_the_reason_and_other_needs_a_note(make_client, owner):
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    bids = [await add_bid(ana, job, start + timedelta(hours=h)) for h, job in [(1, "a"), (2, "b")]]
+    ids = [str(b.id) for b in bids]
+    async with make_client(owner) as c:
+        other = await c.post("/bids/review", json={"ids": ids, "status": "rejected", "reason": "other"})  # bulk has no note
+        ok = await c.post("/bids/review", json={"ids": ids, "status": "rejected", "reason": "duplicate"})
+        approved = await c.post("/bids/review", json={"ids": ids[:1], "status": "approved"})
+    assert (other.status_code, other.json()["detail"]) == (400, "A note is required for Other")
+    assert ok.json() == {"updated": 2, "skipped": 0} and approved.json() == {"updated": 1, "skipped": 0}
+    assert [b.rejectReason for b in await Bid.find({"bidderId": ana.id}).sort("firstAt").to_list()] == [None, "duplicate"]
+
+
+async def test_bulk_only_complete_skips_rejected_incomplete_and_unconfirmed(make_client, owner):
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    good = await complete(await add_bid(ana, "good", start + timedelta(hours=1)))
+    rejected = await complete(await add_bid(ana, "rejected", start + timedelta(hours=2), "rejected", rejectReason="duplicate"))
+    no_submit = await add_bid(ana, "nosubmit", start + timedelta(hours=3))
+    for shot in (0, 1):  # every screenshot confirmed, but no Submit
+        await Bid.get_motor_collection().update_one({"_id": no_submit.id}, {"$set": {f"screenshots.{shot}.uploadedAt": no_submit.firstAt}})
+    unconfirmed = await add_bid(ana, "unconfirmed", start + timedelta(hours=4))  # one screenshot never confirmed
+    await Bid.get_motor_collection().update_one({"_id": unconfirmed.id}, {"$set": {"submittedAt": unconfirmed.firstAt}})
+    await add_report(ana, owner, pending=3, rejected=1)
+    ids = [str(b.id) for b in (good, rejected, no_submit, unconfirmed)]
+    async with make_client(owner) as c:
+        r = await c.post("/bids/review", json={"ids": ids, "status": "approved", "onlyComplete": True})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"updated": 1, "skipped": 3}
+    statuses = {b.jobTitle: (b.status, b.rejectReason) for b in await Bid.find({"bidderId": ana.id}).to_list()}
+    assert statuses == {"Good": ("approved", None), "Rejected": ("rejected", "duplicate"), "Nosubmit": ("pending", None),
+                        "Unconfirmed": ("pending", None)}
+    assert (await Bid.get(good.id)).reviewedByName == "Pedro"
+    assert (await Bid.get(rejected.id)).reviewedByName is None  # untouched
+    row = await BidReport.find_one(BidReport.bidderId == ana.id)
+    assert (row.count, row.pending, row.rejected) == (1, 2, 1)
+
+
+async def test_bulk_only_complete_still_skips_foreign_ids_and_refreshes_once_per_period(make_client, owner, monkeypatch):
+    from app.routers import bids
+
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    stranger = await make_bidder(await make_user("Other"), "Zed")
+    mine = [await complete(await add_bid(ana, job, start + timedelta(hours=h))) for h, job in [(1, "a"), (2, "b")]]
+    foreign = await complete(await add_bid(stranger, "z", start + timedelta(hours=1)))
+    refreshed = []
+
+    async def spy(bid):
+        refreshed.append(bid.bidderId)
+
+    monkeypatch.setattr(bids, "refresh_report_rows", spy)
+    async with make_client(owner) as c:
+        r = await c.post("/bids/review", json={"ids": [str(b.id) for b in (*mine, foreign)], "status": "approved", "onlyComplete": True})
+    assert r.json() == {"updated": 2, "skipped": 1}
+    assert refreshed == [ana.id]
+    assert (await Bid.get(foreign.id)).status == "pending"
+
+
+async def test_only_complete_only_goes_with_approved(make_client, owner):
+    start, _ = day_window()
+    bid = await complete(await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1)))
+    async with make_client(owner) as c:
+        responses = [
+            await c.post("/bids/review", json={"ids": [str(bid.id)], "status": status, "onlyComplete": True})
+            for status in ("rejected", "pending")
+        ]
+    assert [r.status_code for r in responses] == [400, 400]
+    assert {r.json()["detail"] for r in responses} == {"onlyComplete only goes with approved"}
+    assert (await Bid.get(bid.id)).status == "pending"
+
+
+async def test_bulk_without_only_complete_unchanged(make_client, owner):
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    incomplete = await add_bid(ana, "incomplete", start + timedelta(hours=1))  # no Submit, unconfirmed screenshots
+    rejected = await add_bid(ana, "rejected", start + timedelta(hours=2), "rejected", rejectReason="duplicate")
+    ids = [str(incomplete.id), str(rejected.id)]
+    async with make_client(owner) as c:
+        explicit_false = await c.post("/bids/review", json={"ids": ids[:1], "status": "approved", "onlyComplete": False})
+        default = await c.post("/bids/review", json={"ids": ids[1:], "status": "approved"})
+    assert explicit_false.json() == {"updated": 1, "skipped": 0} and default.json() == {"updated": 1, "skipped": 0}
+    assert [(b.status, b.rejectReason) for b in await Bid.find({"bidderId": ana.id}).sort("firstAt").to_list()] == [
+        ("approved", None)] * 2
