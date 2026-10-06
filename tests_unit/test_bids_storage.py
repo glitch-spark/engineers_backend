@@ -313,6 +313,26 @@ def test_presign_put_is_a_short_lived_png_put_on_backblaze(monkeypatch):
     assert q["X-Amz-Credential"][0].startswith("005abc/") and "/us-east-005/s3/" in q["X-Amz-Credential"][0]
 
 
+def test_presign_get_is_a_short_lived_get_and_maps_errors(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(
+        BID_STORAGE_ENDPOINT_URL="https://s3.us-east-005.backblazeb2.com", BID_STORAGE_ACCESS_KEY_ID="005abc",
+        BID_STORAGE_SECRET_ACCESS_KEY="K005secret", BID_STORAGE_REGION=None, AWS_REGION=None,
+        AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None))
+    url = S3BidStorage().presign_get("bid-screenshots", "puma/2026-10-03/upwork/acme/step1_step_x.png")
+    parts = urlsplit(url)
+    assert parts.netloc == "s3.us-east-005.backblazeb2.com"
+    assert parts.path == "/bid-screenshots/puma/2026-10-03/upwork/acme/step1_step_x.png"
+    assert parse_qs(parts.query)["X-Amz-Expires"] == ["300"]
+
+    monkeypatch.setattr("app.bids.storage.get_settings", lambda: SimpleNamespace(
+        BID_STORAGE_ENDPOINT_URL="nope", BID_STORAGE_ACCESS_KEY_ID="k", BID_STORAGE_SECRET_ACCESS_KEY="s",
+        BID_STORAGE_REGION="x", AWS_REGION=None, AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None))
+    with pytest.raises(BidStorageError, match="invalid BID_STORAGE_ENDPOINT_URL"):
+        S3BidStorage().presign_get("bid-screenshots", "a/b.png")
+
+
 def test_get_bid_storage_is_cached_until_settings_change(monkeypatch):
     from app.bids.storage import reset_bid_storage
 

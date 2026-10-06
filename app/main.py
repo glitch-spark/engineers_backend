@@ -20,6 +20,7 @@ from app.routers import (
     auth as auth_router,
     bidder_ext,
     bidders,
+    bids,
     dashboard,
     global_prompt,
     integrations,
@@ -127,6 +128,7 @@ def create_app() -> FastAPI:
     app.include_router(bidders.router)
     app.include_router(bidder_ext.router)
     app.include_router(bidders.cron_router)
+    app.include_router(bids.router)
 
     return app
 

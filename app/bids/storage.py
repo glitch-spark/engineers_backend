@@ -152,6 +152,17 @@ class S3BidStorage:
         except BotoCoreError as e:
             raise BidStorageError(type(e).__name__) from e
 
+    def presign_get(self, bucket: str, key: str, expires: int = 300) -> str:
+        """Short-lived pre-signed GET link for viewing a screenshot; signing is offline (no network call)."""
+        try:
+            return self._get_client().generate_presigned_url(
+                "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires, HttpMethod="GET",
+            )
+        except ValueError:
+            raise BidStorageError("invalid BID_STORAGE_ENDPOINT_URL") from None
+        except BotoCoreError as e:
+            raise BidStorageError(type(e).__name__) from e
+
     def _count(self, bucket: str, prefix: str, windows: Sequence[Window]) -> list[int]:
         # Pages are fetched lazily, so the whole loop runs inside one worker thread. A job's
         # screenshots can sit on different pages, so first-seen times are gathered before counting.
