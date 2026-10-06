@@ -13,7 +13,8 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.bids.storage import BidStorageError
 from app.bids.windows import latest_cutoff, schedule_from_settings, window_for
-from app.models import Account, UserExtra
+from app.models import Account, ResumeApplication, UserExtra
+from app.models.account import Resume
 from app.models.bid import Bid, Screenshot
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
@@ -55,7 +56,7 @@ class FakeStorage:
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["review-unit"]
-    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, Account, UserExtra, SlackAlertLog])
+    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, Account, ResumeApplication, UserExtra, SlackAlertLog])
     return database
 
 
@@ -164,6 +165,8 @@ async def test_owner_lists_their_bids_for_the_day(make_client, owner, storage):
         "jobTitle": "Two", "firstAt": iso(start + timedelta(hours=2)),
         "submittedAt": None, "screenshotCount": 2, "missingUploads": 2, "status": "pending",
         "reviewedByName": None, "reviewedAt": None, "note": None, "changedSinceReview": False,
+        "jobDomain": "jobs.example", "durationSec": 0, "profileName": None, "resumeNames": [],
+        "tailoredResumeName": None, "rejectReason": None,
     }
 
 
@@ -341,9 +344,73 @@ async def test_screenshots_only_sign_uploaded_ones(make_client, owner, storage):
     assert shots[0] == {
         "key": "ana/2026-10-05/backend/one/step0_step_0.png", "step": 1, "trigger": "step",
         "capturedAt": iso(start + timedelta(hours=1)), "url": None,  # never confirmed
+        "isSubmit": False,
     }
     assert shots[1]["url"] == "https://signed/bid-screenshots/ana/2026-10-05/backend/one/step1_step_1.png"
     assert storage.signed == [("bid-screenshots", "ana/2026-10-05/backend/one/step1_step_1.png")]
+
+
+async def test_screenshots_mark_submit(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
+    submit = Screenshot(key=bid.jobKey + "/step2_submit_2.png", step=3, trigger="submit",
+                        capturedAt=(start + timedelta(hours=1, minutes=2)).replace(tzinfo=None), uploadedAt=start.replace(tzinfo=None))
+    await Bid.get_motor_collection().update_one({"_id": bid.id}, {"$push": {"screenshots": submit.model_dump()}})
+    async with make_client(owner) as c:
+        shots = (await c.get(f"/bids/{bid.id}/screenshots")).json()
+    assert [(s["step"], s["trigger"], s["isSubmit"]) for s in shots] == [(1, "step", False), (2, "step", False), (3, "submit", True)]
+
+
+async def test_list_includes_evidence_and_timezone(make_client, owner):
+    start, _ = day_window()
+    profile = await Account(
+        name="Ian Meron", createdBy=owner.id, resumes=[Resume(filename="A.pdf", markdown="x"), Resume(filename="B.pdf", markdown="x")]
+    ).insert()
+    ana = await make_bidder(owner)
+    await Bidder.get_motor_collection().update_one({"_id": ana.id}, {"$set": {"profileId": profile.id}})
+    bid = await add_bid(ana, "one", start + timedelta(hours=1), "pending")
+    first, last = start + timedelta(hours=1), start + timedelta(hours=1, minutes=4, seconds=30)
+    await Bid.get_motor_collection().update_one(
+        {"_id": bid.id}, {"$set": {"screenshots.1.capturedAt": last.replace(tzinfo=None)}}
+    )
+    await ResumeApplication(
+        userId=owner.id, accountId=profile.id, companyName="One", companyNameLower="one", jobDescription="jd",
+        jobUrl="https://jobs.example/one", status="completed", pdfFilename="Ian_Meron_One.pdf", completedAt=first.replace(tzinfo=None),
+    ).insert()
+    async with make_client(owner) as c:
+        body = (await c.get("/bids", params={"day": DAY})).json()
+    assert body["timezone"] == "America/Chicago"
+    (out,) = body["bids"]
+    assert (out["jobDomain"], out["durationSec"], out["profileName"], out["resumeNames"], out["tailoredResumeName"]) == (
+        "jobs.example", 270, "Ian Meron", ["A.pdf", "B.pdf"], "Ian_Meron_One.pdf")
+    assert out["rejectReason"] is None
+
+
+async def test_list_without_bids_or_profiles_still_answers(make_client, owner):
+    async with make_client(owner) as c:
+        body = (await c.get("/bids", params={"day": DAY})).json()
+    assert body["bids"] == [] and body["timezone"] == "America/Chicago"
+
+
+async def test_get_one_bid(make_client, owner):
+    start, _ = day_window()
+    ana = await make_bidder(owner)
+    bid = await add_bid(ana, "one", start + timedelta(hours=1), "approved", reviewedByName="Pedro")
+    async with make_client(owner) as c:
+        r = await c.get(f"/bids/{bid.id}")
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert (out["id"], out["bidderName"], out["status"], out["reviewedByName"]) == (str(bid.id), "Ana", "approved", "Pedro")
+    assert (out["jobDomain"], out["durationSec"], out["profileName"], out["resumeNames"]) == ("jobs.example", 0, None, [])
+    assert out["tailoredResumeName"] is None and out["rejectReason"] is None
+    async with make_client(await make_user("Root", "admin")) as c:
+        assert (await c.get(f"/bids/{bid.id}")).status_code == 200  # admins review every bidder
+    async with make_client(await make_user("Other")) as c:
+        foreign = await c.get(f"/bids/{bid.id}")
+        missing = await c.get(f"/bids/{PydanticObjectId()}")
+        bad_id = await c.get("/bids/not-an-id")
+    assert [r.status_code for r in (foreign, missing, bad_id)] == [404] * 3
+    assert foreign.json()["detail"] == "bid not found"
 
 
 async def test_screenshots_503_when_signing_fails_or_storage_missing(make_client, owner, storage, monkeypatch):
@@ -372,25 +439,29 @@ async def test_invalid_day_is_400(make_client, owner):
 
 
 @pytest.mark.parametrize("now, day, start, end", [
-    # Mon Oct 5 2026 is CDT (UTC-5); the daily cutoff is 18:30 local.
-    ("2026-10-05T15:00:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 10:00 local: the open window
-    ("2026-10-05T23:29:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 18:29 local, still open
-    ("2026-10-05T23:31:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 18:31 local: just reported
-    ("2026-10-06T01:00:00Z", "2026-10-05", "2026-10-04T23:30:00Z", "2026-10-05T23:30:00Z"),  # 20:00 local, already Oct 6 UTC
-    ("2026-10-06T06:00:00Z", "2026-10-06", "2026-10-05T23:30:00Z", "2026-10-06T23:30:00Z"),  # 01:00 local Oct 6: next day
+    # Tue Oct 6 2026 is CDT (UTC-5); the default daily cutoff is 18:30 local.
+    ("2026-10-06T15:00:00Z", "2026-10-06", "2026-10-05T23:30:00Z", "2026-10-06T23:30:00Z"),  # 10:00 Chicago
+    ("2026-10-07T01:00:00Z", "2026-10-07", "2026-10-06T23:30:00Z", "2026-10-07T23:30:00Z"),  # 20:00 Chicago, already Oct 7 UTC
+    ("2026-10-06T23:29:00Z", "2026-10-06", "2026-10-05T23:30:00Z", "2026-10-06T23:30:00Z"),  # 18:29, window still open
+    ("2026-10-06T23:30:00Z", "2026-10-07", "2026-10-06T23:30:00Z", "2026-10-07T23:30:00Z"),  # 18:30 sharp opens the next one
 ])
-async def test_day_defaults_to_today_in_the_report_timezone(make_client, owner, monkeypatch, now, day, start, end):
-    from zoneinfo import ZoneInfo
-
-    from app.bids.windows import BidSchedule
+async def test_default_day_is_the_open_window(make_client, owner, monkeypatch, now, day, start, end):
     from app.routers import bids
 
-    sched = BidSchedule(tz=ZoneInfo("America/Chicago"), daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0))
-    monkeypatch.setattr(bids, "schedule_from_settings", lambda: sched)
     monkeypatch.setattr(bids, "_now", lambda: datetime.fromisoformat(now.replace("Z", "+00:00")))
     async with make_client(owner) as c:
         body = (await c.get("/bids")).json()
     assert (body["day"], body["start"], body["end"]) == (day, start, end)
+
+
+async def test_open_window_default_spans_a_dst_change(make_client, owner, monkeypatch):
+    from app.routers import bids
+
+    # Chicago falls back on Sun Nov 1 2026 at 02:00, so the window ending Nov 1 18:30 CST is 25 hours long.
+    monkeypatch.setattr(bids, "_now", lambda: datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))  # Sat Oct 31 20:00 CDT
+    async with make_client(owner) as c:
+        body = (await c.get("/bids")).json()
+    assert (body["day"], body["start"], body["end"]) == ("2026-11-01", "2026-10-31T23:30:00Z", "2026-11-02T00:30:00Z")
 
 
 async def test_bulk_review_refreshes_both_weekly_rows_when_a_day_straddles_the_weekly_cutoff(make_client, owner):

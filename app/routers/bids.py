@@ -9,11 +9,12 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
+from app.bids.evidence import duration_sec, evidence_for, job_domain
 from app.bids.live_counts import TtlCache
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
-from app.bids.windows import latest_cutoff, period_key, schedule_from_settings, window_for
+from app.bids.windows import latest_cutoff, open_window, period_key, schedule_from_settings, window_for
 from app.config import get_settings
 from app.deps import get_current_user
 from app.models import UserExtra
@@ -54,7 +55,8 @@ async def _load_reviewable(bid_id: str, user) -> tuple[Bid, Bidder]:
     return bid, _reviewable(await Bidder.get(bid.bidderId), user)
 
 
-def _bid_out(bid: Bid, bidder_name: str) -> dict:
+def _bid_out(bid: Bid, bidder_name: str, evidence: dict) -> dict:
+    """evidence is the bid's entry from evidence_for: profileName, resumeNames, tailoredResumeName."""
     return {
         "id": str(bid.id),
         "bidderId": str(bid.bidderId),
@@ -70,7 +72,15 @@ def _bid_out(bid: Bid, bidder_name: str) -> dict:
         "reviewedAt": _iso_utc(bid.reviewedAt),
         "note": bid.note,
         "changedSinceReview": bid.changedSinceReview,
+        "jobDomain": job_domain(bid.jobUrl),
+        "durationSec": duration_sec(bid),
+        **evidence,
+        "rejectReason": None,
     }
+
+
+async def _single_bid_out(bid: Bid, bidder: Bidder) -> dict:
+    return _bid_out(bid, bidder.name, (await evidence_for([bid], {str(bidder.id): bidder}))[str(bid.id)])
 
 
 def _now() -> datetime:
@@ -96,9 +106,9 @@ async def list_bids(
 ) -> dict:
     sched, now = schedule_from_settings(), _now()
     if day is None:
-        # Today's report day in the report timezone: before the daily cutoff that is the open window, after it
-        # the window just reported.
-        cutoff = datetime.combine(now.astimezone(sched.tz).date(), sched.daily_at, tzinfo=sched.tz)
+        # The open window: the one that ends at the next daily cutoff, so bids filed after the report are listed.
+        opened, _ = open_window("daily", now, sched)
+        cutoff = datetime.combine(opened.astimezone(sched.tz).date() + timedelta(days=1), sched.daily_at, tzinfo=sched.tz)
     else:
         try:
             if not _DAY.fullmatch(day):
@@ -124,13 +134,15 @@ async def list_bids(
     if status:
         query["status"] = status
     bids = await Bid.find(query).sort("-firstAt").to_list()
+    evidence = await evidence_for(bids, {str(b.id): b for b in shown})
 
     folders = await _folders_without_record(shown, counts, start, end, now)
     return {
         "day": period_key(cutoff),
         "start": _iso_utc(start),
         "end": _iso_utc(end),
-        "bids": [_bid_out(b, names[b.bidderId]) for b in bids],
+        "timezone": sched.tz.key,
+        "bids": [_bid_out(b, names[b.bidderId], evidence[str(b.id)]) for b in bids],
         "summary": {
             str(b.id): dict(
                 zip(("name", "approved", "pending", "rejected"), (b.name, *counts[str(b.id)])),
@@ -162,6 +174,12 @@ async def _folders_without_record(
     return {i: None if n is None else max(0, n - sum(counts[i])) for i, n in found.items()}
 
 
+@router.get("/{bid_id}")
+async def get_bid(bid_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    bid, bidder = await _load_reviewable(bid_id, user)
+    return await _single_bid_out(bid, bidder)
+
+
 @router.get("/{bid_id}/screenshots")
 async def bid_screenshots(bid_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> list[dict]:
     bid, _ = await _load_reviewable(bid_id, user)
@@ -179,7 +197,10 @@ async def bid_screenshots(bid_id: str, user: Annotated[UserExtra, Depends(get_cu
             raise unavailable from None
         urls = {s.key: url for s, url in zip(uploaded, signed)}
     return [
-        {"key": s.key, "step": s.step, "trigger": s.trigger, "capturedAt": _iso_utc(s.capturedAt), "url": urls.get(s.key)}
+        {
+            "key": s.key, "step": s.step, "trigger": s.trigger, "isSubmit": s.trigger == "submit",
+            "capturedAt": _iso_utc(s.capturedAt), "url": urls.get(s.key),
+        }
         for s in shots
     ]
 
@@ -208,7 +229,7 @@ async def review_bid(bid_id: str, body: ReviewIn, user: Annotated[UserExtra, Dep
     # finishing together can each count before the other's write, leaving the stored row one decision behind
     # until the next review of that day.
     await refresh_report_rows(bid)
-    return _bid_out(bid, bidder.name)
+    return await _single_bid_out(bid, bidder)
 
 
 @router.post("/review")
