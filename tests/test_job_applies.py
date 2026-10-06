@@ -1474,14 +1474,14 @@ async def test_rescore_keeps_tailored_applied_and_exported(client, staff_user, a
         "appliedResumes": [{"accountId": acc, "resumeId": str(us.resumes[0].id), "at": datetime.utcnow()}],
         f"tailored.{acc}": tailored,
         f"exported.{acc}": datetime.utcnow(),
-        f"exportedRows.{acc}": {"sheetId": "s", "tab": "2026-10-03", "row": 2},
+        f"exportedSheets.{acc}.s": {"tab": "2026-10-03", "row": 2},
     }
     await JobApplyRow.get_motor_collection().update_one({"_id": rid}, {"$set": kept})
     assert (await start(client, h, run_id, {"US": [us2]}, [us2])).status_code == 200  # `us` is no longer picked
     await worker.run_worker(PydanticObjectId(run_id))
     row = await JobApplyRow.get(rid)
     assert [m.accountId for m in row.appliedResumes] == [acc]
-    assert row.tailored == {acc: tailored} and acc in row.exported and row.exportedRows[acc]["row"] == 2
+    assert row.tailored == {acc: tailored} and acc in row.exported and row.exportedSheets[acc]["s"]["row"] == 2
 
 
 # ---------- runs are kept 7 days ----------

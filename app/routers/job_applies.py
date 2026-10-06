@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, gsheet, sheet_checks, tailored_score, worker
+from app.job_apply.sheet_links import exported_to
 from app.job_apply.sheet_checks import sheet_text
 from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import (
@@ -297,11 +298,13 @@ class _AppRowView(BaseModel):
     tailored: dict[str, PydanticObjectId] = Field(default_factory=dict)
     tailorOnly: list[str] = Field(default_factory=list)
     exported: dict[str, datetime] = Field(default_factory=dict)
+    exportedSheets: dict[str, dict[str, dict]] = Field(default_factory=dict)
+    exportedRows: dict[str, dict] = Field(default_factory=dict)
 
     class Settings:
         projection = {
             "_id": 1, "url": 1, "profileGates": 1, "applied": 1, "appliedResumes": 1, "tailored": 1, "tailorOnly": 1,
-            "exported": 1,
+            "exported": 1, "exportedSheets": 1, "exportedRows": 1,
             "bestByProfile.accountId": 1, "bestByProfile.resumeId": 1, "bestByProfile.filename": 1, "bestByProfile.total": 1,
         }
 
@@ -379,17 +382,20 @@ def _job_applied(row, apps: list[dict], ctx: _AppContext) -> bool:
     return bool(row.appliedResumes or row.applied or row.url in ctx.logged_urls)
 
 
-async def _application_counts(run: JobApplyRun) -> dict:
+async def _application_counts(run: JobApplyRun, sheet_id: Optional[str] = None) -> dict:
+    """`sheet_id`: the sheet an export goes to by default (the viewer's saved one); None = any sheet."""
     rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).project(_AppRowView).to_list()
     ctx = await _app_context(run, rows)
     counts = dict.fromkeys(("applied", "ready", "tailoring", "needsResume"), 0)
     per_profile = {str(s.accountId): {"toGo": 0, "ready": 0} for s in run.selection}
-    jobs = to_export = 0
+    jobs = to_export = exported_ready = 0
     for row in rows:
         apps = _applications(row, run.threshold, ctx)
         pending = [a for a in apps if a["state"] != "applied"]
         jobs += bool(pending)
-        to_export += sum(a["accountId"] not in row.exported and a["state"] == "ready" for a in pending)
+        ready = [a for a in pending if a["state"] == "ready"]
+        to_export += sum(not exported_to(row, a["accountId"], sheet_id) for a in ready)
+        exported_ready += sum(a["accountId"] in row.exported for a in ready)
         for a in apps:
             counts[a["state"]] += 1
         for a in pending:
@@ -400,7 +406,8 @@ async def _application_counts(run: JobApplyRun) -> dict:
     return {
         "jobs": jobs,  # jobs with at least one application to go
         "toGo": counts["ready"] + counts["tailoring"] + counts["needsResume"],
-        "toExport": to_export,  # applications with a resume to send, not yet in the shared sheet
+        "toExport": to_export,  # applications with a resume to send, not yet in the saved sheet
+        "exportedReady": exported_ready,  # ...already in a sheet: they can still go to another one
         **counts,
         "byProfile": [
             {"accountId": acc, "name": names.get(acc, "(deleted profile)"), **n} for acc, n in per_profile.items()
@@ -629,7 +636,7 @@ async def get_run(
     log = JobApplicationLog.get_motor_collection()
     out["appliedInRun"] = await log.count_documents({"runId": run.id})
     # Applications = job × profile: what's left to apply with, per profile and per state.
-    out["applications"] = await _application_counts(run)
+    out["applications"] = await _application_counts(run, _saved_sheet_id(user))
     out["toApply"] = out["applications"]["jobs"]
     # Matches the Excluded tab (counts.excluded only counts jobs that failed a job-level check).
     out["excludedCount"] = await JobApplyRow.find(await _rows_query(run, view="excluded")).count()
@@ -1458,6 +1465,14 @@ def _download_cell(link: str) -> str:
     return f'=HYPERLINK("{link}","Download")'
 
 
+def _saved_sheet_id(user: UserExtra) -> Optional[str]:
+    """The spreadsheet id of the user's saved export link; None without one (or if it no longer parses)."""
+    try:
+        return gsheet.parse_gsheet_url(user.jobApplySheetUrl)[0] if user.jobApplySheetUrl else None
+    except SheetError:
+        return None
+
+
 def _export_target(sheet_url: str, user: UserExtra) -> tuple[str, str]:
     """(link, spreadsheet id) to export to: the one given, else the one saved from the last export."""
     url = sheet_url.strip() or (user.jobApplySheetUrl or "")
@@ -1503,7 +1518,8 @@ def _today_label(user: UserExtra) -> str:
 async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Append one row per job x profile with a resume to send (that profile's tailored resume when it's done, else its
     matching uploaded one) to today's "Apply · <date>" tab of the shared Google Sheet. Applications waiting for a
-    tailored resume aren't written yet: exporting again after tailoring adds them. Rows already exported are skipped."""
+    tailored resume aren't written yet: exporting again after tailoring adds them. Rows already in that sheet are
+    skipped; another sheet gets them all."""
     run = await _owned_run(run_id, user)
     url, sheet_id = _export_target(body.sheetUrl, user)
 
@@ -1521,8 +1537,8 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             acc = app["accountId"]
             if app["state"] == "applied":
                 continue
-            if acc in row.exported:
-                already += 1
+            if exported_to(row, acc, sheet_id):
+                already += 1  # already in this sheet (another sheet doesn't count)
                 continue
             if app["state"] != "ready":
                 waiting += 1  # tailoring, or needs a tailored resume: exported once it's done
@@ -1559,9 +1575,8 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 log.warning("export of run %s: unexpected range %r, rows not recorded", run.id, written)
         coll = JobApplyRow.get_motor_collection()
         for i, (row_id, acc) in enumerate(marks):
-            fields = {f"exported.{acc}": now, "updatedAt": now}
-            if first is not None:
-                fields[f"exportedRows.{acc}"] = {"sheetId": sheet_id, "tab": tab, "row": first + i}
+            where = {"tab": tab, "row": first + i if first is not None else None}
+            fields = {f"exported.{acc}": now, f"exportedSheets.{acc}.{sheet_id}": where, "updatedAt": now}
             await coll.update_one({"_id": row_id}, {"$set": fields})
     await _remember_sheet(url, user)
     return {
