@@ -30,6 +30,7 @@ from app.models.job_apply import (
     JobApplyRow,
     JobApplyRun,
     JobInfo,
+    JobApproval,
     ProfileGates,
     RunCounts,
     RunSelection,
@@ -530,6 +531,7 @@ async def create_run(
     await JobApplyRow.insert_many([
         JobApplyRow(
             runId=run.id, userId=user.id, rowIndex=r.rowIndex, url=r.url, jdText=r.jdText,
+            company=r.company or "", sheetCompany=r.company or "",
             jdSource="sheet" if r.jdText else None,
             jdStructured=True if r.jdText else None,
         )
@@ -969,6 +971,17 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     await JobApplyRow.get_motor_collection().update_one(
         {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}
     )
+    if row.url:  # shared per link: other runs of it are approved too (see worker.sync_corrections)
+        if body.include:
+            await JobApproval.get_motor_collection().update_one(
+                {"url": row.url},
+                {"$set": {"url": row.url, "approvedBy": user.id, "approvedByName": user.name or user.email or "",
+                          "approvedAt": datetime.utcnow(), "updatedAt": datetime.utcnow()},
+                 "$setOnInsert": {"createdAt": datetime.utcnow()}},
+                upsert=True,
+            )
+        else:
+            await JobApproval.find(JobApproval.url == row.url).delete()
     return _row_summary(row, run.threshold)
 
 
@@ -1088,7 +1101,7 @@ async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_cur
         {"_id": row.id},
         {"$set": {
             "status": "pending", "statusReason": None, "screen": None, "jdText": None, "jdSource": None,
-            "jdStructured": None, "fetchedPostedDate": None, "postedDate": None, "title": "", "company": "",
+            "jdStructured": None, "fetchedPostedDate": None, "postedDate": None, "title": "", "company": row.sheetCompany,
             "extraction": None, "extractionSource": None, "infoAt": None, "gates": [], "groupKey": None, "scoredAt": None,
             "scores": [], "profileGates": [], "bestByProfile": [], "topScore": None, "tailorOnly": [],
             "updatedAt": datetime.utcnow(),

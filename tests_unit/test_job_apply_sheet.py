@@ -135,3 +135,14 @@ def test_sheet_counts_links_cleaned_and_duplicates():
     rows = parse_sheet("j.xlsx", xlsx([["URL"], ["https://jobs.lever.co/acme/1a2b/apply?utm_source=x"],
                                        ["https://jobs.lever.co/acme/1a2b"], ["https://a.com/jobs/2"]]))
     assert len(rows) == 2 and rows.links == 3 and rows.cleaned == 1 and rows.duplicates == 1
+
+
+def test_company_column_is_read_from_its_header():
+    data = xlsx([["Company Name", "Job URL", "Description"], ["Acme Corp", "https://jobs.acme.com/1", JD], ["  Beta  ", "https://beta.io/j/2", None], [None, "https://gamma.io/3", None]])
+    rows = parse_sheet("jobs.xlsx", data)
+    assert [r.company for r in rows] == ["Acme Corp", "Beta", None]
+
+
+def test_no_company_without_a_company_header():
+    data = xlsx([["Link", "Description"], ["https://jobs.acme.com/1", JD]])
+    assert parse_sheet("jobs.xlsx", data)[0].company is None

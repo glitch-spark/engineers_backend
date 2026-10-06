@@ -116,6 +116,7 @@ class JobApplyRow(TimestampedDocument):
     forceInclude: bool = False  # a person approved this job: it is Worth applying whatever the checks said
     title: str = ""
     company: str = ""
+    sheetCompany: str = ""  # the company written in the uploaded sheet: kept over fetched, AI and corrected names
     fetchedPostedDate: Optional[date] = None  # from JSON-LD / ATS API; beats the LLM's date
     postedDate: Optional[date] = None
     extraction: Optional[JobExtraction] = None
@@ -204,6 +205,20 @@ class JobInfo(TimestampedDocument):
 
     class Settings:
         name = "job_info"
+        indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
+
+
+class JobApproval(TimestampedDocument):
+    """A person approved this job link into Worth applying, for everyone who uses the link: other runs pick it up
+    when they read the job or, if already read, when opened (`sync_corrections`). Undoing it removes this record."""
+
+    url: str
+    approvedBy: Optional[PydanticObjectId] = None
+    approvedByName: str = ""
+    approvedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "job_approval"
         indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
 
 

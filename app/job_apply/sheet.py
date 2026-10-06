@@ -1,5 +1,6 @@
 """Uploaded .xlsx / .csv → job rows. Columns are detected, not configured: the URL column is the one whose
-cells (or hyperlink targets) are mostly http(s) links; the JD column is the other column with the longest text."""
+cells (or hyperlink targets) are mostly http(s) links; the JD column is the other column with the longest text; the
+company column is the one headed "Company" / "Company Name" / "Employer" (kept as written, over any machine reading)."""
 import csv
 import io
 import re
@@ -14,6 +15,7 @@ MIN_JD_AVG_CHARS = 200  # a column must average this much text to count as the J
 MIN_JD_CELL_CHARS = 100  # shorter cells are treated as "no JD" and the URL is fetched instead
 
 _URL = re.compile(r"^https?://\S+$", re.I)
+_COMPANY_HEADER = re.compile(r"^(company( name)?|employer|organi[sz]ation)$", re.I)
 _HYPERLINK_FORMULA = re.compile(r'^=\s*HYPERLINK\(\s*"([^"]+)"(?:\s*[,;]\s*"([^"]*)")?', re.I)
 
 
@@ -26,6 +28,7 @@ class SheetRow:
     rowIndex: int  # 1-based row number in the sheet
     url: Optional[str]
     jdText: Optional[str]
+    company: Optional[str] = None  # from the sheet's company column, as written
 
 
 @dataclass
@@ -138,12 +141,20 @@ def parse_sheet_ex(filename: str, data: bytes) -> tuple[list[SheetRow], bool]:
         if avg >= MIN_JD_AVG_CHARS and avg > best_avg:
             jd_col, best_avg = i, avg
 
+    company_col = next(
+        (i for i, c in enumerate(rows[0]) if has_header and i not in (url_col, jd_col) and _COMPANY_HEADER.match(c.text.strip())),
+        None,
+    )
+
     out: list[SheetRow] = []
     for offset, r in enumerate(body):
         urls = r[url_col].urls if url_col < len(r) else []
         jd = r[jd_col].text if jd_col is not None and jd_col < len(r) and len(urls) == 1 else ""
+        company = (r[company_col].text.strip() or None) if company_col is not None and company_col < len(r) else None
         for url in urls:  # several links in one cell are several jobs; a description can't be split between them
-            out.append(SheetRow(rowIndex=body_numbers[offset], url=url, jdText=jd if len(jd) >= MIN_JD_CELL_CHARS else None))
+            out.append(SheetRow(
+                rowIndex=body_numbers[offset], url=url, jdText=jd if len(jd) >= MIN_JD_CELL_CHARS else None, company=company,
+            ))
     return _dedupe(out), True
 
 
