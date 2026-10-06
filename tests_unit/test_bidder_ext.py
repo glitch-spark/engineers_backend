@@ -12,6 +12,7 @@ from beanie import PydanticObjectId, init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
 from app.models import Account, UserExtra
+from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
 from app.models.slack_alert_log import SlackAlertLog
@@ -31,7 +32,7 @@ LONG_PASSWORD = "Password is too long"
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["ext-unit"]
-    await init_beanie(database=database, document_models=[Bidder, BidReport, Account, UserExtra, SlackAlertLog])
+    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, Account, UserExtra, SlackAlertLog])
     return database
 
 
@@ -463,6 +464,83 @@ async def test_upload_uses_the_current_profile(ext, owner, storage):
         assert r.status_code == 200, r.text
         r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
         assert segment in r.json()["key"]
+
+
+async def test_upload_url_records_the_bid(ext, storage):
+    _, _, body = await register(ext)
+    payload, at = _shot(jobUrl="https://www.upwork.com/jobs/~01", jobTitle="Fix my roof")
+    r = await ext.post("/ext/upload-url", json=payload, headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    bids = await Bid.find_all().to_list()
+    assert len(bids) == 1 and r.json()["bidId"] == str(bids[0].id)
+    assert (bids[0].jobUrl, bids[0].jobTitle) == ("https://www.upwork.com/jobs/~01", "Fix my roof")
+    assert [(s.key, s.step, s.trigger, s.uploadedAt) for s in bids[0].screenshots] == [
+        (r.json()["key"], 1, "step", None)
+    ]
+
+
+async def test_upload_url_truncates_the_job_title(ext, storage):
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/upload-url", json=_shot(jobTitle="t" * 400)[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    assert (await Bid.find_one()).jobTitle == "t" * 300
+
+
+async def test_upload_url_drops_a_non_http_job_url(ext, storage):
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/upload-url", json=_shot(jobUrl="javascript:alert(1)")[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    assert (await Bid.find_one()).jobUrl is None
+
+
+async def test_upload_url_rejects_a_too_long_job_url(ext, real_app, storage):
+    _, _, body = await register(ext)
+    h = auth(body["token"])
+    too_long = "https://x.io/" + "a" * (2001 - len("https://x.io/"))
+    r = await real_app.post("/ext/upload-url", json=_shot(jobUrl=too_long)[0], headers=h)
+    assert (r.status_code, r.json()) == (400, {"error": "jobUrl is too long"})
+    assert await Bid.find_all().to_list() == [] and storage.calls == []
+    r = await real_app.post("/ext/upload-url", json=_shot(jobUrl=too_long[:-1])[0], headers=h)
+    assert r.status_code == 200, r.text
+
+
+async def test_upload_url_without_job_fields_still_works(ext, storage):
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    bid = await Bid.find_one()
+    assert str(bid.id) == r.json()["bidId"] and (bid.jobUrl, bid.jobTitle) == (None, None)
+
+
+async def test_confirm_sets_uploaded_at(ext, storage):
+    _, _, body = await register(ext)
+    h = auth(body["token"])
+    key = (await ext.post("/ext/upload-url", json=_shot()[0], headers=h)).json()["key"]
+    r = await ext.post("/ext/uploads/confirm", json={"key": key}, headers=h)
+    assert (r.status_code, r.json()) == (200, {"ok": True})
+    assert (await Bid.find_one()).screenshots[0].uploadedAt is not None
+
+
+async def test_confirm_of_an_unknown_key_is_404(ext, storage):
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/uploads/confirm", json={"key": "ana-lima/nope.png"}, headers=auth(body["token"]))
+    assert (r.status_code, r.json()) == (404, {"detail": "upload not found"})
+
+
+async def test_confirm_requires_a_bidder_token_and_only_reaches_own_uploads(ext, storage):
+    _, _, ana = await register(ext)
+    key = (await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(ana["token"]))).json()["key"]
+    assert (await ext.post("/ext/uploads/confirm", json={"key": key})).status_code == 401
+    _, _, bo = await register(ext, "Bob Lima", "bobby")
+    r = await ext.post("/ext/uploads/confirm", json={"key": key}, headers=auth(bo["token"]))
+    assert r.status_code == 404
+    assert (await Bid.find_one()).screenshots[0].uploadedAt is None
+
+
+async def test_confirm_404_carries_a_readable_error(ext, real_app, storage):
+    _, _, body = await register(ext)
+    r = await real_app.post("/ext/uploads/confirm", json={"key": "x/y.png"}, headers=auth(body["token"]))
+    assert (r.status_code, r.json()) == (404, {"error": "upload not found"})
 
 
 async def test_upload_url_validation(ext, storage):

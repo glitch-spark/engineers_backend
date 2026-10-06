@@ -3,16 +3,18 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
+from urllib.parse import urlsplit
 
 from beanie.exceptions import RevisionIdWasChanged
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, StringConstraints
 from pymongo.errors import DuplicateKeyError
 
 from app.bids import rate_limit
 from app.bids.folders import folder_url
 from app.bids.invites import hash_code, invite_is_live
 from app.bids.rate_limit import FailureLimiter, client_ip, limiter_keys
+from app.bids.records import confirm_upload, record_screenshot
 from app.bids.schemas import LoginIn, RegisterIn, bidder_me, credentials_problem
 from app.bids.storage import BidStorageError, get_bid_storage
 from app.bids.upload_keys import build_upload_key
@@ -160,12 +162,32 @@ class UploadUrlIn(BaseModel):
     step: int = Field(ge=1, le=500)
     trigger: Literal["step", "next", "submit"]
     capturedAt: AwareDatetime
+    # Only stripped here; length and scheme are rules the route checks (the app turns schema errors into a bare
+    # "Invalid request").
+    jobUrl: Optional[Annotated[str, StringConstraints(strip_whitespace=True)]] = None
+    jobTitle: Optional[Annotated[str, StringConstraints(strip_whitespace=True)]] = None
+
+
+_JOB_URL_MAX = 2000
+_JOB_TITLE_MAX = 300
+
+
+def _job_url(raw: Optional[str]) -> Optional[str]:
+    """400 when too long; None unless it is an http(s) link (it ends up as a clickable href in the review UI)."""
+    if raw and len(raw) > _JOB_URL_MAX:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "jobUrl is too long")
+    try:
+        parts = urlsplit(raw or "")
+    except ValueError:
+        return None
+    return raw if parts.scheme in ("http", "https") and parts.netloc else None
 
 
 @router.post("/upload-url")
 async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
     """The backend picks the object path; the extension only PUTs the PNG to the returned link."""
     bidder = auth.bidder
+    job_url = _job_url(body.jobUrl)
     unavailable = HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Uploads are not configured")
     bucket = get_settings().BID_STORAGE_BUCKET
     storage = get_bid_storage()
@@ -178,6 +200,10 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
         )
     except ValueError:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "capturedAt is not current")
+    bid = await record_screenshot(
+        bidder, key, body.step, body.trigger, body.capturedAt, job_url,
+        (body.jobTitle or "")[:_JOB_TITLE_MAX] or None,
+    )
     try:
         url = await asyncio.to_thread(storage.presign_put, bucket, key)
     except BidStorageError:
@@ -185,7 +211,20 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
     return {
         "url": url,
         "key": key,
+        "bidId": str(bid.id),
         "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
         "headers": {"Content-Type": "image/png"},
         **_renewal(auth),
     }
+
+
+class ConfirmIn(BaseModel):
+    key: str = Field(min_length=1, max_length=1000)
+
+
+@router.post("/uploads/confirm")
+async def confirm(body: ConfirmIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
+    """The extension calls this once the PNG PUT succeeded; only then does the screenshot count as uploaded."""
+    if not await confirm_upload(auth.bidder.id, body.key):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found")
+    return {"ok": True, **_renewal(auth)}
