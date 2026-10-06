@@ -223,11 +223,15 @@ async def review_bids(body: BulkReviewIn, user: Annotated[UserExtra, Depends(get
         await Bid.get_motor_collection().update_many(
             {"_id": {"$in": [b.id for b in allowed]}}, {"$set": _decision(user, body.status, None)}
         )
-        # One recount per bidder and report day, after all the writes (same race as the single review).
+        # One recount per bidder, daily window and weekly window, after all the writes (same race as the single
+        # review). refresh_report_rows takes both rows from one bid's firstAt; the weekly cutoff falls inside a
+        # daily window (Saturday's), so bids of one day can belong to two weekly rows.
         sched = schedule_from_settings()
-        per_day: dict[tuple, Bid] = {}
+        per_period: dict[tuple, Bid] = {}
         for b in allowed:
-            per_day.setdefault((b.bidderId, _next_daily_cutoff(b.firstAt.replace(tzinfo=timezone.utc), sched)), b)
-        for b in per_day.values():
+            at = b.firstAt.replace(tzinfo=timezone.utc)
+            key = (b.bidderId, latest_cutoff("daily", at, sched), latest_cutoff("weekly", at, sched))
+            per_period.setdefault(key, b)
+        for b in per_period.values():
             await refresh_report_rows(b)
     return {"updated": len(allowed), "skipped": len(wanted) - len(allowed)}

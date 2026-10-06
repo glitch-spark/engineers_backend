@@ -387,3 +387,29 @@ async def test_day_defaults_to_the_open_window(make_client, owner):
     start, end = day_window(body["day"])
     assert body["start"] == iso(start)
     assert start <= before < end
+
+
+async def test_bulk_review_refreshes_both_weekly_rows_when_a_day_straddles_the_weekly_cutoff(make_client, owner):
+    sched = schedule_from_settings()
+    weekly = datetime.combine(date(2026, 10, 5) + timedelta(days=sched.weekly_day), sched.weekly_at, tzinfo=sched.tz)
+    before, after = weekly - timedelta(hours=1), weekly + timedelta(hours=1)
+    assert latest_cutoff("daily", before, sched) == latest_cutoff("daily", after, sched)  # one daily window
+    daily_start, daily_end = window_for("daily", latest_cutoff("daily", before, sched) + timedelta(days=1), sched)
+    ana = await make_bidder(owner)
+    early = await add_bid(ana, "early", before)
+    late = await add_bid(ana, "late", after)
+
+    def row(kind, key, start, end):
+        return BidReport(
+            kind=kind, periodKey=key, periodStart=start.replace(tzinfo=None), periodEnd=end.replace(tzinfo=None),
+            bidderId=ana.id, ownerId=owner.id, bidderName="Ana", rate=0.5, count=0, amount=0.0, pending=1, rejected=0,
+        )
+
+    await row("daily", "d", daily_start, daily_end).insert()
+    for key, end in (("w1", weekly), ("w2", weekly + timedelta(days=7))):
+        await row("weekly", key, *window_for("weekly", end, sched)).insert()
+    async with make_client(owner) as c:
+        r = await c.post("/bids/review", json={"ids": [str(early.id), str(late.id)], "status": "approved"})
+    assert r.json() == {"updated": 2, "skipped": 0}
+    rows = {x.periodKey: (x.count, x.pending, x.amount) for x in await BidReport.find({"bidderId": ana.id}).to_list()}
+    assert rows == {"d": (2, 0, 1.0), "w1": (1, 0, 0.5), "w2": (1, 0, 0.5)}
