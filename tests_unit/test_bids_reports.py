@@ -169,6 +169,12 @@ async def db():
     return database
 
 
+@pytest.fixture(autouse=True)
+def no_records_start(monkeypatch):
+    """A local .env must not flip the folder-path tests onto bid records."""
+    records_start(monkeypatch, None)
+
+
 def records_start(monkeypatch, value):
     monkeypatch.setattr(records, "get_settings", lambda: get_settings().model_copy(update={"BID_RECORDS_START": value}))
 
@@ -184,7 +190,7 @@ async def add_bid(b, name, status, at=START + timedelta(hours=3)):
 
 
 async def test_build_rows_counts_approved_records_after_start(db, monkeypatch):
-    records_start(monkeypatch, "2026-10-01")  # window ends Fri Oct 2 18:30 CDT, after the start day
+    records_start(monkeypatch, "2026-10-01")  # the window starts Thu Oct 1 18:30 CDT, after the start day began
     ana = await stored_bidder(rate=0.1)
     for name, status in (("j1", "approved"), ("j2", "approved"), ("j3", "pending"), ("j4", "rejected")):
         await add_bid(ana, name, status)
@@ -196,7 +202,9 @@ async def test_build_rows_counts_approved_records_after_start(db, monkeypatch):
     assert storage.calls == 0
 
 
-@pytest.mark.parametrize("start_day", [None, "2026-10-03"])  # unset, or a start day after the window ended
+# unset; a start day that straddles the window (it starts Oct 1 18:30 CDT, so Oct 2 midnight falls inside it);
+# a start day after the window ended
+@pytest.mark.parametrize("start_day", [None, "2026-10-02", "2026-10-03"])
 async def test_build_rows_uses_folders_before_start_or_when_unset(db, monkeypatch, start_day):
     records_start(monkeypatch, start_day)
     ana = await stored_bidder()

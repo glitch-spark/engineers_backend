@@ -56,8 +56,9 @@ BID_DAILY_REPORT_TIME=18:30
 # monday ... sunday
 BID_WEEKLY_REPORT_DAY=saturday
 BID_WEEKLY_REPORT_TIME=16:00
-# YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows ending after that day's local midnight count
-# approved bid records instead of screenshot folders. Blank = folders everywhere (section 6).
+# YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows starting on or after that day's local midnight
+# count approved bid records instead of screenshot folders. Blank = folders everywhere (section 6).
+# Set it on the API service (the same service runs the report cron).
 BID_RECORDS_START=
 # Unset = reports are saved but not posted.
 SLACK_BIDS_CHANNEL_ID=C0123456789
@@ -182,17 +183,22 @@ object path and returns a short-lived signed upload link, so bidders hold no sto
    every active bidder whose folder URL will change when they register (name, folder,
    current URL). Registering switches counting to the new folder for the whole week in
    progress, so register those bidders right after a weekly cutoff, or adjust them by hand.
-3. Issue invite codes and send each bidder the extension zip with the code. Tell them:
+3. Issue invite codes and send each bidder the extension zip (version **3.1.0** only: a 3.0.0 build
+   does not confirm uploads, so its bids' screenshots would show as missing) with the code. Tell them:
    Remove any older "Bid Track Local" extension first (or unzip this version over its folder
    and click Reload). Two installs side by side double-count or lose bids.
 4. Revoke each old shared upload key (`puma-uploader`, …) as soon as that prefix's bidders
    have registered, so only the backend can write there.
 5. Switch counting to approved bid records with `BID_RECORDS_START=<YYYY-MM-DD>` (in
-   `BID_REPORT_TIMEZONE`) on the API **and** cron services. Set it **before bidders start on
-   rollout day**, to that day. A report window counts records when it ends after that day's
-   local midnight; earlier windows, and every window while it is unset, keep counting
-   screenshot folders. Only **approved** bids count toward `count` and pay (`count x rate`);
+   `BID_REPORT_TIMEZONE`) on the API service (it also runs the report cron). Set it **before
+   bidders start on rollout day**, to that day. A report window counts records only when it
+   **starts** on or after that day's local midnight; a window that starts earlier, including
+   one that straddles it, and every window while it is unset, keep counting screenshot
+   folders. So the first day counted from records is the first full daily window starting on
+   or after it, and the first weekly window counted from records is the first one starting
+   on or after it. Only **approved** bids count toward `count` and pay (`count x rate`);
    pending and rejected bids are reported beside it, e.g. `(pending 1, rejected 1)` in Slack
    and `pending` / `rejected` in the app's report rows (`null` on folder-counted rows). The
-   live counts switch at the same moment and show the approved count. Bids are counted on
+   live counts judge each open window by its own start in the same way, so for a while after
+   rollout "today" can come from records and "this week" from folders. Bids are counted on
    the day of their first screenshot.

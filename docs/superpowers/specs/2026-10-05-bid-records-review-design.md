@@ -104,7 +104,10 @@ Indexes: unique `(bidderId, jobKey)`; `(ownerId, firstAt)`; `(bidderId, firstAt)
 
 - `BID_RECORDS_START` (date, report timezone) is set on rollout day. For a window that **starts on or after** it,
   a bidder's count = approved bids with `firstAt` in the window. For windows before it, the folder count is used
-  as today. A window that straddles the start date uses records (rollout happens at a quiet time; see §8).
+  as today. A window that starts before it, including one that straddles the start date, keeps the folder count.
+  So the first day counted from records is the first full daily window starting on or after it, and the first weekly
+  window counted from records is the first one starting on or after it. Live counts judge each open window by its own
+  start.
 - `BidReportRow` gains `pending` and `rejected` (both `Optional[int]`); `count` stays the approved number and
   `amount = count × rate`.
 - Applies to: daily/weekly Slack reports (`build_rows`), the per-bidder reports page, and live counts on the
@@ -132,7 +135,9 @@ Indexes: unique `(bidderId, jobKey)`; `(ownerId, firstAt)`; `(bidderId, firstAt)
 
 1. Release `feat/bidder-login` with this feature: backend to `dev` (Railway deploy approved by the owner),
    frontend to `main`, the extension as a new version zip.
-2. Set `BID_RECORDS_START` to the rollout day (before bidders start that day).
+2. Set `BID_RECORDS_START` to the rollout day (before bidders start that day) on the API service, which also runs
+   the report cron. Distribute only extension 3.1.0 (3.0.0 does not confirm uploads, so its bids' screenshots would
+   show as missing).
 3. Owners send invite codes; bidders remove the old extension, install the new one and register
    (`docs/bids.md` rollout section).
 4. Revoke each old Backblaze upload key once its bidder has registered.

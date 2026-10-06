@@ -17,7 +17,7 @@
 - Status values: `pending` | `approved` | `rejected` (default `pending`).
 - Reviewers: the bidder's owner (`Bidder.createdBy`) or a user with `role == "admin"`; anyone else gets 404 `bid not found`.
 - Counts: only `approved` counts toward `count` and `amount = round(count * rate, 2)`; pending/rejected are reported separately.
-- `BID_RECORDS_START`: optional `YYYY-MM-DD` in `BID_REPORT_TIMEZONE`. A window uses records iff the setting is set and `window_end > local midnight of BID_RECORDS_START` (converted to UTC); otherwise folders. Unset = today's behavior everywhere.
+- `BID_RECORDS_START`: optional `YYYY-MM-DD` in `BID_REPORT_TIMEZONE`. A window uses records iff the setting is set and `window_start >= local midnight of BID_RECORDS_START` (converted to UTC); a window that starts earlier, including one that straddles it, keeps the folder count. Live counts judge each open window by its own start. Unset = today's behavior everywhere.
 - Signed view links expire in 300 seconds. Bulk review takes at most 500 ids.
 - `jobUrl` max 2,000 chars and must be http(s) (else stored as `None`); `jobTitle` max 300 (truncated).
 - Backend tests: `pytest tests_unit --continue-on-collection-errors` (3 files fail to collect beforehand; `test_bidder_ext.py::test_upload_url_without_storage_is_503` fails beforehand when the local `.env` configures storage). Use mongomock-motor like `tests_unit/test_bids_db.py`.
@@ -87,7 +87,7 @@
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_count_by_status_counts_each_status_in_the_window` (bids inside/outside `[start, end)`).
-  - `test_uses_records_only_after_the_start_day`: unset → False; set to `2026-10-06` in `America/Chicago` → a window ending `2026-10-06T04:59Z` is False, ending `05:01Z` is True.
+  - `test_uses_records_only_after_the_start_day`: unset → False; set to `2026-10-06` in `America/Chicago` → a window starting `2026-10-06T04:59Z` is False, starting `05:00Z` is True.
   - `test_build_rows_counts_approved_records_after_start`: 2 approved + 1 pending + 1 rejected → `count == 2`, `pending == 1`, `rejected == 1`, `amount == round(2 * rate, 2)`, storage not called.
   - `test_build_rows_uses_folders_before_start_or_when_unset` (existing fake storage; `pending is None`).
   - `test_refresh_report_rows_updates_the_stored_day` after approving a bid.

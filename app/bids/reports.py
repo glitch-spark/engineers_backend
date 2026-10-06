@@ -107,9 +107,9 @@ async def build_rows(
     storage: BidStorage,
     sched: BidSchedule,
 ) -> list[BidReportRow]:
-    """One row per bidder. A window that ends after BID_RECORDS_START counts approved bid records
-    (pending and rejected reported beside them); an earlier one counts screenshot folders."""
-    if uses_records(end, sched):
+    """One row per bidder. A window that starts on or after BID_RECORDS_START counts approved bid
+    records (pending and rejected reported beside them); an earlier one counts screenshot folders."""
+    if uses_records(start, sched):
         by_status = await count_by_status([b.id for b in bidders], start, end)
         counts = {str(b.id): (by_status[str(b.id)][0], None) for b in bidders}
     else:
