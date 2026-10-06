@@ -99,13 +99,28 @@ def counted(kind, pending, rejected, count=2):
 
 
 def test_report_line_shows_pending_and_rejected():
-    _, weekly = format_report("weekly", START, END, [counted("weekly", 1, 1)], OWNERS, CT, "https://app.example")
-    line = texts(weekly)[1].splitlines()[1]
-    assert line == "• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00 (pending 1, rejected 1)"
-    _, daily = format_report("daily", START, END, [counted("daily", 3, 0)], OWNERS, CT, "https://app.example")
-    assert texts(daily)[1].splitlines()[1] == "• 🇧🇷 Ana Silva — 2 (pending 3, rejected 0)"
+    weekly_text, weekly = format_report("weekly", START, END, [counted("weekly", 1, 1)], OWNERS, CT, "https://app.example")
+    t = texts(weekly)
+    assert t[1] == ("*<@U1>* — Approved 2 bids (pending 1, rejected 1) · *$1.00*\n"
+                    "• 🇧🇷 Ana Silva — Approved 2 bids × $0.50 = $1.00 (pending 1, rejected 1)")
+    assert t[2] == "*Total: Approved 2 bids (pending 1, rejected 1) · $1.00* · <https://app.example/bidders|View in app>"
+    assert weekly_text == "Weekly bids & pay — week ending Fri Oct 2: Approved 2 bids (pending 1, rejected 1) · $1.00"
+
+    daily_text, daily = format_report("daily", START, END, [counted("daily", 3, 0)], OWNERS, CT, "https://app.example")
+    t = texts(daily)
+    assert t[1] == ("*<@U1>* — Approved 2 bids (pending 3, rejected 0)\n"
+                    "• 🇧🇷 Ana Silva — Approved 2 (pending 3, rejected 0)")
+    assert t[2] == "*Total: Approved 2 bids (pending 3, rejected 0) · 1 bidder* · <https://app.example/bidders|View in app>"
+    assert daily_text == "Daily bids — Fri Oct 2: Approved 2 bids (pending 3, rejected 0)"
+
+
+def test_report_totals_add_up_pending_and_rejected_across_bidders():
+    rows = [counted("daily", 1, 2, count=3), counted("daily", 4, 0, count=1)]
+    _, messages = format_report("daily", START, END, rows, OWNERS, CT, "https://app.example")
+    assert texts(messages)[1].splitlines()[0] == "*<@U1>* — Approved 4 bids (pending 5, rejected 2)"
 
 
 def test_rows_without_pending_keep_the_folder_line():
     _, weekly = format_report("weekly", START, END, [counted("weekly", None, None)], OWNERS, CT, "https://app.example")
-    assert texts(weekly)[1].splitlines()[1] == "• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00"
+    assert texts(weekly)[1] == "*<@U1>* — 2 bids · *$1.00*\n• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00"
+    assert texts(weekly)[2].startswith("*Total: 2 bids · $1.00*")
