@@ -7,7 +7,7 @@ alwaysApply: true
 
 FastAPI + Beanie/Motor on MongoDB Atlas. Keep existing collection names (`userextras`, `transactions`, …) — do not rename for cleanliness (ADR-0003).
 
-- Roles: `admin`, `staff`, `accountant`. JWT bearer in `Authorization`.
+- Roles: `admin`, `staff`, `interview_manager` (staff access + read any interview; tagged on #caller posts). JWT bearer in `Authorization`.
 - Slack is optional: no-op when tokens/webhooks are unset.
 - Card numbers: store **last 4 only**. Never persist a full PAN.
 - New Beanie models must be imported in `app/models/__init__.py` and listed in `DOCUMENT_MODELS` in `app/db.py`.

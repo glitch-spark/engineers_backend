@@ -51,7 +51,7 @@ def run(interview, before, *, fail=None, **kw):
         patch.object(slack_bot, "slack_bot_configured", lambda: True),
         patch.object(slack_bot, "get_settings", lambda: SimpleNamespace(SLACK_CALLER_CHANNEL_ID="C1")),
         patch.object(slack_bot, "_main_post_text", AsyncMock(return_value="MAIN")),
-        patch.object(slack_bot, "_owner_and_manager", AsyncMock(return_value=(OWNER, MANAGER))),
+        patch.object(slack_bot, "_owner_and_managers", AsyncMock(return_value=(OWNER, [MANAGER]))),
     ):
         changed = asyncio.run(slack_bot.sync_caller_thread(interview, before, **kw))
     return changed, calls

@@ -1,4 +1,4 @@
-"""Interview managers (admin-set) and typed Slack member IDs, against an in-memory MongoDB (mongomock-motor)."""
+"""The interview manager role and typed Slack member IDs, against an in-memory MongoDB (mongomock-motor)."""
 
 import os
 
@@ -43,53 +43,69 @@ def client(db):
     return make
 
 
-# --- interview manager -----------------------------------------------------------------------------
+# --- interview manager role ------------------------------------------------------------------------
 
 
-async def test_admin_sets_and_clears_manager(client):
-    admin, pedro, maria = await make_user("Root", "admin"), await make_user("Pedro"), await make_user("Maria")
+async def test_admin_sets_interview_manager_role(client):
+    admin, maria = await make_user("Root", "admin"), await make_user("Maria")
     async with client(admin) as c:
-        r = await c.put(f"/users/{pedro.id}", json={"interviewManagerId": str(maria.id)})
-        assert r.status_code == 200, r.text
-        assert r.json()["interviewManagerId"] == str(maria.id)
-        assert (await UserExtra.get(pedro.id)).interviewManagerId == maria.id
-        r = await c.put(f"/users/{pedro.id}", json={"interviewManagerId": None})
-        assert r.status_code == 200 and r.json()["interviewManagerId"] is None
-    assert (await UserExtra.get(pedro.id)).interviewManagerId is None
+        r = await c.put(f"/users/{maria.id}", json={"role": "interview_manager"})
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == "interview_manager"
+    assert (await UserExtra.get(maria.id)).role == "interview_manager"
 
 
-async def test_name_only_update_keeps_manager(client):
-    admin, pedro, maria = await make_user("Root", "admin"), await make_user("Pedro"), await make_user("Maria")
+@pytest.mark.parametrize("bad", ["accountant", "owner", ""])
+async def test_unknown_role_is_rejected(client, bad):
+    admin, maria = await make_user("Root", "admin"), await make_user("Maria")
     async with client(admin) as c:
-        await c.put(f"/users/{pedro.id}", json={"interviewManagerId": str(maria.id)})
-        await c.put(f"/users/{pedro.id}", json={"name": "Pedro S"})
-    assert (await UserExtra.get(pedro.id)).interviewManagerId == maria.id
+        assert (await c.put(f"/users/{maria.id}", json={"role": bad})).status_code == 422
+        assert (await c.post("/users", json={"name": "New", "email": "n@x.io", "role": bad})).status_code == 422
+    assert (await UserExtra.get(maria.id)).role == "staff"
 
 
-async def test_manager_must_be_active_other_user(client):
-    admin, pedro = await make_user("Root", "admin"), await make_user("Pedro")
-    gone = await make_user("Gone", active=False)
-    async with client(admin) as c:
-        for bad in (str(pedro.id), str(gone.id), str(PydanticObjectId()), "nope"):
-            r = await c.put(f"/users/{pedro.id}", json={"interviewManagerId": bad})
-            assert (r.status_code, r.json()["detail"]) == (400, "Choose another active user"), bad
-
-
-async def test_staff_cannot_set_manager(client):
-    pedro, maria = await make_user("Pedro"), await make_user("Maria")
+async def test_staff_cannot_change_roles(client):
+    pedro = await make_user("Pedro")
     async with client(pedro) as c:
-        r = await c.put(f"/users/{pedro.id}", json={"interviewManagerId": str(maria.id)})
+        r = await c.put(f"/users/{pedro.id}", json={"role": "interview_manager"})
     assert r.status_code == 403
 
 
-async def test_users_list_has_manager_name(client):
+async def test_per_user_manager_field_is_gone(client):
     admin, pedro, maria = await make_user("Root", "admin"), await make_user("Pedro"), await make_user("Maria")
-    pedro.interviewManagerId = maria.id
-    await pedro.save()
     async with client(admin) as c:
-        rows = {u["name"]: u for u in (await c.get("/users", params={"limit": 50})).json()["users"]}
-    assert (rows["Pedro"]["interviewManagerId"], rows["Pedro"]["interviewManagerName"]) == (str(maria.id), "Maria")
-    assert (rows["Maria"]["interviewManagerId"], rows["Maria"]["interviewManagerName"]) == (None, None)
+        r = await c.put(f"/users/{pedro.id}", json={"interviewManagerId": str(maria.id)})
+        assert r.status_code == 200 and "interviewManagerId" not in r.json()
+        rows = (await c.get("/users", params={"limit": 50})).json()["users"]
+    assert all("interviewManagerId" not in u and "interviewManagerName" not in u for u in rows)
+
+
+async def test_interview_managers_are_active_role_holders(db):
+    from app.slack_bot import interview_managers
+
+    await make_user("Zed", "interview_manager")
+    await make_user("Amy", "interview_manager")
+    await make_user("Gone", "interview_manager", active=False)
+    await make_user("Pedro")
+    await make_user("Root", "admin")
+    assert [u.name for u in await interview_managers()] == ["Amy", "Zed"]
+
+
+async def test_no_interview_managers(db):
+    from app.slack_bot import interview_managers
+
+    await make_user("Pedro")
+    assert await interview_managers() == []
+
+
+async def test_interview_manager_can_view_any_interview():
+    from types import SimpleNamespace
+
+    from app.routers.interviews import _can_view
+
+    iv = SimpleNamespace(createdBy=PydanticObjectId(), caller=None, stageHistory=[])
+    assert _can_view(iv, SimpleNamespace(id=PydanticObjectId(), role="interview_manager")) is True
+    assert _can_view(iv, SimpleNamespace(id=PydanticObjectId(), role="staff")) is False
 
 
 # --- typed Slack member ID ------------------------------------------------------------------------
@@ -151,18 +167,6 @@ async def test_oauth_routes_are_gone(client):
         assert (await c.post("/integrations/slack/oauth-start")).status_code in (404, 405)
         assert (await c.get("/integrations/slack/oauth-callback")).status_code in (404, 405)
         assert (await c.delete("/integrations/slack/disconnect")).status_code in (404, 405)
-
-
-async def test_unchanged_inactive_manager_still_saves(client):
-    admin, pedro, maria = await make_user("Root", "admin"), await make_user("Pedro"), await make_user("Maria")
-    pedro.interviewManagerId = maria.id
-    await pedro.save()
-    maria.isActive = False
-    await maria.save()
-    async with client(admin) as c:
-        r = await c.put(f"/users/{pedro.id}", json={"phone": "123", "interviewManagerId": str(maria.id)})
-    assert r.status_code == 200, r.text
-    assert (await UserExtra.get(pedro.id)).interviewManagerId == maria.id
 
 
 async def test_lookup_returns_is_active(client):

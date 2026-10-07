@@ -2,7 +2,7 @@
 
 One Slack App bot (`SLACK_BOT_TOKEN`) does four things:
 
-1. **#caller threads** — one thread per caller interview in `SLACK_CALLER_CHANNEL_ID`, tagging the owner's
+1. **#caller threads** — one thread per caller interview in `SLACK_CALLER_CHANNEL_ID`, tagging every
    interview manager; replies when a round is confirmed, rescheduled, canceled or moved to the next round.
 2. **30-minute reminders** — a reply in that thread ~30 min before each caller round starts.
 3. **Daily caller list** — at 05:00 America/Chicago, the day's confirmed caller interviews in
@@ -38,8 +38,9 @@ APP_TIMEZONE=America/New_York
 - **Slack member ID** — each user types theirs in **Profile → Slack** (Slack: your profile → ⋮ → **Copy member
   ID**, e.g. `U04ABC12345`). It is used to @-mention them and to DM them. One ID belongs to one user.
   Without one, messages show their name and they get no ping or DM.
-- **Interview manager** — admins pick one per user on **Users** (edit a user → Interview manager). The manager is
-  tagged in that user's #caller threads and daily-list lines.
+- **Interview manager** — a user role; admins set it on **Users** (edit a user → Role → Interview manager). Every
+  active interview manager is tagged in all #caller threads and daily-list lines, and can open any interview
+  (read-only) to coordinate it. With none, posts say "no interview manager assigned".
 
 ## 4. #caller threads
 
@@ -47,7 +48,7 @@ APP_TIMEZONE=America/New_York
   recruiter, stage, time, method, caller, coworkers, **Interview manager**, and **Confirmed / Not confirmed yet**.
   Interviews from before this change keep their older per-round posts; their latest one becomes the thread.
 - Every change edits the main post to describe the **latest round** and adds one reply, ending with
-  `cc @manager @owner`:
+  `cc @managers @owner`:
 
   | Change | Reply |
   |---|---|

@@ -36,8 +36,8 @@ IV = SimpleNamespace(companyName="Acme", jobUrl="https://jobs.example/1", accoun
 OWNER, MANAGER = user("Pedro", "U0OWNER001"), user("Maria", "U0MANAGER1")
 
 
-def reply(event, e, prev=None, *, owner=OWNER, manager=MANAGER):
-    return asyncio.run(caller_thread_reply(event, e, prev, owner=owner, manager=manager))
+def reply(event, e, prev=None, *, owner=OWNER, managers=(MANAGER,)):
+    return asyncio.run(caller_thread_reply(event, e, prev, owner=owner, managers=list(managers)))
 
 
 # --- caller_thread_event ------------------------------------------------------------------------
@@ -82,29 +82,35 @@ def test_event_none_when_unchanged_or_caller_toggled():
 
 
 def test_main_post_shows_manager_and_badge():
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], manager=MANAGER)
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], managers=[MANAGER])
     assert "*Interview manager:* <@U0MANAGER1>" in text
     assert ":hourglass_flowing_sand: Not confirmed yet" in text
-    text = caller_round_text(IV, entry(confirmed=True), account=None, owner=OWNER, coworkers=[], manager=MANAGER)
+    text = caller_round_text(IV, entry(confirmed=True), account=None, owner=OWNER, coworkers=[], managers=[MANAGER])
     assert ":white_check_mark: Confirmed" in text
 
 
 def test_main_post_without_manager():
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], manager=None)
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], managers=[])
     assert "*Interview manager:* no interview manager assigned" in text
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], manager=user("Maria"))
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], managers=[user("Maria")])
     assert "*Interview manager:* Maria" in text
+
+
+def test_main_post_tags_every_manager():
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[],
+                             managers=[MANAGER, user("Ana", "U0MANAGER2")])
+    assert "*Interview manager:* <@U0MANAGER1> <@U0MANAGER2>" in text
 
 
 def test_main_post_no_caller_variant():
     text = caller_round_text(IV, entry(caller=False, stage="tech_round_1"), account=None, owner=OWNER,
-                             coworkers=[], manager=MANAGER)
+                             coworkers=[], managers=[MANAGER])
     assert text.splitlines()[0] == ":telephone_receiver: *No caller needed for Tech Round 1* — posted by <@U0OWNER001>"
     assert "Caller assigned" not in text and "Confirmed" not in text
 
 
 def test_canceled_main_post_has_no_badge():
-    text = caller_round_text(IV, entry(status="canceled"), account=None, owner=OWNER, coworkers=[], manager=MANAGER)
+    text = caller_round_text(IV, entry(status="canceled"), account=None, owner=OWNER, coworkers=[], managers=[MANAGER])
     assert text.startswith(":x: *CANCELED*") and "Not confirmed yet" not in text
 
 
@@ -134,8 +140,10 @@ def test_details_reply_lists_changes_and_none_without_changes():
 
 def test_reply_cc_line_tags_manager_and_owner():
     assert reply("confirmed", entry(confirmed=True), snap()).splitlines()[-1] == "cc <@U0MANAGER1> <@U0OWNER001>"
-    assert reply("confirmed", entry(confirmed=True), snap(), manager=user("Maria"), owner=user("Pedro")).splitlines()[-1] == "cc Maria Pedro"
-    assert reply("confirmed", entry(confirmed=True), snap(), manager=None).splitlines()[-1] == "cc no interview manager assigned <@U0OWNER001>"
+    assert reply("confirmed", entry(confirmed=True), snap(), managers=[user("Maria")], owner=user("Pedro")).splitlines()[-1] == "cc Maria Pedro"
+    assert reply("confirmed", entry(confirmed=True), snap(), managers=[]).splitlines()[-1] == "cc no interview manager assigned <@U0OWNER001>"
+    two = reply("confirmed", entry(confirmed=True), snap(), managers=[MANAGER, user("Ana", "U0MANAGER2")])
+    assert two.splitlines()[-1] == "cc <@U0MANAGER1> <@U0MANAGER2> <@U0OWNER001>"
 
 
 def test_rescheduled_and_confirmed_reply_says_confirmed():

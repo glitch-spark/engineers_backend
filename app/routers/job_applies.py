@@ -1025,16 +1025,10 @@ class InfoBody(BaseModel):
 _NULLABLE = {"postedDate", "workAuthorization", "timezoneNote"}
 
 
-def _require_editor(user: UserExtra) -> None:
-    if user.role not in ("admin", "staff"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admin and staff can correct jobs.")
-
-
 @router.put("/rows/{row_id}/info")
 async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Correct a job's parsed info and/or description. Saved per URL for everyone; this row is read again now,
     other runs use it the next time they read the URL."""
-    _require_editor(user)
     row = await _owned_row(row_id, user)
     if not row.url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only jobs with a link can be corrected.")
@@ -1097,7 +1091,6 @@ async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra
 @router.delete("/rows/{row_id}/info")
 async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Drop the correction for this job's URL and read the job again with the machine (fetch + LLM)."""
-    _require_editor(user)
     row = await _owned_row(row_id, user)
     run = await JobApplyRun.get(row.runId)
     if run is None:

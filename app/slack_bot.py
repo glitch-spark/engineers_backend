@@ -18,7 +18,7 @@ import logging
 import re
 import math
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -407,7 +407,7 @@ def caller_round_text(
     account: Optional[Account],
     owner: Optional[UserExtra],
     coworkers: list[UserExtra],
-    manager: Optional[UserExtra] = None,
+    managers: Sequence[UserExtra] = (),
 ) -> str:
     """The interview's #caller main post, describing its latest round: marked canceled once called off,
     "No caller needed" when that round has no caller."""
@@ -442,21 +442,21 @@ def caller_round_text(
     ]
     if coworkers:
         lines.append(f"*Coworkers:* {' '.join(_mention(u) for u in coworkers)}")
-    lines.append(f"*Interview manager:* {_manager_text(manager)}")
+    lines.append(f"*Interview manager:* {_managers_text(managers)}")
     if not off:
         lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
                      else ":hourglass_flowing_sand: Not confirmed yet")
     return "\n".join(lines)
 
 
-def _manager_text(manager: Optional[UserExtra]) -> str:
-    return _mention(manager) if manager is not None else "no interview manager assigned"
+def _managers_text(managers: Sequence[UserExtra]) -> str:
+    return " ".join(_mention(m) for m in managers) or "no interview manager assigned"
 
 
 async def caller_thread_reply(
-    event: str, entry: Any, prev: Optional[dict], *, owner: Optional[UserExtra], manager: Optional[UserExtra],
+    event: str, entry: Any, prev: Optional[dict], *, owner: Optional[UserExtra], managers: Sequence[UserExtra],
 ) -> Optional[str]:
-    """The thread reply for a caller_thread_event; ends with a cc line for the manager and the owner.
+    """The thread reply for a caller_thread_event; ends with a cc line for the interview managers and the owner.
     None for "details" when no listed field changed."""
     stage, when = _stage_label(entry.stage), slack_time(getattr(entry, "scheduledAt", None))
     caller = getattr(entry, "caller", None)
@@ -490,7 +490,7 @@ async def caller_thread_reply(
         head = "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
     else:
         return None
-    return f"{head}\ncc {_manager_text(manager)} {_mention(owner)}"
+    return f"{head}\ncc {_managers_text(managers)} {_mention(owner)}"
 
 
 def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
@@ -510,20 +510,24 @@ _MESSAGE_GONE = {"message_not_found", "channel_not_found", "cant_update_message"
 
 
 async def _main_post_text(
-    interview: Interview, entry: Any, owner: Optional[UserExtra], manager: Optional[UserExtra] = None,
+    interview: Interview, entry: Any, owner: Optional[UserExtra], managers: Sequence[UserExtra] = (),
 ) -> str:
     caller = entry.caller
     account = await Account.get(interview.accountId) if interview.accountId else None
     ids = list(caller.coworkerIds) if caller is not None and caller.enabled else []
     coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
-    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers, manager=manager)
+    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers, managers=managers)
 
 
-async def _owner_and_manager(interview: Any) -> tuple[Optional[UserExtra], Optional[UserExtra]]:
-    """The interview's owner and the owner's interview manager (None when unassigned)."""
-    owner = await UserExtra.get(interview.createdBy)
-    manager_id = getattr(owner, "interviewManagerId", None) if owner else None
-    return owner, (await UserExtra.get(manager_id) if manager_id else None)
+async def interview_managers() -> list[UserExtra]:
+    """Active users with the interview manager role, by name: tagged on every caller interview."""
+    found = await UserExtra.find({"role": "interview_manager", "isActive": {"$ne": False}}).to_list()
+    return sorted(found, key=lambda u: (u.name or u.email or "").lower())
+
+
+async def _owner_and_managers(interview: Any) -> tuple[Optional[UserExtra], list[UserExtra]]:
+    """The interview's owner and every interview manager."""
+    return await UserExtra.get(interview.createdBy), await interview_managers()
 
 
 async def _post_main(channel: str, text: str) -> Optional[str]:
@@ -579,8 +583,8 @@ async def sync_caller_thread(
             else:
                 if not any(caller_is_on(round_caller_snapshot(e)) for e in live):
                     return False
-                owner, manager = await _owner_and_manager(interview)
-                ts = await _post_main(channel, await _main_post_text(interview, latest, owner, manager))
+                owner, managers = await _owner_and_managers(interview)
+                ts = await _post_main(channel, await _main_post_text(interview, latest, owner, managers))
                 if ts:
                     interview.slackThread = SlackThread(channel=channel, ts=ts)
                 return bool(ts)
@@ -597,8 +601,8 @@ async def sync_caller_thread(
         if not touched:
             return changed
 
-        owner, manager = await _owner_and_manager(interview)
-        text = await _main_post_text(interview, latest, owner, manager)
+        owner, managers = await _owner_and_managers(interview)
+        text = await _main_post_text(interview, latest, owner, managers)
         try:
             await _slack_api("chat.update", {"channel": thread.channel, "ts": thread.ts, "text": text})
         except RuntimeError as exc:
@@ -614,7 +618,7 @@ async def sync_caller_thread(
         pick = next((ev for ev in events if ev[0] == "moved"), events[-1] if events else None)
         if pick is not None:
             event, entry, prev = pick
-            reply = await caller_thread_reply(event, entry, prev, owner=owner, manager=manager)
+            reply = await caller_thread_reply(event, entry, prev, owner=owner, managers=managers)
             if reply:
                 await _slack_api("chat.postMessage", {
                     "channel": thread.channel, "text": reply, "thread_ts": thread.ts,
@@ -1139,11 +1143,11 @@ async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, 
 
 
 async def _caller_daily_people(interview: Any, entry: Any) -> dict[str, Any]:
-    owner, manager = await _owner_and_manager(interview)
+    owner, managers = await _owner_and_managers(interview)
     ids = list(entry.caller.coworkerIds or [])
     coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
     account = await Account.get(interview.accountId) if interview.accountId else None
-    return {"owner": owner, "coworkers": coworkers, "manager": manager, "profile": _profile_label(account)}
+    return {"owner": owner, "coworkers": coworkers, "managers": managers, "profile": _profile_label(account)}
 
 
 async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
@@ -1213,7 +1217,7 @@ async def run_caller_daily(
         rows = []
         for iv, entry in await load(start, end):
             who = await people(iv, entry)
-            users = [who["owner"], *who["coworkers"], who["manager"]]
+            users = [who["owner"], *who["coworkers"], *who["managers"]]
             mentions = " ".join(dict.fromkeys(_mention(u) for u in users if u is not None))
             rows.append({
                 "start": _aware_utc(entry.scheduledAt),

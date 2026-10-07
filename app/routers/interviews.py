@@ -275,9 +275,9 @@ async def _sync_caller_posts(
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
-    """Admin, owner, or a coworker on any round's caller request."""
+    """Admin, interview manager, owner, or a coworker on any round's caller request."""
     return (
-        user.role == "admin"
+        user.role in ("admin", "interview_manager")
         or str(iv.createdBy) == str(user.id)
         or is_coworker(iv.caller, user.id)
         or any(is_coworker(getattr(e, "caller", None), user.id) for e in (iv.stageHistory or []))

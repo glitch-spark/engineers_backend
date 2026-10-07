@@ -49,12 +49,12 @@ async def test_users_update_admin(client, admin_user, staff_user, auth_header):
     r = await client.put(
         f"/users/{staff_user.id}",
         headers=auth_header(admin_user),
-        json={"name": "Updated Name", "role": "accountant"},
+        json={"name": "Updated Name", "role": "interview_manager"},
     )
     assert r.status_code == 200
     body = r.json()
     assert body["name"] == "Updated Name"
-    assert body["role"] == "accountant"
+    assert body["role"] == "interview_manager"
 
 
 async def test_users_delete_admin(client, admin_user, staff_user, auth_header):

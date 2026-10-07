@@ -1605,14 +1605,12 @@ async def test_machine_reading_never_overwrites_a_correction(client, staff_user,
     assert again["title"] == "Human Title" and again["humanEdited"] is True
 
 
-async def test_correction_needs_a_description_and_an_editor_role(client, staff_user, make_user, auth_header, monkeypatch):
+async def test_correction_needs_a_description(client, staff_user, auth_header, monkeypatch):
     monkeypatch.setattr(worker, "FETCH", failing_fetch)
     h = auth_header(staff_user)
     run_id = await screened_run(client, h)
     gh = (await rows_by_url(client, h, run_id))[GH]
     assert (await put_info(client, h, gh["_id"], title="No JD yet")).status_code == 400
-    accountant = await make_user(name="Acc", email="acc@example.com", role="accountant")
-    assert (await put_info(client, auth_header(accountant), gh["_id"], jdText=REMOTE_JD)).status_code == 403
     assert (await put_info(client, h, gh["_id"], workMode="sideways", jdText=REMOTE_JD)).status_code == 422
 
 

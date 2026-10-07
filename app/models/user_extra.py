@@ -1,12 +1,12 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from beanie import PydanticObjectId
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
 
-UserRole = Literal["admin", "staff", "accountant"]
+# interview_manager: staff access, can view any interview, tagged on every #caller interview post.
+UserRole = Literal["admin", "staff", "interview_manager"]
 
 
 class UserExtra(TimestampedDocument):
@@ -46,9 +46,6 @@ class UserExtra(TimestampedDocument):
     freeLlmApiKey: Optional[str] = None
     freeLlmMaxTokens: Optional[int] = None
     freeLlmKeyVerified: bool = False
-
-    # Who coordinates this user's caller interviews in Slack (another user; set by admins).
-    interviewManagerId: Optional[PydanticObjectId] = None
 
     # Slack interview bot. slackUserId is the member ID the user types in (U…): DMs and @-mentions.
     slackUserId: Optional[str] = None
