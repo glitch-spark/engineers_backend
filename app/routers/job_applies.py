@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
-from app.job_apply import file_links, gsheet, sheet_checks, tailored_score, worker
+from app.job_apply import file_links, gsheet, jd_store, sheet_checks, tailored_score, worker
 from app.job_apply.sheet_links import exported_to
 from app.job_apply.sheet_checks import sheet_text
 from app.job_apply.fetch import route as fetch_route
@@ -68,6 +68,7 @@ async def _owned_row(row_id: str, user: UserExtra) -> JobApplyRow:
     row = await JobApplyRow.get(to_object_id(row_id))
     if row is None or not _can_see(row.userId, user):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    await jd_store.hydrate([row])
     return row
 
 
@@ -1407,6 +1408,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     else:
         query = await _rows_query(run, view="suggested")
     rows = await JobApplyRow.find(query).sort("+rowIndex").to_list()
+    await jd_store.hydrate(rows)
     ctx = await _app_context(run, rows)
     existing = ctx.tailored
     remaining = await resume_queue.remaining_today(owner)

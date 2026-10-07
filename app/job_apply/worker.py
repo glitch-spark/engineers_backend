@@ -17,6 +17,7 @@ from beanie.odm.utils.encoder import Encoder
 
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
+from app.job_apply import jd_store
 from app.job_apply.gates import blocked, failing_reasons, job_gates
 from app.job_apply.screening import NO_LOCATION, WORTH, bucket, group_key, markets_for, scoring_key
 from app.job_apply.pipeline import ProfileInfo, ResumeInput, score_row
@@ -127,7 +128,10 @@ _SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "tailorO
 async def _save_fields(row: JobApplyRow, fields: tuple[str, ...]) -> None:
     """$set only what a stage changed. Never `applied` (the user may tick it mid-run) and never an upsert
     (a run deleted after Cancel must stay deleted)."""
-    doc = Encoder(to_db=True).encode({f: getattr(row, f) for f in fields})
+    values = {f: getattr(row, f) for f in fields}
+    if "jdText" in values:
+        values["jdText"] = jd_store.persisted(row.jdText, row.jdSource)
+    doc = Encoder(to_db=True).encode(values)
     doc["updatedAt"] = datetime.utcnow()
     await JobApplyRow.get_motor_collection().update_one({"_id": row.id}, {"$set": doc})
 
@@ -168,7 +172,9 @@ class _Checker:
 
 
 async def _rows(run_id: PydanticObjectId) -> list[JobApplyRow]:
-    return await JobApplyRow.find(JobApplyRow.runId == run_id).sort("+rowIndex").to_list()
+    rows = await JobApplyRow.find(JobApplyRow.runId == run_id).sort("+rowIndex").to_list()
+    await jd_store.hydrate(rows)
+    return rows
 
 
 async def _cache_description(url: str, text: str) -> None:

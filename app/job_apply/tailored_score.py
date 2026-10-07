@@ -6,11 +6,13 @@ their row is next listed (`backfill`).
 import asyncio
 import logging
 import time
+from types import SimpleNamespace
 from datetime import date
 from typing import Optional
 
 from beanie import PydanticObjectId
 
+from app.job_apply import jd_store
 from app.job_apply.resume_parse import parse_resume
 from app.job_apply.schema import JobExtraction, TailoredMatch
 from app.job_apply.scoring import Idf, build_idf, score_resume
@@ -42,9 +44,11 @@ async def _run_idf(run_id: PydanticObjectId) -> Idf:
     if hit and time.monotonic() - hit[0] < IDF_TTL_SECONDS:
         return hit[1]
     cursor = JobApplyRow.get_motor_collection().find(
-        {"runId": run_id, "extraction": {"$ne": None}, "jdText": {"$nin": [None, ""]}}, {"jdText": 1}
+        {"runId": run_id, "extraction": {"$ne": None}}, {"jdText": 1, "jdSource": 1, "url": 1}
     )
-    jds = [d["jdText"] async for d in cursor]
+    rows = [SimpleNamespace(jdText=d.get("jdText"), jdSource=d.get("jdSource"), url=d.get("url")) async for d in cursor]
+    await jd_store.hydrate(rows)
+    jds = [r.jdText for r in rows if r.jdText]
     idf = await asyncio.to_thread(lambda: build_idf([substantive_text(jd) or jd for jd in jds]))
     if len(_idf_cache) > 32:
         _idf_cache.clear()
@@ -59,6 +63,7 @@ async def score_text(row_id: Optional[PydanticObjectId], text: Optional[str]) ->
     if not row_id or not (text or "").strip():
         return None
     row = await JobApplyRow.get(row_id)
+    await jd_store.hydrate([row])
     if row is None or row.extraction is None or not row.jdText:
         return None
     run = await JobApplyRun.get(row.runId)
