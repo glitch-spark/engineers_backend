@@ -26,10 +26,8 @@ class Settings(BaseSettings):
     # The cron secret protects the scheduled tick endpoint. All optional so the app boots without Slack.
     SLACK_BOT_TOKEN: Optional[str] = None
     SLACK_BOT_CRON_SECRET: Optional[str] = None
-    SLACK_DIGEST_HOUR: int = 8
-    SLACK_DIGEST_MINUTE: int = 0
     SLACK_CALLER_CHANNEL_ID: Optional[str] = None
-    # Daily list of the day's confirmed caller interviews (e.g. #engineer-caller-test); unset = off.
+    # Daily list of the day's caller interviews (e.g. #engineer-caller-test); unset = off.
     # Posted once a day at SLACK_CALLER_DAILY_TIME (HH:MM) in SLACK_CALLER_DAILY_TIMEZONE.
     SLACK_CALLER_DAILY_CHANNEL_ID: Optional[str] = None
     SLACK_CALLER_DAILY_TIME: str = "05:00"

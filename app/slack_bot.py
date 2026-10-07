@@ -690,7 +690,7 @@ async def run_caller_reminders(
     return {"sent": sent, "failed": failed}
 
 
-# --- daily list of confirmed caller interviews -----------------------------------------------------
+# --- daily list of caller interviews ---------------------------------------------------------------
 
 
 def caller_daily_due(now: datetime, *, at: time, tz: ZoneInfo) -> Optional[date]:

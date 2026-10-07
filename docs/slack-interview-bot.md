@@ -40,8 +40,6 @@ SLACK_CALLER_DAILY_TIMEZONE=America/Chicago  # CST/CDT handled automatically
 SLACK_DAILY_PLAN_CHANNEL_ID=C0246813579      # daily plans, edited in place
 SLACK_TRANSACTIONS_CHANNEL_ID=C0135792468    # transactions with Approve / Reject; unset = no transaction posts
 SLACK_SIGNING_SECRET=...                     # verifies button clicks; unset = posts without buttons
-SLACK_DIGEST_HOUR=8
-SLACK_DIGEST_MINUTE=0
 APP_TIMEZONE=America/New_York
 ```
 
