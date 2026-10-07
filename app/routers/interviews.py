@@ -382,16 +382,9 @@ async def _load_editable(iv_id: str, user: UserExtra) -> Interview:
 async def _after_save(
     iv: Interview,
     *,
-    user: UserExtra,
     extract_stage_ids: Iterable[Optional[str]] = (),
 ) -> None:
-    """Pipeline re-sync and transcript extraction after an update."""
-    try:
-        from app.routers.applications import attach_interview_to_app
-        await attach_interview_to_app(user_id=user.id, interview=iv)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("pipeline auto-link failed for interview %s on update: %s", iv.id, exc)
-
+    """Transcript extraction after an update."""
     for sid in extract_stage_ids:
         asyncio.create_task(extract_and_score(iv, sid))
 
@@ -732,11 +725,6 @@ async def create_interview(
 
     if entry.transcript.strip():
         asyncio.create_task(extract_and_score(iv, entry.id))
-    try:
-        from app.routers.applications import attach_interview_to_app
-        await attach_interview_to_app(user_id=user.id, interview=iv)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("pipeline auto-link failed for interview %s: %s", iv.id, exc)
     await _sync_caller_posts(iv, {})
     return await _interview_out(iv)
 
@@ -829,7 +817,6 @@ async def update_interview(
             {"interviewId": iv.id, "stageId": None}
         ).update({"$set": {"stageId": tip.id}})
     await _sync_caller_posts(iv, before)
-    await _after_save(iv, user=user)
     return await _interview_out(iv)
 
 
@@ -861,7 +848,7 @@ async def add_interview_stage(
     await _save_interview(iv)
 
     await _sync_caller_posts(iv, before, added={entry.id})
-    await _after_save(iv, user=user, extract_stage_ids=[entry.id] if entry.transcript.strip() else [])
+    await _after_save(iv, extract_stage_ids=[entry.id] if entry.transcript.strip() else [])
     return await _interview_out(iv)
 
 
@@ -939,7 +926,7 @@ async def update_interview_stage(
         else:
             await InterviewQuestion.find({"interviewId": iv.id, "stageId": entry.id}).delete()
     await _sync_caller_posts(iv, before)
-    await _after_save(iv, user=user, extract_stage_ids=extract_ids)
+    await _after_save(iv, extract_stage_ids=extract_ids)
     return await _interview_out(iv)
 
 
@@ -965,7 +952,6 @@ async def delete_interview_stage(
     _sync_top_from_tip(iv)
     await _save_interview(iv)
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
-    await _after_save(iv, user=user)
     return await _interview_out(iv)
 
 

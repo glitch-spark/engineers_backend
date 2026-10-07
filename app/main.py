@@ -16,14 +16,12 @@ from app.job_apply import worker as job_apply_worker
 from app.routers import (
     accounts,
     ai_review,
-    applications,
     auth as auth_router,
     bidder_ext,
     bidders,
     bids,
     dashboard,
     global_prompt,
-    integrations,
     interview_prep,
     interviews,
     job_applies,
@@ -119,10 +117,6 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(resume.router)
     app.include_router(job_applies.router)
-    app.include_router(applications.router)
-    app.include_router(integrations.router)
-    app.include_router(integrations.oauth_router)
-    app.include_router(integrations.outlook_oauth_router)
     app.include_router(slack_bot.router)
     app.include_router(slack_bot.cron_router)
     app.include_router(bidders.router)

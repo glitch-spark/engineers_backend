@@ -87,38 +87,9 @@ class Settings(BaseSettings):
     EXTRACTION_MODEL: str = "gpt-4o-mini"
     # Job Applies: OpenAI model that reads job postings (locations, work mode, clearance). Empty = RESUME_OPENAI_MODEL.
     JOB_EXTRACT_MODEL: str = ""
-    # Gmail integration — OAuth client + Fernet key for refresh-token storage.
-    # If GOOGLE_OAUTH_CLIENT_ID is unset, the gmail router 503s on use so the
-    # rest of the app still boots without these. EMAIL_TOKEN_KEY is a 32-byte
-    # urlsafe-base64 Fernet key — generate one with
-    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     # Service account for writing Job Applies exports into a Google Sheet shared with its email as Editor:
     # the key file's JSON (or a path to it). Unset = export disabled with a setup message.
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = None
-    GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
-    GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None
-    GOOGLE_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/gmail/oauth-callback"
-    EMAIL_TOKEN_KEY: Optional[str] = None
-    # Days of inbox history pulled on the first connect. Subsequent syncs use
-    # Gmail's history.list delta API and only fetch new messages. 30d captures
-    # recent job-search activity; capped by EMAIL_SYNC_MAX_MESSAGES.
-    EMAIL_INITIAL_SYNC_DAYS: int = 30
-    # Hard cap on messages classified per sync — guards LLM cost on noisy
-    # inboxes. Anything older than the cap is skipped (not failed).
-    EMAIL_SYNC_MAX_MESSAGES: int = 500
-    # Min classifier confidence (0-1) required to auto-advance an Application
-    # stage. Below threshold the email lands in the Needs Review tray.
-    EMAIL_AUTO_ADVANCE_CONFIDENCE: float = 0.8
-    # Microsoft Identity OAuth for the Outlook integration. Same shape as
-    # the Google block — if MS_OAUTH_CLIENT_ID is unset the outlook routes
-    # 503 on use so the rest of the app still boots.
-    # MS_OAUTH_TENANT is the Azure AD tenant id; "common" supports both
-    # personal and work accounts. Pin to your tenant id once you submit
-    # the app for org verification.
-    MS_OAUTH_CLIENT_ID: Optional[str] = None
-    MS_OAUTH_CLIENT_SECRET: Optional[str] = None
-    MS_OAUTH_REDIRECT_URI: str = "http://localhost:8080/integrations/outlook/oauth-callback"
-    MS_OAUTH_TENANT: str = "common"
     AWS_REGION: Optional[str] = None
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None

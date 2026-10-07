@@ -6,7 +6,7 @@ shared Google Sheet. Each row has a **Download** link for the resume to send. Th
 
 ## One-time setup (Google Cloud)
 
-1. Open <https://console.cloud.google.com/> and pick the project the app already uses for Gmail (or any project).
+1. Open <https://console.cloud.google.com/> and pick any project.
 2. **APIs & Services → Library →** search **Google Sheets API → Enable**.
 3. **IAM & Admin → Service Accounts → Create service account**.
    - Name: `job-applies-export`.

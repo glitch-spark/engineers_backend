@@ -9,7 +9,6 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.interview_normalize import interview_status_value  # noqa: E402
 from app.models.interview import InterviewStatus  # noqa: E402
-from app.routers.applications import pipeline_outcome_for_status  # noqa: E402
 from app.interview_rounds import count_interview_rounds as _count_interview_rounds  # noqa: E402
 
 START = datetime(2026, 9, 28, tzinfo=timezone.utc)
@@ -69,10 +68,3 @@ def test_dashboard_status_is_plain_string():
     assert interview_status_value("failed") == "rejected"
     assert interview_status_value(None) is None
 
-
-def test_pipeline_outcome_for_status():
-    assert pipeline_outcome_for_status(InterviewStatus.rejected) == "rejected"
-    assert pipeline_outcome_for_status("rejected") == "rejected"
-    assert pipeline_outcome_for_status(InterviewStatus.canceled) is None
-    assert pipeline_outcome_for_status("passed") is None
-    assert pipeline_outcome_for_status(None) is None
