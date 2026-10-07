@@ -1,6 +1,7 @@
 """Approve / Reject buttons in Slack: the signature check, then POST /integrations/slack/interactions with
 signed requests, Slack and the response_url faked, against an in-memory MongoDB. No network, no real DB."""
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -242,6 +243,53 @@ async def test_second_click_already_decided(client, slack):
     assert stored.status == "approved"
     assert len(thread_replies(slack)) == 1
     assert slack.texts() == ["Already approved by Root."] * 2
+
+
+async def test_simultaneous_clicks_only_one_decides(db, slack):
+    """A double-click or two admins at once: exactly one decision lands and one thread reply is posted."""
+    owner = await make_user("Pedro", slack_id="U0OWNER001")
+    a = await make_user("Root", "admin", "U0ADMIN001")
+    b = await make_user("Boss", "admin", "U0ADMIN002")
+    row = await make_tx(owner)
+    real_get = Transaction.get
+    reads = []
+
+    async def get_then_wait(*args, **kw):
+        """Both clicks read the row before either writes, as two real requests would interleave."""
+        doc = await real_get(*args, **kw)
+        reads.append(1)
+        while len(reads) < 2:
+            await asyncio.sleep(0)
+        return doc
+
+    with patch.object(Transaction, "get", get_then_wait):
+        results = await asyncio.gather(
+            handle_transaction_action("tx_approve", str(row.id), "U0ADMIN001"),
+            handle_transaction_action("tx_reject", str(row.id), "U0ADMIN002"),
+        )
+    assert results.count(None) == 1
+    stored = await Transaction.get(row.id)
+    winner, loser_text = (a, results[1]) if results[0] is None else (b, results[0])
+    assert stored.approvedBy == winner.id
+    assert stored.status == ("approved" if winner is a else "rejected")
+    assert loser_text == f"Already {stored.status} by {winner.name}."
+    assert len(thread_replies(slack)) == 1
+
+
+async def test_set_status_returns_false_when_the_row_changed_since_read(db, slack):
+    owner = await make_user("Pedro", slack_id="U0OWNER001")
+    a = await make_user("Root", "admin", "U0ADMIN001")
+    b = await make_user("Boss", "admin", "U0ADMIN002")
+    row = await make_tx(owner)
+    stale = await Transaction.get(row.id)
+    assert await st.set_transaction_status(row, "approved", a) is True
+    assert await st.set_transaction_status(stale, "rejected", b) is False
+    stored = await Transaction.get(row.id)
+    assert (stored.status, stored.approvedBy) == ("approved", a.id)
+    assert len(thread_replies(slack)) == 1
+    # A deliberate change from the current state still works (the app's admin flipping a decision).
+    assert await st.set_transaction_status(stored, "rejected", b) is True
+    assert (await Transaction.get(row.id)).status == "rejected"
 
 
 async def test_already_rejected_wording(db, slack):

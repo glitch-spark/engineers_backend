@@ -196,13 +196,26 @@ async def delete_transaction_post(tx: Transaction) -> None:
         log.warning("slack_transactions delete failed for transaction %s: %s", tx.id, exc)
 
 
-async def set_transaction_status(tx: Transaction, status: Literal["approved", "rejected"], by: UserExtra) -> None:
-    """Record the decision, then show it in Slack. The one place a transaction gets approved or rejected."""
+async def set_transaction_status(tx: Transaction, status: Literal["approved", "rejected"], by: UserExtra) -> bool:
+    """Record the decision, then show it in Slack. The one place a transaction gets approved or rejected.
+
+    The decision is claimed atomically: it only lands if the stored status is still the one `tx` was read with
+    (expected-status guard), so of two decisions racing on the same row exactly one wins and announces. False
+    (nothing written, nothing announced) when the row changed since it was read."""
+    expected = tx.status
+    now = datetime.utcnow()
+    claimed = await Transaction.get_motor_collection().update_one(
+        {"_id": tx.id, "status": expected},
+        {"$set": {"status": status, "approvedBy": by.id, "approvedAt": now, "updatedAt": now}},
+    )
+    if claimed.modified_count != 1:
+        return False
     tx.status = status
     tx.approvedBy = by.id
-    tx.approvedAt = datetime.utcnow()
-    await tx.save()
+    tx.approvedAt = now
+    await tx.save()  # keeps any other edits the caller made to `tx` alongside the decision
     await announce_decision(tx, by)
+    return True
 
 
 # --- Approve / Reject buttons --------------------------------------------------------------------------
@@ -257,12 +270,19 @@ async def handle_transaction_action(action_id: str, tx_id: str, slack_user_id: s
     tx = await Transaction.get(oid)
     if tx is None:
         return NO_TRANSACTION
-    if tx.status != "pending":
-        word = "approved" if tx.status == "approved" else "rejected"
-        by = _display_name(await UserExtra.get(tx.approvedBy)) if tx.approvedBy else ""
-        return f"Already {word} by {by}." if by else f"Already {word}."
-    await set_transaction_status(tx, status, admin)
-    return None
+    if tx.status == "pending" and await set_transaction_status(tx, status, admin):
+        return None
+    if tx.status == "pending":  # another click decided it after we read it
+        tx = await Transaction.get(oid)
+        if tx is None:
+            return NO_TRANSACTION
+    return await _already_decided(tx)
+
+
+async def _already_decided(tx: Transaction) -> str:
+    word = "approved" if tx.status == "approved" else "rejected"
+    by = _display_name(await UserExtra.get(tx.approvedBy)) if tx.approvedBy else ""
+    return f"Already {word} by {by}." if by else f"Already {word}."
 
 
 async def _post_ephemeral(response_url: str, payload: dict) -> None:

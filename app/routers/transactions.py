@@ -465,7 +465,10 @@ async def update_transaction(
             tx.payerId = await _resolve_payer_id(body.payerId, tx.userId)
 
     if new_status:
-        await set_transaction_status(tx, new_status, user)
+        if not await set_transaction_status(tx, new_status, user):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="This transaction was just decided by someone else",
+            )
     else:
         await tx.save()
     await upsert_charge_from_transaction(tx)
