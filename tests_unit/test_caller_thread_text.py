@@ -9,7 +9,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.interview_caller import caller_thread_event, round_caller_snapshot  # noqa: E402
 from app.models.interview import InterviewCaller, InterviewStageEvent  # noqa: E402
-from app.slack_bot import caller_round_text, caller_thread_reply, cc_line, slack_time  # noqa: E402
+from app.slack_bot import _mention, caller_round_text, caller_thread_reply, cc_line, slack_time  # noqa: E402
 
 START = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
 LATER = START + timedelta(days=1)
@@ -83,6 +83,14 @@ def test_event_none_when_unchanged_or_caller_toggled():
 def test_cc_line_mentions_each_user_once_in_order():
     assert cc_line(OWNER, MANAGER, OWNER) == "cc <@U0OWNER001> <@U0MANAGER1>"
     assert cc_line(user("Maria"), user("Ana", "U0ANA00001")) == "cc Maria <@U0ANA00001>"
+
+
+def test_mention_without_slack_id_is_escaped_so_a_name_cannot_ping():
+    assert _mention(user("<!channel> & co")) == "&lt;!channel&gt; &amp; co"
+    assert _mention(user("Maria")) == "Maria"
+    assert _mention(user("Ana", "U0ANA00001")) == "<@U0ANA00001>"
+    assert _mention(SimpleNamespace(name="", email="<!here>@x.io", slackUserId=None)) == "&lt;!here&gt;@x.io"
+    assert cc_line(user("<!everyone>")) == "cc &lt;!everyone&gt;"
 
 
 def test_cc_line_skips_missing_users_and_is_none_without_anyone():

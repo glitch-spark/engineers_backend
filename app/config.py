@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     SLACK_CALLER_DAILY_TIMEZONE: str = "America/Chicago"
     # Channel (C…) where the bot posts each daily plan and edits it in place.
     SLACK_DAILY_PLAN_CHANNEL_ID: Optional[str] = None
+    # Channel (C…) where the bot posts each transaction, with Approve/Reject buttons. Unset = no posts.
+    SLACK_TRANSACTIONS_CHANNEL_ID: Optional[str] = None
+    # Verifies Slack's signature on button clicks (Slack app → Basic Information). Unset = no buttons.
+    SLACK_SIGNING_SECRET: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720
     OPENAI_API_KEY: Optional[str] = None
     # Streamed AI Review (interview): chat-completions, long-form. Mini is enough.

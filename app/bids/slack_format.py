@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 from app.bids.windows import Kind
 from app.models.bid_report import BidReportRow
-from app.slack import _fmt_usd
 from app.slack_bot import _country_flag, _slack_escape
+from app.slack_transactions import fmt_usd
 
 MAX_SECTION_CHARS = 3000
 MAX_BLOCKS = 50
@@ -68,7 +68,7 @@ def _bidder_line(kind: Kind, r: BidReportRow) -> str:
         label += f" · {_slack_escape(r.profileName)}"
     count = r.count or 0
     if kind == "weekly":
-        return f"• {label} — {_label(_bids(count), [r], f' × {_fmt_usd(r.rate)} = {_fmt_usd(r.amount or 0)}')}"
+        return f"• {label} — {_label(_bids(count), [r], f' × {fmt_usd(r.rate)} = {fmt_usd(r.amount or 0)}')}"
     return f"• {label} — {_label(f'{count:,}', [r])}"
 
 
@@ -78,7 +78,7 @@ def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow]) -> lis
     failed = len(rows) - len(ok)
     head = f"*{_owner_label(label)}* — {_label(_bids(sum(r.count or 0 for r in ok)), ok)}"
     if kind == "weekly":
-        head += f" · *{_fmt_usd(round(sum(r.amount or 0 for r in ok), 2))}*"
+        head += f" · *{fmt_usd(round(sum(r.amount or 0 for r in ok), 2))}*"
     if failed:
         head += f" · {failed} failed"
     ordered = sorted(rows, key=lambda r: (bool(r.error), -(r.count or 0), r.bidderName.lower()))
@@ -99,7 +99,7 @@ def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[Bid
     start, end = start.astimezone(tz), end.astimezone(tz)
     ok = [r for r in rows if not r.error]
     total = sum(r.count or 0 for r in ok)
-    money = _fmt_usd(round(sum(r.amount or 0 for r in ok), 2))
+    money = fmt_usd(round(sum(r.amount or 0 for r in ok), 2))
 
     if kind == "daily":
         header = (f"📨 *Daily bids — {_date(end)}* · {start:%a} {_time(start)} → "

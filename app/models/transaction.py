@@ -36,6 +36,9 @@ class Transaction(TimestampedDocument):
     # Optional on the model so pre-payer rows still load; new creates default
     # to the owner when the client omits it.
     payerId: Optional[PydanticObjectId] = None
+    # The bot's post in the transactions channel; edited in place when the row changes.
+    slackChannel: Optional[str] = None
+    slackTs: Optional[str] = None
 
     class Settings:
         name = "transactions"

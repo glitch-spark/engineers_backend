@@ -396,7 +396,7 @@ def _mention(user: Optional[UserExtra]) -> str:
     slack_id = (user.slackUserId or "").strip()
     if slack_id:
         return f"<@{slack_id}>"
-    return (user.name or user.email or "someone").strip()
+    return _slack_escape((user.name or user.email or "someone").strip())
 
 
 def cc_line(*users: Optional[UserExtra]) -> Optional[str]:

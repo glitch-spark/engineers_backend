@@ -9,7 +9,7 @@ from app.alerts_service import upsert_charge_from_transaction
 from app.deps import get_current_user
 from app.models import Transaction, UserExtra
 from app.routers._util import ci_regex, doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack import notify_new_transaction, notify_transaction_status_change
+from app.slack_transactions import delete_transaction_post, set_transaction_status, sync_transaction_post
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -403,12 +403,7 @@ async def create_transaction(
     await tx.insert()
     await upsert_charge_from_transaction(tx)
 
-    await notify_new_transaction(
-        creator_email=user.email or "",
-        amount=float(body.amount),
-        date=date_dt.strftime("%Y-%m-%d"),
-        description=body.description or "",
-    )
+    await sync_transaction_post(tx)
 
     return doc_to_dict(tx)
 
@@ -430,25 +425,15 @@ async def update_transaction(
     if not is_admin and not is_owner and not is_payer:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
+    new_status = None
     if body.status and body.status in ("approved", "rejected"):
         if not is_admin and not is_payer:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="only the payer can approve")
         if tx.status != body.status:
-            tx.status = body.status
-            tx.approvedBy = user.id
-            tx.approvedAt = datetime.utcnow()
-            owner = await UserExtra.get(tx.userId)
-            await notify_transaction_status_change(
-                tx_id=str(tx.id),
-                new_status=body.status,
-                approver_email=user.email or "",
-                owner_email=(owner.email if owner else None),
-                amount=tx.amount,
-                date=tx.date.strftime("%Y-%m-%d") if tx.date else None,
-                notes=tx.notes,
-            )
+            new_status = body.status
 
-    if tx.status == "pending" or is_admin:
+    # A decision locks the row for everyone but admins, including edits sent along with it.
+    if (tx.status == "pending" and new_status is None) or is_admin:
         if body.date is not None:
             d = parse_date(body.date)
             if d is not None:
@@ -479,8 +464,13 @@ async def update_transaction(
         if body.payerId is not None:
             tx.payerId = await _resolve_payer_id(body.payerId, tx.userId)
 
-    await tx.save()
+    if new_status:
+        await set_transaction_status(tx, new_status, user)
+    else:
+        await tx.save()
     await upsert_charge_from_transaction(tx)
+    if tx.status == "pending":
+        await sync_transaction_post(tx)
     return doc_to_dict(tx)
 
 
@@ -500,4 +490,5 @@ async def delete_transaction(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     await tx.delete()
+    await delete_transaction_post(tx)
     return {"ok": True}
