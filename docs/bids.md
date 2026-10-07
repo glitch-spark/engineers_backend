@@ -157,9 +157,11 @@ object path and returns a short-lived signed upload link, so bidders hold no sto
 - **Never change `BID_STORAGE_BUCKET`** once bidders exist: registered bidders are counted
   from `s3://<old bucket>/<folder>/` while their uploads would be signed for the new bucket.
 - **Routes** (`/ext`): `POST /ext/register` (invite code, username, password), `POST /ext/login`,
-  `GET /ext/me`, and `POST /ext/upload-url` (`job`, `step`, `trigger`, `capturedAt`) which returns
-  `url`, `key`, `expiresAt` and `headers`; PUT the PNG to `url` within 5 minutes with
-  `Content-Type: image/png`. Registering switches counting to the bidder's folder
+  `GET /ext/me`, `POST /ext/password` (`currentPassword`, `newPassword`; logs out the bidder's other
+  browsers and returns a fresh `token`; a wrong current password counts toward the login rate limit), and
+  `POST /ext/upload-url` (`job`, `step`, `trigger`, `capturedAt`, optional `format`: `png` (default),
+  `webp` or `jpeg`) which returns `url`, `key`, `expiresAt` and `headers`; PUT the image to `url` within
+  5 minutes with the returned `Content-Type`. Registering switches counting to the bidder's folder
   (`s3://<bucket>/<folder>/`).
 - **Errors** are `{"error": "<message>"}` with the status. A username or password that breaks
   the rules answers 400 with `Username must be 3–40 characters: lowercase letters, numbers, dots,

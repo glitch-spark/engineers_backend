@@ -34,3 +34,12 @@ def test_key_uses_the_bidders_local_date():
 def test_stale_capture_time_is_rejected():
     with pytest.raises(ValueError, match="capturedAt is not current"):
         build_upload_key("ana", None, "j", 1, "step", NOW - timedelta(hours=25), NOW)
+
+
+def test_key_extension_follows_the_image_format():
+    at = datetime(2026, 10, 3, 9, 30, 15, tzinfo=timezone.utc)
+    key = lambda **kw: build_upload_key("ana", None, "acme", 1, "step", at, NOW, **kw)
+    assert key().endswith("_093015.png")
+    assert key(image_format="png").endswith("_093015.png")
+    assert key(image_format="webp").endswith("_093015.webp")
+    assert key(image_format="jpeg").endswith("_093015.jpg")
