@@ -656,7 +656,7 @@ def daily_plan_text(plan: Any, owner: Optional[UserExtra], done: Any = None) -> 
     goal = plan.goal
     done = done if done is not None else plan.done
     lines = [
-        f":spiral_note_pad: *Daily plan* — {_mention(owner)}",
+        f":spiral_note_pad: {_mention(owner)}'s *Daily Plan*",
         f"*{_plan_day_label(plan.date, sep=' ')}*",
         f"Bids: self {done.bidsSelf}/{goal.bidsSelf} · bidder {done.bidsBidder}/{goal.bidsBidder}",
         f"Interviews: self {done.interviewsSelf} · caller {done.interviewsCaller}",
@@ -736,76 +736,35 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def digest_summary(total: int) -> str:
-    enjoy = "Enjoy your interview" if total == 1 else "Enjoy your interviews"
-    return f"You have {_plural(total, 'interview')} today. {enjoy}, and good luck! :four_leaf_clover:"
-
-
-def _digest_line(
-    n: int,
-    iv: Interview,
-    *,
-    profile: str,
-    tz: ZoneInfo,
-) -> str:
-    starts = _caller_start(iv)
-    parts: list[str] = []
-    if starts is not None:
-        parts.append(f"*{fmt_caller_time(starts, tz, with_day=False)}*")
-    parts.append(profile.strip() or "—")
-    company = (iv.companyName or "").strip() or "—"
-    job_url = (iv.jobUrl or "").strip()
-    parts.append(_mrkdwn_link(job_url, company) if job_url else company)
-    parts.append(_stage_label(iv.stage))
-    return f"{n}. " + " · ".join(parts)
-
-
-def digest_blocks(
-    mine: list[Interview],
+def digest_text(
+    day: date,
+    interviews: list[Interview],
     *,
     profiles: dict[str, str],
     tz: ZoneInfo,
-    why: Optional[str] = None,
-) -> list[dict[str, Any]]:
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"Today's interviews ({len(mine)})", "emoji": True},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": digest_summary(len(mine))},
-        },
-    ]
-    if mine:
-        lines = []
-        for n, iv in enumerate(mine, start=1):
-            profile = profiles.get(str(iv.accountId), "") if iv.accountId else ""
-            lines.append(_digest_line(n, iv, profile=profile, tz=tz))
-        blocks.append({"type": "divider"})
-        blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*My interviews ({len(mine)})*\n" + "\n".join(lines)},
-            }
-        )
-    blocks.append(
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"<{_frontend_link('/interviews')}|Open interviews>"},
-        }
-    )
+    why: Optional[str],
+) -> str:
+    """The personal digest DM: one row per interview in the order given, the interviews link, then the why."""
+    title = f":alarm_clock: *Today's interviews* — {_day_title(day)}"
+    if not interviews:
+        return f"{title} · none today. Have a rest."
+    lines = [f"{title} · {_plural(len(interviews), 'interview')}"]
+    for iv in interviews:
+        starts = _caller_start(iv)
+        profile = profiles.get(str(iv.accountId), "") if iv.accountId else ""
+        company = (iv.companyName or "").strip() or "—"
+        job_url = (iv.jobUrl or "").strip()
+        parts = [
+            fmt_caller_time(starts, tz, with_day=False) if starts is not None else "Time TBD",
+            profile.strip() or "—",
+            _mrkdwn_link(job_url, company) if job_url else company,
+            _stage_label(iv.stage),
+        ]
+        lines.append("• " + " · ".join(parts))
+    lines.append(f"<{_frontend_link('/interviews')}|Open interviews>")
     if why:
-        blocks.extend(
-            [
-                {"type": "divider"},
-                {
-                    "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": f"*Know your why*\n_{why}_"}],
-                },
-            ]
-        )
-    return blocks
+        lines.append(f"_Know your why: {why}_")
+    return "\n".join(lines)
 
 
 async def run_digest_for_user(user: UserExtra) -> int:
@@ -839,30 +798,14 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
         {"createdBy": user.id, "scheduledAt": {"$gte": start_n, "$lt": end_n}}
     ).sort([("scheduledAt", 1)]).to_list()
     mine = _by_start([iv for iv in interviews if iv.status not in _SKIP_STATUSES])
-    if not mine:
-        text = "You have no interviews today. Have a rest."
-        blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Today's interviews", "emoji": True},
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": text},
-            },
-        ]
-        ok = await send_dm(slack_id, text=text, blocks=blocks)
-        if ok:
-            await _mark_sent(user.id, kind)
-            return 1, None
-        return 0, "dm_failed"
-
-    why = know_your_why_for_date(day)
-    profiles = await _profile_labels(mine)
-    text = digest_summary(len(mine))
-    blocks = digest_blocks(mine, profiles=profiles, tz=tz, why=why)
-    ok = await send_dm(slack_id, text=text, blocks=blocks)
-    if ok:
+    text = digest_text(
+        day,
+        mine,
+        profiles=await _profile_labels(mine),
+        tz=tz,
+        why=know_your_why_for_date(day),
+    )
+    if await send_dm(slack_id, text=text):
         await _mark_sent(user.id, kind)
         return 1, None
     return 0, "dm_failed"

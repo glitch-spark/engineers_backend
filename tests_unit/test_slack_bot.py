@@ -19,10 +19,12 @@ from app.slack_bot import (
     _fmt_scheduled,
     _interview_blocks,
     _interview_fields,
+    _frontend_link,
     _profile_label,
     _stage_label,
     calendar_day_bounds,
     digest_slot_open,
+    digest_text,
     interview_dm_eligible,
     notify_interview_dm,
     validate_timezone,
@@ -241,6 +243,88 @@ async def test_notify_interview_dm_sends_to_owner():
     assert "*Interview Stage:* AI Interview" in kwargs["blocks"][1]["text"]["text"]
 
 
+NY = ZoneInfo("America/New_York")
+TODAY = date(2026, 10, 7)
+
+
+class _FrozenNow(datetime):
+    """`datetime` whose now() is Wed Oct 7 2026, 8:00 in the asked zone."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 10, 7, 8, 0, tzinfo=tz)
+
+
+def _digest_iv(company, *, start=None, stage="intro", job_url=None, account_id="acc1"):
+    caller = SimpleNamespace(enabled=True, startsAt=start) if start else None
+    return SimpleNamespace(
+        accountId=account_id, companyName=company, jobUrl=job_url, stage=stage, caller=caller,
+    )
+
+
+def _digest_pair():
+    with_caller = _digest_iv(
+        "Acme", start=datetime(2026, 10, 7, 14, 30, tzinfo=timezone.utc), job_url="https://jobs.example/1"
+    )
+    without_caller = _digest_iv("Globex", stage="final", account_id="acc2")
+    return with_caller, without_caller
+
+
+def test_digest_text_rows():
+    with_caller, without_caller = _digest_pair()
+    text = digest_text(
+        TODAY, [with_caller, without_caller],
+        profiles={"acc1": "Ian Meron", "acc2": "Maria K"}, tz=NY, why="Ship it",
+    )
+    assert text.splitlines() == [
+        ":alarm_clock: *Today's interviews* — Wed Oct 7 · 2 interviews",
+        "• 10:30 AM EDT · Ian Meron · <https://jobs.example/1|Acme> · Intro",
+        "• Time TBD · Maria K · Globex · Final",
+        f"<{_frontend_link('/interviews')}|Open interviews>",
+        "_Know your why: Ship it_",
+    ]
+
+
+def test_digest_text_times_use_the_users_zone():
+    chicago = ZoneInfo("America/Chicago")
+    iv = _digest_iv("Acme", start=datetime(2026, 10, 7, 14, 30, tzinfo=timezone.utc))
+    row = digest_text(TODAY, [iv], profiles={}, tz=chicago, why=None).splitlines()[1]
+    assert row.startswith("• 9:30 AM CDT · ")
+
+
+def test_digest_text_without_why_ends_with_the_link():
+    with_caller, _ = _digest_pair()
+    lines = digest_text(TODAY, [with_caller], profiles={}, tz=NY, why=None).splitlines()
+    assert lines[-1] == f"<{_frontend_link('/interviews')}|Open interviews>"
+    assert not any("Know your why" in line for line in lines)
+
+
+def test_digest_text_missing_profile_and_company_show_a_dash():
+    iv = _digest_iv(None, account_id=None)
+    row = digest_text(TODAY, [iv], profiles={}, tz=NY, why=None).splitlines()[1]
+    assert row == "• Time TBD · — · — · Intro"
+
+
+def test_digest_text_is_one_row_per_interview_in_the_order_given():
+    with_caller, without_caller = _digest_pair()
+    lines = digest_text(TODAY, [without_caller, with_caller], profiles={}, tz=NY, why=None).splitlines()
+    assert lines[1].startswith("• Time TBD") and lines[2].startswith("• 10:30 AM EDT")
+
+
+def test_digest_text_empty_day():
+    assert digest_text(TODAY, [], profiles={}, tz=NY, why=None) == (
+        ":alarm_clock: *Today's interviews* — Wed Oct 7 · none today. Have a rest."
+    )
+    # Nothing else is added on a free day, even with a why.
+    assert len(digest_text(TODAY, [], profiles={}, tz=NY, why="Ship it").splitlines()) == 1
+
+
+def test_digest_text_singular():
+    with_caller, _ = _digest_pair()
+    first = digest_text(TODAY, [with_caller], profiles={}, tz=NY, why=None).splitlines()[0]
+    assert first.endswith("· 1 interview")
+
+
 @pytest.mark.asyncio
 async def test_digest_empty_day_sends_rest_message():
     from app.slack_bot import _digest_for_user
@@ -258,6 +342,7 @@ async def test_digest_empty_day_sends_rest_message():
     find = SimpleNamespace(sort=lambda *_a, **_k: SimpleNamespace(to_list=AsyncMock(return_value=[])))
     with (
         patch("app.slack_bot.digest_slot_open", return_value=True),
+        patch("app.slack_bot.datetime", _FrozenNow),
         patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
         patch("app.slack_bot._mark_sent", mark),
         patch("app.slack_bot.send_dm", send),
@@ -267,7 +352,10 @@ async def test_digest_empty_day_sends_rest_message():
     assert sent == 1
     assert reason is None
     send.assert_awaited_once()
-    assert send.await_args.kwargs["text"] == "You have no interviews today. Have a rest."
+    assert send.await_args.kwargs["text"] == (
+        ":alarm_clock: *Today's interviews* — Wed Oct 7 · none today. Have a rest."
+    )
+    assert "blocks" not in send.await_args.kwargs
     mark.assert_awaited_once()
 
 
@@ -292,6 +380,7 @@ async def test_digest_lists_only_the_users_own_interviews():
     send = AsyncMock(return_value=True)
     with (
         patch("app.slack_bot.digest_slot_open", return_value=True),
+        patch("app.slack_bot.datetime", _FrozenNow),
         patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
         patch("app.slack_bot._mark_sent", AsyncMock()),
         patch("app.slack_bot._profile_labels", AsyncMock(return_value={"acc1": "Backend"})),
@@ -303,6 +392,10 @@ async def test_digest_lists_only_the_users_own_interviews():
     query = find.call_args.args[0]
     assert set(query) == {"createdBy", "scheduledAt"}
     assert query["createdBy"] == "user1"
-    blob = str(send.await_args.kwargs["blocks"])
-    assert "*My interviews (1)*" in blob
-    assert "as caller" not in blob
+    assert "blocks" not in send.await_args.kwargs
+    lines = send.await_args.kwargs["text"].splitlines()
+    assert lines[0] == ":alarm_clock: *Today's interviews* — Wed Oct 7 · 1 interview"
+    assert lines[1] == "• Time TBD · Backend · <https://jobs.example/1|Acme> · AI Interview"
+    assert lines[-2].endswith("|Open interviews>")
+    assert lines[-1].startswith("_Know your why: ") and lines[-1].endswith("_")
+    assert "as caller" not in "\n".join(lines)

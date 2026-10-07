@@ -2,7 +2,7 @@
 
 No database needed: `pytest --noconftest tests/test_caller.py`.
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -18,8 +18,7 @@ from app.interview_caller import (
 from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.slack_bot import (
     caller_round_text,
-    digest_blocks,
-    digest_summary,
+    digest_text,
     fmt_caller_time,
     slack_time,
     _by_start,
@@ -124,17 +123,14 @@ def test_digest_sorted_by_time_tbd_last():
     assert [iv.companyName for iv in _by_start([own_tbd, own_late, own_early])] == ["OwnEarly", "OwnLate", "OwnTBD"]
 
 
-def test_digest_summary_and_numbering():
-    assert digest_summary(2) == (
-        "You have 2 interviews today. Enjoy your interviews, and good luck! :four_leaf_clover:"
+def test_digest_text_is_plain_rows_with_a_count():
+    text = digest_text(
+        date(2026, 9, 29), [_iv(B), _iv(B)], profiles={}, tz=ZoneInfo("America/New_York"), why=None
     )
-    assert digest_summary(1).startswith("You have 1 interview today. Enjoy your interview,")
-
-    blocks = digest_blocks([_iv(B), _iv(B)], profiles={}, tz=ZoneInfo("America/New_York"))
-    texts = "\n".join(b["text"]["text"] for b in blocks if b.get("type") == "section")
-    assert "*My interviews (2)*" in texts
-    assert "\n2. " in texts
-    assert "as caller" not in texts
+    lines = text.splitlines()
+    assert lines[0] == ":alarm_clock: *Today's interviews* — Tue Sep 29 · 2 interviews"
+    assert [line.startswith("• Time TBD") for line in lines[1:3]] == [True, True]
+    assert "as caller" not in text
 
 
 def _user(name, slack=None):

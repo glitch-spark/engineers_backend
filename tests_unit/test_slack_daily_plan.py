@@ -42,7 +42,7 @@ def test_daily_plan_text_follow_up():
     done = Counts(bidsSelf=140, bidsBidder=100, interviewsSelf=2, interviewsCaller=1)
     lines = daily_plan_text(_plan(), _owner(), done=done).splitlines()
     assert lines[:-1] == [
-        ":spiral_note_pad: *Daily plan* — <@U123>",
+        ":spiral_note_pad: <@U123>'s *Daily Plan*",
         "*10/1 (Thu)*",
         "Bids: self 140/150 · bidder 100/100",
         "Interviews: self 2 · caller 1",
@@ -51,6 +51,16 @@ def test_daily_plan_text_follow_up():
         "Moved review &amp; prep",
     ]
     assert lines[-1].endswith("/report?week=2026-09-28|Open Report>")
+
+
+def test_daily_plan_heading():
+    owner = SimpleNamespace(name="Pedro", email="p@x.com", slackUserId="U0OWNER001")
+    assert daily_plan_text(_plan(), owner).splitlines()[0] == ":spiral_note_pad: <@U0OWNER001>'s *Daily Plan*"
+
+
+def test_daily_plan_heading_names_an_unlinked_owner():
+    owner = SimpleNamespace(name="Pedro", email="p@x.com", slackUserId=None)
+    assert daily_plan_text(_plan(), owner).splitlines()[0] == ":spiral_note_pad: Pedro's *Daily Plan*"
 
 
 def test_daily_plan_text_minimal():
