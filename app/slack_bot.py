@@ -124,8 +124,9 @@ def _stage_label(stage: Any) -> str:
 
 
 def _mrkdwn_link(url: Optional[str], label: str) -> str:
+    """`<url|label>` for an http(s) URL, else just the label. Only the label is escaped, never the URL."""
     href = (url or "").strip()
-    safe = (label or "").replace("|", " ").replace(">", "").strip() or "link"
+    safe = _slack_escape((label or "").strip()).replace("|", " ").strip() or "link"
     if href.startswith("http://") or href.startswith("https://"):
         return f"<{href}|{safe}>"
     return safe
@@ -260,6 +261,8 @@ def _method_text(caller: Any) -> str:
     value = (getattr(caller, "methodValue", "") or "").strip()
     if value.startswith("http://") or value.startswith("https://"):
         value = _mrkdwn_link(value, value)
+    else:
+        value = _slack_escape(value)
     if label and value:
         return f"{label} — {value}"
     return label or value or "TBD"
@@ -293,32 +296,32 @@ def caller_round_text(
     caller = entry.caller
     who = _mention(owner)
     when = slack_time(getattr(entry, "scheduledAt", None))
-    company = (interview.companyName or "").strip() or "—"
+    company = _text(interview.companyName)
+    profile = _text(_profile_label(account))
     if caller is None or not caller.enabled:
         lines = [
             f":telephone_receiver: {who} — *No caller needed* for {_stage_label(entry.stage)}",
-            f"*Profile:* {_profile_label(account) or '—'}",
+            f"*Profile:* {profile}",
             f"*Company name:* {company}",
             f"*Stage:* {_stage_label(entry.stage)}",
             f"*Interview time:* {when}",
         ]
     else:
         off = interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
-        job_url = (interview.jobUrl or "").strip()
-        recruiter = (getattr(entry, "interviewerName", None) or "").strip() or "—"
+        recruiter = _text(getattr(entry, "interviewerName", None))
         flag = _country_flag(account.country if account else None)
         if flag and recruiter != "—":
             recruiter = f"{recruiter} {flag}"
         lines = [
             (f":x: {who} — *Canceled* ~Caller needed~" if off else f":telephone_receiver: {who} — *Caller needed*"),
-            f"*Profile:* {_profile_label(account) or '—'}",
+            f"*Profile:* {profile}",
             f"*Company name:* {company}",
-            f"*JD Link:* {job_url or '—'}",
+            f"*JD Link:* {_text(interview.jobUrl)}",
             f"*Recruiter name:* {recruiter}",
             f"*Stage:* {_stage_label(entry.stage)}",
             f"*Interview time:* {f'~{when}~' if off else when}",
             f"*Method:* {_method_text(caller)}",
-            f"*Caller assigned:* {(getattr(caller, 'callerName', '') or '').strip() or 'TBD'}",
+            f"*Caller assigned:* {_text(getattr(caller, 'callerName', ''), 'TBD')}",
         ]
         if not off:
             lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
@@ -348,13 +351,13 @@ def caller_thread_reply(
     elif event == "rescheduled":
         old = slack_time((prev or {}).get("time"))
         if getattr(entry, "confirmed", False):  # rescheduled and confirmed in one save
-            name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
+            name = _text(getattr(caller, "callerName", ""), "TBD")
             tail = f"confirmed, caller {name}"
         else:
             tail = "needs confirmation"
         lines = [f":repeat: {who} — *Rescheduled* — {old} → {when} · {tail}"]
     elif event == "confirmed":
-        name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
+        name = _text(getattr(caller, "callerName", ""), "TBD")
         lines = [f":white_check_mark: {who} — *Confirmed* — {stage} · {when} · caller {name}"]
     elif event == "unconfirmed":
         lines = [f":warning: {who} — *Confirmation removed* — {stage} · {when}"]
@@ -375,8 +378,8 @@ def _snapshot_label(key: str, value: Any) -> str:
     if key == "status":
         return str(value).capitalize()
     if key == "method":
-        return _METHOD_LABELS.get(value or "", value or "TBD")
-    return str(value)
+        return _METHOD_LABELS.get(value or "", _slack_escape(value or "TBD"))
+    return _slack_escape(str(value))
 
 
 # Slack errors meaning the stored post is gone, so we post a fresh one.
@@ -516,6 +519,11 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _text(value: Optional[str], default: str = "—") -> str:
+    """User-entered text for a Slack line: trimmed and escaped (so it cannot ping or link), `default` when blank."""
+    return _slack_escape((value or "").strip()) or default
+
+
 def _plan_day_label(day: datetime, offset: int = 0, sep: str = "") -> str:
     """Matches the SPA's planDayLabel, e.g. `9/27(Sun)`, or `9/27 (Sun)` with `sep=" "`."""
     d = day + timedelta(days=offset)
@@ -627,12 +635,10 @@ def digest_text(
     for iv in interviews:
         starts = _caller_start(iv)
         profile = profiles.get(str(iv.accountId), "") if iv.accountId else ""
-        company = (iv.companyName or "").strip() or "—"
-        job_url = (iv.jobUrl or "").strip()
         parts = [
             fmt_caller_time(starts, tz, with_day=False) if starts is not None else "Time TBD",
-            profile.strip() or "—",
-            _mrkdwn_link(job_url, company) if job_url else company,
+            _text(profile),
+            _mrkdwn_link(iv.jobUrl, (iv.companyName or "").strip() or "—"),
             _stage_label(iv.stage),
         ]
         lines.append("• " + " · ".join(parts))
@@ -731,14 +737,14 @@ def caller_reminder_text(
 ) -> str:
     start = _aware_utc(entry.scheduledAt)
     minutes = max(1, math.ceil((start - _aware_utc(now)).total_seconds() / 60))
-    company = (getattr(interview, "companyName", None) or "").strip() or "—"
+    company = _text(getattr(interview, "companyName", None))
     caller = entry.caller
     lines = [
         f":alarm_clock: *Starting in {minutes} min* — {slack_time(start, with_day=False)}"
         f" · {_stage_label(entry.stage)} · {company}",
-        f"*Profile:* {_profile_label(account) or '—'}",
+        f"*Profile:* {_text(_profile_label(account))}",
         f"*Method:* {_method_text(caller)}",
-        f"*Caller assigned:* {(caller.callerName or '').strip() or 'TBD'}",
+        f"*Caller assigned:* {_text(caller.callerName, 'TBD')}",
     ]
     cc = cc_line(owner, *managers)
     return "\n".join([*lines, cc] if cc else lines)
@@ -971,10 +977,10 @@ async def run_caller_daily(
             who = await people(iv, entry)
             rows.append({
                 "start": _aware_utc(entry.scheduledAt),
-                "company": (iv.companyName or "").strip() or "—",
+                "company": _text(iv.companyName),
                 "stage": _stage_label(entry.stage),
-                "profile": who["profile"],
-                "callerName": (entry.caller.callerName or "").strip() or "TBD",
+                "profile": _slack_escape(who["profile"]),
+                "callerName": _text(entry.caller.callerName, "TBD"),
                 "method": _METHOD_LABELS.get(entry.caller.method or "", ""),
                 "mentions": _mention(who["owner"]),
                 "link": await permalink(iv, entry),

@@ -208,6 +208,19 @@ def test_digest_text_singular():
     assert first.endswith("· 1 interview")
 
 
+def test_digest_text_escapes_user_entered_text():
+    iv = _digest_iv("Acme <!channel> & Co", account_id="acc1")
+    row = digest_text(TODAY, [iv], profiles={"acc1": "<!here> Meron"}, tz=NY, why=None).splitlines()[1]
+    assert row == "• Time TBD · &lt;!here&gt; Meron · Acme &lt;!channel&gt; &amp; Co · Intro"
+
+
+def test_digest_text_escapes_only_the_text_of_a_job_link():
+    iv = _digest_iv("Acme <!channel> & Co", job_url="https://jobs.example/1?a=1&b=2")
+    row = digest_text(TODAY, [iv], profiles={}, tz=NY, why=None).splitlines()[1]
+    assert "<https://jobs.example/1?a=1&b=2|Acme &lt;!channel&gt; &amp; Co>" in row
+    assert "<!channel>" not in row
+
+
 @pytest.mark.asyncio
 async def test_digest_empty_day_sends_rest_message():
     from app.slack_bot import _digest_for_user

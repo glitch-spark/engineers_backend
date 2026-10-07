@@ -219,3 +219,82 @@ def test_rescheduled_and_confirmed_reply_says_confirmed():
     t, t2 = slack_time(START), slack_time(LATER)
     first = reply("rescheduled", entry(at=LATER, confirmed=True), snap()).splitlines()[0]
     assert first == f":repeat: <@U0OWNER001> — *Rescheduled* — {t} → {t2} · confirmed, caller Sam"
+
+
+# --- user-entered text is escaped ------------------------------------------------------------------
+
+HOSTILE_COMPANY = "Acme <!channel> & Co"
+ESCAPED_COMPANY = "Acme &lt;!channel&gt; &amp; Co"
+HOSTILE_NAME = "<@U123> Jane"
+ESCAPED_NAME = "&lt;@U123&gt; Jane"
+
+
+def hostile_entry(**kw):
+    e = entry(name=HOSTILE_NAME, **kw)
+    e.interviewerName = HOSTILE_NAME
+    return e
+
+
+def test_main_post_escapes_user_entered_text():
+    iv = SimpleNamespace(companyName=HOSTILE_COMPANY, jobUrl="https://jobs.example/1", accountId=None)
+    account = SimpleNamespace(name="<!here> Profile", country="us")
+    text = caller_round_text(iv, hostile_entry(), account=account, owner=OWNER, managers=[MANAGER])
+    lines = text.splitlines()
+    assert f"*Company name:* {ESCAPED_COMPANY}" in lines
+    assert f"*Recruiter name:* {ESCAPED_NAME} 🇺🇸" in lines
+    assert f"*Caller assigned:* {ESCAPED_NAME}" in lines
+    assert "*Profile:* &lt;!here&gt; Profile" in lines
+    assert "<!channel>" not in text and "<@U123>" not in text and "<!here>" not in text
+    # Slack's own tokens survive: the owner and cc mentions, the time tag.
+    assert lines[0].startswith(":telephone_receiver: <@U0OWNER001> — ")
+    assert lines[-1] == "cc <@U0MANAGER1>"
+    assert "<!date^" in text
+
+
+def test_main_post_escapes_job_link_text_and_method_value():
+    iv = SimpleNamespace(companyName="Acme", jobUrl="<!channel>?a=1&b=2", accountId=None)
+    e = entry()
+    e.caller.methodValue = "call <!here> & wait"
+    lines = caller_round_text(iv, e, account=None, owner=OWNER, managers=[]).splitlines()
+    assert "*JD Link:* &lt;!channel&gt;?a=1&amp;b=2" in lines
+    assert "*Method:* Video meeting — call &lt;!here&gt; &amp; wait" in lines
+
+
+def test_main_post_keeps_a_meeting_link_intact_and_escapes_only_its_text():
+    e = entry()
+    e.caller.methodValue = "https://meet.example/x?a=1&b=2"
+    line = next(l for l in caller_round_text(IV, e, account=None, owner=OWNER, managers=[]).splitlines()
+                if l.startswith("*Method:*"))
+    assert line == "*Method:* Video meeting — <https://meet.example/x?a=1&b=2|https://meet.example/x?a=1&amp;b=2>"
+
+
+def test_main_post_no_caller_variant_escapes_company_and_profile():
+    iv = SimpleNamespace(companyName=HOSTILE_COMPANY, jobUrl=None, accountId=None)
+    account = SimpleNamespace(name="<!here> Profile", country=None)
+    text = caller_round_text(iv, entry(caller=False), account=account, owner=OWNER, managers=[])
+    assert f"*Company name:* {ESCAPED_COMPANY}" in text and "*Profile:* &lt;!here&gt; Profile" in text
+    assert "<!channel>" not in text
+
+
+def test_reply_escapes_the_caller_name():
+    confirmed = reply("confirmed", hostile_entry(confirmed=True), snap())
+    assert confirmed.splitlines()[0].endswith(f"· caller {ESCAPED_NAME}") and "<@U123>" not in confirmed
+    resched = reply("rescheduled", hostile_entry(at=LATER, confirmed=True), snap())
+    assert resched.splitlines()[0].endswith(f"· confirmed, caller {ESCAPED_NAME}") and "<@U123>" not in resched
+
+
+def test_details_reply_escapes_the_changed_values():
+    text = reply("details", hostile_entry(), snap(name="<!channel>"))
+    assert f"Caller assigned: &lt;!channel&gt; → {ESCAPED_NAME}" in text.splitlines()
+    assert "<!channel>" not in text and "<@U123>" not in text
+    new = entry()
+    new.caller.methodValue = "https://x.example/?a=1&b=2"
+    old = snap()
+    old["link"] = "<!here>"
+    text = reply("details", new, old)
+    assert "Link: &lt;!here&gt; → https://x.example/?a=1&amp;b=2" in text.splitlines()
+
+
+def test_details_reply_keeps_the_time_tag_unescaped():
+    text = reply("details", entry(name="Dana", at=LATER), snap(name="TBD"))
+    assert f"Time: {slack_time(START)} → {slack_time(LATER)}" in text.splitlines()

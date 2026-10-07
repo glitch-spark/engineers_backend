@@ -174,6 +174,26 @@ def test_missing_owner_reads_someone():
     assert fake.posts[0][1].splitlines()[1].endswith(" — someone · <https://slack.example/p1|thread>")
 
 
+def test_user_entered_text_is_escaped_in_the_list_row():
+    iv = SimpleNamespace(id="iv1", companyName="Acme <!channel> & Co", createdBy="u1", accountId=None)
+    entry = caller_round(9, interviewerName="<@U123> Jane")
+    entry.caller.callerName = "<@U999> Sam"
+    fake = Fake(rows=[(iv, entry)])
+
+    async def people(_iv, _entry):
+        return {"owner": OWNER, "profile": "<!here> Meron"}
+
+    fake.people = people
+    assert fake.run(chi(DAY, 5, 2)) == "posted"
+    row = fake.posts[0][1].splitlines()[1]
+    assert " · Acme &lt;!channel&gt; &amp; Co · " in row
+    assert " · &lt;!here&gt; Meron · caller &lt;@U999&gt; Sam · " in row
+    for raw in ("<!channel>", "<!here>", "<@U999>", "<@U123>"):
+        assert raw not in row
+    # The owner mention and the thread link are Slack's own tokens and stay intact.
+    assert row.endswith(" — <@U0OWNER001> · <https://slack.example/p1|thread>")
+
+
 def test_not_due_before_five():
     fake = Fake()
     assert fake.run(chi(DAY, 4, 55)) == "not_due" and fake.posts == []

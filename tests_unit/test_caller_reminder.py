@@ -103,6 +103,28 @@ def test_reminder_without_anyone_to_cc_has_no_cc_line():
     assert "cc " not in text and text.splitlines()[-1] == "*Caller assigned:* Sam"
 
 
+def test_reminder_text_escapes_user_entered_text():
+    r = _round(27)
+    r.caller.callerName = "<@U123> Sam"
+    text = caller_reminder_text(
+        _iv(r, company="Acme <!channel> & Co"), r, now=NOW, owner=OWNER, managers=[MANAGER],
+        account=SimpleNamespace(name="<!here> Profile"),
+    )
+    lines = text.splitlines()
+    assert lines[0].endswith(" · Intro · Acme &lt;!channel&gt; &amp; Co")
+    assert "*Profile:* &lt;!here&gt; Profile" in lines
+    assert "*Caller assigned:* &lt;@U123&gt; Sam" in lines
+    assert "<!channel>" not in text and "<!here>" not in text and "<@U123>" not in text
+    assert lines[-1] == "cc <@UA> <@UB>" and "<!date^" in lines[0]
+
+
+def test_reminder_text_escapes_a_method_value_that_is_not_a_link():
+    r = _round(27)
+    r.caller.methodValue = "dial <!channel> & hold"
+    text = caller_reminder_text(_iv(r), r, now=NOW, owner=OWNER, managers=[], account=None)
+    assert "*Method:* Video meeting — dial &lt;!channel&gt; &amp; hold" in text.splitlines()
+
+
 class _Fakes:
     def __init__(self, interviews=(), post_ok=True):
         self.interviews = list(interviews)
