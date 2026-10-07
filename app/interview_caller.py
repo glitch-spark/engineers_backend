@@ -108,6 +108,7 @@ def round_caller_snapshot(entry: Any) -> Optional[dict]:
         "link": (caller.methodValue or "").strip(),
         "caller": (caller.callerName or "").strip() or "TBD",
         "coworkers": tuple(sorted(str(i) for i in caller.coworkerIds)),
+        "confirmed": bool(getattr(entry, "confirmed", False)),
     }
 
 

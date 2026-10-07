@@ -163,6 +163,8 @@ class StagePatch(BaseModel):
     transcript: Optional[str] = None
     note: Optional[str] = None
     caller: Optional[CallerIn] = None
+    # Caller rounds only; owner or admin.
+    confirmed: Optional[bool] = None
 
 
 class InterviewUpdate(BaseModel):
@@ -389,6 +391,7 @@ def _sync_top_from_tip(iv: Interview) -> None:
     # the latest round for one release (DM digest, _can_view read them).
     iv.interviewerName = tip.interviewerName
     iv.caller = tip.caller
+    iv.confirmed = bool(getattr(tip, "confirmed", False))
 
 
 def _reject_adjacent_duplicate(iv: Interview) -> None:
@@ -945,6 +948,8 @@ async def update_interview_stage(
         if sched is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
         old_start, old_end = entry.scheduledAt, entry.endsAt
+        if old_start is None or _utc_naive(old_start) != _utc_naive(sched):
+            entry.confirmed = False  # a new time needs the caller lined up again
         entry.scheduledAt = sched
         # Rescheduling keeps the round's duration unless a new end is sent.
         if body.endsAt is None and old_start is not None and old_end is not None:
@@ -975,6 +980,12 @@ async def update_interview_stage(
             body.caller, starts_at=entry.scheduledAt, owner_id=iv.createdBy,
             previous=entry.caller,
         )
+    if entry.caller is None or not entry.caller.enabled:
+        entry.confirmed = False
+    if body.confirmed is not None:
+        if body.confirmed and (entry.caller is None or not entry.caller.enabled):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only caller rounds are confirmed")
+        entry.confirmed = body.confirmed
     iv.stageHistory[idx] = entry
 
     _reject_adjacent_duplicate(iv)

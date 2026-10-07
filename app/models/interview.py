@@ -85,6 +85,8 @@ class InterviewStageEvent(BaseModel):
     interviewerName: Optional[str] = None
     endsAt: Optional[datetime] = None
     caller: Optional[InterviewCaller] = None
+    # A caller round whose caller is lined up (set by the owner or an admin). Cleared when the time changes.
+    confirmed: bool = False
 
     @field_validator("status", mode="before")
     @classmethod
@@ -119,6 +121,7 @@ class Interview(TimestampedDocument):
     note: str = ""
     stageHistory: List[InterviewStageEvent] = []
     caller: Optional[InterviewCaller] = None
+    confirmed: bool = False  # mirrors the latest round
 
     # Set when an unmigrated document was resolved on read: questions linked to
     # removed "rejected" rounds must follow on save (routers.interviews._save_interview).
