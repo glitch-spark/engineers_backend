@@ -19,18 +19,10 @@ from app.interview_caller import (  # noqa: E402
 from app.models.interview import InterviewCaller, InterviewStageEvent  # noqa: E402
 
 START = datetime(2026, 10, 1, 14, 0, tzinfo=timezone.utc)
-OWNER = ObjectId()
-MATE = ObjectId()
 
 
 def _build(**body):
-    return build_round_caller(
-        CallerIn(**{"enabled": True, **body}),
-        starts_at=START,
-        owner_id=OWNER,
-        valid_coworker_ids={str(MATE), str(OWNER)},
-        previous=None,
-    )
+    return build_round_caller(CallerIn(**{"enabled": True, **body}), starts_at=START, previous=None)
 
 
 def _entry(**kw):
@@ -46,21 +38,37 @@ def _entry(**kw):
 
 
 def test_build_round_caller_uses_round_start():
-    caller = _build(coworkerIds=[str(MATE), str(OWNER)])
+    caller = _build()
     assert caller.startsAt == START
-    assert [str(i) for i in caller.coworkerIds] == [str(MATE)]  # owner dropped
-    with pytest.raises(CallerError):
-        _build(coworkerIds=[str(ObjectId())])
     with pytest.raises(CallerError):
         _build(method="carrier_pigeon")
 
 
+def test_caller_body_ignores_coworker_ids():
+    caller = _build(coworkerIds=[str(ObjectId())])  # old clients still send them
+    assert caller.enabled is True
+    assert not hasattr(caller, "coworkerIds")
+
+
+def test_snapshot_has_no_coworkers():
+    snap = round_caller_snapshot(_entry())
+    assert "coworkers" not in snap
+    assert set(snap) == {"time", "stage", "status", "method", "link", "caller", "confirmed"}
+
+
+def test_old_round_with_coworker_ids_loads_without_them():
+    old = {
+        "id": "r1", "stage": "intro", "at": START, "scheduledAt": START,
+        "caller": {"enabled": True, "callerName": "Sam", "coworkerIds": [ObjectId()]},
+    }
+    entry = InterviewStageEvent.model_validate(old)
+    assert entry.caller.callerName == "Sam"
+    assert "coworkerIds" not in entry.model_dump()["caller"]
+
+
 def test_build_round_caller_disabled_keeps_ts():
     prev = InterviewCaller(enabled=True, slackChannelTs="1.2")
-    caller = build_round_caller(
-        CallerIn(enabled=False), starts_at=START, owner_id=OWNER,
-        valid_coworker_ids=set(), previous=prev,
-    )
+    caller = build_round_caller(CallerIn(enabled=False), starts_at=START, previous=prev)
     assert caller.enabled is False
     assert caller.slackChannelTs == "1.2"
 

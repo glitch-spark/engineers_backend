@@ -82,35 +82,35 @@ def test_event_none_when_unchanged_or_caller_toggled():
 
 
 def test_main_post_shows_manager_and_badge():
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], managers=[MANAGER])
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[MANAGER])
     assert "*Interview manager:* <@U0MANAGER1>" in text
     assert ":hourglass_flowing_sand: Not confirmed yet" in text
-    text = caller_round_text(IV, entry(confirmed=True), account=None, owner=OWNER, coworkers=[], managers=[MANAGER])
+    text = caller_round_text(IV, entry(confirmed=True), account=None, owner=OWNER, managers=[MANAGER])
     assert ":white_check_mark: Confirmed" in text
 
 
 def test_main_post_without_manager():
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], managers=[])
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[])
     assert "*Interview manager:* no interview manager assigned" in text
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[], managers=[user("Maria")])
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[user("Maria")])
     assert "*Interview manager:* Maria" in text
 
 
 def test_main_post_tags_every_manager():
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, coworkers=[],
+    text = caller_round_text(IV, entry(), account=None, owner=OWNER,
                              managers=[MANAGER, user("Ana", "U0MANAGER2")])
     assert "*Interview manager:* <@U0MANAGER1> <@U0MANAGER2>" in text
 
 
 def test_main_post_no_caller_variant():
     text = caller_round_text(IV, entry(caller=False, stage="tech_round_1"), account=None, owner=OWNER,
-                             coworkers=[], managers=[MANAGER])
+                             managers=[MANAGER])
     assert text.splitlines()[0] == ":telephone_receiver: *No caller needed for Tech Round 1* — posted by <@U0OWNER001>"
     assert "Caller assigned" not in text and "Confirmed" not in text
 
 
 def test_canceled_main_post_has_no_badge():
-    text = caller_round_text(IV, entry(status="canceled"), account=None, owner=OWNER, coworkers=[], managers=[MANAGER])
+    text = caller_round_text(IV, entry(status="canceled"), account=None, owner=OWNER, managers=[MANAGER])
     assert text.startswith(":x: *CANCELED*") and "Not confirmed yet" not in text
 
 

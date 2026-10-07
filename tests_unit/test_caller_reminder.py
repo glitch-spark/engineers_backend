@@ -69,16 +69,13 @@ def _user(name, slack=None):
     return SimpleNamespace(name=name, email=f"{name}@x.com", slackUserId=slack)
 
 
-def test_reminder_text_tags_coworkers_and_owner():
+def test_reminder_text_tags_the_owner():
     r = _round(27, stage="tech")
-    text = caller_reminder_text(
-        _iv(r, company="Globex"), r, now=NOW,
-        owner=_user("Ann", "UA"), coworkers=[_user("Bo", "UB"), _user("Casey")],
-    )
+    text = caller_reminder_text(_iv(r, company="Globex"), r, now=NOW, owner=_user("Ann", "UA"))
     assert text.startswith(":alarm_clock: *Starting in 27 min* — ")
     assert slack_time(r.scheduledAt, with_day=False) in text
     assert "Globex" in text and "https://meet.example/x" in text and "Sam" in text
-    assert text.splitlines()[-1] == "<@UB> Casey <@UA>"
+    assert text.splitlines()[-1] == "<@UA>"
 
 
 class _Fakes:
@@ -108,7 +105,7 @@ class _Fakes:
         return self.post_ok
 
     async def people(self, iv, entry):
-        return _user("Ann", "UA"), []
+        return _user("Ann", "UA")
 
 
 def _run(fakes, now=NOW):

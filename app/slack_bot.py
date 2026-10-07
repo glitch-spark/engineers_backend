@@ -7,9 +7,8 @@ private SLACK_CALLER_CHANNEL_ID, and each daily plan in
 SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
 Sends an instant DM when an interview is created or meaningfully updated,
-plus a daily digest at each user's chosen time/timezone that also lists
-calls the user joins as a coworker. A round with a caller gets a reply in its
-#caller thread ~30 minutes before it starts, tagging the coworkers and owner.
+plus a daily digest at each user's chosen time/timezone. A round with a caller
+gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner.
 """
 
 from __future__ import annotations
@@ -406,7 +405,6 @@ def caller_round_text(
     *,
     account: Optional[Account],
     owner: Optional[UserExtra],
-    coworkers: list[UserExtra],
     managers: Sequence[UserExtra] = (),
 ) -> str:
     """The interview's #caller main post, describing its latest round: marked canceled once called off,
@@ -440,8 +438,6 @@ def caller_round_text(
         f"*Method:* {_method_text(caller)}",
         f"*Caller assigned:* {(getattr(caller, 'callerName', '') or '').strip() or 'TBD'}",
     ]
-    if coworkers:
-        lines.append(f"*Coworkers:* {' '.join(_mention(u) for u in coworkers)}")
     lines.append(f"*Interview manager:* {_managers_text(managers)}")
     if not off:
         lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
@@ -484,7 +480,7 @@ async def caller_thread_reply(
     elif event == "unconfirmed":
         head = f":warning: *Confirmation removed* — {stage} · {when}"
     elif event == "details":
-        lines = await _change_lines(prev, entry)
+        lines = _change_lines(prev, entry)
         if not lines:
             return None
         head = "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
@@ -493,15 +489,13 @@ async def caller_thread_reply(
     return f"{head}\ncc {_managers_text(managers)} {_mention(owner)}"
 
 
-def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
+def _snapshot_label(key: str, value: Any) -> str:
     if key == "stage":
         return _stage_label(value)
     if key == "status":
         return str(value).capitalize()
     if key == "method":
         return _METHOD_LABELS.get(value or "", value or "TBD")
-    if key == "coworkers":
-        return " ".join(mentions.get(str(i), "someone") for i in value) or "—"
     return str(value)
 
 
@@ -512,11 +506,8 @@ _MESSAGE_GONE = {"message_not_found", "channel_not_found", "cant_update_message"
 async def _main_post_text(
     interview: Interview, entry: Any, owner: Optional[UserExtra], managers: Sequence[UserExtra] = (),
 ) -> str:
-    caller = entry.caller
     account = await Account.get(interview.accountId) if interview.accountId else None
-    ids = list(caller.coworkerIds) if caller is not None and caller.enabled else []
-    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
-    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers, managers=managers)
+    return caller_round_text(interview, entry, account=account, owner=owner, managers=managers)
 
 
 async def interview_managers() -> list[UserExtra]:
@@ -630,16 +621,11 @@ async def sync_caller_thread(
         return False
 
 
-async def _change_lines(prev: Optional[dict], entry: Any) -> list[str]:
+def _change_lines(prev: Optional[dict], entry: Any) -> list[str]:
     if prev is None:
         return []
     new = round_caller_snapshot(entry) or {}
-    ids = {str(i) for i in (prev.get("coworkers") or ())} | {str(i) for i in new.get("coworkers") or ()}
-    users = await UserExtra.find({"_id": {"$in": [PydanticObjectId(i) for i in ids]}}).to_list() if ids else []
-    mentions = {str(u.id): _mention(u) for u in users}
-    return caller_change_lines(
-        prev, new, fmt_time=slack_time, label=lambda k, v: _snapshot_label(k, v, mentions),
-    )
+    return caller_change_lines(prev, new, fmt_time=slack_time, label=_snapshot_label)
 
 
 def _slack_escape(text: str) -> str:
@@ -737,37 +723,13 @@ def _by_start(interviews: list[Interview]) -> list[Interview]:
     return sorted(interviews, key=lambda iv: (_caller_start(iv) is None, _caller_start(iv) or far))
 
 
-def split_digest_interviews(
-    interviews: list[Interview],
-    user_id: Any,
-) -> tuple[list[Interview], list[Interview]]:
-    """(owned by user, joined as coworker). Owning wins when both apply."""
-    mine: list[Interview] = []
-    with_caller: list[Interview] = []
-    seen: set[str] = set()
-    for iv in interviews:
-        key = str(iv.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        if str(iv.createdBy) == str(user_id):
-            mine.append(iv)
-        else:
-            with_caller.append(iv)
-    return _by_start(mine), _by_start(with_caller)
-
-
 def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def digest_summary(mine: int, with_caller: int) -> str:
-    total = mine + with_caller
-    head = f"You have {_plural(total, 'interview')} today"
-    if with_caller:
-        head += f" ({mine} yours, {with_caller} as caller)"
+def digest_summary(total: int) -> str:
     enjoy = "Enjoy your interview" if total == 1 else "Enjoy your interviews"
-    return f"{head}. {enjoy}, and good luck! :four_leaf_clover:"
+    return f"You have {_plural(total, 'interview')} today. {enjoy}, and good luck! :four_leaf_clover:"
 
 
 def _digest_line(
@@ -776,69 +738,48 @@ def _digest_line(
     *,
     profile: str,
     tz: ZoneInfo,
-    host: Optional[str] = None,
 ) -> str:
     starts = _caller_start(iv)
     parts: list[str] = []
     if starts is not None:
         parts.append(f"*{fmt_caller_time(starts, tz, with_day=False)}*")
-    elif host is not None:
-        parts.append("*Time TBD*")
     parts.append(profile.strip() or "—")
     company = (iv.companyName or "").strip() or "—"
     job_url = (iv.jobUrl or "").strip()
     parts.append(_mrkdwn_link(job_url, company) if job_url else company)
     parts.append(_stage_label(iv.stage))
-    if host is not None:
-        parts.append(f"host {host}")
-        method = _method_text(iv.caller)
-        if method != "TBD":
-            parts.append(method)
     return f"{n}. " + " · ".join(parts)
 
 
 def digest_blocks(
     mine: list[Interview],
-    with_caller: list[Interview],
     *,
     profiles: dict[str, str],
-    hosts: dict[str, str],
     tz: ZoneInfo,
     why: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    total = len(mine) + len(with_caller)
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"Today's interviews ({total})", "emoji": True},
+            "text": {"type": "plain_text", "text": f"Today's interviews ({len(mine)})", "emoji": True},
         },
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": digest_summary(len(mine), len(with_caller))},
+            "text": {"type": "mrkdwn", "text": digest_summary(len(mine))},
         },
     ]
-    n = 0
-
-    def section(title: str, rows: list[Interview], *, as_caller: bool) -> None:
-        nonlocal n
+    if mine:
         lines = []
-        for iv in rows:
-            n += 1
+        for n, iv in enumerate(mine, start=1):
             profile = profiles.get(str(iv.accountId), "") if iv.accountId else ""
-            host = hosts.get(str(iv.createdBy), "someone") if as_caller else None
-            lines.append(_digest_line(n, iv, profile=profile, tz=tz, host=host))
+            lines.append(_digest_line(n, iv, profile=profile, tz=tz))
         blocks.append({"type": "divider"})
         blocks.append(
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*{title} ({len(rows)})*\n" + "\n".join(lines)},
+                "text": {"type": "mrkdwn", "text": f"*My interviews ({len(mine)})*\n" + "\n".join(lines)},
             }
         )
-
-    if mine:
-        section("My interviews", mine, as_caller=False)
-    if with_caller:
-        section("Calls with you as caller", with_caller, as_caller=True)
     blocks.append(
         {
             "type": "section",
@@ -886,21 +827,10 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
 
     start_n, end_n = calendar_day_bounds(day)
     interviews = await Interview.find(
-        {
-            "$or": [
-                {"createdBy": user.id, "scheduledAt": {"$gte": start_n, "$lt": end_n}},
-                # Callers live on rounds: match the coworker's round on this day.
-                {"stageHistory": {"$elemMatch": {
-                    "caller.enabled": True,
-                    "caller.coworkerIds": user.id,
-                    "scheduledAt": {"$gte": start_n, "$lt": end_n},
-                }}},
-            ],
-        }
+        {"createdBy": user.id, "scheduledAt": {"$gte": start_n, "$lt": end_n}}
     ).sort([("scheduledAt", 1)]).to_list()
-    interviews = [iv for iv in interviews if iv.status not in _SKIP_STATUSES]
-    mine, with_caller = split_digest_interviews(interviews, user.id)
-    if not mine and not with_caller:
+    mine = _by_start([iv for iv in interviews if iv.status not in _SKIP_STATUSES])
+    if not mine:
         text = "You have no interviews today. Have a rest."
         blocks = [
             {
@@ -919,21 +849,9 @@ async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
         return 0, "dm_failed"
 
     why = know_your_why_for_date(day)
-    profiles = await _profile_labels(interviews)
-    owner_ids = {iv.createdBy for iv in with_caller}
-    owners = (
-        await UserExtra.find({"_id": {"$in": list(owner_ids)}}).to_list() if owner_ids else []
-    )
-    hosts = {str(u.id): _mention(u) for u in owners}
-    text = digest_summary(len(mine), len(with_caller))
-    blocks = digest_blocks(
-        mine,
-        with_caller,
-        profiles=profiles,
-        hosts=hosts,
-        tz=tz,
-        why=why,
-    )
+    profiles = await _profile_labels(mine)
+    text = digest_summary(len(mine))
+    blocks = digest_blocks(mine, profiles=profiles, tz=tz, why=why)
     ok = await send_dm(slack_id, text=text, blocks=blocks)
     if ok:
         await _mark_sent(user.id, kind)
@@ -981,19 +899,17 @@ def caller_reminder_text(
     *,
     now: datetime,
     owner: Optional[UserExtra],
-    coworkers: list[UserExtra],
 ) -> str:
     start = _aware_utc(entry.scheduledAt)
     minutes = max(1, math.ceil((start - _aware_utc(now)).total_seconds() / 60))
     company = (getattr(interview, "companyName", None) or "").strip() or "—"
     caller = entry.caller
-    tags = list(dict.fromkeys([*(_mention(u) for u in coworkers), _mention(owner)]))
     return "\n".join([
         f":alarm_clock: *Starting in {minutes} min* — {slack_time(start, with_day=False)}"
         f" · {_stage_label(entry.stage)} · {company}",
         f"*Method:* {_method_text(caller)}",
         f"*Caller assigned:* {(caller.callerName or '').strip() or 'TBD'}",
-        " ".join(tags),
+        _mention(owner),
     ])
 
 
@@ -1041,10 +957,8 @@ async def _reminder_post(interview: Any, entry: Any, text: str) -> bool:
         return False
 
 
-async def _reminder_people(interview: Any, entry: Any) -> tuple[Optional[UserExtra], list[UserExtra]]:
-    ids = list(entry.caller.coworkerIds or [])
-    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
-    return await UserExtra.get(interview.createdBy), coworkers
+async def _reminder_people(interview: Any, entry: Any) -> Optional[UserExtra]:
+    return await UserExtra.get(interview.createdBy)
 
 
 def _reminder_configured() -> bool:
@@ -1073,8 +987,8 @@ async def run_caller_reminders(
             continue
         ok = False
         try:
-            owner, coworkers = await people(iv, entry)
-            text = caller_reminder_text(iv, entry, now=now, owner=owner, coworkers=coworkers)
+            owner = await people(iv, entry)
+            text = caller_reminder_text(iv, entry, now=now, owner=owner)
             ok = await post(iv, entry, text)
         except Exception as exc:
             log.warning("slack_bot caller reminder failed for round %s: %s", entry.id, exc)
@@ -1144,10 +1058,8 @@ async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, 
 
 async def _caller_daily_people(interview: Any, entry: Any) -> dict[str, Any]:
     owner, managers = await _owner_and_managers(interview)
-    ids = list(entry.caller.coworkerIds or [])
-    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
     account = await Account.get(interview.accountId) if interview.accountId else None
-    return {"owner": owner, "coworkers": coworkers, "managers": managers, "profile": _profile_label(account)}
+    return {"owner": owner, "managers": managers, "profile": _profile_label(account)}
 
 
 async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
@@ -1217,7 +1129,7 @@ async def run_caller_daily(
         rows = []
         for iv, entry in await load(start, end):
             who = await people(iv, entry)
-            users = [who["owner"], *who["coworkers"], *who["managers"]]
+            users = [who["owner"], *who["managers"]]
             mentions = " ".join(dict.fromkeys(_mention(u) for u in users if u is not None))
             rows.append({
                 "start": _aware_utc(entry.scheduledAt),

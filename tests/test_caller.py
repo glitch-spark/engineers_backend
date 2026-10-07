@@ -13,7 +13,6 @@ from app.interview_caller import (
     CallerError,
     CallerIn,
     build_round_caller,
-    is_coworker,
     round_caller_snapshot,
 )
 from app.models.interview import InterviewCaller, InterviewStageEvent
@@ -23,24 +22,16 @@ from app.slack_bot import (
     digest_summary,
     fmt_caller_time,
     slack_time,
-    split_digest_interviews,
+    _by_start,
 )
 
 OWNER = PydanticObjectId()
 B = PydanticObjectId()
-C = PydanticObjectId()
 START = datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc)
 
 
-def _build(previous=None, valid=None, **kw):
-    body = CallerIn(enabled=True, **kw)
-    return build_round_caller(
-        body,
-        starts_at=START,
-        owner_id=OWNER,
-        valid_coworker_ids={str(B), str(C)} if valid is None else valid,
-        previous=previous,
-    )
+def _build(previous=None, **kw):
+    return build_round_caller(CallerIn(enabled=True, **kw), starts_at=START, previous=previous)
 
 
 def _entry(caller):
@@ -53,47 +44,36 @@ def test_defaults_to_tbd():
     assert c.callerName == "TBD"
     assert c.startsAt == START  # the caller joins at the round's start
     assert c.timezone is None  # Slack shows each reader their own time
-    assert c.coworkerIds == []
 
 
 def test_old_clients_may_still_send_a_timezone():
     assert _build(timezone="Mars/Olympus").timezone is None
 
 
-def test_rejects_bad_method_and_unknown_coworker():
+def test_rejects_bad_method():
     with pytest.raises(CallerError):
         _build(method="carrier_pigeon")
-    with pytest.raises(CallerError):
-        _build(coworkerIds=[str(PydanticObjectId())])
 
 
-def test_coworkers_deduped_and_owner_dropped():
-    c = _build(coworkerIds=[str(B), str(B), str(OWNER), str(C)])
-    assert c.coworkerIds == [B, C]
-    assert is_coworker(c, B)
-    assert not is_coworker(c, OWNER)
+def test_old_clients_may_still_send_coworker_ids():
+    c = _build(coworkerIds=[str(B)])
+    assert c.enabled is True
+    assert not hasattr(c, "coworkerIds")
 
 
 def test_disable_keeps_previous_data_but_turns_off():
-    prev = _build(callerName="Sam", coworkerIds=[str(B)])
+    prev = _build(callerName="Sam")
     prev.slackChannelTs = "123.456"
-    off = build_round_caller(
-        CallerIn(enabled=False),
-        starts_at=START,
-        owner_id=OWNER,
-        valid_coworker_ids=set(),
-        previous=prev,
-    )
+    off = build_round_caller(CallerIn(enabled=False), starts_at=START, previous=prev)
     assert off.enabled is False
     assert off.callerName == "Sam"
     assert round_caller_snapshot(_entry(off)) is None
-    assert not is_coworker(off, B)
 
 
 def test_update_keeps_slack_thread_ts():
     prev = _build()
     prev.slackChannelTs = "111.222"
-    nxt = _build(previous=prev, valid=set(), callerName="Sam")
+    nxt = _build(previous=prev, callerName="Sam")
     assert nxt.slackChannelTs == "111.222"
     assert round_caller_snapshot(_entry(nxt)) != round_caller_snapshot(_entry(prev))
 
@@ -135,50 +115,26 @@ def _iv(owner, *, caller=None, company="Acme"):
     )
 
 
-def test_split_digest_mine_first_and_sorted_by_time():
+def test_digest_sorted_by_time_tbd_last():
     early = InterviewCaller(enabled=True, startsAt=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc))
     late = InterviewCaller(enabled=True, startsAt=datetime(2026, 9, 29, 18, 0, tzinfo=timezone.utc))
     own_tbd = _iv(B, company="OwnTBD")
     own_late = _iv(B, caller=late, company="OwnLate")
-    joined = _iv(OWNER, caller=early, company="Joined")
-    mine, with_caller = split_digest_interviews([own_tbd, joined, own_late, joined], B)
-    assert [iv.companyName for iv in mine] == ["OwnLate", "OwnTBD"]
-    assert [iv.companyName for iv in with_caller] == ["Joined"]
+    own_early = _iv(B, caller=early, company="OwnEarly")
+    assert [iv.companyName for iv in _by_start([own_tbd, own_late, own_early])] == ["OwnEarly", "OwnLate", "OwnTBD"]
 
 
-def test_digest_summary_and_numbering_across_sections():
-    assert digest_summary(2, 0) == (
+def test_digest_summary_and_numbering():
+    assert digest_summary(2) == (
         "You have 2 interviews today. Enjoy your interviews, and good luck! :four_leaf_clover:"
     )
-    assert digest_summary(2, 2) == (
-        "You have 4 interviews today (2 yours, 2 as caller). "
-        "Enjoy your interviews, and good luck! :four_leaf_clover:"
-    )
-    assert digest_summary(1, 0).startswith("You have 1 interview today. Enjoy your interview,")
+    assert digest_summary(1).startswith("You have 1 interview today. Enjoy your interview,")
 
-    joined = _iv(
-        OWNER,
-        caller=InterviewCaller(enabled=True, method="video", methodValue="https://meet.example/x"),
-    )
-    blocks = digest_blocks(
-        [_iv(B), _iv(B)],
-        [joined],
-        profiles={},
-        hosts={str(OWNER): "<@UOWNER>"},
-        tz=ZoneInfo("America/New_York"),
-    )
+    blocks = digest_blocks([_iv(B), _iv(B)], profiles={}, tz=ZoneInfo("America/New_York"))
     texts = "\n".join(b["text"]["text"] for b in blocks if b.get("type") == "section")
     assert "*My interviews (2)*" in texts
-    assert "*Calls with you as caller (1)*" in texts
-    assert "\n3. *Time TBD*" in texts
-    assert "host <@UOWNER>" in texts
-    assert "Video meeting" in texts
-
-
-def test_digest_omits_empty_section():
-    blocks = digest_blocks([_iv(B)], [], profiles={}, hosts={}, tz=ZoneInfo("UTC"))
-    texts = "\n".join(b["text"]["text"] for b in blocks if b.get("type") == "section")
-    assert "Calls with you as caller" not in texts
+    assert "\n2. " in texts
+    assert "as caller" not in texts
 
 
 def _user(name, slack=None):
@@ -201,13 +157,7 @@ def test_caller_round_text_with_and_without_details():
             methodValue="+1 555 0100",
         ),
     )
-    text = caller_round_text(
-        iv,
-        entry,
-        account=account,
-        owner=_user("A", "UA"),
-        coworkers=[_user("B", "UB"), _user("Casey")],
-    )
+    text = caller_round_text(iv, entry, account=account, owner=_user("A", "UA"))
     assert text.startswith(":telephone_receiver: *Caller needed* — posted by <@UA>")
     assert "*Profile:* Orion Osborn" in text
     assert "*Company name:* Wikimedia" in text
@@ -217,14 +167,13 @@ def test_caller_round_text_with_and_without_details():
     assert f"*Interview time:* {slack_time(START)}" in text
     assert "*Method:* Phone (Hushed) — +1 555 0100" in text
     assert "*Caller assigned:* TBD" in text
-    assert "*Coworkers:* <@UB> Casey" in text
+    assert "*Coworkers:*" not in text
 
     entry.interviewerName = None
     entry.caller = InterviewCaller(enabled=True)
-    text = caller_round_text(iv, entry, account=account, owner=_user("A"), coworkers=[])
+    text = caller_round_text(iv, entry, account=account, owner=_user("A"))
     assert "*Recruiter name:* —" in text
     assert "*Method:* TBD" in text
-    assert "*Coworkers:*" not in text
     assert "CANCELED" not in text
 
 
@@ -237,6 +186,6 @@ def test_caller_round_text_marks_canceled_rounds():
     for status, enabled in (("canceled", True), ("rejected", True), ("scheduled", False)):
         entry.status = status
         entry.caller.enabled = enabled
-        text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"), coworkers=[])
+        text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"))
         assert text.startswith(":x: *CANCELED* — ~Caller needed~ — posted by <@UA>")
         assert f"*Interview time:* ~{slack_time(START)}~" in text

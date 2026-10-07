@@ -562,10 +562,7 @@ async def test_users_lookup_requires_auth(client):
     assert r.status_code == 401
 
 
-async def test_caller_mode_create_and_coworker_can_view(
-    client, staff_user, staff_user_2, admin_user, make_user, auth_header
-):
-    outsider = await make_user(name="Outsider", email="out@example.com")
+async def test_caller_mode_create_and_only_owner_can_view(client, staff_user, staff_user_2, auth_header):
     acc = await _make_account(owner_id=staff_user.id)
     r = await client.post(
         "/interviews",
@@ -578,7 +575,6 @@ async def test_caller_mode_create_and_coworker_can_view(
                 "timezone": "America/New_York",
                 "method": "video",
                 "methodValue": "https://meet.example/abc",
-                "coworkerIds": [str(staff_user_2.id), str(staff_user.id)],
             },
         ),
     )
@@ -587,14 +583,10 @@ async def test_caller_mode_create_and_coworker_can_view(
     assert caller["enabled"] is True
     assert caller["callerName"] == "TBD"
     assert caller["startsAt"].startswith("2026-09-30T01:15:00")
-    assert caller["coworkerIds"] == [str(staff_user_2.id)]
+    assert "coworkerIds" not in caller and "coworkers" not in caller
     iv_id = r.json()["_id"]
 
     r = await client.get(f"/interviews/{iv_id}", headers=auth_header(staff_user_2))
-    assert r.status_code == 200
-    assert [c["name"] for c in r.json()["caller"]["coworkers"]] == ["Staff Two"]
-
-    r = await client.get(f"/interviews/{iv_id}", headers=auth_header(outsider))
     assert r.status_code == 403
 
     r = await client.put(f"/interviews/{iv_id}", headers=auth_header(staff_user_2), json={"note": "x"})
@@ -610,11 +602,9 @@ async def test_caller_mode_create_and_coworker_can_view(
     assert r.status_code == 200
     assert r.json()["caller"]["enabled"] is False
     assert r.json()["stageHistory"][-1]["caller"]["enabled"] is False
-    r = await client.get(f"/interviews/{iv_id}", headers=auth_header(staff_user_2))
-    assert r.status_code == 403
 
 
-async def test_caller_mode_rejects_unknown_coworker(client, staff_user, auth_header):
+async def test_caller_mode_ignores_coworker_ids_from_old_clients(client, staff_user, auth_header):
     acc = await _make_account(owner_id=staff_user.id)
     r = await client.post(
         "/interviews",
@@ -624,7 +614,32 @@ async def test_caller_mode_rejects_unknown_coworker(client, staff_user, auth_hea
             caller={"enabled": True, "coworkerIds": ["64b7f0000000000000000000"]},
         ),
     )
-    assert r.status_code == 400, r.text
+    assert r.status_code == 201, r.text
+    assert "coworkerIds" not in r.json()["caller"]
+
+
+async def test_old_interview_with_coworker_ids_loads_and_saves(client, staff_user, auth_header):
+    from bson import ObjectId
+
+    from app.models import Interview
+
+    acc = await _make_account(owner_id=staff_user.id)
+    when = datetime(2026, 10, 1, 14, 0)
+    oid = ObjectId()
+    await Interview.get_motor_collection().insert_one({
+        "_id": oid, "accountId": acc.id, "createdBy": staff_user.id, "scheduledAt": when,
+        "companyName": "Acme", "stage": "intro", "status": "scheduled", "transcript": "", "note": "",
+        "stageHistory": [{
+            "id": "r1", "stage": "intro", "status": "scheduled", "at": when, "scheduledAt": when,
+            "caller": {"enabled": True, "callerName": "Sam", "coworkerIds": [ObjectId()]},
+        }],
+    })
+    r = await client.get(f"/interviews/{oid}", headers=auth_header(staff_user))
+    assert r.status_code == 200, r.text
+    assert "coworkerIds" not in r.json()["stageHistory"][0]["caller"]
+    r = await client.put(f"/interviews/{oid}", headers=auth_header(staff_user), json={"companyName": "Globex"})
+    assert r.status_code == 200, r.text
+    assert r.json()["companyName"] == "Globex"
 
 
 async def test_caller_mode_ignores_timezone_from_old_clients(client, staff_user, auth_header):

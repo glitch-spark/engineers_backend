@@ -48,7 +48,7 @@ CallerMethod = Literal["video", "phone_hushed", "phone_slynumber"]
 
 
 class InterviewCaller(BaseModel):
-    """Optional request for a caller (a coworker) to join this interview."""
+    """Optional request for a caller to join this interview."""
 
     enabled: bool = False
     callerName: str = "TBD"
@@ -57,7 +57,6 @@ class InterviewCaller(BaseModel):
     timezone: Optional[str] = None  # legacy, no longer written: Slack shows each reader their own time
     method: Optional[CallerMethod] = None
     methodValue: str = ""
-    coworkerIds: List[PydanticObjectId] = []
     slackChannelTs: Optional[str] = None
 
     @field_validator("startsAt", mode="after")
@@ -173,6 +172,4 @@ class Interview(TimestampedDocument):
             IndexModel([("accountId", 1)]),
             IndexModel([("stage", 1)]),
             IndexModel([("status", 1)]),
-            IndexModel([("caller.coworkerIds", 1)]),
-            IndexModel([("stageHistory.caller.coworkerIds", 1)]),
         ]

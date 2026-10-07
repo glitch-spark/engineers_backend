@@ -2,7 +2,7 @@
 
 import os
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -269,3 +269,40 @@ async def test_digest_empty_day_sends_rest_message():
     send.assert_awaited_once()
     assert send.await_args.kwargs["text"] == "You have no interviews today. Have a rest."
     mark.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_digest_lists_only_the_users_own_interviews():
+    from app.slack_bot import _digest_for_user
+
+    user = SimpleNamespace(
+        id="user1",
+        slackUserId="U123",
+        slackAlertsEnabled=True,
+        slackTimezone="America/New_York",
+        slackDigestHour=8,
+        slackDigestMinute=0,
+    )
+    iv = _fake_interview(job_url="https://jobs.example/1")
+    iv.status = None
+    iv.caller = None
+    find = MagicMock(return_value=SimpleNamespace(
+        sort=lambda *_a, **_k: SimpleNamespace(to_list=AsyncMock(return_value=[iv])),
+    ))
+    send = AsyncMock(return_value=True)
+    with (
+        patch("app.slack_bot.digest_slot_open", return_value=True),
+        patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
+        patch("app.slack_bot._mark_sent", AsyncMock()),
+        patch("app.slack_bot._profile_labels", AsyncMock(return_value={"acc1": "Backend"})),
+        patch("app.slack_bot.send_dm", send),
+        patch("app.slack_bot.Interview.find", find),
+    ):
+        sent, _ = await _digest_for_user(user)
+    assert sent == 1
+    query = find.call_args.args[0]
+    assert set(query) == {"createdBy", "scheduledAt"}
+    assert query["createdBy"] == "user1"
+    blob = str(send.await_args.kwargs["blocks"])
+    assert "*My interviews (1)*" in blob
+    assert "as caller" not in blob

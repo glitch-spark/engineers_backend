@@ -57,13 +57,19 @@ def test_sync_top_follows_timed_tip_within_same_day():
     assert iv.endsAt == AT + timedelta(hours=6)
 
 
-def test_coworker_on_earlier_round_can_still_view():
+def test_can_view_is_admin_interview_manager_or_owner():
     from bson import ObjectId
 
     from app.routers.interviews import _can_view
-    mate, owner = ObjectId(), ObjectId()
-    earlier = _round("passed", caller=InterviewCaller(enabled=True, coworkerIds=[mate]))
-    later = _round("scheduled", stage="panel")
-    iv = SimpleNamespace(createdBy=owner, caller=None, stageHistory=[earlier, later])
-    assert _can_view(iv, SimpleNamespace(id=mate, role="staff")) is True
+    owner, former_mate = ObjectId(), ObjectId()
+    # An old round still lists a coworker; that no longer grants access.
+    old_caller = InterviewCaller.model_validate({"enabled": True, "coworkerIds": [former_mate]})
+    iv = SimpleNamespace(
+        createdBy=owner, caller=None,
+        stageHistory=[_round("passed", caller=old_caller), _round("scheduled", stage="panel")],
+    )
+    assert _can_view(iv, SimpleNamespace(id=owner, role="staff")) is True
+    assert _can_view(iv, SimpleNamespace(id=ObjectId(), role="interview_manager")) is True
+    assert _can_view(iv, SimpleNamespace(id=ObjectId(), role="admin")) is True
     assert _can_view(iv, SimpleNamespace(id=ObjectId(), role="staff")) is False
+    assert _can_view(iv, SimpleNamespace(id=former_mate, role="staff")) is False

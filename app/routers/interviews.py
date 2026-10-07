@@ -29,7 +29,6 @@ from app.interview_caller import (
     CallerError,
     CallerIn,
     build_round_caller,
-    is_coworker,
     round_caller_snapshot,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
@@ -184,29 +183,14 @@ class InterviewUpdate(BaseModel):
     stageHistory: Optional[Any] = None
 
 
-async def _round_caller(
+def _round_caller(
     body: CallerIn,
     *,
     starts_at: datetime,
-    owner_id: Any,
     previous: Optional[InterviewCaller],
 ) -> InterviewCaller:
-    raw_ids = [str(i).strip() for i in (body.coworkerIds or []) if str(i).strip()]
-    valid: set[str] = set()
-    if body.enabled and raw_ids:
-        oids = [to_object_id(i) for i in raw_ids]
-        rows = await UserExtra.find(
-            {"_id": {"$in": oids}, "isActive": {"$ne": False}}
-        ).to_list()
-        valid = {str(u.id) for u in rows}
     try:
-        return build_round_caller(
-            body,
-            starts_at=starts_at,
-            owner_id=owner_id,
-            valid_coworker_ids=valid,
-            previous=previous,
-        )
+        return build_round_caller(body, starts_at=starts_at, previous=previous)
     except CallerError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
@@ -275,13 +259,8 @@ async def _sync_caller_posts(
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
-    """Admin, interview manager, owner, or a coworker on any round's caller request."""
-    return (
-        user.role in ("admin", "interview_manager")
-        or str(iv.createdBy) == str(user.id)
-        or is_coworker(iv.caller, user.id)
-        or any(is_coworker(getattr(e, "caller", None), user.id) for e in (iv.stageHistory or []))
-    )
+    """Admin, interview manager, or owner."""
+    return user.role in ("admin", "interview_manager") or str(iv.createdBy) == str(user.id)
 
 
 def _parse_datetime(s: str) -> Optional[datetime]:
@@ -420,33 +399,7 @@ async def _after_save(
 async def _interview_out(iv: Interview) -> dict:
     rows = await populate_owner([iv], field="createdBy")
     out = await _populate_account(rows)
-    out = await _populate_coworkers(out)
     return out[0]
-
-
-async def _populate_coworkers(items: Iterable[dict]) -> list:
-    """Attach `caller.coworkers` [{_id, name, email}] next to `caller.coworkerIds`."""
-    items = list(items)
-    ids: set[str] = set()
-    for item in items:
-        caller = item.get("caller") or {}
-        ids.update(str(i) for i in caller.get("coworkerIds") or [])
-    users = (
-        await UserExtra.find({"_id": {"$in": [to_object_id(i) for i in ids]}}).to_list()
-        if ids
-        else []
-    )
-    by_id = {str(u.id): u for u in users}
-    for item in items:
-        caller = item.get("caller")
-        if not caller:
-            continue
-        caller["coworkers"] = [
-            {"_id": cid, "name": by_id[cid].name, "email": by_id[cid].email}
-            for cid in (str(i) for i in caller.get("coworkerIds") or [])
-            if cid in by_id
-        ]
-    return items
 
 
 async def _populate_account(items: Iterable[dict], *, field: str = "accountId") -> list:
@@ -618,7 +571,7 @@ async def list_interviews(
         [(field, direction), ("_id", direction)]
     ).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
-    rows_out = await _populate_coworkers(await _populate_account(rows_with_owner))
+    rows_out = await _populate_account(rows_with_owner)
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -658,10 +611,10 @@ async def list_interview_rounds(
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
     rows = await Interview.find(query).to_list()
-    out = await _populate_coworkers(await _populate_account(await populate_owner(rows, field="createdBy")))
+    out = await _populate_account(await populate_owner(rows, field="createdBy"))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_)
     # The interviews behind the rounds, so a click can open the side panel
-    # (GET /{id} is limited to owner/admin/coworker; this feed is not).
+    # (GET /{id} is limited to owner/admin/interview manager; this feed is not).
     shown = {r["interviewId"] for r in rounds}
     return {"rounds": rounds, "interviews": {str(i["_id"]): i for i in out if str(i["_id"]) in shown}}
 
@@ -687,10 +640,9 @@ async def get_interview(
     return await _interview_out(iv)
 
 
-async def _build_round(
+def _build_round(
     rnd: RoundIn,
     *,
-    owner_id: Any,
     user: UserExtra,
     source: str,
 ) -> InterviewStageEvent:
@@ -722,9 +674,7 @@ async def _build_round(
         transcript=rnd.transcript or "",
     )
     if rnd.caller is not None:
-        entry.caller = await _round_caller(
-            rnd.caller, starts_at=start, owner_id=owner_id, previous=None,
-        )
+        entry.caller = _round_caller(rnd.caller, starts_at=start, previous=None)
     return entry
 
 
@@ -761,9 +711,7 @@ async def create_interview(
     if not company:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="companyName is required")
     account_oid = await _account_for_write(body.accountId, user)
-    entry = await _build_round(
-        body.round or _legacy_round(body), owner_id=user.id, user=user, source="create",
-    )
+    entry = _build_round(body.round or _legacy_round(body), user=user, source="create")
 
     # History is appended after construction: the model's read-time resolver
     # only understands raw dicts.
@@ -899,7 +847,7 @@ async def add_interview_stage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="rejected is a status; set status on the current round",
         )
-    entry = await _build_round(body, owner_id=iv.createdBy, user=user, source="stage")
+    entry = _build_round(body, user=user, source="stage")
     prev_tip = _tip(iv)
     if prev_tip is not None and _normalize_stage(prev_tip.stage) == entry.stage:
         raise HTTPException(
@@ -966,10 +914,7 @@ async def update_interview_stage(
     if body.note is not None:
         entry.note = body.note
     if body.caller is not None:
-        entry.caller = await _round_caller(
-            body.caller, starts_at=entry.scheduledAt, owner_id=iv.createdBy,
-            previous=entry.caller,
-        )
+        entry.caller = _round_caller(body.caller, starts_at=entry.scheduledAt, previous=entry.caller)
     ended = _status_value(entry.status) in ENDED_STATUSES
     if entry.caller is None or not entry.caller.enabled or ended:
         entry.confirmed = False  # a caller is only lined up for an active caller round

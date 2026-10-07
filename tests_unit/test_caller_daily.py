@@ -103,7 +103,6 @@ class Fake:
 
     async def people(self, iv, entry):
         return {"owner": SimpleNamespace(name="Pedro", email="p@x.io", slackUserId="U0OWNER001"),
-                "coworkers": [SimpleNamespace(name="Pedro", email="p@x.io", slackUserId="U0OWNER001")],
                 "managers": [SimpleNamespace(name="Maria", email="m@x.io", slackUserId=None)],
                 "profile": "Ian Meron"}
 
