@@ -33,13 +33,15 @@ def test_release_gives_the_attempt_back():
 
 
 def test_client_ip_prefers_forwarded_for():
-    assert client_ip(SimpleNamespace(headers={"x-forwarded-for": " 1.2.3.4, 10.0.0.1"}, client=None)) == "1.2.3.4"
+    assert client_ip(SimpleNamespace(headers={"x-forwarded-for": " 1.2.3.4 "}, client=None)) == "1.2.3.4"
+    # The proxy appends the real peer; anything before it is client-sent and spoofable.
+    assert client_ip(SimpleNamespace(headers={"x-forwarded-for": "6.6.6.6, 1.2.3.4"}, client=None)) == "1.2.3.4"
     assert client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="9.9.9.9"))) == "9.9.9.9"
     assert client_ip(SimpleNamespace(headers={}, client=None)) == "unknown"
 
 
 def test_client_ip_is_capped():
-    forged = " " + "a" * 500 + " , 10.0.0.1"
+    forged = "10.0.0.1, " + "a" * 500 + " "
     assert client_ip(SimpleNamespace(headers={"x-forwarded-for": forged}, client=None)) == "a" * 64
 
 

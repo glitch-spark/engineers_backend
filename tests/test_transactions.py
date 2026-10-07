@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from beanie import PydanticObjectId
+
 from app.models import Transaction
 
 
@@ -422,3 +424,30 @@ async def test_self_payer_admin_can_request_and_approve(client, admin_user, auth
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "approved"
 
+
+
+async def test_self_paid_staff_cannot_approve_or_reject(client, staff_user, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-03-12", "amount": -9, "payMethod": "coin", "payerId": str(staff_user.id)},
+    )
+    tx_id = r.json()["_id"]
+    for decision in ("approved", "rejected"):
+        r = await client.put(f"/transactions/{tx_id}", headers=auth_header(staff_user), json={"status": decision})
+        assert r.status_code == 403
+    tx = await Transaction.get(PydanticObjectId(tx_id))
+    assert tx.status == "pending"
+
+
+async def test_owner_switching_payer_to_self_cannot_approve(client, staff_user, staff_user_2, auth_header):
+    r = await client.post(
+        "/transactions",
+        headers=auth_header(staff_user),
+        json={"date": "2026-03-13", "amount": -9, "payMethod": "coin", "payerId": str(staff_user_2.id)},
+    )
+    tx_id = r.json()["_id"]
+    r = await client.put(f"/transactions/{tx_id}", headers=auth_header(staff_user), json={"payerId": str(staff_user.id)})
+    assert r.status_code == 200
+    r = await client.put(f"/transactions/{tx_id}", headers=auth_header(staff_user), json={"status": "approved"})
+    assert r.status_code == 403

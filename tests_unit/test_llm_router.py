@@ -1,4 +1,4 @@
-"""Unit tests for free LLM routing and screening answer parsing."""
+"""Unit tests for LLM routing and screening answer parsing."""
 
 import json
 import os
@@ -8,126 +8,10 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from types import SimpleNamespace
 
-from app.free_llm import (
-    api_key_hint,
-    build_free_chat_kwargs,
-    clamp_max_tokens,
-    get_preset,
-    preset_catalog_public,
-)
 from app.llm_router import (
-    _free_llm_user_message,
-    _free_max_tokens_for_purpose,
-    _free_timeout_for_purpose,
-    _message_text,
     _validate_screening_output,
-    free_llm_configured,
     parse_screening_answers,
 )
-
-
-def test_preset_catalog_has_six_models():
-    models = preset_catalog_public()
-    assert len(models) == 6
-    ids = {m["id"] for m in models}
-    assert ids == {
-        "deepseek-v4-pro",
-        "minimax-m3",
-        "minimax-m2.7",
-        "glm-5.2",
-        "glm-5.3",
-        "kimi-k3",
-    }
-
-
-def test_get_preset_known_and_unknown():
-    assert get_preset("minimax-m3") is not None
-    assert get_preset("glm-5.2") is not None
-    glm53 = get_preset("glm-5.3")
-    assert glm53 is not None
-    assert glm53.model == "z-ai/glm-5.3"
-    assert glm53.temperature == 0.5
-    assert glm53.top_p == 1.0
-    assert glm53.system_prompt == "You are a helpful assistant."
-    assert glm53.test_max_tokens == 256
-    assert glm53.extra_body == {
-        "reasoning_effort": "high",
-        "chat_template_kwargs": {"reasoning_effort": "high"},
-    }
-    kimi = get_preset("kimi-k3")
-    assert kimi is not None
-    assert kimi.model == "moonshotai/kimi-k3"
-    assert kimi.extra_body == {"reasoning_effort": "high"}
-    assert kimi.top_p is None
-    assert kimi.content_as_parts is True
-    assert kimi.test_max_tokens == 1024
-    assert kimi.test_timeout_seconds == 300
-    assert kimi.min_timeout_seconds == 300
-    assert get_preset("unknown-model") is None
-
-
-def test_glm53_payload_matches_nvidia_catalog():
-    glm53 = get_preset("glm-5.3")
-    assert glm53 is not None
-    kwargs = build_free_chat_kwargs(glm53, "Which number is larger, 9.11 or 9.8?", 1024)
-    assert kwargs["model"] == "z-ai/glm-5.3"
-    assert kwargs["messages"] == [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Which number is larger, 9.11 or 9.8?"},
-    ]
-    assert kwargs["temperature"] == 0.5
-    assert kwargs["top_p"] == 1.0
-    assert kwargs["extra_body"] == {
-        "reasoning_effort": "high",
-        "chat_template_kwargs": {"reasoning_effort": "high"},
-    }
-
-
-def test_kimi_payload_omits_top_p_and_uses_content_parts():
-    kimi = get_preset("kimi-k3")
-    assert kimi is not None
-    kwargs = build_free_chat_kwargs(kimi, "Hello", 256)
-    assert kwargs["model"] == "moonshotai/kimi-k3"
-    assert kwargs["messages"][0]["content"] == [{"type": "text", "text": "Hello"}]
-    assert kwargs["temperature"] == 1.0
-    assert "top_p" not in kwargs
-    assert kwargs["extra_body"] == {"reasoning_effort": "high"}
-
-
-def test_deepseek_payload_keeps_string_content_and_top_p():
-    deepseek = get_preset("deepseek-v4-pro")
-    assert deepseek is not None
-    kwargs = build_free_chat_kwargs(deepseek, "Hello", 128)
-    assert kwargs["messages"][0]["content"] == "Hello"
-    assert kwargs["top_p"] == 0.95
-    assert kwargs["extra_body"] == {"chat_template_kwargs": {"thinking": False}}
-
-
-def test_message_text_ignores_reasoning_and_joins_parts():
-    assert _message_text(SimpleNamespace(content="  ok  ", reasoning_content="think")) == "ok"
-    assert _message_text(
-        SimpleNamespace(content=[{"type": "text", "text": "hel"}, {"type": "text", "text": "lo"}])
-    ) == "hello"
-
-
-def test_clamp_max_tokens():
-    preset = get_preset("minimax-m3")
-    assert clamp_max_tokens(None, preset) == 8192
-    assert clamp_max_tokens(100, preset) == 512
-    assert clamp_max_tokens(99999, preset) == 16384
-
-
-def test_api_key_hint_masks():
-    assert api_key_hint("nvapi-abcdefghijklmnop") == "••••mnop"
-    assert api_key_hint("") == ""
-    assert api_key_hint("ab") == ""
-
-
-def test_free_llm_configured_requires_model_and_key():
-    user = SimpleNamespace(freeLlmModelId="minimax-m3", freeLlmApiKey=None)
-    assert free_llm_configured(user) is False
-    user.freeLlmApiKey = "nvapi-test"
-    assert free_llm_configured(user) is True
 
 
 def test_parse_screening_answers_json():
@@ -141,7 +25,7 @@ def test_parse_screening_answers_numbered_fallback():
 
 
 def test_parse_screening_answers_objects_in_answers_array():
-    """Free LLMs often return objects instead of plain answer strings."""
+    """Models often return objects instead of plain answer strings."""
     raw = json.dumps({
         "answers": [
             {
@@ -301,36 +185,6 @@ def test_validate_screening_rejects_unrepairable_wrapper_left_in_answer():
         _validate_screening_output(broken, ["Q1"])
 
 
-def test_free_llm_user_message_timeout():
-    from openai import APITimeoutError
-
-    msg = _free_llm_user_message(APITimeoutError("timed out"), timeout_seconds=45)
-    assert "45s" in msg
-    assert "timed out" in msg.lower() or "timeout" in msg.lower()
-
-
-def test_free_llm_user_message_invalid_key():
-    from openai import APIStatusError
-
-    real_exc = APIStatusError.__new__(APIStatusError)
-    real_exc.status_code = 401
-    real_exc.message = "Unauthorized"
-    msg = _free_llm_user_message(real_exc, timeout_seconds=45)
-    assert "Invalid NVIDIA API key" in msg
-
-
-def test_free_timeout_and_token_caps_by_purpose():
-    assert _free_timeout_for_purpose("resume") == 480.0
-    assert _free_timeout_for_purpose("screening") == 120.0
-    kimi = get_preset("kimi-k3")
-    assert _free_timeout_for_purpose("screening", kimi) == 300.0
-    assert _free_timeout_for_purpose("resume", kimi) == 480.0
-    assert _free_max_tokens_for_purpose("resume", 8192) == 8192
-    assert _free_max_tokens_for_purpose("resume", 16384) == 16000
-    assert _free_max_tokens_for_purpose("resume", 2048) == 2048
-    assert _free_max_tokens_for_purpose("screening", 8192) == 8192
-
-
 async def test_job_extract_asks_openai_for_temperature_zero(monkeypatch):
     """Extraction must give the same reading for the same posting run after run."""
     import app.llm_router as router
@@ -388,27 +242,3 @@ async def test_job_extract_uses_its_own_model_when_set(monkeypatch):
         OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL=""))
     await router.complete_with_fallback("p", None, purpose="job_extract")
     assert seen == ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o-mini"]
-
-
-async def test_job_extract_skips_free_model_when_extract_model_set(monkeypatch):
-    """A configured JOB_EXTRACT_MODEL is the model whose accuracy was measured: use it, not a user's free preset."""
-    import app.llm_router as router
-
-    calls = []
-
-    async def fake_free(*a, **k):
-        calls.append("free")
-        return '{"title":"T"}', {}
-
-    async def fake_responses(prompt, model=None, *, temperature=None):
-        calls.append(model)
-        return '{"title":"T"}', {}
-
-    preset = SimpleNamespace(model="z-ai/glm")
-    monkeypatch.setattr(router, "resolve_free_preset", lambda user: (preset, 4096, "key"))
-    monkeypatch.setattr(router, "_free_chat_completion", fake_free)
-    monkeypatch.setattr(router, "_openai_responses", fake_responses)
-    monkeypatch.setattr(router, "get_settings", lambda: SimpleNamespace(
-        OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL="gpt-4.1-mini"))
-    await router.complete_with_fallback("p", SimpleNamespace(id="u"), purpose="job_extract")
-    assert calls == ["gpt-4.1-mini"]

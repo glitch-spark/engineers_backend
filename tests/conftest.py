@@ -18,7 +18,7 @@ if not TEST_URI:
     )
 
 os.environ["MONGODB_URI"] = TEST_URI
-os.environ.setdefault("AUTH_SECRET", "test-secret-for-pytest-only")
+os.environ.setdefault("AUTH_SECRET", "test-secret-for-pytest-only-" + "x" * 32)
 os.environ["SLACK_DAILY_PLAN_CHANNEL_ID"] = ""  # never post test plans to Slack
 os.environ["SLACK_TRANSACTIONS_CHANNEL_ID"] = ""  # never post test transactions to Slack
 os.environ.setdefault("FRONTEND_ORIGIN", "http://test.localhost")

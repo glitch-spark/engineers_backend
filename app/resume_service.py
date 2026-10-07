@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
@@ -30,6 +31,7 @@ from app.config import get_settings
 from app.html_sanitize import (
     body_html_for_llm,
     body_styles_vs_head,
+    sanitize_template_html,
     strip_style_tags,
     wrap_body_for_llm,
 )
@@ -220,12 +222,15 @@ def _ensure_body_styles(out_html: str, template_html: str) -> str:
 
 
 def _model_body_fragment(model_raw: str) -> str:
-    """Strip fences + any sneaked <style> from model output; wrap as <body>."""
+    """Strip fences + any sneaked <style> from model output; wrap as <body>.
+    The model's HTML gets the same sanitizer as an uploaded template (scripts,
+    handlers, frames, javascript: links) — the job description it read is
+    untrusted text."""
     raw = _strip_fences(model_raw)
     inner = _body_inner_html(raw)
     if inner is None:
         inner = (raw or "").strip()
-    inner = strip_style_tags(inner)
+    inner = sanitize_template_html(strip_style_tags(inner))
     return f"<body>{inner}</body>"
 
 
@@ -233,8 +238,11 @@ def _finalize_resume_html(template: str, model_raw: str) -> str:
     """Assemble final HTML: template shell + cleaned model body + body styles.
 
     CSS never comes from the model. Em-dash normalization applies to body text
-    only so stylesheet content is preserved byte-for-byte.
+    only so stylesheet content is preserved byte-for-byte. The template is
+    sanitized again here (idempotent on clean templates) so ones saved before
+    the sanitizer was tightened are covered too.
     """
+    template = sanitize_template_html(template)
     fragment = _model_body_fragment(model_raw)
     out = _reassemble_body(template, fragment)
     out = _ensure_body_styles(out, template)
@@ -387,6 +395,31 @@ def _pt_to_mm(v: float) -> str:
     return f"{v * _PT_TO_MM:.3f}mm"
 
 
+# The only network a resume render may use: Google Fonts stylesheets + font
+# files. Everything else (other hosts, internal addresses, plain http) is
+# aborted; data:/blob:/about: URLs never reach the network.
+_RENDER_HOSTS = frozenset({"fonts.googleapis.com", "fonts.gstatic.com"})
+_LOCAL_SCHEMES = ("data:", "blob:", "about:")
+
+
+def _render_request_allowed(url: str) -> bool:
+    if url.startswith(_LOCAL_SCHEMES):
+        return True
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return parts.scheme == "https" and port in (None, 443) and (parts.hostname or "").lower() in _RENDER_HOSTS
+
+
+async def _render_route(route) -> None:
+    if _render_request_allowed(route.request.url):
+        await route.continue_()
+    else:
+        await route.abort("blockedbyclient")
+
+
 async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[dict] = None) -> bytes:
     m = margin_pt or _DEFAULT_MARGIN_PT
     async with async_playwright() as p:
@@ -399,7 +432,11 @@ async def _html_to_pdf(html: str, page_format: str = "A4", margin_pt: Optional[d
             ],
         )
         try:
-            page = await browser.new_page()
+            # No script runs in the resume (the body is model output), and the
+            # page can only load Google Fonts — see _render_request_allowed.
+            context = await browser.new_context(java_script_enabled=False, service_workers="block")
+            await context.route("**/*", _render_route)
+            page = await context.new_page()
             await page.set_content(html, wait_until="networkidle")
             # Wait for web fonts (the template's own <link>/<style>
             # @import) to resolve before snapshotting; otherwise

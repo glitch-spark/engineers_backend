@@ -64,7 +64,7 @@ def test_period_key_is_local_date_of_cutoff():
 
 
 def test_schedule_from_settings_parses_values():
-    s = Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a", BID_REPORT_TIMEZONE="UTC",
+    s = Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a" * 32, BID_REPORT_TIMEZONE="UTC",
                  BID_DAILY_REPORT_TIME="07:05", BID_WEEKLY_REPORT_DAY="Monday", BID_WEEKLY_REPORT_TIME="09:00")
     assert schedule_from_settings(s) == BidSchedule(tz=ZoneInfo("UTC"), daily_at=time(7, 5), weekly_day=0,
                                                     weekly_at=time(9, 0))
@@ -77,7 +77,7 @@ def test_schedule_from_settings_parses_values():
     ("s3.us-east-005.backblazeb2.com", "https://s3.us-east-005.backblazeb2.com"),
 ])
 def test_storage_endpoint_url_is_optional_and_trimmed(value, expected):
-    s = Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a", BID_STORAGE_ENDPOINT_URL=value)
+    s = Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a" * 32, BID_STORAGE_ENDPOINT_URL=value)
     assert s.BID_STORAGE_ENDPOINT_URL == expected
 
 
@@ -87,7 +87,7 @@ def test_storage_endpoint_url_is_optional_and_trimmed(value, expected):
 ])
 def test_invalid_schedule_settings_fail_validation(field, value):
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a", **{field: value})
+        Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a" * 32, **{field: value})
 
 
 def _bid_env_values(text: str) -> dict:

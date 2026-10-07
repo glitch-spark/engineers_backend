@@ -17,9 +17,8 @@ class ResumeLLMCache(TimestampedDocument):
     The template lives inside the hashed prompt, so editing a profile's
     template changes the key and naturally misses stale entries.
 
-    `isFallback` marks entries produced by OpenAI when the free tier failed.
-    These are skipped when the user has a working free-LLM key so the free
-    tier gets retried instead of being permanently locked out by the cache.
+    `isFallback` marks entries produced by a fallback model after the
+    requested one failed.
 
     Entries expire after CACHE_TTL_SECONDS (MongoDB TTL index on createdAt)
     so stale fallback entries are eventually cleaned up."""

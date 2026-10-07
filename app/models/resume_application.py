@@ -79,8 +79,8 @@ class ResumeApplication(TimestampedDocument):
     outputTokens: Optional[int] = None
     reasoningTokens: Optional[int] = None
 
-    # Which LLM produced the resume HTML (free NVIDIA tier vs OpenAI fallback).
-    resumeLlmProvider: Optional[str] = None  # "free" | "openai"
+    # Which LLM produced the resume HTML. Older records may hold the retired "free" (NVIDIA) provider.
+    resumeLlmProvider: Optional[str] = None  # "anthropic" | "openai"
     resumeLlmModel: Optional[str] = None
     resumeLlmFallbackUsed: Optional[bool] = None
     resumeLlmFallbackReason: Optional[str] = None
@@ -95,7 +95,7 @@ class ResumeApplication(TimestampedDocument):
     # submission). Empty when the user didn't request one.
     coverLetterText: Optional[str] = None
     # Which model wrote the cover letter (same shape as the resume/screening fields).
-    coverLetterLlmProvider: Optional[str] = None  # "free" | "openai" | "anthropic"
+    coverLetterLlmProvider: Optional[str] = None  # "openai" | "anthropic"
     coverLetterLlmModel: Optional[str] = None
     coverLetterLlmFallbackUsed: Optional[bool] = None
     coverLetterLlmFallbackReason: Optional[str] = None

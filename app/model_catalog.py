@@ -86,6 +86,9 @@ _SPECS: tuple[ModelSpec, ...] = (
 )
 _BY_ID = {s.id: s for s in _SPECS}
 
+# Provider prefixes that were removed (NVIDIA "free:" presets). Old jobs may still carry such an id.
+_RETIRED_PREFIXES = ("free:",)
+
 _A = "anthropic:claude-"
 _O = "openai:"
 
@@ -130,10 +133,15 @@ def _preset_ids(task: Task, provider: Provider) -> list[str]:
     return [model_id for model_id, _tag in PRESETS[(task, provider)] if _BY_ID[model_id].active]
 
 
+def _is_retired(model_id: str) -> bool:
+    return model_id.startswith(_RETIRED_PREFIXES)
+
+
 def is_inactive(model_id: Optional[str]) -> bool:
-    """A known model that has been switched off."""
-    spec = _BY_ID.get((model_id or "").strip())
-    return spec is not None and not spec.active
+    """A known model that has been switched off, or one from a removed provider."""
+    wanted = (model_id or "").strip()
+    spec = _BY_ID.get(wanted)
+    return (spec is not None and not spec.active) or _is_retired(wanted)
 
 
 def preset_tag(task: Task, model_id: str) -> Optional[str]:
@@ -186,6 +194,8 @@ def validate_requested(task: Task, model_id: Optional[str], user: Optional[UserE
     if not wanted:
         return None
     spec = _BY_ID.get(wanted)
+    if spec is None and _is_retired(wanted):
+        raise ModelNotAvailable(f"Model '{wanted}' has been removed; pick another model.")
     if spec is None:
         raise ModelNotAvailable(f"Unknown model '{wanted}'.")
     if not spec.active:

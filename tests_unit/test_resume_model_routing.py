@@ -116,7 +116,7 @@ def user_client(authed_user=None):
     app = FastAPI()
     app.include_router(resume_router.router)
     app.dependency_overrides[get_current_user] = lambda: authed_user or SimpleNamespace(
-        id="u1", role="staff", freeLlmModelId=None, freeLlmApiKey=None, freeLlmMaxTokens=None
+        id="u1", role="staff"
     )
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 

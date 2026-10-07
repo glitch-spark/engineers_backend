@@ -16,7 +16,7 @@ from app.deps import get_current_user
 from app.llm_router import LlmResult
 from app.routers import resume as resume_router
 
-OWNER = SimpleNamespace(id="u1", role="staff", freeLlmModelId="glm-5.2", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
+OWNER = SimpleNamespace(id="u1", role="staff")
 ACCOUNT = SimpleNamespace(name="Profile", styleTemplate="<p>Jane, Python engineer</p>")
 
 

@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _YMD = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+AUTH_SECRET_MIN_LEN = 32
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
@@ -115,6 +116,17 @@ class Settings(BaseSettings):
     BID_RECORDS_START: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
+
+    @field_validator("AUTH_SECRET")
+    @classmethod
+    def _validate_auth_secret(cls, v: str) -> str:
+        # Signs every login, bidder and link token (HS256): a short secret can be brute-forced offline.
+        if len(v) < AUTH_SECRET_MIN_LEN:
+            raise ValueError(
+                f"must be at least {AUTH_SECRET_MIN_LEN} characters; generate one with "
+                "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+            )
+        return v
 
     @field_validator("BID_STORAGE_ENDPOINT_URL", mode="before")
     @classmethod

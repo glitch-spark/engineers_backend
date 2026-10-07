@@ -21,7 +21,7 @@ from app.models.resume_application import CoverLetterVersion
 from app.routers import resume as resume_router
 
 JOB_ID = "a" * 24
-ME = SimpleNamespace(id="u1", role="staff", freeLlmModelId=None, freeLlmApiKey=None, freeLlmMaxTokens=None)
+ME = SimpleNamespace(id="u1", role="staff")
 
 
 class FakeDocs:
@@ -152,7 +152,7 @@ async def test_regen_forbidden_for_other_staff_user(writer):
 async def test_regen_admin_can_regenerate_for_owner(writer):
     FakeJobs.store[JOB_ID] = make_job(userId="someone-else")
     FakeUsers.store["someone-else"] = SimpleNamespace(coverLetterPromptBody="")
-    admin = SimpleNamespace(id="admin", role="admin", freeLlmModelId=None, freeLlmApiKey=None, freeLlmMaxTokens=None)
+    admin = SimpleNamespace(id="admin", role="admin")
     r = await regen({}, user=admin)
     assert r.status_code == 200
 

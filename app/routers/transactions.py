@@ -429,6 +429,12 @@ async def update_transaction(
     if body.status and body.status in ("approved", "rejected"):
         if not is_admin and not is_payer:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="only the payer can approve")
+        # Self-paid (owner is also the payer, set at create or by switching payerId while pending): nobody else
+        # signs off, so only an admin may decide it.
+        if not is_admin and is_owner:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="only an admin can approve your own self-paid transaction",
+            )
         if tx.status != body.status:
             new_status = body.status
 

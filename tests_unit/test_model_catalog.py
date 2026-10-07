@@ -78,12 +78,11 @@ def test_provider_needs_its_api_key(use_settings):
     assert mc.available_models("resume", None) == []
 
 
-def test_nvidia_free_models_are_never_offered(use_settings):
-    user = SimpleNamespace(freeLlmModelId="glm-5.3", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
-    assert not [i for i in ids(mc.available_models("resume", user)) if i.startswith("free:")]
-    with pytest.raises(mc.ModelNotAvailable):
-        mc.validate_requested("resume", "free:glm-5.3", user)
-    assert mc.default_model_id("resume", user) == "anthropic:claude-sonnet-5-5"
+def test_removed_nvidia_model_ids_are_rejected_and_count_as_off(use_settings):
+    with pytest.raises(mc.ModelNotAvailable, match="removed"):
+        mc.validate_requested("resume", "free:glm-5.3")
+    assert mc.is_inactive("free:glm-5.3")
+    assert not mc.is_inactive("bogus:model")
 
 
 def test_fable_is_cover_letter_only_and_haiku_never_writes_letters(use_settings):

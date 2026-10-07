@@ -41,12 +41,6 @@ class UserExtra(TimestampedDocument):
     jobApplySheetUrl: Optional[str] = None
     coverLetterPromptBody: Optional[str] = None
 
-    # NVIDIA Integrate free-tier LLM (resume gen + job-linked screening only).
-    freeLlmModelId: Optional[str] = None
-    freeLlmApiKey: Optional[str] = None
-    freeLlmMaxTokens: Optional[int] = None
-    freeLlmKeyVerified: bool = False
-
     # Slack interview bot. slackUserId is the member ID the user types in (U…): DMs and @-mentions.
     slackUserId: Optional[str] = None
     slackAlertsEnabled: bool = True

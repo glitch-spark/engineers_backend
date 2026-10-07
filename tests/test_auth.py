@@ -1,4 +1,14 @@
+import pytest
+
 from app.models import UserExtra
+from app.routers import auth as auth_router
+
+
+@pytest.fixture(autouse=True)
+def _fresh_login_limiter():
+    auth_router.LIMITER._failures.clear()
+    yield
+    auth_router.LIMITER._failures.clear()
 
 
 async def test_register_first_user_becomes_admin(client):
@@ -15,11 +25,11 @@ async def test_register_first_user_becomes_admin(client):
 async def test_register_second_user_becomes_staff(client):
     await client.post(
         "/auth/register",
-        json={"username": "alice", "email": "a@x.com", "password": "p"},
+        json={"username": "alice", "email": "a@x.com", "password": "password1"},
     )
     r = await client.post(
         "/auth/register",
-        json={"username": "bob", "email": "b@x.com", "password": "p"},
+        json={"username": "bob", "email": "b@x.com", "password": "password1"},
     )
     assert r.status_code == 201
     user = await UserExtra.find_one(UserExtra.email == "b@x.com")
@@ -29,11 +39,11 @@ async def test_register_second_user_becomes_staff(client):
 async def test_register_duplicate_email_returns_409(client):
     await client.post(
         "/auth/register",
-        json={"username": "a", "email": "dup@x.com", "password": "p"},
+        json={"username": "a", "email": "dup@x.com", "password": "password1"},
     )
     r = await client.post(
         "/auth/register",
-        json={"username": "a2", "email": "DUP@x.com", "password": "p"},
+        json={"username": "a2", "email": "DUP@x.com", "password": "password1"},
     )
     assert r.status_code == 409
 
@@ -49,11 +59,11 @@ async def test_register_missing_fields_returns_400(client):
 async def test_login_returns_token_and_user(client):
     await client.post(
         "/auth/register",
-        json={"username": "alice", "email": "a@x.com", "password": "secret"},
+        json={"username": "alice", "email": "a@x.com", "password": "secret123"},
     )
     r = await client.post(
         "/auth/login",
-        json={"username": "alice", "password": "secret"},
+        json={"username": "alice", "password": "secret123"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -66,12 +76,12 @@ async def test_login_returns_token_and_user(client):
 async def test_login_records_last_login_and_returns_account_dates(client):
     await client.post(
         "/auth/register",
-        json={"username": "alice", "email": "a@x.com", "password": "secret"},
+        json={"username": "alice", "email": "a@x.com", "password": "secret123"},
     )
     user = await UserExtra.find_one(UserExtra.email == "a@x.com")
     assert user.lastLoginAt is None
 
-    r = await client.post("/auth/login", json={"username": "alice", "password": "secret"})
+    r = await client.post("/auth/login", json={"username": "alice", "password": "secret123"})
     assert r.status_code == 200, r.text
     out = r.json()["user"]
     assert out["createdAt"] and out["lastLoginAt"]
@@ -85,10 +95,10 @@ async def test_login_records_last_login_and_returns_account_dates(client):
 async def test_login_works_with_email_or_name(client):
     await client.post(
         "/auth/register",
-        json={"username": "alice", "email": "a@x.com", "password": "secret"},
+        json={"username": "alice", "email": "a@x.com", "password": "secret123"},
     )
-    by_email = await client.post("/auth/login", json={"username": "a@x.com", "password": "secret"})
-    by_name = await client.post("/auth/login", json={"username": "alice", "password": "secret"})
+    by_email = await client.post("/auth/login", json={"username": "a@x.com", "password": "secret123"})
+    by_name = await client.post("/auth/login", json={"username": "alice", "password": "secret123"})
     assert by_email.status_code == 200
     assert by_name.status_code == 200
 
@@ -96,7 +106,7 @@ async def test_login_works_with_email_or_name(client):
 async def test_login_wrong_password_returns_401(client):
     await client.post(
         "/auth/register",
-        json={"username": "alice", "email": "a@x.com", "password": "secret"},
+        json={"username": "alice", "email": "a@x.com", "password": "secret123"},
     )
     r = await client.post("/auth/login", json={"username": "alice", "password": "wrong"})
     assert r.status_code == 401
@@ -119,3 +129,12 @@ async def test_me_with_token_returns_user(client, staff_user, auth_header):
     assert body["email"] == staff_user.email
     assert body["role"] == "staff"
     assert body["id"] == str(staff_user.id)
+
+
+async def test_register_short_password_returns_400(client):
+    r = await client.post(
+        "/auth/register",
+        json={"username": "alice", "email": "a@x.com", "password": "short"},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Password must be at least 8 characters"

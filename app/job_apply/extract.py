@@ -452,7 +452,7 @@ def _validate(raw: str) -> None:
 async def extract_job(
     jd: str, *, user, run_date: date, llm=None
 ) -> tuple[JobExtraction, Literal["llm", "rules"]]:
-    """LLM extraction (free tier → OpenAI via llm_router); rule-based fallback on any failure."""
+    """LLM extraction (OpenAI via llm_router); rule-based fallback on any failure."""
     if llm is None:
         from app.llm_router import complete_with_fallback as llm
     try:

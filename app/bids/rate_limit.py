@@ -1,4 +1,4 @@
-"""In-process brute-force limit for /ext/login and /ext/register (per process; one API process)."""
+"""In-process brute-force limit for /ext/login, /ext/register and /auth/login (per process; one API process)."""
 
 import math
 from collections import defaultdict
@@ -67,8 +67,11 @@ LIMITER = FailureLimiter()
 
 
 def client_ip(request) -> str:
-    """First X-Forwarded-For entry (Railway's proxy), else the socket peer. Capped: the header is client-sent."""
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()[:IP_KEY_LEN]
+    """Last X-Forwarded-For entry, else the socket peer.
+
+    Railway's proxy appends the address it saw to whatever the client sent, so only the right-most entry is
+    trustworthy; earlier ones are client-chosen (a fresh fake per request would dodge the IP limit). Capped."""
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[-1].strip()[:IP_KEY_LEN]
     if forwarded:
         return forwarded
     return request.client.host if request.client else "unknown"

@@ -20,9 +20,16 @@ def ci_regex(value: str) -> dict:
     return {"$regex": re.escape(value), "$options": "i"}
 
 
+# Never serialized, whatever route the document goes out through.
+_SECRET_FIELDS = ("hashedPassword", "freeLlmApiKey")
+# What an embedded owner/payer carries by default: enough to show who it is, nothing private.
+_OWNER_FIELDS = ("_id", "name", "email", "image")
+
+
 def doc_to_dict(doc: Document) -> dict:
     payload = doc.model_dump(by_alias=True, mode="json")
-    payload.pop("hashedPassword", None)
+    for key in _SECRET_FIELDS:
+        payload.pop(key, None)
     if "id" in payload and "_id" not in payload:
         payload["_id"] = payload.pop("id")
     return payload
@@ -49,6 +56,7 @@ async def populate_owner(
     """Populate `field` as the owner (ownerEmail/Name/Image) and optionally
     extra `(id_field, prefix)` pairs — e.g. `(("payerId", "payer"),)` adds
     payerEmail/payerName/payerImage and replaces that id with the user dict.
+    The embedded user dict holds only _id/name/email/image plus any `only` fields.
     """
     docs = list(docs)
     extra = extra or ()
@@ -71,9 +79,8 @@ async def populate_owner(
         person = by_id.get(str(uid)) if uid is not None else None
         if person is not None:
             person_dict = doc_to_dict(person)
-            if only is not None:
-                keep = set(only) | {"_id", "image"}
-                person_dict = {k: v for k, v in person_dict.items() if k in keep}
+            keep = set(_OWNER_FIELDS) | set(only or ())
+            person_dict = {k: v for k, v in person_dict.items() if k in keep}
             item[id_field] = person_dict
             item[f"{prefix}Email"] = person.email
             item[f"{prefix}Name"] = person.name

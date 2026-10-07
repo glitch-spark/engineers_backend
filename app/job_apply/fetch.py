@@ -651,28 +651,90 @@ def _status_problem(status: int) -> str:
     return f"the site answered HTTP {status}"
 
 
-async def browser_html(url: str) -> str:
-    """Render a script-heavy page with headless Chromium (at most BROWSER_CONCURRENCY at once)."""
-    from playwright.async_api import async_playwright
+async def _redirect_hop(url: str, location: Optional[str]) -> str:
+    """Where a 3xx answer to `url` points, once that address passes check_url (FetchError otherwise)."""
+    if not location:
+        raise FetchError("redirect without a location")
+    target = urljoin(url, location.strip())
+    await check_url(target)
+    return target
 
-    await check_url(url)
+
+def _main_navigation(request) -> bool:
+    try:
+        return request.is_navigation_request() and request.frame.parent_frame is None
+    except Exception:  # noqa: BLE001 — no frame (worker request): not a page navigation
+        return False
+
+
+def _browser_guard(state: dict) -> Callable[[Any], Awaitable[None]]:
+    """Route handler for every request the browser makes. Chromium follows a redirect without asking the route
+    again, so the request is sent here with redirects off and every hop is checked like _get_page does. A redirect
+    of the page itself is aborted and its (checked) target left in state["redirect"] for browser_html to open, so
+    the page keeps its real address; any other request's redirects are followed here and the last answer served."""
 
     async def guard(route) -> None:
+        request = route.request
+        url = request.url
         try:
-            await check_url(route.request.url)
+            await check_url(url)
+            overrides: dict = {}
+            for _ in range(MAX_REDIRECTS + 1):
+                resp = await route.fetch(max_redirects=0, timeout=TIMEOUT * 1000, **overrides)
+                if not (300 <= resp.status < 400 and resp.status != 304):
+                    await route.fulfill(response=resp)
+                    return
+                url = await _redirect_hop(url, resp.headers.get("location"))
+                if _main_navigation(request):
+                    state["redirect"] = url
+                    await route.abort("aborted")  # no error page, which would cut off the next goto
+                    return
+                overrides["url"] = url
+                if resp.status == 303 or (resp.status in (301, 302) and request.method == "POST"):
+                    overrides.update(method="GET", post_data=b"")
+            raise FetchError("too many redirects")
         except FetchError:
-            await route.abort()
-            return
-        await route.continue_()
+            await route.abort("blockedbyclient")
+        except Exception:  # noqa: BLE001 — unreachable host, timeout, page already closed
+            try:
+                await route.abort()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return guard
+
+
+async def _close_socket(ws) -> None:
+    await ws.close()
+
+
+async def browser_html(url: str) -> str:
+    """Render a script-heavy page with headless Chromium (at most BROWSER_CONCURRENCY at once). Every request and
+    every redirect hop goes through check_url; service workers (which bypass routing) and WebSockets are refused."""
+    from playwright.async_api import Error as PlaywrightError, async_playwright
+
+    await check_url(url)
+    state: dict = {}
 
     async with _browser_sem:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch()
             try:
-                page = await browser.new_page(user_agent=UA)
-                await page.route("**/*", guard)  # every request the page makes, redirects included
-                await page.goto(url, wait_until="networkidle", timeout=30_000)
-                return await page.content()
+                context = await browser.new_context(user_agent=UA, service_workers="block")
+                await context.route("**/*", _browser_guard(state))
+                await context.route_web_socket("**/*", _close_socket)
+                page = await context.new_page()
+                for _ in range(MAX_REDIRECTS + 1):
+                    state.pop("redirect", None)
+                    try:
+                        await page.goto(url, wait_until="networkidle", timeout=30_000)
+                    except PlaywrightError:
+                        if not state.get("redirect"):
+                            raise
+                    if not state.get("redirect"):
+                        return await page.content()
+                    url = state["redirect"]  # the page redirected to a checked address: open it
+                raise FetchError("too many redirects")
             finally:
                 await browser.close()
 

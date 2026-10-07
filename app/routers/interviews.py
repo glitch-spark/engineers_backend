@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Iterable, List, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -261,6 +262,25 @@ async def _sync_caller_posts(
 def _can_view(iv: Interview, user: UserExtra) -> bool:
     """Admin, interview manager, or owner."""
     return user.role in ("admin", "interview_manager") or str(iv.createdBy) == str(user.id)
+
+
+_JOB_URL_MAX = 2000
+
+
+def _job_url(raw: Optional[str]) -> Optional[str]:
+    """None when blank; 400 unless an http(s) link (the UI renders it as a clickable href), as in bidder_ext."""
+    url = (raw or "").strip()
+    if not url:
+        return None
+    if len(url) > _JOB_URL_MAX:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="jobUrl is too long")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        parts = None
+    if parts is None or parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="jobUrl must be an http(s) link")
+    return url
 
 
 def _parse_datetime(s: str) -> Optional[datetime]:
@@ -715,7 +735,7 @@ async def create_interview(
         endsAt=entry.endsAt,
         companyName=company,
         appliedPosition=(body.appliedPosition or "").strip() or None,
-        jobUrl=(body.jobUrl or "").strip() or None,
+        jobUrl=_job_url(body.jobUrl),
         mainTechStack=(body.mainTechStack or "").strip() or None,
         stageHistory=[],
     )
@@ -770,7 +790,7 @@ async def update_interview(
     if body.appliedPosition is not None:
         iv.appliedPosition = body.appliedPosition.strip() or None
     if body.jobUrl is not None:
-        iv.jobUrl = body.jobUrl.strip() or None
+        iv.jobUrl = _job_url(body.jobUrl)
     if body.mainTechStack is not None:
         iv.mainTechStack = body.mainTechStack.strip() or None
 

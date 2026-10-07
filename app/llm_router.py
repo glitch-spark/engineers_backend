@@ -1,4 +1,4 @@
-"""LLM routing: NVIDIA free tier primary, OpenAI fallback for resume + screening."""
+"""LLM routing: catalog models (Anthropic, OpenAI) with fallback for resume, cover letter + screening."""
 
 from __future__ import annotations
 
@@ -8,19 +8,9 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
+from openai import AsyncOpenAI
 
 from app.config import get_settings
-from app.free_llm import (
-    FREE_LLM_RESUME_MAX_OUTPUT_TOKENS,
-    FREE_LLM_RESUME_TIMEOUT_SECONDS,
-    FREE_LLM_SCREENING_TIMEOUT_SECONDS,
-    NVIDIA_BASE_URL,
-    FreeLlmPreset,
-    build_free_chat_kwargs,
-    clamp_max_tokens,
-    get_preset,
-)
 from app.llm_anthropic import anthropic_complete
 from app.model_catalog import (
     TASK_EFFORT,
@@ -35,7 +25,7 @@ from app.models import UserExtra
 
 log = logging.getLogger(__name__)
 
-LlmProvider = Literal["free", "openai", "anthropic"]
+LlmProvider = Literal["openai", "anthropic"]
 
 
 @dataclass
@@ -48,117 +38,6 @@ class LlmResult:
     fallback_reason: Optional[str] = None
     model_id: str = ""  # provider-prefixed catalog id, e.g. "anthropic:claude-sonnet-5-5"
     cost_usd: Optional[float] = None  # None when the model's price is unknown
-
-
-def free_llm_configured(user: Optional[UserExtra]) -> bool:
-    if user is None:
-        return False
-    preset = get_preset(user.freeLlmModelId)
-    key = (user.freeLlmApiKey or "").strip()
-    return preset is not None and bool(key)
-
-
-def resolve_free_preset(user: UserExtra) -> tuple[Optional[FreeLlmPreset], int, str]:
-    preset = get_preset(user.freeLlmModelId)
-    if preset is None:
-        return None, 8192, ""
-    max_tokens = clamp_max_tokens(user.freeLlmMaxTokens, preset)
-    api_key = (user.freeLlmApiKey or "").strip()
-    return preset, max_tokens, api_key
-
-
-def _free_llm_user_message(exc: Exception, *, timeout_seconds: float) -> str:
-    """Map NVIDIA/OpenAI SDK errors to short user-facing messages."""
-    if isinstance(exc, APITimeoutError):
-        return (
-            f"NVIDIA request timed out after {int(timeout_seconds)}s. "
-            "The model may be slow — try again in a moment."
-        )
-    if isinstance(exc, APIConnectionError):
-        return "Could not reach NVIDIA Integrate. Check your network connection."
-    if isinstance(exc, RateLimitError):
-        return "NVIDIA rate limit exceeded on your API key. Wait a minute and try again."
-    if isinstance(exc, APIStatusError):
-        if exc.status_code == 401:
-            return "Invalid NVIDIA API key. Check that your nvapi-… key is correct and active."
-        if exc.status_code == 403:
-            return "NVIDIA API key rejected. Ensure the key has access to the selected model."
-        detail = getattr(exc, "message", None) or str(exc)
-        return f"NVIDIA API error ({exc.status_code}): {detail}"
-    return f"Free LLM request failed: {exc}"
-
-
-def _free_timeout_for_purpose(purpose: str, preset: Optional[FreeLlmPreset] = None) -> float:
-    if purpose == "resume":
-        base = float(FREE_LLM_RESUME_TIMEOUT_SECONDS)
-    elif purpose == "screening":
-        base = float(FREE_LLM_SCREENING_TIMEOUT_SECONDS)
-    else:
-        base = float(FREE_LLM_RESUME_TIMEOUT_SECONDS)
-    floor = float(preset.min_timeout_seconds) if preset and preset.min_timeout_seconds else 0.0
-    return max(base, floor)
-
-
-def _free_max_tokens_for_purpose(purpose: str, max_tokens: int) -> int:
-    if purpose == "resume":
-        return min(max_tokens, FREE_LLM_RESUME_MAX_OUTPUT_TOKENS)
-    return max_tokens
-
-
-def _message_text(message: object) -> str:
-    """Final assistant text only — never use Kimi reasoning_content as the answer."""
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-                continue
-            if isinstance(part, dict):
-                if part.get("type") in (None, "text"):
-                    parts.append(str(part.get("text") or ""))
-                continue
-            text = getattr(part, "text", None)
-            if text:
-                parts.append(str(text))
-        return "".join(parts).strip()
-    return (str(content).strip() if content else "")
-
-
-async def _free_chat_completion(
-    prompt: str,
-    preset: FreeLlmPreset,
-    api_key: str,
-    max_tokens: int,
-    *,
-    timeout: float = FREE_LLM_RESUME_TIMEOUT_SECONDS,
-    temperature: Optional[float] = None,
-) -> tuple[str, dict]:
-    client = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=timeout)
-    kwargs = build_free_chat_kwargs(preset, prompt, max_tokens)
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    response = await client.chat.completions.create(**kwargs)
-    text = ""
-    if response.choices:
-        text = _message_text(response.choices[0].message)
-    usage_out: dict = {}
-    if response.usage:
-        if response.usage.prompt_tokens is not None:
-            usage_out["input"] = int(response.usage.prompt_tokens)
-        if response.usage.completion_tokens is not None:
-            usage_out["output"] = int(response.usage.completion_tokens)
-    return text, usage_out
-
-
-def _free_error_retryable(exc: Exception) -> bool:
-    if isinstance(exc, APIStatusError):
-        code = exc.status_code
-        return code == 429 or code >= 500
-    # Timeouts, connection errors, etc.
-    return True
 
 
 # Purposes whose output must not vary between runs of the same input (structured extraction, not writing).
@@ -212,23 +91,6 @@ async def _openai_responses(
     return (response.output_text or "").strip(), usage_out
 
 
-async def complete_openai_only(prompt: str, *, purpose: str = "llm") -> LlmResult:
-    """Force OpenAI (no free attempt). Used when free output fails validation."""
-    settings = get_settings()
-    if not settings.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured")
-    openai_model = settings.RESUME_OPENAI_MODEL
-    text, usage = await _openai_responses(prompt, openai_model)
-    log.info("%s via OpenAI-only model=%s", purpose, openai_model)
-    return LlmResult(
-        text=text,
-        provider="openai",
-        model=openai_model,
-        usage=usage,
-        fallback_used=True,
-    )
-
-
 async def complete_with_fallback(
     prompt: str,
     user: Optional[UserExtra],
@@ -236,68 +98,19 @@ async def complete_with_fallback(
     validate: Optional[Callable[[str], None]] = None,
     purpose: str = "llm",
 ) -> LlmResult:
-    """Try free NVIDIA tier when configured; fall back to OpenAI on errors/bad output."""
+    """One OpenAI call for callers outside the model catalog (job extraction)."""
     settings = get_settings()
-    preset, max_tokens, api_key = resolve_free_preset(user) if user else (None, 8192, "")
-    if purpose == "job_extract" and (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip():
-        preset = None  # the configured extraction model is the one whose accuracy was measured
-    attempted_free = False
-    fallback_reason: Optional[str] = None
-
-    if preset and api_key:
-        attempted_free = True
-        try:
-            free_timeout = _free_timeout_for_purpose(purpose, preset)
-            free_max_tokens = _free_max_tokens_for_purpose(purpose, max_tokens)
-            text, usage = await _free_chat_completion(
-                prompt,
-                preset,
-                api_key,
-                free_max_tokens,
-                timeout=free_timeout,
-                temperature=_temperature_for(purpose),
-            )
-            if not text.strip():
-                raise ValueError("empty free LLM output")
-            if validate:
-                validate(text)
-            log.info(
-                "%s via free model=%s in=%s out=%s",
-                purpose,
-                preset.model,
-                usage.get("input", "?"),
-                usage.get("output", "?"),
-            )
-            return LlmResult(
-                text=text,
-                provider="free",
-                model=preset.model,
-                usage=usage,
-                fallback_used=False,
-            )
-        except Exception as exc:
-            fallback_reason = _free_llm_user_message(exc, timeout_seconds=free_timeout)
-            log.warning(
-                "%s free LLM failed (model=%s): %s — falling back to OpenAI",
-                purpose,
-                preset.model,
-                exc,
-            )
-            if not _free_error_retryable(exc) and not validate:
-                pass
-
     if not settings.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured and free LLM unavailable")
+        raise RuntimeError("OPENAI_API_KEY not configured")
 
     openai_model = _openai_model_for(purpose, settings)
     text, usage = await _openai_responses(prompt, openai_model, temperature=_temperature_for(purpose))
     if validate:
         validate(text)
     log.info(
-        "%s via OpenAI model=%s fallback=%s in=%s out=%s",
+        "%s via OpenAI model=%s in=%s out=%s",
         purpose,
         openai_model,
-        attempted_free,
         usage.get("input", "?"),
         usage.get("output", "?"),
     )
@@ -306,8 +119,7 @@ async def complete_with_fallback(
         provider="openai",
         model=openai_model,
         usage=usage,
-        fallback_used=attempted_free,
-        fallback_reason=fallback_reason,
+        fallback_used=False,
     )
 
 
@@ -386,7 +198,7 @@ async def complete_resume(
 def _coerce_screening_answer(item: object) -> str:
     """Normalize one answer entry to plain text.
 
-    Free / OpenAI models sometimes return objects instead of strings, e.g.
+    Models sometimes return objects instead of strings, e.g.
       {"question": "...", "answer": "Real text", "type_used": "long_text"}
     or Python-style dicts as strings. Always extract the answer text.
     """
@@ -416,7 +228,7 @@ def _coerce_screening_answer(item: object) -> str:
 
 
 def _escape_raw_controls_in_json_strings(text: str) -> str:
-    """Escape raw newlines/tabs inside JSON strings (common free-LLM bug).
+    """Escape raw newlines/tabs inside JSON strings (common model bug).
 
     Valid JSON forbids unescaped control characters in strings; models often
     emit real newlines inside quoted answer text. Walk the text and escape
@@ -522,7 +334,7 @@ def _answers_from_parsed(parsed: object) -> list[str]:
     """Extract a list of plain answer strings from a parsed LLM payload.
 
     Handles double-encoded JSON strings and full `{"answers":[...]}` blobs
-    stuffed into a single string element (common free-LLM wrapping).
+    stuffed into a single string element (common model wrapping).
     """
     if isinstance(parsed, dict):
         ans = parsed.get("answers")
@@ -617,7 +429,7 @@ def _validate_screening_output(raw: str, questions: list[str]) -> None:
     answers = parse_screening_answers(raw, questions)
     if not any(a.strip() for a in answers):
         raise ValueError("screening LLM returned no parseable answers")
-    # Reject leftover wrapper dumps so free→OpenAI fallback retries instead of
+    # Reject leftover wrapper dumps so the fallback model retries instead of
     # storing raw JSON (with visible \n escapes) as answer text.
     if any(_looks_like_answers_wrapper_blob(a) for a in answers):
         raise ValueError("screening LLM returned unparsed answers JSON wrapper")
@@ -633,24 +445,3 @@ async def complete_screening(
         _validate_screening_output(raw, questions)
 
     return await complete("screening", prompt, user, model_id=model_id, validate=_validate)
-
-
-async def test_free_connection(user: UserExtra) -> dict:
-    """Lightweight ping against the user's configured free model."""
-    preset, max_tokens, api_key = resolve_free_preset(user)
-    if preset is None or not api_key:
-        raise ValueError("Free LLM model and API key must be configured")
-    test_timeout = float(preset.test_timeout_seconds)
-    try:
-        text, _usage = await _free_chat_completion(
-            "Reply with exactly: ok",
-            preset,
-            api_key,
-            min(max_tokens, preset.test_max_tokens),
-            timeout=test_timeout,
-        )
-    except Exception as exc:
-        raise ValueError(_free_llm_user_message(exc, timeout_seconds=test_timeout)) from exc
-    if not text.strip():
-        raise ValueError("Model returned empty response")
-    return {"ok": True, "model": preset.model, "sample": text.strip()[:80]}

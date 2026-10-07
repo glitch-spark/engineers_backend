@@ -46,7 +46,7 @@ def make_client():
         app = FastAPI()
         app.include_router(resume_router.router)
         if authed:
-            fake = user or SimpleNamespace(freeLlmModelId=None, freeLlmApiKey=None, freeLlmMaxTokens=None)
+            fake = user or SimpleNamespace(id="u1")
             app.dependency_overrides[get_current_user] = lambda: fake
         return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
@@ -90,12 +90,11 @@ async def test_models_list_both_providers_in_preset_order(use_settings, make_cli
     ]
 
 
-async def test_models_cover_letter_excludes_haiku_and_nvidia(use_settings, make_client):
-    user = SimpleNamespace(freeLlmModelId="glm-5.3", freeLlmApiKey="nvapi-x", freeLlmMaxTokens=None)
-    async with make_client(user=user) as client:
+async def test_models_cover_letter_excludes_haiku(use_settings, make_client):
+    async with make_client() as client:
         r = await client.get("/resume/models", params={"task": "cover_letter"})
     ids = [m["id"] for m in r.json()["models"]]
-    assert ids and not [i for i in ids if "haiku" in i or i.startswith("free:")]
+    assert ids and not [i for i in ids if "haiku" in i]
     assert "anthropic:claude-fable-5-1" in ids
     assert r.json()["defaultId"] == "anthropic:claude-opus-5-5"
 

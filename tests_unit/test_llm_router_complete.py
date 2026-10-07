@@ -153,6 +153,12 @@ async def test_turned_off_model_saved_on_a_queued_job_uses_the_default(monkeypat
     assert res.fallback_used is False
 
 
+async def test_removed_nvidia_model_saved_on_a_queued_job_uses_the_default(monkeypatch):
+    seen = script(monkeypatch, {"anthropic:claude-sonnet-5-5": ("answer", USAGE)})
+    res = await llm_router.complete("resume", "p", None, model_id="free:glm-5.3")
+    assert seen == ["anthropic:claude-sonnet-5-5"] and res.text == "answer"
+
+
 async def test_complete_screening_passes_model_id(monkeypatch):
     seen = script(
         monkeypatch,
