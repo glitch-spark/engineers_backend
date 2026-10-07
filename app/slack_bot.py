@@ -1,14 +1,13 @@
-"""Slack interview bot: OAuth identity link + private DMs.
+"""Slack interview bot: #caller threads, reminders, the daily caller list and personal digests.
 
-Uses the workspace Bot Token for chat.postMessage DMs. Users connect via
-Slack OAuth (user_scope=identity.basic) so we store their Slack member id
-on UserExtra. Channel posts: the opt-in "Caller needed" message in the
-private SLACK_CALLER_CHANNEL_ID, and each daily plan in
-SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
+Uses the workspace Bot Token (chat.postMessage). Users type their Slack member id in Profile; it is
+stored on UserExtra and used to @-mention and DM them. Channel posts: one "Caller needed" thread per
+interview in the private SLACK_CALLER_CHANNEL_ID, the daily caller list in SLACK_CALLER_DAILY_CHANNEL_ID, and
+each daily plan in SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
-Sends an instant DM when an interview is created or meaningfully updated,
-plus a daily digest at each user's chosen time/timezone. A round with a caller
-gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner and the interview managers.
+A round with a caller gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner and
+the interview managers. A daily digest DM goes out at each user's chosen time/timezone. Transactions live in
+app/slack_transactions.py.
 """
 
 from __future__ import annotations
@@ -115,17 +114,6 @@ async def send_dm(slack_user_id: str, *, text: str, blocks: Optional[list[dict]]
         return False
 
 
-def _fmt_scheduled(dt: Optional[datetime], tz: ZoneInfo) -> str:
-    """Calendar date as M/D/YY plus the zone abbrev for that date."""
-    if dt is None:
-        return "—"
-    naive = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-    day = naive.date()
-    local = datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=tz)
-    abbrev = (local.strftime("%Z") or "").strip() or "UTC"
-    return f"{day.month}/{day.day}/{day.strftime('%y')} {abbrev}"
-
-
 def _stage_label(stage: Any) -> str:
     key = _enum_key(stage)
     if not key:
@@ -164,77 +152,6 @@ async def _profile_labels(interviews: list[Interview]) -> dict[str, str]:
         return {}
     accounts = await Account.find({"_id": {"$in": list(account_ids)}}).to_list()
     return {str(a.id): _profile_label(a) for a in accounts}
-
-
-def _interview_fields(
-    interview: Interview,
-    *,
-    profile: str,
-    tz: ZoneInfo,
-) -> str:
-    company = (getattr(interview, "companyName", None) or "").strip() or "—"
-    job_url = (getattr(interview, "jobUrl", None) or "").strip() or None
-    company_value = _mrkdwn_link(job_url, company) if job_url else company
-    position = (getattr(interview, "appliedPosition", None) or "").strip() or "—"
-    if job_url:
-        position = f"{position} ({_mrkdwn_link(job_url, 'Job description')})"
-    return "\n".join(
-        [
-            f"*Profile Name:* {profile.strip() or '—'}",
-            f"*Company Name:* {company_value}",
-            f"*Applied Position:* {position}",
-            f"*Interview Stage:* {_stage_label(getattr(interview, 'stage', None))}",
-            f"*Scheduled Time:* {_fmt_scheduled(getattr(interview, 'scheduledAt', None), tz)}",
-        ]
-    )
-
-
-def _interview_blocks(
-    title: str,
-    interviews: list[Interview],
-    *,
-    why: Optional[str] = None,
-    profiles: Optional[dict[str, str]] = None,
-    tz: Optional[ZoneInfo] = None,
-    include_open_link: bool = False,
-) -> list[dict[str, Any]]:
-    profiles = profiles or {}
-    zone = tz or ZoneInfo("UTC")
-    chunks = []
-    for iv in interviews:
-        profile = profiles.get(str(iv.accountId)) if iv.accountId else ""
-        chunks.append(_interview_fields(iv, profile=profile or "", tz=zone))
-    body = "\n\n".join(chunks) if chunks else "_No interviews._"
-    blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": body}},
-    ]
-    if include_open_link:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"<{_frontend_link('/interviews')}|Open interviews>",
-                },
-            }
-        )
-    if why:
-        blocks.extend(
-            [
-                {"type": "divider"},
-                {
-                    "type": "context",
-                    "elements": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Know your why*\n_{why}_",
-                        }
-                    ],
-                },
-            ]
-        )
-    return blocks
 
 
 async def _already_sent(user_id: PydanticObjectId, kind: str) -> bool:
@@ -294,54 +211,12 @@ _SKIP_STATUSES = {
 }
 
 
-def interview_dm_eligible(user: Optional[UserExtra]) -> bool:
-    """True if this user should receive interview bot DMs."""
-    if user is None:
-        return False
-    if not (user.slackUserId or "").strip():
-        return False
-    if user.slackAlertsEnabled is False:
-        return False
-    return True
-
-
 def _enum_key(value: Any) -> Optional[str]:
     if value is None:
         return None
     raw = getattr(value, "value", value)
     text = str(raw).strip()
     return text or None
-
-
-async def notify_interview_dm(
-    interview: Interview,
-    *,
-    kind: str = "created",
-) -> bool:
-    """Best-effort private DM to the interview owner. Never raises."""
-    try:
-        if not slack_bot_configured():
-            return False
-        owner = await UserExtra.get(interview.createdBy)
-        if not interview_dm_eligible(owner):
-            return False
-        slack_id = (owner.slackUserId or "").strip()
-        title = "New interview" if kind == "created" else "Interview updated"
-        tz = resolve_user_tz(owner)
-        when = _fmt_scheduled(interview.scheduledAt, tz)
-        company = (interview.companyName or "Interview").strip()
-        profiles = await _profile_labels([interview])
-        blocks = _interview_blocks(
-            title,
-            [interview],
-            profiles=profiles,
-            tz=tz,
-        )
-        text = f"{title}: {company} on {when}"
-        return await send_dm(slack_id, text=text, blocks=blocks)
-    except Exception:
-        log.exception("slack_bot notify_interview_dm crashed kind=%s", kind)
-        return False
 
 
 _METHOD_LABELS = {

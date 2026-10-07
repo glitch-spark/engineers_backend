@@ -16,17 +16,12 @@ from app.know_your_why import know_your_why_for_date
 from app.models.interview import InterviewStage
 from app.slack_bot import (
     _country_flag,
-    _fmt_scheduled,
-    _interview_blocks,
-    _interview_fields,
     _frontend_link,
     _profile_label,
     _stage_label,
     calendar_day_bounds,
     digest_slot_open,
     digest_text,
-    interview_dm_eligible,
-    notify_interview_dm,
     validate_timezone,
 )
 from app.slack_timezones import (
@@ -117,12 +112,6 @@ def test_profile_label_is_name_only():
     assert _profile_label(None) == ""
 
 
-def test_fmt_scheduled_mdy_and_abbrev():
-    chicago = ZoneInfo("America/Chicago")
-    assert _fmt_scheduled(datetime(2026, 9, 23, 12, 0, 0), chicago) == "9/23/26 CDT"
-    assert _fmt_scheduled(None, chicago) == "—"
-
-
 def test_stage_label_humanizes():
     assert _stage_label(InterviewStage.intro) == "Intro"
     assert _stage_label(InterviewStage.tech_round_1) == "Tech Round 1"
@@ -130,117 +119,11 @@ def test_stage_label_humanizes():
     assert _stage_label(None) == "—"
 
 
-def test_interview_fields_with_job_url():
-    interview = _fake_interview(
-        position="Senior Software Engineer",
-        job_url="https://jobs.example.com/acme",
-        stage=InterviewStage.intro,
-    )
-    interview.scheduledAt = datetime(2026, 9, 23, 12, 0, 0)
-    body = _interview_fields(
-        interview,
-        profile="Martin Zhang",
-        tz=ZoneInfo("America/Chicago"),
-    )
-    assert body == (
-        "*Profile Name:* Martin Zhang\n"
-        "*Company Name:* <https://jobs.example.com/acme|Acme>\n"
-        "*Applied Position:* Senior Software Engineer "
-        "(<https://jobs.example.com/acme|Job description>)\n"
-        "*Interview Stage:* Intro\n"
-        "*Scheduled Time:* 9/23/26 CDT"
-    )
-
-
-def test_interview_blocks_digest_includes_why_and_link():
-    interview = _fake_interview(position="Senior Backend")
-    blocks = _interview_blocks(
-        "Today's interviews (1)",
-        [interview],
-        why="Show up curious.",
-        profiles={"acc1": "AI Full-stack"},
-        tz=ZoneInfo("UTC"),
-        include_open_link=True,
-    )
-    body = blocks[1]["text"]["text"]
-    assert "*Profile Name:* AI Full-stack" in body
-    assert "*Company Name:* Acme" in body
-    assert "*Interview Stage:* AI Interview" in body
-    assert any("Open interviews" in str(b) for b in blocks)
-    assert any("Know your why" in str(b) for b in blocks)
-
-
-def test_interview_blocks_instant_omits_why_and_link():
-    interview = _fake_interview(account_id="missing")
-    blocks = _interview_blocks("New interview", [interview], tz=ZoneInfo("UTC"))
-    blob = str(blocks)
-    assert "Know your why" not in blob
-    assert "Open interviews" not in blob
-    assert "*Profile Name:* —" in blocks[1]["text"]["text"]
-
-
 def test_know_your_why_stable_for_date():
     a = know_your_why_for_date("2026-07-28")
     b = know_your_why_for_date(date(2026, 7, 28))
     assert a == b
     assert isinstance(a, str) and len(a) > 10
-
-
-def test_interview_dm_eligible():
-    assert interview_dm_eligible(None) is False
-    assert interview_dm_eligible(SimpleNamespace(slackUserId="", slackAlertsEnabled=True)) is False
-    assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=False)) is False
-    assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=True)) is True
-    assert interview_dm_eligible(SimpleNamespace(slackUserId="U1", slackAlertsEnabled=None)) is True
-
-
-@pytest.mark.asyncio
-async def test_notify_interview_dm_skips_when_bot_unconfigured():
-    interview = _fake_interview()
-    interview.createdBy = "user1"
-    with patch("app.slack_bot.slack_bot_configured", return_value=False):
-        assert await notify_interview_dm(interview, kind="created") is False
-
-
-@pytest.mark.asyncio
-async def test_notify_interview_dm_skips_ineligible_owner():
-    interview = _fake_interview()
-    interview.createdBy = "user1"
-    owner = SimpleNamespace(slackUserId="", slackAlertsEnabled=True)
-    with (
-        patch("app.slack_bot.slack_bot_configured", return_value=True),
-        patch("app.slack_bot.UserExtra.get", AsyncMock(return_value=owner)),
-        patch("app.slack_bot.send_dm", AsyncMock()) as send,
-    ):
-        assert await notify_interview_dm(interview, kind="created") is False
-        send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_notify_interview_dm_sends_to_owner():
-    interview = _fake_interview(position="Senior Backend")
-    interview.createdBy = "user1"
-    owner = SimpleNamespace(
-        slackUserId="U123",
-        slackAlertsEnabled=True,
-        slackTimezone="America/New_York",
-    )
-    send = AsyncMock(return_value=True)
-    with (
-        patch("app.slack_bot.slack_bot_configured", return_value=True),
-        patch("app.slack_bot.UserExtra.get", AsyncMock(return_value=owner)),
-        patch("app.slack_bot._profile_labels", AsyncMock(return_value={"acc1": "Backend"})),
-        patch("app.slack_bot.send_dm", send),
-    ):
-        assert await notify_interview_dm(interview, kind="created") is True
-    send.assert_awaited_once()
-    kwargs = send.await_args.kwargs
-    assert kwargs["text"].startswith("New interview:")
-    assert kwargs["blocks"][0]["text"]["text"] == "New interview"
-    blob = str(kwargs["blocks"])
-    assert "Know your why" not in blob
-    assert "Open interviews" not in blob
-    assert "*Interview Stage:* AI Interview" in kwargs["blocks"][1]["text"]["text"]
 
 
 NY = ZoneInfo("America/New_York")

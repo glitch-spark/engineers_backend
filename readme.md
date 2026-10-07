@@ -34,7 +34,7 @@ uvicorn app.main:app --reload
 | `FRONTEND_ORIGIN` | no | CORS allowlist; default `http://localhost:5173` |
 | `APP_BASE_URL` | no | Used in Slack message links; default `http://localhost:8080` |
 | `APP_TIMEZONE` | no | IANA zone for Slack timestamps; default `America/New_York` |
-| `SLACK_WEBHOOK_URL` | no | Slack notifications are no-ops when unset |
+| `SLACK_BOT_TOKEN` | no | Slack bot token; Slack messages are no-ops when unset (setup in `docs/slack-interview-bot.md`) |
 | `JWT_EXPIRES_MIN` | no | JWT lifetime in minutes; default 720 (12 h) |
 | `OPENAI_API_KEY` | no* | Required for `/ai-review/*` and `/resume/generate`; those routes 503 without it |
 | `RESUME_OPENAI_MODEL` | no | OpenAI model for the interview features and job extraction (not the resume/cover letter/screening selector); default `gpt-5-mini` |
@@ -53,7 +53,8 @@ app/
 ├── db.py          # Motor + init_beanie
 ├── security.py    # bcrypt + HS256 JWT
 ├── deps.py        # get_current_user, require_admin
-├── slack.py       # webhook (no-op if SLACK_WEBHOOK_URL unset)
+├── slack_bot.py   # Slack bot: #caller threads, reminders, digests (no-op if SLACK_BOT_TOKEN unset)
+├── slack_transactions.py  # transaction posts with Approve/Reject buttons
 └── models/        # Beanie Documents (5)
 
 docs/adr/          # architecture decision records

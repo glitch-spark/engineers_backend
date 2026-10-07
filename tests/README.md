@@ -49,9 +49,9 @@ risk touching the prod db.
 
 ## Slack
 
-`SLACK_WEBHOOK_URL` is forced to `""` in `conftest.py`. `slack._post_to_slack`
-returns early when the URL is empty, so `notify_*` calls become no-ops without
-mocking. No real network.
+`conftest.py` forces `SLACK_DAILY_PLAN_CHANNEL_ID` and `SLACK_TRANSACTIONS_CHANNEL_ID`
+to `""`, so daily plans and transactions are never posted to Slack. Unit tests fake
+`app.slack_bot._slack_api`; no real network.
 
 ## bcrypt compat
 
