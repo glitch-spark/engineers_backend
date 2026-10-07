@@ -13,7 +13,6 @@ from app.security import hash_password, verify_password
 from app.slack_bot import (
     normalize_slack_timezone,
     slack_bot_configured,
-    slack_oauth_configured,
 )
 from app.slack_timezones import slack_timezone_catalog
 
@@ -70,7 +69,6 @@ def _slack_profile_fields(user: UserExtra) -> dict:
             if user.slackDigestMinute is not None
             else s.SLACK_DIGEST_MINUTE
         ),
-        "slackOAuthConfigured": slack_oauth_configured(),
         "slackBotConfigured": slack_bot_configured(),
     }
 

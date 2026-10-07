@@ -1,17 +1,12 @@
-"""Slack interview bot routes: OAuth connect, prefs, test DM, cron tick."""
+"""Slack interview bot routes: Slack member ID and prefs, test DM, cron tick."""
 
 from __future__ import annotations
 
 import logging
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Annotated, Optional
-from urllib.parse import urlencode
 
-from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
-from jose import JWTError, jwt
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
@@ -19,14 +14,12 @@ from app.deps import get_current_user
 from app.models import UserExtra
 from app.know_your_why import know_your_why_for_date
 from app.slack_bot import (
-    build_oauth_authorize_url,
-    exchange_oauth_code,
+    normalize_slack_id,
     normalize_slack_timezone,
     resolve_user_tz,
     run_alert_tick,
     send_dm,
     slack_bot_configured,
-    slack_oauth_configured,
     validate_timezone,
 )
 from app.slack_timezones import slack_timezone_catalog
@@ -36,43 +29,6 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/integrations/slack", tags=["slack-bot"])
 cron_router = APIRouter(prefix="/internal/slack-bot", tags=["slack-bot"])
-
-_STATE_AUDIENCE = "slack-oauth"
-_STATE_TTL_SECONDS = 600
-
-
-def _sign_state(user_id: PydanticObjectId) -> str:
-    s = get_settings()
-    payload = {
-        "sub": str(user_id),
-        "aud": _STATE_AUDIENCE,
-        "exp": datetime.now(timezone.utc) + timedelta(seconds=_STATE_TTL_SECONDS),
-        "jti": secrets.token_urlsafe(16),
-    }
-    return jwt.encode(payload, s.AUTH_SECRET, algorithm="HS256")
-
-
-def _verify_state(token: str) -> PydanticObjectId:
-    s = get_settings()
-    try:
-        payload = jwt.decode(
-            token, s.AUTH_SECRET, algorithms=["HS256"], audience=_STATE_AUDIENCE
-        )
-        return PydanticObjectId(payload["sub"])
-    except (JWTError, KeyError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="invalid or expired state") from exc
-
-
-def _frontend_redirect(*, status_value: str, detail: Optional[str] = None) -> RedirectResponse:
-    s = get_settings()
-    qs = {"slack": status_value}
-    if detail:
-        qs["detail"] = detail[:200]
-    return RedirectResponse(
-        url=f"{s.FRONTEND_ORIGIN}/profile?{urlencode(qs)}",
-        status_code=302,
-    )
-
 
 def _slack_profile_fields(user: UserExtra) -> dict:
     connected = bool((user.slackUserId or "").strip())
@@ -84,6 +40,7 @@ def _slack_profile_fields(user: UserExtra) -> dict:
     )
     return {
         "slackConnected": connected,
+        "slackUserId": (user.slackUserId or "").strip() or None,
         "slackAlertsEnabled": bool(user.slackAlertsEnabled),
         "slackTimezone": tz_name,
         "slackTimezones": slack_timezone_catalog(),
@@ -97,12 +54,13 @@ def _slack_profile_fields(user: UserExtra) -> dict:
             if user.slackDigestMinute is not None
             else s.SLACK_DIGEST_MINUTE
         ),
-        "slackOAuthConfigured": slack_oauth_configured(),
         "slackBotConfigured": slack_bot_configured(),
     }
 
 
 class SlackPrefsUpdate(BaseModel):
+    # The user's Slack member ID (U…); blank clears it.
+    slackUserId: Optional[str] = None
     slackAlertsEnabled: Optional[bool] = None
     slackTimezone: Optional[str] = None
     slackDigestHour: Optional[int] = Field(default=None, ge=0, le=23)
@@ -114,66 +72,22 @@ async def slack_status(user: Annotated[UserExtra, Depends(get_current_user)]) ->
     return _slack_profile_fields(user)
 
 
-@router.post("/oauth-start")
-async def slack_oauth_start(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    if not slack_oauth_configured():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Slack OAuth is not configured on the server",
-        )
-    url = build_oauth_authorize_url(state=_sign_state(user.id))
-    return {"url": url}
-
-
-@router.get("/oauth-callback")
-async def slack_oauth_callback(
-    code: Optional[str] = Query(None),
-    state: Optional[str] = Query(None),
-    error: Optional[str] = Query(None),
-):
-    if error:
-        return _frontend_redirect(status_value="error", detail=error)
-    if not code or not state:
-        return _frontend_redirect(status_value="error", detail="missing code or state")
-    try:
-        user_id = _verify_state(state)
-    except HTTPException:
-        return _frontend_redirect(status_value="error", detail="invalid state")
-    user = await UserExtra.get(user_id)
-    if user is None:
-        return _frontend_redirect(status_value="error", detail="user not found")
-    try:
-        slack_uid = await exchange_oauth_code(code)
-    except Exception as exc:
-        log.warning("slack oauth-callback failed for %s: %s", user_id, exc)
-        return _frontend_redirect(status_value="error", detail=str(exc)[:200])
-
-    # One Slack account → one Engineers user (clear stale links).
-    others = await UserExtra.find(
-        {"slackUserId": slack_uid, "_id": {"$ne": user.id}}
-    ).to_list()
-    for other in others:
-        other.slackUserId = None
-        await other.save()
-
-    user.slackUserId = slack_uid
-    user.slackAlertsEnabled = True
-    await user.save()
-    return _frontend_redirect(status_value="connected")
-
-
-@router.delete("/disconnect")
-async def slack_disconnect(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    user.slackUserId = None
-    await user.save()
-    return _slack_profile_fields(user)
-
-
 @router.patch("/prefs")
 async def slack_prefs(
     body: SlackPrefsUpdate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
+    if "slackUserId" in body.model_fields_set:
+        try:
+            slack_id = normalize_slack_id(body.slackUserId)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        # One Slack account → one Engineers user.
+        if slack_id and await UserExtra.find_one({"slackUserId": slack_id, "_id": {"$ne": user.id}}):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="That Slack ID is already used by another user",
+            )
+        user.slackUserId = slack_id
     if body.slackAlertsEnabled is not None:
         user.slackAlertsEnabled = body.slackAlertsEnabled
     if body.slackTimezone is not None:
@@ -203,7 +117,7 @@ async def slack_test_dm(user: Annotated[UserExtra, Depends(get_current_user)]) -
     if not slack_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connect Slack before sending a test DM",
+            detail="Add your Slack member ID before sending a test DM",
         )
     why = know_your_why_for_date(datetime.now(resolve_user_tz(user)).date())
     ok = await send_dm(

@@ -15,10 +15,10 @@ calls the user joins as a coworker. A round with a caller gets a reply in its
 from __future__ import annotations
 
 import logging
+import re
 import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
-from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -41,22 +41,23 @@ from app.slack_timezones import (
 
 log = logging.getLogger(__name__)
 
-_SLACK_AUTHORIZE = "https://slack.com/oauth/v2/authorize"
-_SLACK_TOKEN = "https://slack.com/api/oauth.v2.access"
 _SLACK_API = "https://slack.com/api"
-_USER_SCOPE = "identity.basic"
+# A Slack member ID as shown under Profile → ⋮ → Copy member ID.
+_SLACK_MEMBER_ID = re.compile(r"[UW][A-Z0-9]{8,11}")
 
 
 def slack_bot_configured() -> bool:
     return bool((get_settings().SLACK_BOT_TOKEN or "").strip())
 
 
-def slack_oauth_configured() -> bool:
-    s = get_settings()
-    return bool(
-        (s.SLACK_CLIENT_ID or "").strip()
-        and (s.SLACK_CLIENT_SECRET or "").strip()
-    )
+def normalize_slack_id(raw: Optional[str]) -> Optional[str]:
+    """A typed Slack member ID, trimmed and upper-cased; None for blank. Raises ValueError when malformed."""
+    value = (raw or "").strip().upper()
+    if not value:
+        return None
+    if not _SLACK_MEMBER_ID.fullmatch(value):
+        raise ValueError("Enter your Slack member ID, like U04ABC12345 (Slack profile → ⋮ → Copy member ID)")
+    return value
 
 
 def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
@@ -69,42 +70,6 @@ def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
 
 def _frontend_link(path: str) -> str:
     return f"{get_settings().FRONTEND_ORIGIN.rstrip('/')}{path}"
-
-
-def build_oauth_authorize_url(*, state: str) -> str:
-    s = get_settings()
-    if not slack_oauth_configured():
-        raise RuntimeError("Slack OAuth is not configured")
-    params = {
-        "client_id": s.SLACK_CLIENT_ID,
-        "user_scope": _USER_SCOPE,
-        "redirect_uri": s.SLACK_OAUTH_REDIRECT_URI,
-        "state": state,
-    }
-    return f"{_SLACK_AUTHORIZE}?{urlencode(params)}"
-
-
-async def exchange_oauth_code(code: str) -> str:
-    """Exchange OAuth code → Slack user id (U…). Raises on failure."""
-    s = get_settings()
-    if not slack_oauth_configured():
-        raise RuntimeError("Slack OAuth is not configured")
-    data = {
-        "client_id": s.SLACK_CLIENT_ID,
-        "client_secret": s.SLACK_CLIENT_SECRET,
-        "code": code,
-        "redirect_uri": s.SLACK_OAUTH_REDIRECT_URI,
-    }
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(_SLACK_TOKEN, data=data)
-    payload = resp.json() if resp.content else {}
-    if not payload.get("ok"):
-        raise RuntimeError(payload.get("error") or f"oauth.v2.access HTTP {resp.status_code}")
-    authed = payload.get("authed_user") or {}
-    uid = (authed.get("id") or "").strip()
-    if not uid:
-        raise RuntimeError("Slack OAuth response missing authed_user.id")
-    return uid
 
 
 async def _slack_api(method: str, body: dict[str, Any]) -> dict[str, Any]:
