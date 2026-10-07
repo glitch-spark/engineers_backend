@@ -87,7 +87,7 @@ def test_next_round_replies_moved_in_same_thread_and_updates_main():
     assert calls[0] == ("chat.update", {"channel": "C1", "ts": "111.222", "text": "MAIN"})
     assert [c[0] for c in calls] == ["chat.update", "chat.postMessage"]
     reply = calls[1][1]
-    assert reply["thread_ts"] == "111.222" and reply["text"].startswith(":arrow_right: *Moved to Tech Round 1*")
+    assert reply["thread_ts"] == "111.222" and reply["text"].startswith(":arrow_right: <@U0OWNER001> — *Moved to Tech Round 1*")
 
 
 def test_next_round_with_mark_previous_passed_posts_one_reply():
@@ -99,21 +99,22 @@ def test_next_round_with_mark_previous_passed_posts_one_reply():
 def test_confirm_replies_confirmed():
     interview = iv(rnd("r1", confirmed=True), thread=THREAD)
     _, calls = run(interview, {"r1": round_caller_snapshot(rnd("r1"))})
-    assert calls[1][1]["text"].startswith(":white_check_mark: *Confirmed*")
-    assert calls[1][1]["text"].splitlines()[-1] == "cc <@U0MANAGER1> <@U0OWNER001>"
+    text = calls[1][1]["text"]
+    assert text.startswith(":white_check_mark: <@U0OWNER001> — *Confirmed*")
+    assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
 
 
 def test_reschedule_replies_rescheduled():
     interview = iv(rnd("r1", at=LATER), thread=THREAD)
     _, calls = run(interview, {"r1": round_caller_snapshot(rnd("r1", confirmed=True))})
-    assert calls[1][1]["text"].startswith(":repeat: *Rescheduled*")
+    assert calls[1][1]["text"].startswith(":repeat: <@U0OWNER001> — *Rescheduled*")
 
 
 def test_cancel_replies_canceled():
     interview = iv(rnd("r1", status="canceled"), thread=THREAD)
     _, calls = run(interview, snaps(iv(rnd("r1"))))
     assert [c[0] for c in calls] == ["chat.update", "chat.postMessage"]
-    assert calls[1][1]["text"].startswith(":no_entry: *Canceled*")
+    assert calls[1][1]["text"].startswith(":no_entry: <@U0OWNER001> — *Canceled*")
 
 
 def test_unchanged_write_does_nothing():
@@ -146,7 +147,7 @@ def test_round_deleted_replies_removed_and_describes_remaining_round():
     interview = iv(rnd("r1"), rnd("r2", at=LATER, stage="panel"), thread=THREAD)
     _, calls = run(interview, snaps(interview), deleted={"r2"})
     assert [c[0] for c in calls] == ["chat.update", "chat.postMessage"]
-    assert calls[1][1]["text"].startswith(":wastebasket: *Round removed* — Panel")
+    assert calls[1][1]["text"].startswith(":wastebasket: <@U0OWNER001> — *Round removed* — Panel")
 
 
 def test_interview_delete_removes_main_post_and_old_round_posts():

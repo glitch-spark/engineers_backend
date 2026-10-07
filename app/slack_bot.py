@@ -8,7 +8,7 @@ SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
 Sends an instant DM when an interview is created or meaningfully updated,
 plus a daily digest at each user's chosen time/timezone. A round with a caller
-gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner.
+gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner and the interview managers.
 """
 
 from __future__ import annotations
@@ -399,6 +399,12 @@ def _mention(user: Optional[UserExtra]) -> str:
     return (user.name or user.email or "someone").strip()
 
 
+def cc_line(*users: Optional[UserExtra]) -> Optional[str]:
+    """"cc @a @b": each user once, in order; None when there is nobody to cc."""
+    mentions = dict.fromkeys(_mention(u) for u in users if u is not None)
+    return f"cc {' '.join(mentions)}" if mentions else None
+
+
 def caller_round_text(
     interview: Interview,
     entry: Any,
@@ -408,64 +414,62 @@ def caller_round_text(
     managers: Sequence[UserExtra] = (),
 ) -> str:
     """The interview's #caller main post, describing its latest round: marked canceled once called off,
-    "No caller needed" when that round has no caller."""
+    "No caller needed" when that round has no caller. Ends with a cc line for the interview managers."""
     caller = entry.caller
+    who = _mention(owner)
     when = slack_time(getattr(entry, "scheduledAt", None))
     company = (interview.companyName or "").strip() or "—"
     if caller is None or not caller.enabled:
-        return "\n".join([
-            f":telephone_receiver: *No caller needed for {_stage_label(entry.stage)}* — posted by {_mention(owner)}",
+        lines = [
+            f":telephone_receiver: {who} — *No caller needed* for {_stage_label(entry.stage)}",
             f"*Profile:* {_profile_label(account) or '—'}",
             f"*Company name:* {company}",
             f"*Stage:* {_stage_label(entry.stage)}",
             f"*Interview time:* {when}",
-        ])
-    off = interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
-    job_url = (interview.jobUrl or "").strip()
-    recruiter = (getattr(entry, "interviewerName", None) or "").strip() or "—"
-    flag = _country_flag(account.country if account else None)
-    if flag and recruiter != "—":
-        recruiter = f"{recruiter} {flag}"
-    lines = [
-        (f":x: *CANCELED* — ~Caller needed~ — posted by {_mention(owner)}" if off
-         else f":telephone_receiver: *Caller needed* — posted by {_mention(owner)}"),
-        f"*Profile:* {_profile_label(account) or '—'}",
-        f"*Company name:* {company}",
-        f"*JD Link:* {job_url or '—'}",
-        f"*Recruiter name:* {recruiter}",
-        f"*Stage:* {_stage_label(entry.stage)}",
-        f"*Interview time:* {f'~{when}~' if off else when}",
-        f"*Method:* {_method_text(caller)}",
-        f"*Caller assigned:* {(getattr(caller, 'callerName', '') or '').strip() or 'TBD'}",
-    ]
-    lines.append(f"*Interview manager:* {_managers_text(managers)}")
-    if not off:
-        lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
-                     else ":hourglass_flowing_sand: Not confirmed yet")
-    return "\n".join(lines)
+        ]
+    else:
+        off = interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
+        job_url = (interview.jobUrl or "").strip()
+        recruiter = (getattr(entry, "interviewerName", None) or "").strip() or "—"
+        flag = _country_flag(account.country if account else None)
+        if flag and recruiter != "—":
+            recruiter = f"{recruiter} {flag}"
+        lines = [
+            (f":x: {who} — *Canceled* ~Caller needed~" if off else f":telephone_receiver: {who} — *Caller needed*"),
+            f"*Profile:* {_profile_label(account) or '—'}",
+            f"*Company name:* {company}",
+            f"*JD Link:* {job_url or '—'}",
+            f"*Recruiter name:* {recruiter}",
+            f"*Stage:* {_stage_label(entry.stage)}",
+            f"*Interview time:* {f'~{when}~' if off else when}",
+            f"*Method:* {_method_text(caller)}",
+            f"*Caller assigned:* {(getattr(caller, 'callerName', '') or '').strip() or 'TBD'}",
+        ]
+        if not off:
+            lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
+                         else ":hourglass_flowing_sand: Not confirmed yet")
+    cc = cc_line(*managers)
+    return "\n".join([*lines, cc] if cc else lines)
 
 
-def _managers_text(managers: Sequence[UserExtra]) -> str:
-    return " ".join(_mention(m) for m in managers) or "no interview manager assigned"
-
-
-async def caller_thread_reply(
+def caller_thread_reply(
     event: str, entry: Any, prev: Optional[dict], *, owner: Optional[UserExtra], managers: Sequence[UserExtra],
 ) -> Optional[str]:
-    """The thread reply for a caller_thread_event; ends with a cc line for the interview managers and the owner.
+    """The thread reply for a caller_thread_event: the owner first, a cc line for the interview managers last.
     None for "details" when no listed field changed."""
+    who = _mention(owner)
     stage, when = _stage_label(entry.stage), slack_time(getattr(entry, "scheduledAt", None))
     caller = getattr(entry, "caller", None)
     if event == "moved":
         tail = "needs confirmation" if caller is not None and caller.enabled else "no caller needed"
-        head = f":arrow_right: *Moved to {stage}* — {when} · {tail}"
+        lines = [f":arrow_right: {who} — *Moved to {stage}* — {when} · {tail}"]
     elif event == "removed":
-        head = f":wastebasket: *Round removed* — {stage}"
+        lines = [f":wastebasket: {who} — *Round removed* — {stage}"]
     elif event == "ended":
         status_label = str(interview_status_value(getattr(entry, "status", None)) or "canceled").capitalize()
-        head = f":no_entry: *{status_label}* — {stage} · {when}"
+        lines = [f":no_entry: {who} — *{status_label}* — {stage} · {when}"]
     elif event == "back_on":
-        head = f":white_check_mark: *Back on* — {stage} · {when} · needs confirmation"
+        lines = [f":white_check_mark: {who} — *Back on* — {stage} · {when} · needs confirmation"]
     elif event == "rescheduled":
         old = slack_time((prev or {}).get("time"))
         if getattr(entry, "confirmed", False):  # rescheduled and confirmed in one save
@@ -473,20 +477,21 @@ async def caller_thread_reply(
             tail = f"confirmed, caller {name}"
         else:
             tail = "needs confirmation"
-        head = f":repeat: *Rescheduled* — {old} → {when} · {tail}"
+        lines = [f":repeat: {who} — *Rescheduled* — {old} → {when} · {tail}"]
     elif event == "confirmed":
         name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
-        head = f":white_check_mark: *Confirmed* — {stage} · {when} · caller {name}"
+        lines = [f":white_check_mark: {who} — *Confirmed* — {stage} · {when} · caller {name}"]
     elif event == "unconfirmed":
-        head = f":warning: *Confirmation removed* — {stage} · {when}"
+        lines = [f":warning: {who} — *Confirmation removed* — {stage} · {when}"]
     elif event == "details":
-        lines = _change_lines(prev, entry)
-        if not lines:
+        changes = _change_lines(prev, entry)
+        if not changes:
             return None
-        head = "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
+        lines = [f":pencil2: {who} — *Caller details updated*", *changes]
     else:
         return None
-    return f"{head}\ncc {_managers_text(managers)} {_mention(owner)}"
+    cc = cc_line(*managers)
+    return "\n".join([*lines, cc] if cc else lines)
 
 
 def _snapshot_label(key: str, value: Any) -> str:
@@ -503,11 +508,15 @@ def _snapshot_label(key: str, value: Any) -> str:
 _MESSAGE_GONE = {"message_not_found", "channel_not_found", "cant_update_message"}
 
 
+async def _interview_account(interview: Any) -> Optional[Account]:
+    return await Account.get(interview.accountId) if interview.accountId else None
+
+
 async def _main_post_text(
     interview: Interview, entry: Any, owner: Optional[UserExtra], managers: Sequence[UserExtra] = (),
 ) -> str:
-    account = await Account.get(interview.accountId) if interview.accountId else None
-    return caller_round_text(interview, entry, account=account, owner=owner, managers=managers)
+    return caller_round_text(interview, entry, account=await _interview_account(interview), owner=owner,
+                             managers=managers)
 
 
 async def interview_managers() -> list[UserExtra]:
@@ -609,7 +618,7 @@ async def sync_caller_thread(
         pick = next((ev for ev in events if ev[0] == "moved"), events[-1] if events else None)
         if pick is not None:
             event, entry, prev = pick
-            reply = await caller_thread_reply(event, entry, prev, owner=owner, managers=managers)
+            reply = caller_thread_reply(event, entry, prev, owner=owner, managers=managers)
             if reply:
                 await _slack_api("chat.postMessage", {
                     "channel": thread.channel, "text": reply, "thread_ts": thread.ts,
@@ -899,18 +908,22 @@ def caller_reminder_text(
     *,
     now: datetime,
     owner: Optional[UserExtra],
+    managers: Sequence[UserExtra],
+    account: Optional[Account],
 ) -> str:
     start = _aware_utc(entry.scheduledAt)
     minutes = max(1, math.ceil((start - _aware_utc(now)).total_seconds() / 60))
     company = (getattr(interview, "companyName", None) or "").strip() or "—"
     caller = entry.caller
-    return "\n".join([
+    lines = [
         f":alarm_clock: *Starting in {minutes} min* — {slack_time(start, with_day=False)}"
         f" · {_stage_label(entry.stage)} · {company}",
+        f"*Profile:* {_profile_label(account) or '—'}",
         f"*Method:* {_method_text(caller)}",
         f"*Caller assigned:* {(caller.callerName or '').strip() or 'TBD'}",
-        _mention(owner),
-    ])
+    ]
+    cc = cc_line(owner, *managers)
+    return "\n".join([*lines, cc] if cc else lines)
 
 
 async def _reminder_load(start: datetime, end: datetime) -> list:
@@ -957,8 +970,12 @@ async def _reminder_post(interview: Any, entry: Any, text: str) -> bool:
         return False
 
 
-async def _reminder_people(interview: Any, entry: Any) -> Optional[UserExtra]:
-    return await UserExtra.get(interview.createdBy)
+async def _reminder_people(
+    interview: Any, entry: Any,
+) -> tuple[Optional[UserExtra], list[UserExtra], Optional[Account]]:
+    """The interview's owner, every interview manager, and its profile account."""
+    owner, managers = await _owner_and_managers(interview)
+    return owner, managers, await _interview_account(interview)
 
 
 def _reminder_configured() -> bool:
@@ -987,8 +1004,8 @@ async def run_caller_reminders(
             continue
         ok = False
         try:
-            owner = await people(iv, entry)
-            text = caller_reminder_text(iv, entry, now=now, owner=owner)
+            owner, managers, account = await people(iv, entry)
+            text = caller_reminder_text(iv, entry, now=now, owner=owner, managers=managers, account=account)
             ok = await post(iv, entry, text)
         except Exception as exc:
             log.warning("slack_bot caller reminder failed for round %s: %s", entry.id, exc)
@@ -1020,21 +1037,24 @@ def _day_title(day: date) -> str:
     return f"{day:%a} {day:%b} {day.day}"
 
 
-def caller_daily_text(day: date, rows: list[dict[str, Any]]) -> str:
-    """The list for `day`: one line per confirmed caller round, by start time."""
+def caller_daily_text(day: date, rows: list[dict[str, Any]], managers: Sequence[UserExtra]) -> str:
+    """The list for `day`: one line per confirmed caller round, by start time, tagging each round's owner,
+    then one cc line for the interview managers."""
+    title = f":alarm_clock: *Caller interviews today* — {_day_title(day)}"
     if not rows:
-        return f":telephone_receiver: No confirmed caller interviews today ({_day_title(day)})."
-    lines = [f":telephone_receiver: *Caller interviews today — {_day_title(day)}*"]
+        return f"{title} · none confirmed."
+    lines = [title]
     for r in sorted(rows, key=lambda r: r["start"]):
         parts = [slack_time(r["start"], with_day=False), r["company"], r["stage"], r["profile"],
                  f"caller {r['callerName']}", r["method"]]
-        line = " · ".join(p for p in parts if p)
+        line = "• " + " · ".join(p for p in parts if p)
         if r["mentions"]:
             line += f" — {r['mentions']}"
         if r["link"]:
             line += f" · <{r['link']}|thread>"
         lines.append(line)
-    return "\n".join(lines)
+    cc = cc_line(*managers)
+    return "\n".join([*lines, cc] if cc else lines)
 
 
 def _is_listed(entry: Any, start: datetime, end: datetime) -> bool:
@@ -1057,9 +1077,10 @@ async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, 
 
 
 async def _caller_daily_people(interview: Any, entry: Any) -> dict[str, Any]:
-    owner, managers = await _owner_and_managers(interview)
-    account = await Account.get(interview.accountId) if interview.accountId else None
-    return {"owner": owner, "managers": managers, "profile": _profile_label(account)}
+    return {
+        "owner": await UserExtra.get(interview.createdBy),
+        "profile": _profile_label(await _interview_account(interview)),
+    }
 
 
 async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
@@ -1107,6 +1128,7 @@ async def run_caller_daily(
     release=_reminder_release,
     post=_caller_daily_post,
     people=_caller_daily_people,
+    managers=interview_managers,
     permalink=_caller_daily_permalink,
     configured=_caller_daily_configured,
 ) -> str:
@@ -1129,8 +1151,6 @@ async def run_caller_daily(
         rows = []
         for iv, entry in await load(start, end):
             who = await people(iv, entry)
-            users = [who["owner"], *who["managers"]]
-            mentions = " ".join(dict.fromkeys(_mention(u) for u in users if u is not None))
             rows.append({
                 "start": _aware_utc(entry.scheduledAt),
                 "company": (iv.companyName or "").strip() or "—",
@@ -1138,10 +1158,10 @@ async def run_caller_daily(
                 "profile": who["profile"],
                 "callerName": (entry.caller.callerName or "").strip() or "TBD",
                 "method": _METHOD_LABELS.get(entry.caller.method or "", ""),
-                "mentions": mentions,
+                "mentions": _mention(who["owner"]),
                 "link": await permalink(iv, entry),
             })
-        ok = await post(channel, caller_daily_text(day, rows))
+        ok = await post(channel, caller_daily_text(day, rows, await managers()))
     except Exception as exc:
         log.warning("slack_bot caller daily list failed: %s", exc)
     if not ok:

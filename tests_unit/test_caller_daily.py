@@ -55,25 +55,44 @@ def test_bounds_on_dst_day_are_25_hours():
 # --- text -----------------------------------------------------------------------------------------
 
 
+OWNER = SimpleNamespace(name="Pedro", email="p@x.io", slackUserId="U0OWNER001")
+MANAGER = SimpleNamespace(name="Maria", email="m@x.io", slackUserId="U0MANAGER1")
+
+
 def row(hh, company, **kw):
     base = dict(start=chi(DAY, hh), company=company, stage="Intro", profile="Ian Meron", callerName="Sam",
-                method="Video call", mentions="<@U0OWNER001> <@U0MANAGER1>", link="https://slack.example/p1")
+                method="Video meeting", mentions="<@U0OWNER001>", link="https://slack.example/p1")
     base.update(kw)
     return base
 
 
-def test_text_lists_rows_with_mentions_and_link():
-    text = caller_daily_text(DAY, [row(14, "Beta"), row(9, "Acme", link=None)])
+def test_daily_list_owner_per_line_managers_once():
+    text = caller_daily_text(DAY, [row(10, "Acme")], [MANAGER])
+    assert text.splitlines()[0] == ":alarm_clock: *Caller interviews today* — Wed Oct 7"
+    assert text.splitlines()[1].startswith("• ")
+    assert text.splitlines()[1].endswith("— <@U0OWNER001> · <https://slack.example/p1|thread>")
+    assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
+    assert caller_daily_text(DAY, [], []) == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed."
+
+
+def test_text_lists_rows_by_start_with_owner_and_link():
+    text = caller_daily_text(DAY, [row(14, "Beta"), row(9, "Acme", link=None)], [MANAGER])
     lines = text.splitlines()
-    assert lines[0] == ":telephone_receiver: *Caller interviews today — Wed Oct 7*"
-    assert lines[1] == (f"{slack_time(chi(DAY, 9), with_day=False)} · Acme · Intro · Ian Meron · caller Sam · Video call"
-                        " — <@U0OWNER001> <@U0MANAGER1>")
-    assert lines[2].endswith(" — <@U0OWNER001> <@U0MANAGER1> · <https://slack.example/p1|thread>")
+    assert len(lines) == 4
+    assert lines[1] == (f"• {slack_time(chi(DAY, 9), with_day=False)} · Acme · Intro · Ian Meron · caller Sam"
+                        " · Video meeting — <@U0OWNER001>")
+    assert lines[2].endswith(" — <@U0OWNER001> · <https://slack.example/p1|thread>")
     assert "Beta" in lines[2]
 
 
-def test_text_empty_day():
-    assert caller_daily_text(DAY, []) == ":telephone_receiver: No confirmed caller interviews today (Wed Oct 7)."
+def test_text_cc_names_every_manager_and_leaves_out_none():
+    two = caller_daily_text(DAY, [row(9, "Acme")], [MANAGER, SimpleNamespace(name="Ana", email="a@x.io", slackUserId=None)])
+    assert two.splitlines()[-1] == "cc <@U0MANAGER1> Ana"
+    assert "cc " not in caller_daily_text(DAY, [row(9, "Acme")], [])
+
+
+def test_text_empty_day_is_one_line_even_with_managers():
+    assert caller_daily_text(DAY, [], [MANAGER]) == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed."
 
 
 # --- run ------------------------------------------------------------------------------------------
@@ -82,6 +101,7 @@ def test_text_empty_day():
 class Fake:
     def __init__(self, rows=(), post_ok=True):
         self.claimed, self.released, self.posts, self.rows, self.post_ok = set(), [], [], list(rows), post_ok
+        self.owner, self.manager_calls = OWNER, 0
 
     async def load(self, start, end):
         self.window = (start, end)
@@ -102,9 +122,11 @@ class Fake:
         return self.post_ok
 
     async def people(self, iv, entry):
-        return {"owner": SimpleNamespace(name="Pedro", email="p@x.io", slackUserId="U0OWNER001"),
-                "managers": [SimpleNamespace(name="Maria", email="m@x.io", slackUserId=None)],
-                "profile": "Ian Meron"}
+        return {"owner": self.owner, "profile": "Ian Meron"}
+
+    async def managers(self):
+        self.manager_calls += 1
+        return [SimpleNamespace(name="Maria", email="m@x.io", slackUserId=None)]
 
     async def permalink(self, iv, entry):
         return "https://slack.example/p1"
@@ -112,7 +134,7 @@ class Fake:
     def run(self, now, configured=("C_DAILY", FIVE, CHI)):
         return asyncio.run(run_caller_daily(
             now, load=self.load, claim=self.claim, release=self.release, post=self.post,
-            people=self.people, permalink=self.permalink, configured=lambda: configured,
+            people=self.people, managers=self.managers, permalink=self.permalink, configured=lambda: configured,
         ))
 
 
@@ -132,9 +154,24 @@ def test_posts_once_per_day():
     assert len(fake.posts) == 1
     channel, text = fake.posts[0]
     assert channel == "C_DAILY" and "Acme" in text
-    assert text.splitlines()[1].endswith(" — <@U0OWNER001> Maria · <https://slack.example/p1|thread>")  # de-duplicated
+    assert text.splitlines()[1].endswith(" — <@U0OWNER001> · <https://slack.example/p1|thread>")
+    assert text.splitlines()[-1] == "cc Maria"
     assert fake.window == caller_daily_bounds(DAY, CHI)
     assert fake.claimed == {"caller-daily:2026-10-07"}
+
+
+def test_managers_are_loaded_once_for_the_whole_list():
+    fake = Fake(rows=[(IV, caller_round(9)), (IV, caller_round(11)), (IV, caller_round(13))])
+    assert fake.run(chi(DAY, 5, 2)) == "posted"
+    assert fake.manager_calls == 1
+    assert len(fake.posts[0][1].splitlines()) == 5  # title, three rows, one cc
+
+
+def test_missing_owner_reads_someone():
+    fake = Fake(rows=[(IV, caller_round())])
+    fake.owner = None
+    assert fake.run(chi(DAY, 5, 2)) == "posted"
+    assert fake.posts[0][1].splitlines()[1].endswith(" — someone · <https://slack.example/p1|thread>")
 
 
 def test_not_due_before_five():
@@ -145,7 +182,7 @@ def test_not_due_before_five():
 def test_catch_up_later_that_day_posts():
     fake = Fake()
     assert fake.run(chi(DAY, 11, 40)) == "posted"
-    assert fake.posts[0][1] == ":telephone_receiver: No confirmed caller interviews today (Wed Oct 7)."
+    assert fake.posts[0][1] == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed."
 
 
 def test_failed_post_releases_claim():
@@ -196,6 +233,23 @@ async def test_only_confirmed_active_rounds_are_loaded(db):
 
     rows = await slack_bot._caller_daily_load(*caller_daily_bounds(DAY, CHI))
     assert sorted((iv.companyName, e.scheduledAt.hour) for iv, e in rows) == [("Both", 21), ("Yes", 14)]
+
+
+async def test_daily_people_are_the_owner_and_profile_only():
+    from beanie import init_beanie
+    from mongomock_motor import AsyncMongoMockClient
+
+    from app.models import Account, UserExtra
+
+    await init_beanie(database=AsyncMongoMockClient()["daily-people"], document_models=[Account, UserExtra])
+    owner = await UserExtra(name="Ann", email="ann@x.io", slackUserId="UA").insert()
+    await UserExtra(name="Ben", email="ben@x.io", role="interview_manager").insert()
+    account = await Account(name="Ian Meron", createdBy=owner.id).insert()
+
+    who = await slack_bot._caller_daily_people(SimpleNamespace(createdBy=owner.id, accountId=account.id), None)
+    assert set(who) == {"owner", "profile"} and who["owner"].id == owner.id and who["profile"] == "Ian Meron"
+    who = await slack_bot._caller_daily_people(SimpleNamespace(createdBy=owner.id, accountId=None), None)
+    assert who["profile"] == ""
 
 
 # --- cron order -------------------------------------------------------------------------------

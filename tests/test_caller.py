@@ -158,7 +158,7 @@ def test_caller_round_text_with_and_without_details():
         ),
     )
     text = caller_round_text(iv, entry, account=account, owner=_user("A", "UA"))
-    assert text.startswith(":telephone_receiver: *Caller needed* — posted by <@UA>")
+    assert text.startswith(":telephone_receiver: <@UA> — *Caller needed*")
     assert "*Profile:* Orion Osborn" in text
     assert "*Company name:* Wikimedia" in text
     assert "*JD Link:* https://job-boards.greenhouse.io/wikimedia/jobs/7919287" in text
@@ -167,14 +167,15 @@ def test_caller_round_text_with_and_without_details():
     assert f"*Interview time:* {slack_time(START)}" in text
     assert "*Method:* Phone (Hushed) — +1 555 0100" in text
     assert "*Caller assigned:* TBD" in text
-    assert "*Coworkers:*" not in text
+    assert "*Coworkers:*" not in text and "*Interview manager:*" not in text
+    assert "cc " not in text  # no interview managers to cc
 
     entry.interviewerName = None
     entry.caller = InterviewCaller(enabled=True)
     text = caller_round_text(iv, entry, account=account, owner=_user("A"))
     assert "*Recruiter name:* —" in text
     assert "*Method:* TBD" in text
-    assert "CANCELED" not in text
+    assert "Canceled" not in text
 
 
 def test_caller_round_text_marks_canceled_rounds():
@@ -183,9 +184,19 @@ def test_caller_round_text_marks_canceled_rounds():
         stage="intro", scheduledAt=START, status="canceled", interviewerName=None,
         caller=InterviewCaller(enabled=True, startsAt=START),
     )
-    for status, enabled in (("canceled", True), ("rejected", True), ("scheduled", False)):
+    for status in ("canceled", "rejected"):
         entry.status = status
-        entry.caller.enabled = enabled
         text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"))
-        assert text.startswith(":x: *CANCELED* — ~Caller needed~ — posted by <@UA>")
+        assert text.startswith(":x: <@UA> — *Canceled* ~Caller needed~")
         assert f"*Interview time:* ~{slack_time(START)}~" in text
+
+
+def test_caller_round_text_without_a_caller_needs_none():
+    iv = _iv(OWNER, company="Wikimedia")
+    entry = SimpleNamespace(
+        stage="intro", scheduledAt=START, status="scheduled", interviewerName=None,
+        caller=InterviewCaller(enabled=False, startsAt=START),
+    )
+    text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"))
+    assert text.splitlines()[0] == ":telephone_receiver: <@UA> — *No caller needed* for Intro"
+    assert f"*Interview time:* {slack_time(START)}" in text

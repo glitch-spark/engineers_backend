@@ -69,13 +69,38 @@ def _user(name, slack=None):
     return SimpleNamespace(name=name, email=f"{name}@x.com", slackUserId=slack)
 
 
-def test_reminder_text_tags_the_owner():
+OWNER, MANAGER = _user("Ann", "UA"), _user("Ben", "UB")
+ACCOUNT = SimpleNamespace(name="Ian Meron")
+
+
+def test_reminder_text_tags_owner_and_managers():
     r = _round(27, stage="tech")
-    text = caller_reminder_text(_iv(r, company="Globex"), r, now=NOW, owner=_user("Ann", "UA"))
-    assert text.startswith(":alarm_clock: *Starting in 27 min* — ")
-    assert slack_time(r.scheduledAt, with_day=False) in text
-    assert "Globex" in text and "https://meet.example/x" in text and "Sam" in text
-    assert text.splitlines()[-1] == "<@UA>"
+    text = caller_reminder_text(_iv(r, company="Globex"), r, now=NOW, owner=OWNER, managers=[MANAGER], account=ACCOUNT)
+    assert text.splitlines() == [
+        f":alarm_clock: *Starting in 27 min* — {slack_time(r.scheduledAt, with_day=False)} · Tech · Globex",
+        "*Profile:* Ian Meron",
+        "*Method:* Video meeting — <https://meet.example/x|https://meet.example/x>",
+        "*Caller assigned:* Sam",
+        "cc <@UA> <@UB>",
+    ]
+
+
+def test_reminder_text_without_account_or_managers():
+    r = _round(27)
+    text = caller_reminder_text(_iv(r), r, now=NOW, owner=OWNER, managers=[], account=None)
+    assert "*Profile:* —" in text and text.splitlines()[-1] == "cc <@UA>"
+
+
+def test_reminder_cc_lists_the_owner_once_when_also_a_manager():
+    r = _round(27)
+    text = caller_reminder_text(_iv(r), r, now=NOW, owner=OWNER, managers=[OWNER, MANAGER], account=None)
+    assert text.splitlines()[-1] == "cc <@UA> <@UB>"
+
+
+def test_reminder_without_anyone_to_cc_has_no_cc_line():
+    r = _round(27)
+    text = caller_reminder_text(_iv(r), r, now=NOW, owner=None, managers=[], account=None)
+    assert "cc " not in text and text.splitlines()[-1] == "*Caller assigned:* Sam"
 
 
 class _Fakes:
@@ -105,7 +130,7 @@ class _Fakes:
         return self.post_ok
 
     async def people(self, iv, entry):
-        return _user("Ann", "UA")
+        return OWNER, [MANAGER], ACCOUNT
 
 
 def _run(fakes, now=NOW):
@@ -125,6 +150,13 @@ def test_reminder_sent_once_per_start_time():
     assert _run(fakes, NOW + timedelta(minutes=10)) == {"sent": 1, "failed": 0}
 
 
+def test_reminder_run_posts_profile_and_cc_from_people():
+    fakes = _Fakes([_iv(_round(28))])
+    assert _run(fakes) == {"sent": 1, "failed": 0}
+    lines = fakes.posts[0][1].splitlines()
+    assert lines[1] == "*Profile:* Ian Meron" and lines[-1] == "cc <@UA> <@UB>"
+
+
 def test_failed_post_releases_the_claim():
     r = _round(28)
     fakes = _Fakes([_iv(r)], post_ok=False)
@@ -142,3 +174,28 @@ def test_nothing_when_slack_is_off():
     ))
     assert res == {"sent": 0, "failed": 0}
     assert fakes.posts == []
+
+
+# --- who the reminder tags (mongomock) ----------------------------------------------------------
+
+
+async def test_reminder_people_are_owner_managers_and_account():
+    from beanie import init_beanie
+    from mongomock_motor import AsyncMongoMockClient
+
+    from app import slack_bot
+    from app.models import Account, UserExtra
+
+    await init_beanie(database=AsyncMongoMockClient()["reminder-unit"], document_models=[Account, UserExtra])
+    owner = await UserExtra(name="Ann", email="ann@x.io", slackUserId="UA").insert()
+    await UserExtra(name="Zed", email="zed@x.io", role="interview_manager").insert()
+    await UserExtra(name="Ben", email="ben@x.io", role="interview_manager").insert()
+    account = await Account(name="Ian Meron", createdBy=owner.id).insert()
+    iv = SimpleNamespace(createdBy=owner.id, accountId=account.id)
+
+    got_owner, managers, got_account = await slack_bot._reminder_people(iv, None)
+    assert got_owner.id == owner.id and [m.name for m in managers] == ["Ben", "Zed"]
+    assert got_account.name == "Ian Meron"
+
+    got_owner, _, got_account = await slack_bot._reminder_people(SimpleNamespace(createdBy=owner.id, accountId=None), None)
+    assert got_owner.id == owner.id and got_account is None
