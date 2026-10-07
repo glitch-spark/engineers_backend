@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 
+from beanie import PydanticObjectId
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
@@ -46,7 +47,10 @@ class UserExtra(TimestampedDocument):
     freeLlmMaxTokens: Optional[int] = None
     freeLlmKeyVerified: bool = False
 
-    # Slack interview bot — private daily digest DMs.
+    # Who coordinates this user's caller interviews in Slack (another user; set by admins).
+    interviewManagerId: Optional[PydanticObjectId] = None
+
+    # Slack interview bot. slackUserId is the member ID the user types in (U…): DMs and @-mentions.
     slackUserId: Optional[str] = None
     slackAlertsEnabled: bool = True
     slackTimezone: Optional[str] = None  # IANA, e.g. America/New_York

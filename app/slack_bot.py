@@ -15,22 +15,28 @@ calls the user joins as a coworker. A round with a caller gets a reply in its
 from __future__ import annotations
 
 import logging
+import re
 import math
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional
-from urllib.parse import urlencode
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
 from beanie import PydanticObjectId
 
-from app.interview_caller import ENDED_STATUSES, caller_change_lines, round_caller_snapshot
+from app.interview_caller import (
+    ENDED_STATUSES,
+    caller_change_lines,
+    caller_is_on,
+    caller_thread_event,
+    round_caller_snapshot,
+)
 from app.interview_normalize import interview_status_value
 
 from app.config import get_settings
 from app.know_your_why import know_your_why_for_date
 from app.models import Account, Interview, UserExtra
-from app.models.interview import InterviewStatus
+from app.models.interview import InterviewStatus, SlackThread
 from app.models.slack_alert_log import SlackAlertLog
 from app.slack_timezones import (
     format_gmt_offset,
@@ -41,22 +47,23 @@ from app.slack_timezones import (
 
 log = logging.getLogger(__name__)
 
-_SLACK_AUTHORIZE = "https://slack.com/oauth/v2/authorize"
-_SLACK_TOKEN = "https://slack.com/api/oauth.v2.access"
 _SLACK_API = "https://slack.com/api"
-_USER_SCOPE = "identity.basic"
+# A Slack member ID as shown under Profile → ⋮ → Copy member ID.
+_SLACK_MEMBER_ID = re.compile(r"[UW][A-Z0-9]{8,11}")
 
 
 def slack_bot_configured() -> bool:
     return bool((get_settings().SLACK_BOT_TOKEN or "").strip())
 
 
-def slack_oauth_configured() -> bool:
-    s = get_settings()
-    return bool(
-        (s.SLACK_CLIENT_ID or "").strip()
-        and (s.SLACK_CLIENT_SECRET or "").strip()
-    )
+def normalize_slack_id(raw: Optional[str]) -> Optional[str]:
+    """A typed Slack member ID, trimmed and upper-cased; None for blank. Raises ValueError when malformed."""
+    value = (raw or "").strip().upper()
+    if not value:
+        return None
+    if not _SLACK_MEMBER_ID.fullmatch(value):
+        raise ValueError("Enter your Slack member ID, like U04ABC12345 (Slack profile → ⋮ → Copy member ID)")
+    return value
 
 
 def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
@@ -69,42 +76,6 @@ def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
 
 def _frontend_link(path: str) -> str:
     return f"{get_settings().FRONTEND_ORIGIN.rstrip('/')}{path}"
-
-
-def build_oauth_authorize_url(*, state: str) -> str:
-    s = get_settings()
-    if not slack_oauth_configured():
-        raise RuntimeError("Slack OAuth is not configured")
-    params = {
-        "client_id": s.SLACK_CLIENT_ID,
-        "user_scope": _USER_SCOPE,
-        "redirect_uri": s.SLACK_OAUTH_REDIRECT_URI,
-        "state": state,
-    }
-    return f"{_SLACK_AUTHORIZE}?{urlencode(params)}"
-
-
-async def exchange_oauth_code(code: str) -> str:
-    """Exchange OAuth code → Slack user id (U…). Raises on failure."""
-    s = get_settings()
-    if not slack_oauth_configured():
-        raise RuntimeError("Slack OAuth is not configured")
-    data = {
-        "client_id": s.SLACK_CLIENT_ID,
-        "client_secret": s.SLACK_CLIENT_SECRET,
-        "code": code,
-        "redirect_uri": s.SLACK_OAUTH_REDIRECT_URI,
-    }
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(_SLACK_TOKEN, data=data)
-    payload = resp.json() if resp.content else {}
-    if not payload.get("ok"):
-        raise RuntimeError(payload.get("error") or f"oauth.v2.access HTTP {resp.status_code}")
-    authed = payload.get("authed_user") or {}
-    uid = (authed.get("id") or "").strip()
-    if not uid:
-        raise RuntimeError("Slack OAuth response missing authed_user.id")
-    return uid
 
 
 async def _slack_api(method: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -436,12 +407,22 @@ def caller_round_text(
     account: Optional[Account],
     owner: Optional[UserExtra],
     coworkers: list[UserExtra],
+    manager: Optional[UserExtra] = None,
 ) -> str:
-    """The #caller main post for one round; marked canceled once called off."""
+    """The interview's #caller main post, describing its latest round: marked canceled once called off,
+    "No caller needed" when that round has no caller."""
     caller = entry.caller
-    off = not caller.enabled or interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
     when = slack_time(getattr(entry, "scheduledAt", None))
     company = (interview.companyName or "").strip() or "—"
+    if caller is None or not caller.enabled:
+        return "\n".join([
+            f":telephone_receiver: *No caller needed for {_stage_label(entry.stage)}* — posted by {_mention(owner)}",
+            f"*Profile:* {_profile_label(account) or '—'}",
+            f"*Company name:* {company}",
+            f"*Stage:* {_stage_label(entry.stage)}",
+            f"*Interview time:* {when}",
+        ])
+    off = interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
     job_url = (interview.jobUrl or "").strip()
     recruiter = (getattr(entry, "interviewerName", None) or "").strip() or "—"
     flag = _country_flag(account.country if account else None)
@@ -461,7 +442,55 @@ def caller_round_text(
     ]
     if coworkers:
         lines.append(f"*Coworkers:* {' '.join(_mention(u) for u in coworkers)}")
+    lines.append(f"*Interview manager:* {_manager_text(manager)}")
+    if not off:
+        lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
+                     else ":hourglass_flowing_sand: Not confirmed yet")
     return "\n".join(lines)
+
+
+def _manager_text(manager: Optional[UserExtra]) -> str:
+    return _mention(manager) if manager is not None else "no interview manager assigned"
+
+
+async def caller_thread_reply(
+    event: str, entry: Any, prev: Optional[dict], *, owner: Optional[UserExtra], manager: Optional[UserExtra],
+) -> Optional[str]:
+    """The thread reply for a caller_thread_event; ends with a cc line for the manager and the owner.
+    None for "details" when no listed field changed."""
+    stage, when = _stage_label(entry.stage), slack_time(getattr(entry, "scheduledAt", None))
+    caller = getattr(entry, "caller", None)
+    if event == "moved":
+        tail = "needs confirmation" if caller is not None and caller.enabled else "no caller needed"
+        head = f":arrow_right: *Moved to {stage}* — {when} · {tail}"
+    elif event == "removed":
+        head = f":wastebasket: *Round removed* — {stage}"
+    elif event == "ended":
+        status_label = str(interview_status_value(getattr(entry, "status", None)) or "canceled").capitalize()
+        head = f":no_entry: *{status_label}* — {stage} · {when}"
+    elif event == "back_on":
+        head = f":white_check_mark: *Back on* — {stage} · {when} · needs confirmation"
+    elif event == "rescheduled":
+        old = slack_time((prev or {}).get("time"))
+        if getattr(entry, "confirmed", False):  # rescheduled and confirmed in one save
+            name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
+            tail = f"confirmed, caller {name}"
+        else:
+            tail = "needs confirmation"
+        head = f":repeat: *Rescheduled* — {old} → {when} · {tail}"
+    elif event == "confirmed":
+        name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
+        head = f":white_check_mark: *Confirmed* — {stage} · {when} · caller {name}"
+    elif event == "unconfirmed":
+        head = f":warning: *Confirmation removed* — {stage} · {when}"
+    elif event == "details":
+        lines = await _change_lines(prev, entry)
+        if not lines:
+            return None
+        head = "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
+    else:
+        return None
+    return f"{head}\ncc {_manager_text(manager)} {_mention(owner)}"
 
 
 def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
@@ -480,14 +509,121 @@ def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
 _MESSAGE_GONE = {"message_not_found", "channel_not_found", "cant_update_message"}
 
 
-async def _main_post_text(interview: Interview, entry: Any, owner: Optional[UserExtra]) -> str:
+async def _main_post_text(
+    interview: Interview, entry: Any, owner: Optional[UserExtra], manager: Optional[UserExtra] = None,
+) -> str:
     caller = entry.caller
     account = await Account.get(interview.accountId) if interview.accountId else None
-    coworkers = (
-        await UserExtra.find({"_id": {"$in": list(caller.coworkerIds)}}).to_list()
-        if caller.coworkerIds else []
-    )
-    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers)
+    ids = list(caller.coworkerIds) if caller is not None and caller.enabled else []
+    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
+    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers, manager=manager)
+
+
+async def _owner_and_manager(interview: Any) -> tuple[Optional[UserExtra], Optional[UserExtra]]:
+    """The interview's owner and the owner's interview manager (None when unassigned)."""
+    owner = await UserExtra.get(interview.createdBy)
+    manager_id = getattr(owner, "interviewManagerId", None) if owner else None
+    return owner, (await UserExtra.get(manager_id) if manager_id else None)
+
+
+async def _post_main(channel: str, text: str) -> Optional[str]:
+    res = await _slack_api("chat.postMessage", {
+        "channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False,
+    })
+    return res.get("ts") or None
+
+
+async def sync_caller_thread(
+    interview: Any,
+    before: dict[str, Optional[dict]],
+    *,
+    added: Iterable[str] = (),
+    deleted: Iterable[str] = (),
+) -> bool:
+    """Keep the interview's single #caller thread in step with a write. Never raises.
+
+    `before` holds each round's caller snapshot from before the write; `added` the rounds just appended;
+    `deleted` the rounds being removed (all of them when the interview is deleted, which removes the
+    main post and any older per-round posts). The first round with a caller on creates the thread; an
+    interview that still has per-round posts adopts its latest one. Afterwards the main post is edited to
+    describe the latest round and one thread reply says what changed. Returns True when
+    `interview.slackThread` changed (the caller saves it).
+    """
+    try:
+        channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
+        if not channel or not slack_bot_configured():
+            return False
+        added, deleted = set(added), set(deleted)
+        rounds = [e for e in (interview.stageHistory or []) if e.id]
+        thread = interview.slackThread
+        if rounds and all(e.id in deleted for e in rounds):
+            posts = {thread.ts: thread.channel} if thread else {}
+            for e in rounds:
+                ts = (getattr(e.caller, "slackChannelTs", None) or "").strip()
+                if ts:
+                    posts.setdefault(ts, channel)
+            for ts, ch in posts.items():
+                await _slack_api("chat.delete", {"channel": ch, "ts": ts})
+            return False
+        live = [e for e in rounds if e.id not in deleted]
+        if not live:
+            return False
+        latest = live[-1]
+
+        changed = False
+        if thread is None:
+            legacy = next((e for e in reversed(rounds) if (getattr(e.caller, "slackChannelTs", None) or "").strip()), None)
+            if legacy is not None:
+                thread = SlackThread(channel=channel, ts=legacy.caller.slackChannelTs.strip())
+                interview.slackThread, changed = thread, True
+            else:
+                if not any(caller_is_on(round_caller_snapshot(e)) for e in live):
+                    return False
+                owner, manager = await _owner_and_manager(interview)
+                ts = await _post_main(channel, await _main_post_text(interview, latest, owner, manager))
+                if ts:
+                    interview.slackThread = SlackThread(channel=channel, ts=ts)
+                return bool(ts)
+
+        events, touched = [], False
+        for e in rounds:
+            prev = before.get(e.id)
+            new = None if e.id in deleted else round_caller_snapshot(e)
+            if prev != new or e.id in added or e.id in deleted:
+                touched = True
+            event = caller_thread_event(prev, new, added=e.id in added, removed=e.id in deleted)
+            if event:
+                events.append((event, e, prev))
+        if not touched:
+            return changed
+
+        owner, manager = await _owner_and_manager(interview)
+        text = await _main_post_text(interview, latest, owner, manager)
+        try:
+            await _slack_api("chat.update", {"channel": thread.channel, "ts": thread.ts, "text": text})
+        except RuntimeError as exc:
+            if str(exc) not in _MESSAGE_GONE:
+                raise
+            log.info("slack_bot caller thread %s gone (%s)", thread.ts, exc)
+            ts = await _post_main(thread.channel, text)
+            if ts:
+                interview.slackThread = SlackThread(channel=thread.channel, ts=ts)
+            return bool(ts) or changed
+
+        # One reply per write: a new round says "moved"; otherwise the latest round that changed.
+        pick = next((ev for ev in events if ev[0] == "moved"), events[-1] if events else None)
+        if pick is not None:
+            event, entry, prev = pick
+            reply = await caller_thread_reply(event, entry, prev, owner=owner, manager=manager)
+            if reply:
+                await _slack_api("chat.postMessage", {
+                    "channel": thread.channel, "text": reply, "thread_ts": thread.ts,
+                    "unfurl_links": False, "unfurl_media": False,
+                })
+        return changed
+    except Exception as exc:
+        log.warning("slack_bot caller thread sync failed for %s: %s", getattr(interview, "id", "?"), exc)
+        return False
 
 
 async def _change_lines(prev: Optional[dict], entry: Any) -> list[str]:
@@ -500,70 +636,6 @@ async def _change_lines(prev: Optional[dict], entry: Any) -> list[str]:
     return caller_change_lines(
         prev, new, fmt_time=slack_time, label=lambda k, v: _snapshot_label(k, v, mentions),
     )
-
-
-async def _thread_reply(interview: Interview, entry: Any, kind: str, owner, prev: Optional[dict]) -> Optional[str]:
-    if kind == "canceled":
-        return f":no_entry: *Canceled* — {_stage_label(entry.stage)} · {slack_time(entry.scheduledAt)}"
-    lines = await _change_lines(prev, entry)
-    if kind == "restored":
-        return "\n".join([f":white_check_mark: *Back on* — by {_mention(owner)}", *lines])
-    if not lines:
-        return None
-    return "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
-
-
-async def notify_round_caller(
-    interview: Interview,
-    entry: Any,
-    kind: str,
-    *,
-    prev: Optional[dict] = None,
-) -> Optional[str]:
-    """Bring a round's #caller post in line with `kind`. Never raises.
-
-    created → new main post; updated / canceled / restored → main post edited
-    in place plus a thread reply saying what changed; deleted → main post
-    removed. A main post deleted by hand in Slack is posted again (not for
-    canceled). Returns the live main post's ts, or None.
-    """
-    try:
-        caller = getattr(entry, "caller", None)
-        channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
-        if caller is None or not channel or not slack_bot_configured():
-            return None
-        parent = (caller.slackChannelTs or "").strip() or None
-        if kind == "deleted":
-            if parent:
-                await _slack_api("chat.delete", {"channel": channel, "ts": parent})
-            return None
-        owner = await UserExtra.get(interview.createdBy)
-        text = await _main_post_text(interview, entry, owner)
-        if parent and kind != "created":
-            try:
-                await _slack_api("chat.update", {"channel": channel, "ts": parent, "text": text})
-            except RuntimeError as exc:
-                if str(exc) not in _MESSAGE_GONE:
-                    raise
-                log.info("slack_bot caller post %s gone (%s)", parent, exc)
-                parent = None
-        if parent and kind != "created":
-            reply = await _thread_reply(interview, entry, kind, owner, prev)
-            if reply:
-                await _slack_api("chat.postMessage", {
-                    "channel": channel, "text": reply, "thread_ts": parent,
-                    "unfurl_links": False, "unfurl_media": False,
-                })
-            return parent
-        if kind == "canceled":
-            return None
-        res = await _slack_api("chat.postMessage", {
-            "channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False,
-        })
-        return res.get("ts") or None
-    except Exception as exc:
-        log.warning("slack_bot round caller post failed kind=%s: %s", kind, exc)
-        return None
 
 
 def _slack_escape(text: str) -> str:
@@ -944,10 +1016,14 @@ async def _reminder_release(key: str) -> None:
 
 
 async def _reminder_post(interview: Any, entry: Any, text: str) -> bool:
-    """Reply in the round's #caller thread, or post to #caller when it has none."""
+    """Reply in the interview's #caller thread (or the round's older post), else post to #caller."""
     channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
+    thread = getattr(interview, "slackThread", None)
+    if thread is not None:
+        channel, parent = thread.channel, thread.ts
+    else:
+        parent = (entry.caller.slackChannelTs or "").strip()
     body = {"channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False}
-    parent = (entry.caller.slackChannelTs or "").strip()
     try:
         try:
             await _slack_api("chat.postMessage", {**body, "thread_ts": parent} if parent else body)
@@ -1006,16 +1082,174 @@ async def run_caller_reminders(
     return {"sent": sent, "failed": failed}
 
 
+# --- daily list of confirmed caller interviews -----------------------------------------------------
+
+
+def caller_daily_due(now: datetime, *, at: time, tz: ZoneInfo) -> Optional[date]:
+    """The local day whose list is due: from `at` until that local day ends; None before `at`."""
+    local = _aware_utc(now).astimezone(tz)
+    return local.date() if local.time() >= at else None
+
+
+def caller_daily_bounds(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """UTC-aware [local midnight, next local midnight) of `day` (23 or 25 hours across DST)."""
+    start = datetime.combine(day, time.min, tzinfo=tz)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _day_title(day: date) -> str:
+    return f"{day:%a} {day:%b} {day.day}"
+
+
+def caller_daily_text(day: date, rows: list[dict[str, Any]]) -> str:
+    """The list for `day`: one line per confirmed caller round, by start time."""
+    if not rows:
+        return f":telephone_receiver: No confirmed caller interviews today ({_day_title(day)})."
+    lines = [f":telephone_receiver: *Caller interviews today — {_day_title(day)}*"]
+    for r in sorted(rows, key=lambda r: r["start"]):
+        parts = [slack_time(r["start"], with_day=False), r["company"], r["stage"], r["profile"],
+                 f"caller {r['callerName']}", r["method"]]
+        line = " · ".join(p for p in parts if p)
+        if r["mentions"]:
+            line += f" — {r['mentions']}"
+        if r["link"]:
+            line += f" · <{r['link']}|thread>"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _is_listed(entry: Any, start: datetime, end: datetime) -> bool:
+    caller = getattr(entry, "caller", None)
+    at = getattr(entry, "scheduledAt", None)
+    return bool(
+        caller is not None and caller.enabled and getattr(entry, "confirmed", False) and at is not None
+        and interview_status_value(getattr(entry, "status", None)) not in ENDED_STATUSES
+        and start <= _aware_utc(at) < end
+    )
+
+
+async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, Any]]:
+    """(interview, round) for confirmed, active caller rounds starting in [start, end)."""
+    found = await Interview.find({"stageHistory": {"$elemMatch": {
+        "caller.enabled": True, "confirmed": True, "status": {"$nin": list(ENDED_STATUSES)},
+        "scheduledAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)},
+    }}}).to_list()
+    return [(iv, e) for iv in found for e in iv.stageHistory if _is_listed(e, start, end)]
+
+
+async def _caller_daily_people(interview: Any, entry: Any) -> dict[str, Any]:
+    owner, manager = await _owner_and_manager(interview)
+    ids = list(entry.caller.coworkerIds or [])
+    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
+    account = await Account.get(interview.accountId) if interview.accountId else None
+    return {"owner": owner, "coworkers": coworkers, "manager": manager, "profile": _profile_label(account)}
+
+
+async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
+    thread = getattr(interview, "slackThread", None)
+    channel, ts = (thread.channel, thread.ts) if thread else (
+        (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip(), (entry.caller.slackChannelTs or "").strip())
+    if not channel or not ts:
+        return None
+    try:
+        return (await _slack_api("chat.getPermalink", {"channel": channel, "message_ts": ts})).get("permalink")
+    except Exception as exc:
+        log.info("slack_bot caller daily permalink failed: %s", exc)
+        return None
+
+
+async def _caller_daily_post(channel: str, text: str) -> bool:
+    try:
+        await _slack_api("chat.postMessage", {"channel": channel, "text": text, "unfurl_links": False,
+                                              "unfurl_media": False})
+        return True
+    except Exception as exc:
+        log.warning("slack_bot caller daily post failed: %s", exc)
+        return False
+
+
+def _caller_daily_configured() -> Optional[tuple[str, time, ZoneInfo]]:
+    """(channel, time, zone) when the daily list is on; None when off or misconfigured."""
+    s = get_settings()
+    channel = (s.SLACK_CALLER_DAILY_CHANNEL_ID or "").strip()
+    if not channel or not slack_bot_configured():
+        return None
+    try:
+        hh, mm = (s.SLACK_CALLER_DAILY_TIME or "05:00").split(":")
+        return channel, time(int(hh), int(mm)), ZoneInfo(s.SLACK_CALLER_DAILY_TIMEZONE or "America/Chicago")
+    except Exception as exc:
+        log.warning("slack_bot caller daily misconfigured: %s", exc)
+        return None
+
+
+async def run_caller_daily(
+    now: datetime,
+    *,
+    load=_caller_daily_load,
+    claim=_reminder_claim,
+    release=_reminder_release,
+    post=_caller_daily_post,
+    people=_caller_daily_people,
+    permalink=_caller_daily_permalink,
+    configured=_caller_daily_configured,
+) -> str:
+    """Post the day's confirmed caller interviews once (claim first, release on failure).
+
+    Returns "posted", "not_due", "already_sent", "off" or "failed"."""
+    cfg = configured()
+    if cfg is None:
+        return "off"
+    channel, at, tz = cfg
+    day = caller_daily_due(now, at=at, tz=tz)
+    if day is None:
+        return "not_due"
+    key = f"caller-daily:{day.isoformat()}"
+    if not await claim(key):
+        return "already_sent"
+    ok = False
+    try:
+        start, end = caller_daily_bounds(day, tz)
+        rows = []
+        for iv, entry in await load(start, end):
+            who = await people(iv, entry)
+            users = [who["owner"], *who["coworkers"], who["manager"]]
+            mentions = " ".join(dict.fromkeys(_mention(u) for u in users if u is not None))
+            rows.append({
+                "start": _aware_utc(entry.scheduledAt),
+                "company": (iv.companyName or "").strip() or "—",
+                "stage": _stage_label(entry.stage),
+                "profile": who["profile"],
+                "callerName": (entry.caller.callerName or "").strip() or "TBD",
+                "method": _METHOD_LABELS.get(entry.caller.method or "", ""),
+                "mentions": mentions,
+                "link": await permalink(iv, entry),
+            })
+        ok = await post(channel, caller_daily_text(day, rows))
+    except Exception as exc:
+        log.warning("slack_bot caller daily list failed: %s", exc)
+    if not ok:
+        await release(key)
+        return "failed"
+    return "posted"
+
+
 async def run_alert_tick() -> dict[str, int]:
-    """Cron entrypoint: #caller thread reminders, then the daily digest for every linked user."""
+    """Cron entrypoint: #caller thread reminders, the daily caller list, then each linked user's digest."""
     try:
         reminders = await run_caller_reminders(datetime.now(timezone.utc))
     except Exception as exc:  # never block the per-user digest
         log.exception("slack_bot caller reminders crashed: %s", exc)
         reminders = {"sent": 0, "failed": 0}
     caller_reminders = reminders["sent"]
+    try:
+        caller_daily = await run_caller_daily(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot caller daily list crashed: %s", exc)
+        caller_daily = "failed"
     if not slack_bot_configured():
-        return {"users": 0, "digest": 0, "skipped": 1, "caller_reminders": caller_reminders}
+        return {"users": 0, "digest": 0, "skipped": 1, "caller_reminders": caller_reminders,
+                "caller_daily": caller_daily}
     users = await _linked_users()
     digest_total = 0
     skips = {
@@ -1036,4 +1270,5 @@ async def run_alert_tick() -> dict[str, int]:
                 logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
         except Exception as exc:
             log.exception("slack_bot tick failed for user=%s: %s", user.id, exc)
-    return {"users": len(users), "digest": digest_total, "skipped": 0, "caller_reminders": caller_reminders, **skips}
+    return {"users": len(users), "digest": digest_total, "skipped": 0, "caller_reminders": caller_reminders,
+            "caller_daily": caller_daily, **skips}
