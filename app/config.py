@@ -134,9 +134,9 @@ class Settings(BaseSettings):
     BID_DAILY_REPORT_TIME: str = "18:30"
     BID_WEEKLY_REPORT_DAY: str = "saturday"
     BID_WEEKLY_REPORT_TIME: str = "16:00"
-    # First day (YYYY-MM-DD, in BID_REPORT_TIMEZONE) counted from approved bid records instead of
-    # screenshot folders: a report window uses records when it ends after that day's local midnight.
-    # Unset = folders everywhere. Set it before bidders start on rollout day.
+    # Reports, live counts and the Bidders page count approved bid records (the database). Optional
+    # cut-over day (YYYY-MM-DD, in BID_REPORT_TIMEZONE): a window starting before that day's local
+    # midnight (or straddling it) keeps the old screenshot-folder count. Unset = records everywhere.
     BID_RECORDS_START: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None

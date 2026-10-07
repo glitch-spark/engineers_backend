@@ -287,7 +287,12 @@ async def test_reports_history_is_newest_first_and_limited(api):
     assert (await api.get(f"/bidders/{b.id}/reports", params={"limit": 0})).status_code == 422
 
 
-async def test_live_counts_route(api):
+async def test_live_counts_route(api, monkeypatch):
+    from app.bids import records
+    from app.config import get_settings
+
+    folders = get_settings().model_copy(update={"BID_RECORDS_START": "2099-01-01"})  # every window counts folders
+    monkeypatch.setattr(records, "get_settings", lambda: folders)
     me, other = await make_user("Pedro"), await make_user("Maria")
     ana = await make_bidder(me, "Ana")
     await make_bidder(me, "Old", archived=True)

@@ -68,7 +68,7 @@ def records_start(monkeypatch):
         settings = get_settings().model_copy(update={"BID_RECORDS_START": value})
         monkeypatch.setattr(records, "get_settings", lambda: settings)
 
-    set_start(None)
+    set_start("2099-01-01")  # folders everywhere unless a test sets its own start
     return set_start
 
 

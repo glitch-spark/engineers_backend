@@ -56,9 +56,9 @@ BID_DAILY_REPORT_TIME=18:30
 # monday ... sunday
 BID_WEEKLY_REPORT_DAY=saturday
 BID_WEEKLY_REPORT_TIME=16:00
-# YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows starting on or after that day's local midnight
-# count approved bid records instead of screenshot folders. Blank = folders everywhere (section 6).
-# Set it on the API service (the same service runs the report cron).
+# Optional cut-over day, YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows starting before that day's
+# local midnight (or straddling it) keep counting screenshot folders. Blank = approved bid records
+# everywhere (section 6). Set it on the API service and on the report cron service.
 BID_RECORDS_START=
 # Unset = reports are saved but not posted.
 SLACK_BIDS_CHANNEL_ID=C0123456789
@@ -189,14 +189,12 @@ object path and returns a short-lived signed upload link, so bidders hold no sto
    and click Reload). Two installs side by side double-count or lose bids.
 4. Revoke each old shared upload key (`puma-uploader`, …) as soon as that prefix's bidders
    have registered, so only the backend can write there.
-5. Switch counting to approved bid records with `BID_RECORDS_START=<YYYY-MM-DD>` (in
-   `BID_REPORT_TIMEZONE`) on the API service (it also runs the report cron). Set it **before
-   bidders start on rollout day**, to that day. A report window counts records only when it
-   **starts** on or after that day's local midnight; a window that starts earlier, including
-   one that straddles it, and every window while it is unset, keep counting screenshot
-   folders. So the first day counted from records is the first full daily window starting on
-   or after it, and the first weekly window counted from records is the first one starting
-   on or after it. Only **approved** bids count toward `count` and pay (`count x rate`);
+5. Reports count approved bid records (the database) by default. To keep windows from before
+   rollout on the old screenshot-folder count, set `BID_RECORDS_START=<YYYY-MM-DD>` (in
+   `BID_REPORT_TIMEZONE`) on the API service **and** the report cron service (`python -m
+   app.alerts_tick`, a separate Railway service). A window counts records when it **starts** on or
+   after that day's local midnight; a window that starts earlier, including one that straddles
+   it, keeps counting screenshot folders. Unset, every window counts records. Only **approved** bids count toward `count` and pay (`count x rate`);
    pending and rejected bids are reported beside it, e.g. `(pending 1, rejected 1)` in Slack
    and `pending` / `rejected` in the app's report rows (`null` on folder-counted rows). The
    live counts judge each open window by its own start in the same way, so for a while after

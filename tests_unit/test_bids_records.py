@@ -232,12 +232,16 @@ async def test_count_by_status_with_no_bidders_does_no_query(db):
     assert await count_by_status([], T0, T0 + timedelta(days=1)) == {}
 
 
-def test_uses_records_only_for_windows_starting_on_or_after_the_start_day(monkeypatch):
-    midnight = datetime(2026, 10, 6, 5, 0, tzinfo=timezone.utc)  # Chicago midnight of 2026-10-06 is 05:00Z (CDT)
-
+def test_uses_records_everywhere_when_start_is_unset(monkeypatch):
+    midnight = datetime(2026, 10, 6, 5, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(records, "get_settings", lambda: settings_with(None))
     assert records.records_start_utc(SCHED) is None
-    assert uses_records(midnight, SCHED) is False
+    assert uses_records(midnight, SCHED) is True
+    assert uses_records(midnight - timedelta(days=400), SCHED) is True  # the database is the source by default
+
+
+def test_uses_records_only_for_windows_starting_on_or_after_the_start_day(monkeypatch):
+    midnight = datetime(2026, 10, 6, 5, 0, tzinfo=timezone.utc)  # Chicago midnight of 2026-10-06 is 05:00Z (CDT)
 
     monkeypatch.setattr(records, "get_settings", lambda: settings_with("2026-10-06"))
     assert records.records_start_utc(SCHED) == midnight
@@ -245,7 +249,7 @@ def test_uses_records_only_for_windows_starting_on_or_after_the_start_day(monkey
     assert uses_records(midnight + timedelta(hours=18, minutes=30), SCHED) is True
     assert uses_records(midnight - timedelta(minutes=1), SCHED) is False  # a window straddling it keeps folders
     assert uses_records(midnight - timedelta(days=7), SCHED) is False
-    assert uses_records(midnight, SCHED, settings_with(None)) is False  # an explicit Settings wins
+    assert uses_records(midnight - timedelta(days=7), SCHED, settings_with(None)) is True  # an explicit Settings wins
 
 
 @pytest.mark.parametrize("value, want", [(None, None), ("", None), (" 2026-10-06 ", "2026-10-06")])

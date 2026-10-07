@@ -157,7 +157,7 @@ def test_cron_endpoint_rejects_wrong_secret(monkeypatch):
     assert exc.value.status_code == 401
 
 
-# --- build_rows: approved bid records after BID_RECORDS_START, folders before it or when unset ---
+# --- build_rows: approved bid records (from BID_RECORDS_START when set), folders only before that day ---
 
 START, END = datetime(2026, 10, 1, 23, 30, tzinfo=timezone.utc), DAILY_CUTOFF  # the Thursday-evening to Friday-evening day
 
@@ -171,8 +171,9 @@ async def db():
 
 @pytest.fixture(autouse=True)
 def no_records_start(monkeypatch):
-    """A local .env must not flip the folder-path tests onto bid records."""
-    records_start(monkeypatch, None)
+    """A local .env must not change which source a test counts. Default here: every window predates the start day,
+    so the folder-path tests count folders; record tests set their own start (unset = bid records everywhere)."""
+    records_start(monkeypatch, "2099-01-01")
 
 
 def records_start(monkeypatch, value):
@@ -202,10 +203,22 @@ async def test_build_rows_counts_approved_records_after_start(db, monkeypatch):
     assert storage.calls == 0
 
 
-# unset; a start day that straddles the window (it starts Oct 1 18:30 CDT, so Oct 2 midnight falls inside it);
+async def test_build_rows_counts_records_when_start_is_unset(db, monkeypatch):
+    records_start(monkeypatch, None)
+    ana = await stored_bidder(rate=0.5)
+    await add_bid(ana, "j1", "approved")
+    await add_bid(ana, "j2", "pending")
+    storage = FakeStorage({})  # any folder listing would KeyError
+
+    (row,) = await reports.build_rows("daily", START, END, "2026-10-02", [ana], {}, storage, SCHED)
+    assert (row.count, row.pending, row.rejected, row.amount) == (1, 1, 0, 0.5)
+    assert storage.calls == 0
+
+
+# a start day that straddles the window (it starts Oct 1 18:30 CDT, so Oct 2 midnight falls inside it);
 # a start day after the window ended
-@pytest.mark.parametrize("start_day", [None, "2026-10-02", "2026-10-03"])
-async def test_build_rows_uses_folders_before_start_or_when_unset(db, monkeypatch, start_day):
+@pytest.mark.parametrize("start_day", ["2026-10-02", "2026-10-03"])
+async def test_build_rows_uses_folders_before_start(db, monkeypatch, start_day):
     records_start(monkeypatch, start_day)
     ana = await stored_bidder()
     await add_bid(ana, "j1", "approved")  # a record exists but is not what counts

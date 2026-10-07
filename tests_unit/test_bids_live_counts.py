@@ -53,8 +53,8 @@ def records_start(monkeypatch, value):
 
 @pytest.fixture(autouse=True)
 def no_records_start(monkeypatch):
-    """A local .env must not flip the folder-path tests onto bid records."""
-    records_start(monkeypatch, None)
+    """A local .env must not change which source these folder-path tests count."""
+    records_start(monkeypatch, "2099-01-01")  # these exercise the folder path
 
 
 def bidder(url="s3://b/ana/"):

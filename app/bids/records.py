@@ -88,10 +88,10 @@ def records_start_utc(sched: BidSchedule, s: Optional[Settings] = None) -> Optio
 
 
 def uses_records(window_start: datetime, sched: BidSchedule, s: Optional[Settings] = None) -> bool:
-    """A window counts bid records (not screenshot folders) iff BID_RECORDS_START is set and the window
-    starts on or after local midnight of that day; a window that straddles it keeps the folder count."""
+    """A window counts bid records (the database), not screenshot folders. BID_RECORDS_START only keeps older
+    windows on folder counts: one starting before local midnight of that day (or straddling it) counts folders."""
     start = records_start_utc(sched, s)
-    return start is not None and window_start >= start
+    return start is None or window_start >= start
 
 
 async def count_by_status(
