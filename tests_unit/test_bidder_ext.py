@@ -412,12 +412,14 @@ async def test_successful_logins_do_not_count_toward_the_ip(ext):
 class _FakeStorage:
     def __init__(self, error=None):
         self.calls = []
+        self.content_types = []
         self.error = error
 
-    def presign_put(self, bucket, key):
+    def presign_put(self, bucket, key, content_type="image/png"):
         if self.error:
             raise self.error
         self.calls.append((bucket, key))
+        self.content_types.append(content_type)
         return f"https://signed/{bucket}/{key}"
 
 
@@ -543,11 +545,28 @@ async def test_confirm_404_carries_a_readable_error(ext, real_app, storage):
     assert (r.status_code, r.json()) == (404, {"error": "upload not found"})
 
 
+async def test_upload_url_signs_the_requested_image_format(ext, storage):
+    _, _, body = await register(ext)
+    h = auth(body["token"])
+    for fmt, ext_, mime in (("webp", "webp", "image/webp"), ("jpeg", "jpg", "image/jpeg"), ("png", "png", "image/png")):
+        r = await ext.post("/ext/upload-url", json=_shot(format=fmt)[0], headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["key"].endswith(f".{ext_}")
+        assert r.json()["headers"] == {"Content-Type": mime}
+        assert storage.content_types[-1] == mime
+
+
+async def test_upload_url_defaults_to_png_for_older_extensions(ext, storage):
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
+    assert r.json()["key"].endswith(".png") and storage.content_types == ["image/png"]
+
+
 async def test_upload_url_validation(ext, storage):
     _, _, body = await register(ext)
     h = auth(body["token"])
     naive = datetime.now().replace(microsecond=0).isoformat()
-    for over in ({"step": 0}, {"step": 501}, {"trigger": "click"}, {"capturedAt": naive}, {"job": ""}):
+    for over in ({"step": 0}, {"step": 501}, {"trigger": "click"}, {"capturedAt": naive}, {"job": ""}, {"format": "gif"}):
         r = await ext.post("/ext/upload-url", json=_shot(**over)[0], headers=h)
         assert r.status_code == 422, over
     old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
@@ -609,3 +628,48 @@ async def test_registering_switches_counting_to_the_bidders_folder(ext):
     await b.save()
     assert (await ext.post("/ext/register", json=reg(code))).status_code == 200
     assert (await Bidder.get(PydanticObjectId(bid))).screenshotFolderUrl == "s3://bid-screenshots/test/"
+
+
+async def _change_password(ext, token, current="password1", new="newpass123"):
+    return await ext.post("/ext/password", json={"currentPassword": current, "newPassword": new}, headers=auth(token))
+
+
+async def test_change_password_logs_out_other_sessions(ext):
+    _, _, body = await register(ext)
+    other = (await _login(ext, pw="password1")).json()["token"]   # the same login in another browser
+    r = await _change_password(ext, body["token"])
+    assert r.status_code == 200, r.text
+    fresh = r.json()["token"]
+    assert (await ext.get("/ext/me", headers=auth(fresh))).status_code == 200
+    for old in (body["token"], other):
+        assert (await ext.get("/ext/me", headers=auth(old))).status_code == 401
+    assert (await _login(ext, pw="newpass123")).status_code == 200
+    assert (await _login(ext, pw="password1")).status_code == 401
+
+
+async def test_change_password_needs_the_current_password(ext):
+    _, _, body = await register(ext)
+    r = await _change_password(ext, body["token"], current="not-my-password")
+    assert r.status_code == 400 and r.json()["detail"] == "Current password is wrong"
+    assert (await _login(ext, pw="password1")).status_code == 200
+
+
+async def test_change_password_rules(ext):
+    _, _, body = await register(ext)
+    r = await _change_password(ext, body["token"], new="short")
+    assert r.status_code == 400 and r.json()["detail"] == "Password must be at least 8 characters"
+    r = await _change_password(ext, body["token"], new="password1")
+    assert r.status_code == 400 and r.json()["detail"] == "Choose a password different from the current one"
+    assert (await _login(ext, pw="password1")).status_code == 200
+
+
+async def test_wrong_current_passwords_hit_the_limit(ext):
+    _, _, body = await register(ext)
+    for _ in range(10):
+        assert (await _change_password(ext, body["token"], current="wrong-pass")).status_code == 400
+    assert (await _change_password(ext, body["token"])).status_code == 429
+
+
+async def test_change_password_requires_a_bidder_token(ext):
+    r = await ext.post("/ext/password", json={"currentPassword": "password1", "newPassword": "newpass123"})
+    assert r.status_code == 401

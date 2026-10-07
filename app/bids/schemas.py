@@ -116,11 +116,22 @@ def credentials_problem(username: str, password: str) -> Optional[str]:
     "Invalid request", and the bidder needs to see the rule."""
     if not _USERNAME.fullmatch(username):
         return USERNAME_RULE
+    return password_problem(password)
+
+
+def password_problem(password: str) -> Optional[str]:
     if len(password) < 8:
         return PASSWORD_TOO_SHORT
     if len(password.encode()) > 72:  # bcrypt ignores everything past 72 bytes
         return PASSWORD_TOO_LONG
     return None
+
+
+class PasswordChangeIn(BaseModel):
+    """Length caps only bound memory (past them: the generic 400); the rules are password_problem()."""
+
+    currentPassword: str = Field(max_length=1024)
+    newPassword: str = Field(max_length=1024)
 
 
 class LoginIn(BaseModel):

@@ -15,9 +15,11 @@ from app.bids.folders import folder_url
 from app.bids.invites import hash_code, invite_is_live
 from app.bids.rate_limit import FailureLimiter, client_ip, limiter_keys
 from app.bids.records import confirm_upload, record_screenshot
-from app.bids.schemas import LoginIn, RegisterIn, bidder_me, credentials_problem
+from app.bids.schemas import (
+    LoginIn, PasswordChangeIn, RegisterIn, bidder_me, credentials_problem, password_problem,
+)
 from app.bids.storage import BidStorageError, get_bid_storage
-from app.bids.upload_keys import build_upload_key
+from app.bids.upload_keys import IMAGE_FORMATS, build_upload_key
 from app.config import get_settings
 from app.deps import BidderAuth, get_current_bidder
 from app.models import Account
@@ -157,6 +159,33 @@ async def me(auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
     return {**bidder_me(auth.bidder, await _profile_name(auth.bidder)), **_renewal(auth)}
 
 
+@router.post("/password")
+async def change_password(
+    body: PasswordChangeIn, request: Request, auth: Annotated[BidderAuth, Depends(get_current_bidder)],
+) -> dict:
+    """Bumps tokenVersion, so every other browser on this login is logged out; this one gets a fresh token.
+    A wrong current password counts toward the same limit as failed logins."""
+    bidder = auth.bidder
+    keys = _keys(bidder.username or str(bidder.id), request)
+    reserved_at = _reserve(keys)
+    problem = password_problem(body.newPassword)
+    if not problem and body.newPassword == body.currentPassword:
+        problem = "Choose a password different from the current one"
+    if problem:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, problem)
+    try:
+        current_ok = await asyncio.to_thread(verify_password, body.currentPassword, bidder.passwordHash or _DUMMY_HASH)
+    except ValueError:
+        current_ok = False
+    if not (bidder.passwordHash and current_ok):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Current password is wrong")
+    bidder.passwordHash = await asyncio.to_thread(hash_password, body.newPassword)
+    bidder.tokenVersion += 1
+    await bidder.save()
+    _succeed(keys, reserved_at)
+    return await _session(bidder)
+
+
 class UploadUrlIn(BaseModel):
     job: str = Field(min_length=1, max_length=200)
     step: int = Field(ge=1, le=500)
@@ -166,6 +195,8 @@ class UploadUrlIn(BaseModel):
     # "Invalid request").
     jobUrl: Optional[Annotated[str, StringConstraints(strip_whitespace=True)]] = None
     jobTitle: Optional[Annotated[str, StringConstraints(strip_whitespace=True)]] = None
+    # Extensions before 3.2.0 send no format and upload PNG.
+    format: Literal["png", "webp", "jpeg"] = "png"
 
 
 _JOB_URL_MAX = 2000
@@ -185,7 +216,7 @@ def _job_url(raw: Optional[str]) -> Optional[str]:
 
 @router.post("/upload-url")
 async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
-    """The backend picks the object path; the extension only PUTs the PNG to the returned link."""
+    """The backend picks the object path; the extension only PUTs the image to the returned link."""
     bidder = auth.bidder
     job_url = _job_url(body.jobUrl)
     unavailable = HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Uploads are not configured")
@@ -196,7 +227,7 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
     try:
         key = build_upload_key(
             bidder.folder, await _profile_name(bidder), body.job, body.step, body.trigger,
-            body.capturedAt, datetime.now(timezone.utc),
+            body.capturedAt, datetime.now(timezone.utc), body.format,
         )
     except ValueError:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "capturedAt is not current")
@@ -205,7 +236,8 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
         (body.jobTitle or "")[:_JOB_TITLE_MAX] or None,
     )
     try:
-        url = await asyncio.to_thread(storage.presign_put, bucket, key)
+        content_type = IMAGE_FORMATS[body.format][1]
+        url = await asyncio.to_thread(storage.presign_put, bucket, key, content_type)
     except BidStorageError:
         raise unavailable from None
     return {
@@ -213,7 +245,7 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
         "key": key,
         "bidId": str(bid.id),
         "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
-        "headers": {"Content-Type": "image/png"},
+        "headers": {"Content-Type": content_type},
         **_renewal(auth),
     }
 
@@ -224,7 +256,7 @@ class ConfirmIn(BaseModel):
 
 @router.post("/uploads/confirm")
 async def confirm(body: ConfirmIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
-    """The extension calls this once the PNG PUT succeeded; only then does the screenshot count as uploaded."""
+    """The extension calls this once the image PUT succeeded; only then does the screenshot count as uploaded."""
     if not await confirm_upload(auth.bidder.id, body.key):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found")
     return {"ok": True, **_renewal(auth)}

@@ -1,4 +1,4 @@
-"""Object keys for the extension's screenshots: <folder>/<D>/<profile>/<job>/step<n>_<trigger>_<D>_<HHMMSS>.png."""
+"""Object keys for the extension's screenshots: <folder>/<D>/<profile>/<job>/step<n>_<trigger>_<D>_<HHMMSS>.<ext>."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from typing import Optional
 from app.bids.folders import profile_segment, slug
 
 MAX_AGE = timedelta(hours=24)
+# Upload format -> (file extension, Content-Type). Folder counting accepts all three extensions.
+IMAGE_FORMATS = {"png": ("png", "image/png"), "webp": ("webp", "image/webp"), "jpeg": ("jpg", "image/jpeg")}
 
 
 def job_slug(job: str) -> str:
@@ -19,11 +21,12 @@ def job_slug(job: str) -> str:
 
 def build_upload_key(
     folder: str, profile_name: Optional[str], job: str, step: int, trigger: str,
-    captured_at: datetime, now: datetime,
+    captured_at: datetime, now: datetime, image_format: str = "png",
 ) -> str:
     """Date and time come from captured_at in its own UTC offset (the bidder's local clock)."""
     if abs(captured_at - now) > MAX_AGE:
         raise ValueError("capturedAt is not current")
     day = captured_at.strftime("%Y-%m-%d")
     stamp = captured_at.strftime("%H%M%S")
-    return f"{folder}/{day}/{profile_segment(profile_name)}/{job_slug(job)}/step{step}_{trigger}_{day}_{stamp}.png"
+    ext = IMAGE_FORMATS[image_format][0]
+    return f"{folder}/{day}/{profile_segment(profile_name)}/{job_slug(job)}/step{step}_{trigger}_{day}_{stamp}.{ext}"
