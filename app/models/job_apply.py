@@ -137,7 +137,10 @@ class JobApplyRow(TimestampedDocument):
     tailored: Dict[str, PydanticObjectId] = Field(default_factory=dict)
     # Profiles whose row for this job was exported to the Google Sheet: accountId → when.
     exported: Dict[str, datetime] = Field(default_factory=dict)
-    # Where that row went (accountId → {sheetId, tab, row}), so a tailored resume finished later fills its link in.
+    # Where that row went, per sheet (accountId → sheetId → {tab, row}): the same job can go to several sheets, and a
+    # tailored resume finished later fills its link into each. See app/job_apply/sheet_links.py.
+    exportedSheets: Dict[str, Dict[str, dict]] = Field(default_factory=dict)
+    # Exports before exportedSheets: accountId → {sheetId, tab, row} (one sheet). Read, no longer written.
     exportedRows: Dict[str, dict] = Field(default_factory=dict)
     expiresAt: datetime = Field(default_factory=_expires_at)
 

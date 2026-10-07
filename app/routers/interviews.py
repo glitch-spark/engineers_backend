@@ -25,15 +25,15 @@ from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus
 from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
+    ENDED_STATUSES,
     CallerError,
     CallerIn,
     build_round_caller,
-    caller_post_kind,
     is_coworker,
     round_caller_snapshot,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack_bot import notify_round_caller
+from app.slack_bot import sync_caller_thread
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +163,8 @@ class StagePatch(BaseModel):
     transcript: Optional[str] = None
     note: Optional[str] = None
     caller: Optional[CallerIn] = None
+    # Caller rounds only; owner or admin.
+    confirmed: Optional[bool] = None
 
 
 class InterviewUpdate(BaseModel):
@@ -262,29 +264,13 @@ async def _sync_caller_posts(
     iv: Interview,
     before: dict[str, Optional[dict]],
     *,
+    added: Iterable[str] = (),
     deleted: Iterable[str] = (),
 ) -> None:
-    """Create, edit or delete #caller posts for rounds whose caller details
-    changed since `before` (snapshots taken before the write)."""
+    """Bring the interview's #caller thread in line with a write (snapshots in `before` were taken
+    before it). Rounds being deleted are still in iv.stageHistory; their caller saves the interview."""
     gone = set(deleted)
-    entries = {e.id: e for e in iv.stageHistory if e.id}
-    ts_changed = False
-    for rid in dict.fromkeys([*before, *entries]):
-        entry = entries.get(rid)
-        if entry is None:
-            continue
-        removed = rid in gone
-        new = None if removed else round_caller_snapshot(entry)
-        has_post = bool(entry.caller is not None and (entry.caller.slackChannelTs or "").strip())
-        kind = caller_post_kind(before.get(rid), new, has_post=has_post, round_deleted=removed)
-        if kind is None:
-            continue
-        ts = await notify_round_caller(iv, entry, kind, prev=before.get(rid))
-        if ts and entry.caller is not None and entry.caller.slackChannelTs != ts:
-            entry.caller.slackChannelTs = ts
-            ts_changed = True
-    if ts_changed and not gone:
-        _sync_top_from_tip(iv)
+    if await sync_caller_thread(iv, before, added=added, deleted=gone) and not gone:
         await _save_interview(iv)
 
 
@@ -364,6 +350,10 @@ def migrate_legacy_stage_fields(iv: Interview) -> bool:
     return changed
 
 
+def _status_value(value) -> Optional[str]:
+    return getattr(value, "value", value)
+
+
 def _sync_top_from_tip(iv: Interview) -> None:
     """Interview-level stage/status/scheduledAt always mirror the latest stage."""
     tip = _tip(iv)
@@ -389,6 +379,7 @@ def _sync_top_from_tip(iv: Interview) -> None:
     # the latest round for one release (DM digest, _can_view read them).
     iv.interviewerName = tip.interviewerName
     iv.caller = tip.caller
+    iv.confirmed = bool(getattr(tip, "confirmed", False))
 
 
 def _reject_adjacent_duplicate(iv: Interview) -> None:
@@ -878,6 +869,8 @@ async def update_interview(
     tip = _tip(iv)
     if tip is not None:
         tip.status = iv.status
+        if _status_value(tip.status) in ENDED_STATUSES:
+            tip.confirmed = False
         if tip.caller is not None and tip.caller.enabled and tip.scheduledAt is not None:
             tip.caller.startsAt = tip.scheduledAt
     _sync_top_from_tip(iv)
@@ -919,7 +912,7 @@ async def add_interview_stage(
     _sync_top_from_tip(iv)
     await _save_interview(iv)
 
-    await _sync_caller_posts(iv, before)
+    await _sync_caller_posts(iv, before, added={entry.id})
     await _after_save(iv, user=user, extract_stage_ids=[entry.id] if entry.transcript.strip() else [])
     return await _interview_out(iv)
 
@@ -945,6 +938,8 @@ async def update_interview_stage(
         if sched is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
         old_start, old_end = entry.scheduledAt, entry.endsAt
+        if old_start is None or _utc_naive(old_start) != _utc_naive(sched):
+            entry.confirmed = False  # a new time needs the caller lined up again
         entry.scheduledAt = sched
         # Rescheduling keeps the round's duration unless a new end is sent.
         if body.endsAt is None and old_start is not None and old_end is not None:
@@ -975,6 +970,17 @@ async def update_interview_stage(
             body.caller, starts_at=entry.scheduledAt, owner_id=iv.createdBy,
             previous=entry.caller,
         )
+    ended = _status_value(entry.status) in ENDED_STATUSES
+    if entry.caller is None or not entry.caller.enabled or ended:
+        entry.confirmed = False  # a caller is only lined up for an active caller round
+    if body.confirmed is not None:
+        if body.confirmed and (entry.caller is None or not entry.caller.enabled):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only caller rounds are confirmed")
+        if body.confirmed and ended:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="A canceled or rejected round can't be confirmed",
+            )
+        entry.confirmed = body.confirmed
     iv.stageHistory[idx] = entry
 
     _reject_adjacent_duplicate(iv)

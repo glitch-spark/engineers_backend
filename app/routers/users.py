@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any, Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -25,6 +26,8 @@ class UserUpdate(BaseModel):
     phone: Optional[str] = None
     birthday: Optional[str] = None
     isActive: Optional[bool] = None
+    # Another active user; null clears it.
+    interviewManagerId: Optional[str] = None
 
 
 def _parse_dt(s: str) -> Optional[datetime]:
@@ -46,10 +49,38 @@ async def lookup_users(
     rows = await UserExtra.find(query).to_list()
     return {
         "users": [
-            {"_id": str(u.id), "name": u.name, "email": u.email, "role": u.role}
+            {"_id": str(u.id), "name": u.name, "email": u.email, "role": u.role, "isActive": u.isActive is not False}
             for u in rows
         ]
     }
+
+
+async def _manager_for(user: UserExtra, raw: Optional[str]) -> Optional[PydanticObjectId]:
+    """The chosen interview manager: an existing active user other than `user`; None clears it."""
+    if raw is None or not str(raw).strip():
+        return None
+    if str(raw) == str(user.interviewManagerId):
+        return user.interviewManagerId  # unchanged: a since-deactivated manager doesn't block other edits
+    bad = HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Choose another active user")
+    if not PydanticObjectId.is_valid(raw) or str(raw) == str(user.id):
+        raise bad
+    manager = await UserExtra.get(PydanticObjectId(raw))
+    if manager is None or manager.isActive is False:
+        raise bad
+    return manager.id
+
+
+async def _with_manager_names(docs: list[UserExtra]) -> list[dict]:
+    """User rows plus interviewManagerName (one lookup for the whole page)."""
+    ids = list({d.interviewManagerId for d in docs if d.interviewManagerId})
+    managers = {m.id: m for m in await UserExtra.find({"_id": {"$in": ids}}).to_list()} if ids else {}
+    out = []
+    for d in docs:
+        row = doc_to_dict(d)
+        manager = managers.get(d.interviewManagerId)
+        row["interviewManagerName"] = (manager.name or manager.email) if manager else None
+        out.append(row)
+    return out
 
 
 @router.get("")
@@ -86,7 +117,7 @@ async def list_users(
         .to_list()
     )
 
-    users_out = [doc_to_dict(d) for d in docs]
+    users_out = await _with_manager_names(docs)
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
         "users": users_out,
@@ -148,9 +179,11 @@ async def update_user(
             user.birthday = parsed
     if body.isActive is not None:
         user.isActive = body.isActive
+    if "interviewManagerId" in body.model_fields_set:
+        user.interviewManagerId = await _manager_for(user, body.interviewManagerId)
 
     await user.save()
-    return doc_to_dict(user)
+    return (await _with_manager_names([user]))[0]
 
 
 @router.post("/{user_id}/approve")

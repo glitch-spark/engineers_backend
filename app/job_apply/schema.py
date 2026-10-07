@@ -94,3 +94,12 @@ class ResumeScore(BaseModel):
     terms: list[TermHit] = Field(default_factory=list)
     knockouts: list[str] = Field(default_factory=list)
     uploadedAt: Optional[datetime] = None
+
+
+class TailoredMatch(BaseModel):
+    """A tailored resume scored against the job it was written for, the way uploaded resumes are."""
+    total: int
+    band: str
+    knockouts: list[str] = Field(default_factory=list)
+    # The job's terms the resume doesn't show, heaviest first.
+    missing: list[str] = Field(default_factory=list)

@@ -85,6 +85,8 @@ class InterviewStageEvent(BaseModel):
     interviewerName: Optional[str] = None
     endsAt: Optional[datetime] = None
     caller: Optional[InterviewCaller] = None
+    # A caller round whose caller is lined up (set by the owner or an admin). Cleared when the time changes.
+    confirmed: bool = False
 
     @field_validator("status", mode="before")
     @classmethod
@@ -100,6 +102,13 @@ class InterviewStageEvent(BaseModel):
                 str(data.get("stage") or ""), data.get("at"), data.get("scheduledAt"),
             )
         return data
+
+
+class SlackThread(BaseModel):
+    """An interview's #caller thread: its main post."""
+
+    channel: str
+    ts: str
 
 
 class Interview(TimestampedDocument):
@@ -119,6 +128,9 @@ class Interview(TimestampedDocument):
     note: str = ""
     stageHistory: List[InterviewStageEvent] = []
     caller: Optional[InterviewCaller] = None
+    confirmed: bool = False  # mirrors the latest round
+    # The one #caller thread for all rounds (set by the first caller post).
+    slackThread: Optional[SlackThread] = None
 
     # Set when an unmigrated document was resolved on read: questions linked to
     # removed "rejected" rounds must follow on save (routers.interviews._save_interview).

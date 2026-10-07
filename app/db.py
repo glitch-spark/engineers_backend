@@ -34,6 +34,7 @@ from app.models import (
     AiReviewRun,
     AnalyzeChatLog,
     Application,
+    Bid,
     BidReport,
     Bidder,
     EmailAccount,
@@ -99,6 +100,7 @@ DOCUMENT_MODELS = [
     JobApplicationLog,
     Bidder,
     BidReport,
+    Bid,
 ]
 
 

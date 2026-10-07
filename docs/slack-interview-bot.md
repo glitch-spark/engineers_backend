@@ -1,31 +1,31 @@
-# Slack interview bot (private DMs)
+# Slack interview bot
 
-Instant DMs when you add or reschedule an interview, plus a per-user morning
-digest via a Slack App bot (date-only interviews — no T-30). Interview details
-are never posted to a shared channel. The daily digest includes a “Know your
-why” line; instant create/update DMs do not.
+One Slack App bot (`SLACK_BOT_TOKEN`) does four things:
+
+1. **#caller threads** — one thread per caller interview in `SLACK_CALLER_CHANNEL_ID`, tagging the owner's
+   interview manager; replies when a round is confirmed, rescheduled, canceled or moved to the next round.
+2. **30-minute reminders** — a reply in that thread ~30 min before each caller round starts.
+3. **Daily caller list** — at 05:00 America/Chicago, the day's confirmed caller interviews in
+   `SLACK_CALLER_DAILY_CHANNEL_ID` (e.g. #engineer-caller-test).
+4. **Personal digest** — a private DM with each user's interviews for the day, at their chosen time.
 
 ## 1. Create the Slack App
 
 1. Go to https://api.slack.com/apps → **Create New App** → Blank app.
-2. **OAuth & Permissions**
-   - Bot Token Scopes: `chat:write`, `im:write`
-   - User Token Scopes (under User Token Scopes): `identity.basic`
-3. **Redirect URLs**: add  
-   `https://<your-api-host>/integrations/slack/oauth-callback`  
-   (local: `http://localhost:8080/integrations/slack/oauth-callback`)
-4. **Install to Workspace** → copy **Bot User OAuth Token** (`xoxb-…`).
-5. From **Basic Information** copy **Client ID** and **Client Secret**.
-6. Keep the app **unpublished** (not in the App Directory).
+2. **OAuth & Permissions** → Bot Token Scopes: `chat:write`, `im:write`.
+3. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`).
+4. Invite the bot to #caller and to the daily-list channel (`/invite @<bot>`); both may be private.
+5. Keep the app **unpublished** (not in the App Directory).
 
 ## 2. Backend env
 
 ```env
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_CLIENT_ID=...
-SLACK_CLIENT_SECRET=...
-SLACK_OAUTH_REDIRECT_URI=http://localhost:8080/integrations/slack/oauth-callback
 SLACK_BOT_CRON_SECRET=generate-a-long-random-string
+SLACK_CALLER_CHANNEL_ID=C0123456789          # #caller: one thread per caller interview
+SLACK_CALLER_DAILY_CHANNEL_ID=C0987654321    # daily list; unset = off
+SLACK_CALLER_DAILY_TIME=05:00                # HH:MM in SLACK_CALLER_DAILY_TIMEZONE
+SLACK_CALLER_DAILY_TIMEZONE=America/Chicago  # CST/CDT handled automatically
 SLACK_DIGEST_HOUR=8
 SLACK_DIGEST_MINUTE=0
 APP_TIMEZONE=America/New_York
@@ -33,45 +33,53 @@ APP_TIMEZONE=America/New_York
 
 `APP_TIMEZONE` is the default when a user has not set a Slack timezone in Profile.
 
-## 3. Connect as a user
+## 3. People
 
-1. Log into Engineers → **Profile**.
-2. Click **Connect Slack** → approve in Slack.
-3. Set **timezone** and **digest time**, save, then **Send test DM**.
-4. If test DM fails, open a DM with the bot in Slack once and retry.
+- **Slack member ID** — each user types theirs in **Profile → Slack** (Slack: your profile → ⋮ → **Copy member
+  ID**, e.g. `U04ABC12345`). It is used to @-mention them and to DM them. One ID belongs to one user.
+  Without one, messages show their name and they get no ping or DM.
+- **Interview manager** — admins pick one per user on **Users** (edit a user → Interview manager). The manager is
+  tagged in that user's #caller threads and daily-list lines.
 
-Only users who connect receive DMs. Unconnected teammates get nothing.
+## 4. #caller threads
 
-## 4. Cron
+- The first round with **Request a caller** on posts the interview's main post: profile, company, JD link,
+  recruiter, stage, time, method, caller, coworkers, **Interview manager**, and **Confirmed / Not confirmed yet**.
+  Interviews from before this change keep their older per-round posts; their latest one becomes the thread.
+- Every change edits the main post to describe the **latest round** and adds one reply, ending with
+  `cc @manager @owner`:
 
-Railway sibling (same service as in-app alerts): start command `python -m app.alerts_tick`,
-schedule `*/5 * * * *`. That process calls `run_alert_tick()` first, then the inbox tick.
-Copy `SLACK_BOT_TOKEN` and `FRONTEND_ORIGIN` onto that service. Do not cron the uvicorn API.
+  | Change | Reply |
+  |---|---|
+  | Next round | `➡️ Moved to {stage} — {time} · needs confirmation` (or `· no caller needed`) |
+  | Confirmed in the app | `✅ Confirmed — {stage} · {time} · caller {name}` |
+  | Confirmed unticked | `⚠️ Confirmation removed — {stage} · {time}` |
+  | New time | `🔁 Rescheduled — {old} → {new} · needs confirmation` (Confirmed is cleared) |
+  | Canceled / rejected | `⛔ Canceled — {stage} · {time}` |
+  | Back from canceled | `✅ Back on — {stage} · {time} · needs confirmation` |
+  | Other caller details | `✏️ Caller details updated` with `Field: old → new` lines |
+  | Round deleted | `🗑️ Round removed — {stage}` |
 
-HTTP fallback every 1–5 minutes (GitHub Actions or crontab):
+- The manager arranges the caller and comments in the thread; the owner (or an admin) then ticks **Confirmed** on
+  the round in the app. The bot does not read thread replies.
+- Deleting the interview deletes its main post. Slack failures are logged and never block saving.
+
+## 5. Cron
+
+Railway sibling service: start command `python -m app.alerts_tick`, schedule `*/5 * * * *`. Each tick runs the
+30-minute reminders, the daily caller list (posted once per day, catching up later that day if a tick was
+missed), then personal digests, then in-app alerts and bid reports. Copy `SLACK_BOT_TOKEN`, the `SLACK_CALLER_*`
+settings and `FRONTEND_ORIGIN` onto that service. Do not cron the uvicorn API.
+
+HTTP fallback every 1–5 minutes:
 
 ```bash
 curl -X POST https://<api>/internal/slack-bot/tick \
   -H "X-Cron-Secret: $SLACK_BOT_CRON_SECRET"
 ```
 
-Creating or changing an interview’s date, stage, status, or company also DMs
-that interview’s owner immediately (same bot thread as Test DM). The cron job
-still sends a daily digest (when in the user’s digest window) listing that
-user’s interviews for the calendar day in their timezone (`createdBy` only),
-plus today’s Know your why quote. Empty days still get a rest-day DM and are
-marked sent. Each interview is a labeled field block:
+## 6. Personal digest
 
-```
-*Profile Name:* AI Full-stack
-*Company Name:* <https://jobs.example.com/acme|Acme>
-*Applied Position:* Senior Backend (<https://jobs.example.com/acme|Job description>)
-*Interview Stage:* Intro
-*Scheduled Time:* 9/23/26 CDT
-```
-
-## 5. Privacy
-
-- Queries always filter `createdBy = linked Engineers user`.
-- Messages go only to that user's Slack DM.
-- Existing `SLACK_WEBHOOK_URL` channel pings are separate and unused for digests.
+Users with a member ID and alerts on get a DM at their digest time (Profile → Slack: timezone, time, **Send test
+DM**) listing their own interviews (`createdBy`) for the day, plus a “Know your why” line. If the test DM fails,
+open a DM with the bot in Slack once and retry.

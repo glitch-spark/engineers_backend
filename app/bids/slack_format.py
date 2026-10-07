@@ -30,6 +30,17 @@ def _bids(n: int) -> str:
     return f"{n:,} {'bid' if n == 1 else 'bids'}"
 
 
+def _label(text: str, rows: Sequence[BidReportRow], tail: str = "") -> str:
+    """A bid total as text. From bid records it reads "Approved N ... (pending M, rejected K)": the count is
+    only the approved bids and the note says what is not counted yet. Folder counts stay bare. `tail` is
+    text that belongs between the count and the note (the pay)."""
+    counted = [r for r in rows if not r.error and r.pending is not None]
+    if not counted:
+        return text + tail
+    pending, rejected = sum(r.pending or 0 for r in counted), sum(r.rejected or 0 for r in counted)
+    return f"Approved {text}{tail} (pending {pending:,}, rejected {rejected:,})"
+
+
 def _date(dt: datetime) -> str:
     return f"{dt:%a %b} {dt.day}"
 
@@ -57,15 +68,15 @@ def _bidder_line(kind: Kind, r: BidReportRow) -> str:
         label += f" · {_slack_escape(r.profileName)}"
     count = r.count or 0
     if kind == "weekly":
-        return f"• {label} — {_bids(count)} × {_fmt_usd(r.rate)} = {_fmt_usd(r.amount or 0)}"
-    return f"• {label} — {count:,}"
+        return f"• {label} — {_label(_bids(count), [r], f' × {_fmt_usd(r.rate)} = {_fmt_usd(r.amount or 0)}')}"
+    return f"• {label} — {_label(f'{count:,}', [r])}"
 
 
 def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow]) -> list[str]:
     """One mrkdwn text per owner; split into "(cont.)" sections to stay under Slack's 3,000-char limit."""
     ok = [r for r in rows if not r.error]
     failed = len(rows) - len(ok)
-    head = f"*{_owner_label(label)}* — {_bids(sum(r.count or 0 for r in ok))}"
+    head = f"*{_owner_label(label)}* — {_label(_bids(sum(r.count or 0 for r in ok)), ok)}"
     if kind == "weekly":
         head += f" · *{_fmt_usd(round(sum(r.amount or 0 for r in ok), 2))}*"
     if failed:
@@ -93,13 +104,13 @@ def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[Bid
     if kind == "daily":
         header = (f"📨 *Daily bids — {_date(end)}* · {start:%a} {_time(start)} → "
                   f"{end:%a} {_time(end)} {end:%Z}")
-        footer_total = f"*Total: {_bids(total)} · {len(rows):,} bidders*"
-        fallback = f"Daily bids — {_date(end)}: {_bids(total)}"
+        footer_total = f"*Total: {_label(_bids(total), ok)} · {len(rows):,} bidder{'' if len(rows) == 1 else 's'}*"
+        fallback = f"Daily bids — {_date(end)}: {_label(_bids(total), ok)}"
     else:
         header = (f"💰 *Weekly bids & pay — week ending {_date(end)}* · {_date(start)} {_time(start)} → "
                   f"{_date(end)} {_time(end)} {end:%Z}")
-        footer_total = f"*Total: {_bids(total)} · {money}*"
-        fallback = f"Weekly bids & pay — week ending {_date(end)}: {_bids(total)} · {money}"
+        footer_total = f"*Total: {_label(_bids(total), ok)} · {money}*"
+        fallback = f"Weekly bids & pay — week ending {_date(end)}: {_label(_bids(total), ok)} · {money}"
     footer = f"{footer_total} · <{app_url}/bidders|View in app>"
 
     by_owner: dict[str, list[BidReportRow]] = defaultdict(list)

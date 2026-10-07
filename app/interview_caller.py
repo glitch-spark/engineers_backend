@@ -108,35 +108,44 @@ def round_caller_snapshot(entry: Any) -> Optional[dict]:
         "link": (caller.methodValue or "").strip(),
         "caller": (caller.callerName or "").strip() or "TBD",
         "coworkers": tuple(sorted(str(i) for i in caller.coworkerIds)),
+        "confirmed": bool(getattr(entry, "confirmed", False)),
     }
 
 
-def _is_on(snapshot: Optional[dict]) -> bool:
+def caller_is_on(snapshot: Optional[dict]) -> bool:
     """A caller is requested and the round is not called off."""
     return snapshot is not None and snapshot.get("status") not in ENDED_STATUSES
 
 
-def caller_post_kind(
-    prev: Optional[dict], new: Optional[dict], *, has_post: bool, round_deleted: bool = False,
-) -> Optional[str]:
-    """What a write does to a round's #caller post.
+_is_on = caller_is_on
 
-    created → new main post; updated / canceled / restored → main post edited
-    plus a thread reply; deleted → main post removed; None → nothing.
-    `has_post` is whether the round already has a main post.
+
+def caller_thread_event(
+    prev: Optional[dict], new: Optional[dict], *, added: bool = False, removed: bool = False,
+) -> Optional[str]:
+    """The thread reply a write earns for one round (first match wins).
+
+    moved (round added) · removed · ended (canceled/rejected) · back_on · rescheduled · confirmed ·
+    unconfirmed · details (any other caller field) · None. Turning the caller on or off earns no reply:
+    the main post says so.
     """
-    if round_deleted:
-        return "deleted" if has_post else None
+    if removed:
+        return "removed"
+    if added:
+        return "moved"
+    if prev is None or new is None:
+        return None
     was_on, is_on = _is_on(prev), _is_on(new)
-    if not has_post:
-        # Also retries a first post that failed, on the next real change.
-        return "created" if is_on and new != prev else None
     if was_on and not is_on:
-        return "canceled"
+        return "ended"
     if is_on and not was_on:
-        return "restored"
-    if is_on and new != prev:
-        return "updated"
+        return "back_on"
+    if prev.get("time") != new.get("time"):
+        return "rescheduled"
+    if prev.get("confirmed") != new.get("confirmed"):
+        return "confirmed" if new.get("confirmed") else "unconfirmed"
+    if prev != new:
+        return "details"
     return None
 
 

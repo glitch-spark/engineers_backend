@@ -5,6 +5,7 @@ from beanie import PydanticObjectId
 from pydantic import BaseModel
 from pymongo import IndexModel
 
+from app.job_apply.schema import TailoredMatch
 from app.models.base import TimestampedDocument
 
 
@@ -122,6 +123,8 @@ class ResumeApplication(TimestampedDocument):
     attempts: int = 0  # times the worker claimed this job; 3 interrupted attempts → failed
     promptOverride: Optional[str] = None  # one-off prompt, kept for retries and restarts
     jobApplyRowId: Optional[PydanticObjectId] = None
+    # Job Applies: this resume scored against that row's job (app/job_apply/tailored_score.py); absent = not scored yet.
+    matchScore: Optional[TailoredMatch] = None
 
     class Settings:
         name = "resumeapplications"

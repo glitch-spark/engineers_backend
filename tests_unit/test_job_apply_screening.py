@@ -8,6 +8,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from app.job_apply.schema import GateResult, JobExtraction, Location  # noqa: E402
 from app.job_apply.screening import (  # noqa: E402
     APPROVABLE,
+    WORTH,
     bucket,
     build_report,
     group_key,
@@ -169,21 +170,20 @@ def test_build_report():
          ("other_location", "CA"), ("other_location", "CA"), ("other_location", "APAC")],
         [alex, sam], max_age_days=30,
     )
-    assert rep["total"] == 8 and rep["worth"] == 3 and rep["check"] == 1 and rep["maxAgeDays"] == 30
+    # a Needs-a-check job isn't worth applying to (or scored) until a person approves it
+    assert rep["total"] == 8 and rep["worth"] == 2 and rep["check"] == 1 and rep["maxAgeDays"] == 30
     assert rep["buckets"]["closed"] == 1 and rep["buckets"]["other_location"] == 3 and len(rep["buckets"]) == 10
-    # the three target markets always show, then "not stated"; a Worldwide job is in every market
+    # the three target markets always show, then "not stated" when it has jobs; a Worldwide job is in every market
     assert rep["groups"] == [
-        {"key": "US", "jobs": 1, "check": 0, "fits": ["a"]},
-        {"key": "UKEU", "jobs": 2, "check": 0, "fits": ["s"]},
-        {"key": "LATAM", "jobs": 1, "check": 0, "fits": []},
-        {"key": "none", "jobs": 1, "check": 1, "fits": ["a", "s"]},
+        {"key": "US", "jobs": 1, "fits": ["a"]},
+        {"key": "UKEU", "jobs": 2, "fits": ["s"]},
+        {"key": "LATAM", "jobs": 1, "fits": []},
     ]
     assert rep["others"] == [{"key": "CA", "jobs": 2}, {"key": "APAC", "jobs": 1}]
     # each worthwhile job once, by the set of markets it's in, so a profile's jobs aren't counted twice
     assert rep["combos"] == [
-        {"markets": ["UKEU"], "jobs": 1, "check": 0},
-        {"markets": ["US", "UKEU", "LATAM"], "jobs": 1, "check": 0},
-        {"markets": ["none"], "jobs": 1, "check": 1},
+        {"markets": ["UKEU"], "jobs": 1},
+        {"markets": ["US", "UKEU", "LATAM"], "jobs": 1},
     ]
     assert rep["profiles"] == [alex, sam]
 
@@ -191,7 +191,8 @@ def test_build_report():
 def test_build_report_after_approval():
     alex = {"id": "a", "name": "Alex", "country": "US", "region": "US", "resumes": 1}
     before = build_report([("valid", "US"), ("check", "none"), ("other_location", "CA")], [alex], max_age_days=30)
-    assert before["check"] == 1 and before["worth"] == 2 and before["others"] == [{"key": "CA", "jobs": 1}]
+    assert before["check"] == 1 and before["worth"] == 1 and before["others"] == [{"key": "CA", "jobs": 1}]
+    assert [g["key"] for g in before["groups"]] == ["US", "UKEU", "LATAM"]
     # approving the Needs-a-check job and the Canada-only job: both become Worth applying, the Canada one is
     # counted in the "location not stated" group (scoring_key), and nothing is left needing a check
     after = build_report(
@@ -200,7 +201,13 @@ def test_build_report_after_approval():
     assert after["check"] == 0 and after["worth"] == 3 and after["others"] == []
     assert after["buckets"]["valid"] == 3 and after["buckets"]["check"] == 0
     assert [g["key"] for g in after["groups"]] == ["US", "UKEU", "LATAM", "none"]
-    assert after["groups"][-1] == {"key": "none", "jobs": 2, "check": 0, "fits": ["a"]}
+    assert after["groups"][-1] == {"key": "none", "jobs": 2, "fits": ["a"]}
+
+
+def test_only_worth_applying_jobs_are_scored():
+    # Needs a check is scored only once a person approves it (it is then Worth applying)
+    assert WORTH == ("valid",)
+    assert "check" in APPROVABLE
 
 
 def test_build_report_profile_without_location_fits_every_market():

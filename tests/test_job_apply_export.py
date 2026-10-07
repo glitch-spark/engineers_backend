@@ -199,13 +199,28 @@ async def test_export_records_where_each_row_went(client, staff_user, auth_heade
     await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
     placed = {}
     for r in await JobApplyRow.find({"runId": PydanticObjectId(run_id)}).to_list():
-        for acc, where in (r.exportedRows or {}).items():
-            placed[(acc, r.url)] = where
+        for acc, by_sheet in (r.exportedSheets or {}).items():
+            assert list(by_sheet) == ["1AbC_dEf-123456"]
+            placed[(acc, r.url)] = by_sheet["1AbC_dEf-123456"]
     assert sorted(w["row"] for w in placed.values()) == [2, 3, 4]
     for (acc, url), where in placed.items():
         sheet_row = sheets["rows"][where["row"] - 2]
         assert sheet_row[3] == url and sheet_row[0] == ("Tharun" if acc == str(tharun.id) else "Eric")
-    assert all(w["tab"] == sheets["tab"] and w["sheetId"] for w in placed.values())
+    assert all(w["tab"] == sheets["tab"] for w in placed.values())
+
+
+async def test_the_same_rows_can_go_to_another_sheet(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    run_id, *_ = await _run(client, h, staff_user)
+    other = "https://docs.google.com/spreadsheets/d/9ZyX_wVu-654321/edit"
+    first = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})).json()
+    assert first["added"] == 3
+    again = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET, "dryRun": True})).json()
+    assert again["ready"] == 0 and again["alreadyExported"] == 3
+    run = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    assert run["toExport"] == 0 and run["exportedReady"] == 3  # the button stays on: another sheet can take them
+    second = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": other})).json()
+    assert second["added"] == 3 and second["alreadyExported"] == 0
 
 
 async def _tailor_and_finish(client, h, row_id, account_id, pdf="JVBERi0xLjc="):
