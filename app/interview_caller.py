@@ -141,6 +141,35 @@ def caller_post_kind(
     return None
 
 
+def caller_thread_event(
+    prev: Optional[dict], new: Optional[dict], *, added: bool = False, removed: bool = False,
+) -> Optional[str]:
+    """The thread reply a write earns for one round (first match wins).
+
+    moved (round added) · removed · ended (canceled/rejected) · back_on · rescheduled · confirmed ·
+    unconfirmed · details (any other caller field) · None. Turning the caller on or off earns no reply:
+    the main post says so.
+    """
+    if removed:
+        return "removed"
+    if added:
+        return "moved"
+    if prev is None or new is None:
+        return None
+    was_on, is_on = _is_on(prev), _is_on(new)
+    if was_on and not is_on:
+        return "ended"
+    if is_on and not was_on:
+        return "back_on"
+    if prev.get("time") != new.get("time"):
+        return "rescheduled"
+    if prev.get("confirmed") != new.get("confirmed"):
+        return "confirmed" if new.get("confirmed") else "unconfirmed"
+    if prev != new:
+        return "details"
+    return None
+
+
 def caller_change_lines(
     prev: dict,
     new: dict,

@@ -401,12 +401,22 @@ def caller_round_text(
     account: Optional[Account],
     owner: Optional[UserExtra],
     coworkers: list[UserExtra],
+    manager: Optional[UserExtra] = None,
 ) -> str:
-    """The #caller main post for one round; marked canceled once called off."""
+    """The interview's #caller main post, describing its latest round: marked canceled once called off,
+    "No caller needed" when that round has no caller."""
     caller = entry.caller
-    off = not caller.enabled or interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
     when = slack_time(getattr(entry, "scheduledAt", None))
     company = (interview.companyName or "").strip() or "—"
+    if caller is None or not caller.enabled:
+        return "\n".join([
+            f":telephone_receiver: *No caller needed for {_stage_label(entry.stage)}* — posted by {_mention(owner)}",
+            f"*Profile:* {_profile_label(account) or '—'}",
+            f"*Company name:* {company}",
+            f"*Stage:* {_stage_label(entry.stage)}",
+            f"*Interview time:* {when}",
+        ])
+    off = interview_status_value(getattr(entry, "status", None)) in ENDED_STATUSES
     job_url = (interview.jobUrl or "").strip()
     recruiter = (getattr(entry, "interviewerName", None) or "").strip() or "—"
     flag = _country_flag(account.country if account else None)
@@ -426,7 +436,50 @@ def caller_round_text(
     ]
     if coworkers:
         lines.append(f"*Coworkers:* {' '.join(_mention(u) for u in coworkers)}")
+    lines.append(f"*Interview manager:* {_manager_text(manager)}")
+    if not off:
+        lines.append(":white_check_mark: Confirmed" if getattr(entry, "confirmed", False)
+                     else ":hourglass_flowing_sand: Not confirmed yet")
     return "\n".join(lines)
+
+
+def _manager_text(manager: Optional[UserExtra]) -> str:
+    return _mention(manager) if manager is not None else "no interview manager assigned"
+
+
+async def caller_thread_reply(
+    event: str, entry: Any, prev: Optional[dict], *, owner: Optional[UserExtra], manager: Optional[UserExtra],
+) -> Optional[str]:
+    """The thread reply for a caller_thread_event; ends with a cc line for the manager and the owner.
+    None for "details" when no listed field changed."""
+    stage, when = _stage_label(entry.stage), slack_time(getattr(entry, "scheduledAt", None))
+    caller = getattr(entry, "caller", None)
+    if event == "moved":
+        tail = "needs confirmation" if caller is not None and caller.enabled else "no caller needed"
+        head = f":arrow_right: *Moved to {stage}* — {when} · {tail}"
+    elif event == "removed":
+        head = f":wastebasket: *Round removed* — {stage}"
+    elif event == "ended":
+        status_label = str(interview_status_value(getattr(entry, "status", None)) or "canceled").capitalize()
+        head = f":no_entry: *{status_label}* — {stage} · {when}"
+    elif event == "back_on":
+        head = f":white_check_mark: *Back on* — {stage} · {when} · needs confirmation"
+    elif event == "rescheduled":
+        old = slack_time((prev or {}).get("time"))
+        head = f":repeat: *Rescheduled* — {old} → {when} · needs confirmation"
+    elif event == "confirmed":
+        name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
+        head = f":white_check_mark: *Confirmed* — {stage} · {when} · caller {name}"
+    elif event == "unconfirmed":
+        head = f":warning: *Confirmation removed* — {stage} · {when}"
+    elif event == "details":
+        lines = await _change_lines(prev, entry)
+        if not lines:
+            return None
+        head = "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
+    else:
+        return None
+    return f"{head}\ncc {_manager_text(manager)} {_mention(owner)}"
 
 
 def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
