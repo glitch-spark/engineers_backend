@@ -27,6 +27,9 @@ class BidReportRow(BaseModel):
     count: Optional[int] = None  # None when the folder could not be read
     amount: Optional[float] = None
     error: Optional[str] = None
+    # Bid-record rows only (count is then the approved bids); None on rows counted from folders.
+    pending: Optional[int] = None
+    rejected: Optional[int] = None
 
 
 class BidReport(TimestampedDocument, BidReportRow):

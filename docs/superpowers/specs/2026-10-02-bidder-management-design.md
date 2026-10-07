@@ -6,9 +6,10 @@ Status: approved design, pending spec review
 
 ## 1. Goal
 
-Users manage the bidders who apply to jobs for them. A separate system (outside these repos) saves a
-screenshot each time a bidder submits an application, into one storage folder per bidder. This feature
-counts those screenshots and posts:
+Users manage the bidders who apply to jobs for them. A separate system (the Bid Track browser
+extension, outside these repos) uploads screenshots of each application, step by step, into one
+storage folder per bidder with one subfolder per job. This feature counts those job folders (bids)
+and posts:
 
 - a **daily** bid count per bidder to a Slack channel, and
 - a **weekly** bid count per bidder with the amount to pay them (`bids × rate`).
@@ -20,9 +21,9 @@ week, and browse past daily and weekly results.
 
 | Topic | Decision |
 |---|---|
-| Screenshot source | The existing external system writes screenshots to S3, one folder per bidder. We only count them. Each bidder stores its folder URL. |
-| Storage provider | S3 today, likely replaced by a cheaper provider. Reads go through a one-method adapter. |
-| What counts as a bid | One image file (`.png .jpg .jpeg .webp`, case-insensitive) whose upload time falls inside the window. Screenshots are not inspected. |
+| Screenshot source | The Bid Track browser extension uploads screenshots to Backblaze B2 (bucket `bid-screenshots`) under `<member>/<YYYY-MM-DD>/<profile>/<job>/step<n>_<trigger>_<stamp>.png`. A bidder's folder is their member prefix. We only count them. Each bidder stores its folder URL. |
+| Storage provider | Backblaze B2 via its S3-compatible API (`BID_STORAGE_ENDPOINT_URL`); AWS S3 when unset. Reads go through a small adapter. |
+| What counts as a bid | One job folder (the folder holding the screenshots), counted in the window of its earliest image (`.png .jpg .jpeg .webp`, case-insensitive). The extension's `_bid_track_connection_test_*` uploads are ignored. Screenshots are not inspected. (Changed 2026-10-03 from "one image file", which counted every step of an application.) |
 | Rate | USD per bid. Weekly pay = weekly count × rate. |
 | Daily window | 6:30 PM → 6:30 PM, `America/Chicago`. Reported at 6:30 PM. |
 | Weekly window | Saturday 4:00 PM → Saturday 4:00 PM, `America/Chicago`. Reported Saturday 4:00 PM. Counted directly from storage, independent of the daily windows. |
@@ -93,9 +94,12 @@ Reuses `SlackAlertLog` (unique on `userId` + `kind`), with the channel sentinel 
 class BidStorageError(Exception): ...
 
 class BidStorage(Protocol):
-    async def count_screenshots(self, folder_url: str, start: datetime, end: datetime) -> int: ...
+    async def count_bids(self, folder_url: str, start: datetime, end: datetime) -> int: ...
+    async def count_windows(self, folder_url: str, windows: Sequence[tuple[datetime, datetime]]) -> list[int]: ...
 
 def parse_folder_url(url: str) -> tuple[str, str]: ...   # (bucket, prefix) or ValueError
+def job_first_seen(objects) -> dict[str, datetime]: ...  # job folder -> earliest image upload
+def count_jobs_in_window(first_seen, start, end) -> int: ...
 def get_bid_storage() -> BidStorage: ...
 ```
 
@@ -103,14 +107,18 @@ def get_bid_storage() -> BidStorage: ...
   - `s3://<bucket>/<prefix>`
   - `https://<bucket>.s3.<region>.amazonaws.com/<prefix>` and `https://<bucket>.s3.amazonaws.com/<prefix>`
   - `https://s3.<region>.amazonaws.com/<bucket>/<prefix>` (path style)
+  - `https://s3.<region>.backblazeb2.com/<bucket>/<prefix>`, `https://<bucket>.s3.<region>.backblazeb2.com/<prefix>`
+    and the Backblaze console's `https://f<nnn>.backblazeb2.com/file/<bucket>/<prefix>`
 
   The prefix is URL-decoded and always ends with `/`, so `alice` can never match `alice2/`. An empty
   prefix (whole bucket) is rejected. Anything else raises `ValueError` with a message the API returns as a
-  422.
-- **`S3BidStorage`** pages through `list_objects_v2(Bucket, Prefix)` and counts keys with an image
-  extension whose `LastModified` is in `[start, end)`. Subfolders under the prefix are included. boto3 runs
-  in `asyncio.to_thread`. Any boto/network error is re-raised as `BidStorageError` with a short message
-  (e.g. `AccessDenied`, `NoSuchBucket`).
+  422. The URL only supplies bucket and prefix; the service comes from `BID_STORAGE_ENDPOINT_URL`, so one
+  deployment reads one storage service.
+- **`S3BidStorage`** pages through `list_objects_v2(Bucket, Prefix)` once, records each job folder's
+  earliest image `LastModified` across all pages, and counts the jobs whose first screenshot is in each
+  `[start, end)` window. With `BID_STORAGE_ENDPOINT_URL` set it uses that endpoint with path-style
+  addressing. boto3 runs in `asyncio.to_thread`. Any boto/network error is re-raised as `BidStorageError`
+  with a short message (e.g. `AccessDenied`, `NoSuchBucket`).
 - **`get_bid_storage()`** returns the implementation named by `BID_STORAGE_PROVIDER` (only `s3` today).
   Unknown provider → `BidStorageError` on use, so the app still boots.
 - **Credentials**: `BID_STORAGE_ACCESS_KEY_ID`, `BID_STORAGE_SECRET_ACCESS_KEY`, `BID_STORAGE_REGION`, each
@@ -122,7 +130,8 @@ def get_bid_storage() -> BidStorage: ...
 BID_STORAGE_PROVIDER=s3
 BID_STORAGE_ACCESS_KEY_ID=            # optional, falls back to AWS_ACCESS_KEY_ID
 BID_STORAGE_SECRET_ACCESS_KEY=        # optional, falls back to AWS_SECRET_ACCESS_KEY
-BID_STORAGE_REGION=                   # optional, falls back to AWS_REGION
+BID_STORAGE_REGION=                   # optional, falls back to AWS_REGION (Backblaze: us-east-005)
+BID_STORAGE_ENDPOINT_URL=             # unset = AWS S3; Backblaze: https://s3.us-east-005.backblazeb2.com
 BID_REPORT_TIMEZONE=America/Chicago
 BID_DAILY_REPORT_TIME=18:30           # HH:MM, 24h, in BID_REPORT_TIMEZONE
 BID_WEEKLY_REPORT_DAY=saturday        # monday … sunday
