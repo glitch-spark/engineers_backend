@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     SLACK_DIGEST_HOUR: int = 8
     SLACK_DIGEST_MINUTE: int = 0
     SLACK_CALLER_CHANNEL_ID: Optional[str] = None
+    # Daily list of the day's confirmed caller interviews (e.g. #engineer-caller-test); unset = off.
+    # Posted once a day at SLACK_CALLER_DAILY_TIME (HH:MM) in SLACK_CALLER_DAILY_TIMEZONE.
+    SLACK_CALLER_DAILY_CHANNEL_ID: Optional[str] = None
+    SLACK_CALLER_DAILY_TIME: str = "05:00"
+    SLACK_CALLER_DAILY_TIMEZONE: str = "America/Chicago"
     # Channel (C…) where the bot posts each daily plan and edits it in place.
     SLACK_DAILY_PLAN_CHANNEL_ID: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720

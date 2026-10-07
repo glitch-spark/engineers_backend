@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import re
 import math
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -1077,16 +1077,174 @@ async def run_caller_reminders(
     return {"sent": sent, "failed": failed}
 
 
+# --- daily list of confirmed caller interviews -----------------------------------------------------
+
+
+def caller_daily_due(now: datetime, *, at: time, tz: ZoneInfo) -> Optional[date]:
+    """The local day whose list is due: from `at` until that local day ends; None before `at`."""
+    local = _aware_utc(now).astimezone(tz)
+    return local.date() if local.time() >= at else None
+
+
+def caller_daily_bounds(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """UTC-aware [local midnight, next local midnight) of `day` (23 or 25 hours across DST)."""
+    start = datetime.combine(day, time.min, tzinfo=tz)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _day_title(day: date) -> str:
+    return f"{day:%a} {day:%b} {day.day}"
+
+
+def caller_daily_text(day: date, rows: list[dict[str, Any]]) -> str:
+    """The list for `day`: one line per confirmed caller round, by start time."""
+    if not rows:
+        return f":telephone_receiver: No confirmed caller interviews today ({_day_title(day)})."
+    lines = [f":telephone_receiver: *Caller interviews today — {_day_title(day)}*"]
+    for r in sorted(rows, key=lambda r: r["start"]):
+        parts = [slack_time(r["start"], with_day=False), r["company"], r["stage"], r["profile"],
+                 f"caller {r['callerName']}", r["method"]]
+        line = " · ".join(p for p in parts if p)
+        if r["mentions"]:
+            line += f" — {r['mentions']}"
+        if r["link"]:
+            line += f" · <{r['link']}|thread>"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _is_listed(entry: Any, start: datetime, end: datetime) -> bool:
+    caller = getattr(entry, "caller", None)
+    at = getattr(entry, "scheduledAt", None)
+    return bool(
+        caller is not None and caller.enabled and getattr(entry, "confirmed", False) and at is not None
+        and interview_status_value(getattr(entry, "status", None)) not in ENDED_STATUSES
+        and start <= _aware_utc(at) < end
+    )
+
+
+async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, Any]]:
+    """(interview, round) for confirmed, active caller rounds starting in [start, end)."""
+    found = await Interview.find({"stageHistory": {"$elemMatch": {
+        "caller.enabled": True, "confirmed": True, "status": {"$nin": list(ENDED_STATUSES)},
+        "scheduledAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)},
+    }}}).to_list()
+    return [(iv, e) for iv in found for e in iv.stageHistory if _is_listed(e, start, end)]
+
+
+async def _caller_daily_people(interview: Any, entry: Any) -> dict[str, Any]:
+    owner, manager = await _owner_and_manager(interview)
+    ids = list(entry.caller.coworkerIds or [])
+    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
+    account = await Account.get(interview.accountId) if interview.accountId else None
+    return {"owner": owner, "coworkers": coworkers, "manager": manager, "profile": _profile_label(account)}
+
+
+async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
+    thread = getattr(interview, "slackThread", None)
+    channel, ts = (thread.channel, thread.ts) if thread else (
+        (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip(), (entry.caller.slackChannelTs or "").strip())
+    if not channel or not ts:
+        return None
+    try:
+        return (await _slack_api("chat.getPermalink", {"channel": channel, "message_ts": ts})).get("permalink")
+    except Exception as exc:
+        log.info("slack_bot caller daily permalink failed: %s", exc)
+        return None
+
+
+async def _caller_daily_post(channel: str, text: str) -> bool:
+    try:
+        await _slack_api("chat.postMessage", {"channel": channel, "text": text, "unfurl_links": False,
+                                              "unfurl_media": False})
+        return True
+    except Exception as exc:
+        log.warning("slack_bot caller daily post failed: %s", exc)
+        return False
+
+
+def _caller_daily_configured() -> Optional[tuple[str, time, ZoneInfo]]:
+    """(channel, time, zone) when the daily list is on; None when off or misconfigured."""
+    s = get_settings()
+    channel = (s.SLACK_CALLER_DAILY_CHANNEL_ID or "").strip()
+    if not channel or not slack_bot_configured():
+        return None
+    try:
+        hh, mm = (s.SLACK_CALLER_DAILY_TIME or "05:00").split(":")
+        return channel, time(int(hh), int(mm)), ZoneInfo(s.SLACK_CALLER_DAILY_TIMEZONE or "America/Chicago")
+    except Exception as exc:
+        log.warning("slack_bot caller daily misconfigured: %s", exc)
+        return None
+
+
+async def run_caller_daily(
+    now: datetime,
+    *,
+    load=_caller_daily_load,
+    claim=_reminder_claim,
+    release=_reminder_release,
+    post=_caller_daily_post,
+    people=_caller_daily_people,
+    permalink=_caller_daily_permalink,
+    configured=_caller_daily_configured,
+) -> str:
+    """Post the day's confirmed caller interviews once (claim first, release on failure).
+
+    Returns "posted", "not_due", "already_sent", "off" or "failed"."""
+    cfg = configured()
+    if cfg is None:
+        return "off"
+    channel, at, tz = cfg
+    day = caller_daily_due(now, at=at, tz=tz)
+    if day is None:
+        return "not_due"
+    key = f"caller-daily:{day.isoformat()}"
+    if not await claim(key):
+        return "already_sent"
+    ok = False
+    try:
+        start, end = caller_daily_bounds(day, tz)
+        rows = []
+        for iv, entry in await load(start, end):
+            who = await people(iv, entry)
+            users = [who["owner"], *who["coworkers"], who["manager"]]
+            mentions = " ".join(dict.fromkeys(_mention(u) for u in users if u is not None))
+            rows.append({
+                "start": _aware_utc(entry.scheduledAt),
+                "company": (iv.companyName or "").strip() or "—",
+                "stage": _stage_label(entry.stage),
+                "profile": who["profile"],
+                "callerName": (entry.caller.callerName or "").strip() or "TBD",
+                "method": _METHOD_LABELS.get(entry.caller.method or "", ""),
+                "mentions": mentions,
+                "link": await permalink(iv, entry),
+            })
+        ok = await post(channel, caller_daily_text(day, rows))
+    except Exception as exc:
+        log.warning("slack_bot caller daily list failed: %s", exc)
+    if not ok:
+        await release(key)
+        return "failed"
+    return "posted"
+
+
 async def run_alert_tick() -> dict[str, int]:
-    """Cron entrypoint: #caller thread reminders, then the daily digest for every linked user."""
+    """Cron entrypoint: #caller thread reminders, the daily caller list, then each linked user's digest."""
     try:
         reminders = await run_caller_reminders(datetime.now(timezone.utc))
     except Exception as exc:  # never block the per-user digest
         log.exception("slack_bot caller reminders crashed: %s", exc)
         reminders = {"sent": 0, "failed": 0}
     caller_reminders = reminders["sent"]
+    try:
+        caller_daily = await run_caller_daily(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot caller daily list crashed: %s", exc)
+        caller_daily = "failed"
     if not slack_bot_configured():
-        return {"users": 0, "digest": 0, "skipped": 1, "caller_reminders": caller_reminders}
+        return {"users": 0, "digest": 0, "skipped": 1, "caller_reminders": caller_reminders,
+                "caller_daily": caller_daily}
     users = await _linked_users()
     digest_total = 0
     skips = {
@@ -1107,4 +1265,5 @@ async def run_alert_tick() -> dict[str, int]:
                 logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
         except Exception as exc:
             log.exception("slack_bot tick failed for user=%s: %s", user.id, exc)
-    return {"users": len(users), "digest": digest_total, "skipped": 0, "caller_reminders": caller_reminders, **skips}
+    return {"users": len(users), "digest": digest_total, "skipped": 0, "caller_reminders": caller_reminders,
+            "caller_daily": caller_daily, **skips}
