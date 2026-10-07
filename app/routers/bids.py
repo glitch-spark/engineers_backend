@@ -57,7 +57,27 @@ async def _load_reviewable(bid_id: str, user) -> tuple[Bid, Bidder]:
     return bid, _reviewable(await Bidder.get(bid.bidderId), user)
 
 
-def _bid_out(bid: Bid, bidder_name: str, evidence: dict) -> dict:
+def _thumb_key(bid: Bid) -> Optional[str]:
+    """The screenshot a list shows small: the (last) Submit one, else the last step; uploaded ones only."""
+    uploaded = sorted((s for s in bid.screenshots if s.uploadedAt is not None), key=lambda s: (s.step, s.capturedAt))
+    submits = [s for s in uploaded if s.trigger == "submit"]
+    shot = (submits or uploaded or [None])[-1]
+    return shot.key if shot else None
+
+
+async def _thumb_urls(bids: list[Bid]) -> dict[str, Optional[str]]:
+    """Signed thumbnail link per bid id; None when nothing is uploaded or links can't be signed (the list still loads)."""
+    keys = {str(b.id): _thumb_key(b) for b in bids}
+    bucket, storage = get_settings().BID_STORAGE_BUCKET, get_bid_storage()
+    if not bucket or not hasattr(storage, "presign_get") or not any(keys.values()):
+        return dict.fromkeys(keys)
+    try:  # signing is offline but synchronous
+        return await asyncio.to_thread(lambda: {i: k and storage.presign_get(bucket, k) for i, k in keys.items()})
+    except BidStorageError:
+        return dict.fromkeys(keys)
+
+
+def _bid_out(bid: Bid, bidder_name: str, evidence: dict, thumb_url: Optional[str] = None) -> dict:
     """evidence is the bid's entry from evidence_for: profileName, resumeNames, tailoredResumeName."""
     return {
         "id": str(bid.id),
@@ -78,11 +98,13 @@ def _bid_out(bid: Bid, bidder_name: str, evidence: dict) -> dict:
         "durationSec": duration_sec(bid),
         **evidence,
         "rejectReason": bid.rejectReason,
+        "thumbUrl": thumb_url,
     }
 
 
 async def _single_bid_out(bid: Bid, bidder: Bidder) -> dict:
-    return _bid_out(bid, bidder.name, (await evidence_for([bid], {str(bidder.id): bidder}))[str(bid.id)])
+    evidence = (await evidence_for([bid], {str(bidder.id): bidder}))[str(bid.id)]
+    return _bid_out(bid, bidder.name, evidence, (await _thumb_urls([bid]))[str(bid.id)])
 
 
 def _now() -> datetime:
@@ -159,6 +181,7 @@ async def list_bids(
         query["status"] = status
     bids = await Bid.find(query).sort("-firstAt").to_list()
     evidence = await evidence_for(bids, {str(b.id): b for b in shown})
+    thumbs = await _thumb_urls(bids)
 
     folders = await _folders_without_record(shown, counts, start, end, now)
     return {
@@ -167,7 +190,7 @@ async def list_bids(
         "start": _iso_utc(start),
         "end": _iso_utc(end),
         "timezone": sched.tz.key,
-        "bids": [_bid_out(b, names[b.bidderId], evidence[str(b.id)]) for b in bids],
+        "bids": [_bid_out(b, names[b.bidderId], evidence[str(b.id)], thumbs[str(b.id)]) for b in bids],
         "summary": {
             str(b.id): dict(
                 zip(("name", "approved", "pending", "rejected"), (b.name, *counts[str(b.id)])),

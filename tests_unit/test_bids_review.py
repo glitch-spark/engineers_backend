@@ -166,7 +166,7 @@ async def test_owner_lists_their_bids_for_the_day(make_client, owner, storage):
         "submittedAt": None, "screenshotCount": 2, "missingUploads": 2, "status": "pending",
         "reviewedByName": None, "reviewedAt": None, "note": None, "changedSinceReview": False,
         "jobDomain": "jobs.example", "durationSec": 0, "profileName": None, "resumeNames": [],
-        "tailoredResumeName": None, "rejectReason": None,
+        "tailoredResumeName": None, "rejectReason": None, "thumbUrl": None,  # nothing uploaded
     }
 
 
@@ -711,3 +711,38 @@ async def test_bulk_without_only_complete_unchanged(make_client, owner):
     assert explicit_false.json() == {"updated": 1, "skipped": 0} and default.json() == {"updated": 1, "skipped": 0}
     assert [(b.status, b.rejectReason) for b in await Bid.find({"bidderId": ana.id}).sort("firstAt").to_list()] == [
         ("approved", None)] * 2
+
+
+async def test_list_thumb_is_the_submit_screenshot_else_the_last_uploaded_step(make_client, owner):
+    start, _ = day_window()
+    bidder = await make_bidder(owner)
+    plain = await add_bid(bidder, "plain", start + timedelta(hours=1))
+    submitted = await add_bid(bidder, "submitted", start + timedelta(hours=2))
+    naive = (start + timedelta(hours=2)).astimezone(timezone.utc).replace(tzinfo=None)
+    submitted.screenshots.append(Screenshot(key=f"{submitted.jobKey}/step2_submit.png", step=3, trigger="submit",
+                                            capturedAt=naive, uploadedAt=naive))
+    await submitted.save()
+    none = await add_bid(bidder, "none", start + timedelta(hours=3), uploaded=False)
+    async with make_client(owner) as c:
+        r = await c.get("/bids", params={"day": DAY})
+    assert r.status_code == 200, r.text
+    thumbs = {b["id"]: b["thumbUrl"] for b in r.json()["bids"]}
+    assert thumbs == {
+        str(plain.id): "https://signed/bid-screenshots/ana/2026-10-05/backend/plain/step1_step_1.png",
+        str(submitted.id): "https://signed/bid-screenshots/ana/2026-10-05/backend/submitted/step2_submit.png",
+        str(none.id): None,
+    }
+
+
+async def test_list_thumb_is_null_when_signing_fails(make_client, owner, storage, monkeypatch):
+    start, _ = day_window()
+    await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
+
+    def broken(bucket, key):
+        raise BidStorageError("bad endpoint")
+
+    monkeypatch.setattr(storage, "presign_get", broken)
+    async with make_client(owner) as c:
+        r = await c.get("/bids", params={"day": DAY})
+    assert r.status_code == 200, r.text
+    assert [b["thumbUrl"] for b in r.json()["bids"]] == [None]
