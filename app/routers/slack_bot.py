@@ -1,12 +1,16 @@
-"""Slack interview bot routes: Slack member ID and prefs, test DM, cron tick."""
+"""Slack interview bot routes: Slack member ID and prefs, test DM, button clicks (interactions), cron tick."""
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from urllib.parse import parse_qs
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
@@ -23,6 +27,7 @@ from app.slack_bot import (
     validate_timezone,
 )
 from app.slack_timezones import slack_timezone_catalog
+from app.slack_transactions import is_transaction_action, process_transaction_click, verify_slack_signature
 
 
 log = logging.getLogger(__name__)
@@ -149,6 +154,47 @@ async def slack_test_dm(user: Annotated[UserExtra, Depends(get_current_user)]) -
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to send Slack DM — open a chat with the bot once and retry",
         )
+    return {"ok": True}
+
+
+@router.post("/interactions")
+async def slack_interactions(request: Request, background: BackgroundTasks) -> dict:
+    """Slack button clicks. No app login: Slack signs the request with SLACK_SIGNING_SECRET, checked over the raw
+    body before anything is parsed. Handled clicks are acknowledged at once and applied in the background
+    (Slack wants an answer within 3 seconds); refusals reach the clicker as ephemeral text."""
+    secret = (get_settings().SLACK_SIGNING_SECRET or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="SLACK_SIGNING_SECRET is not configured",
+        )
+    body = await request.body()
+    if not verify_slack_signature(
+        secret,
+        request.headers.get("X-Slack-Request-Timestamp", ""),
+        body,
+        request.headers.get("X-Slack-Signature", ""),
+        now=time.time(),
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid signature")
+    try:
+        payload = json.loads(parse_qs(body.decode("utf-8")).get("payload", [""])[0])
+    except (UnicodeDecodeError, ValueError):
+        return {"ok": True}
+    if not isinstance(payload, dict) or payload.get("type") != "block_actions":
+        return {"ok": True}
+    actions = payload.get("actions") or []
+    action = actions[0] if actions and isinstance(actions[0], dict) else {}
+    action_id = str(action.get("action_id") or "")
+    if not is_transaction_action(action_id):
+        return {"ok": True}
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    background.add_task(
+        process_transaction_click,
+        action_id,
+        str(action.get("value") or ""),
+        str(user.get("id") or ""),
+        str(payload.get("response_url") or ""),
+    )
     return {"ok": True}
 
 

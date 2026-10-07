@@ -6,9 +6,14 @@ Every Slack call is best-effort: failures are logged and never fail the request 
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 from datetime import datetime
 from typing import Any, Literal, Optional
+
+import httpx
+from beanie import PydanticObjectId
 
 from app.config import get_settings
 from app.models import Transaction, UserExtra
@@ -198,3 +203,86 @@ async def set_transaction_status(tx: Transaction, status: Literal["approved", "r
     tx.approvedAt = datetime.utcnow()
     await tx.save()
     await announce_decision(tx, by)
+
+
+# --- Approve / Reject buttons --------------------------------------------------------------------------
+
+# Slack's replay window for signed requests.
+_SIGNATURE_MAX_AGE = 300
+_ACTIONS: dict[str, Literal["approved", "rejected"]] = {"tx_approve": "approved", "tx_reject": "rejected"}
+_RESPONSE_URL_PREFIX = "https://hooks.slack.com/"
+
+NOT_ADMIN = "Only admins can approve or reject transactions in Slack."
+NO_TRANSACTION = "This transaction no longer exists."
+
+
+def is_transaction_action(action_id: str) -> bool:
+    return action_id in _ACTIONS
+
+
+def verify_slack_signature(secret: str, timestamp: str, body: bytes, signature: str, now: float) -> bool:
+    """True when `signature` is Slack's v0 HMAC-SHA256 of `v0:{timestamp}:{body}` under `secret` and the timestamp
+    is within 5 minutes of `now` (either way). Constant-time compare."""
+    if not secret or not timestamp or not signature:
+        return False
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False
+    if abs(now - ts) > _SIGNATURE_MAX_AGE:
+        return False
+    expected = "v0=" + hmac.new(secret.encode(), f"v0:{timestamp}:".encode() + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected.encode(), signature.encode())
+
+
+def _display_name(user: Optional[UserExtra]) -> str:
+    if user is None:
+        return ""
+    return _slack_escape((user.name or "").strip() or (user.email or "").strip())
+
+
+async def handle_transaction_action(action_id: str, tx_id: str, slack_user_id: str) -> Optional[str]:
+    """Apply an Approve / Reject click. None on success, else the text to show the clicker (ephemeral)."""
+    status = _ACTIONS[action_id]
+    slack_user_id = (slack_user_id or "").strip()
+    admin = None
+    if slack_user_id:
+        admin = await UserExtra.find_one({"slackUserId": slack_user_id, "role": "admin", "isActive": {"$ne": False}})
+    if admin is None:
+        return NOT_ADMIN
+    try:
+        oid = PydanticObjectId(tx_id)
+    except Exception:
+        return NO_TRANSACTION
+    tx = await Transaction.get(oid)
+    if tx is None:
+        return NO_TRANSACTION
+    if tx.status != "pending":
+        word = "approved" if tx.status == "approved" else "rejected"
+        by = _display_name(await UserExtra.get(tx.approvedBy)) if tx.approvedBy else ""
+        return f"Already {word} by {by}." if by else f"Already {word}."
+    await set_transaction_status(tx, status, admin)
+    return None
+
+
+async def _post_ephemeral(response_url: str, payload: dict) -> None:
+    """POST to the click's response_url. Only Slack's hooks host is called. Never raises."""
+    if not (response_url or "").startswith(_RESPONSE_URL_PREFIX):
+        log.warning("slack_transactions ignoring response_url outside %s", _RESPONSE_URL_PREFIX)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(response_url, json=payload)
+    except Exception as exc:
+        log.warning("slack_transactions ephemeral reply failed: %s", exc)
+
+
+async def process_transaction_click(action_id: str, tx_id: str, slack_user_id: str, response_url: str) -> None:
+    """Handle a click and tell the clicker when it was refused. Never raises."""
+    try:
+        text = await handle_transaction_action(action_id, tx_id, slack_user_id)
+    except Exception as exc:
+        log.warning("slack_transactions click on %s failed: %s", tx_id, exc)
+        text = "Something went wrong. Try again from the app."
+    if text:
+        await _post_ephemeral(response_url, {"response_type": "ephemeral", "replace_original": False, "text": text})
