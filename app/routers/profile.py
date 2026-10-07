@@ -46,19 +46,8 @@ def _slack_profile_fields(user: UserExtra) -> dict:
     )
     return {
         "slackConnected": connected,
-        "slackAlertsEnabled": bool(user.slackAlertsEnabled),
         "slackTimezone": tz_name,
         "slackTimezones": slack_timezone_catalog(),
-        "slackDigestHour": (
-            user.slackDigestHour
-            if user.slackDigestHour is not None
-            else s.SLACK_DIGEST_HOUR
-        ),
-        "slackDigestMinute": (
-            user.slackDigestMinute
-            if user.slackDigestMinute is not None
-            else s.SLACK_DIGEST_MINUTE
-        ),
         "slackBotConfigured": slack_bot_configured(),
     }
 

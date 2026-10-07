@@ -4,7 +4,7 @@ One Slack App bot (`SLACK_BOT_TOKEN`) sends every Slack message the app posts, i
 
 | Category | Messages | Where |
 |---|---|---|
-| **Reminders** | 30-minute reminder, daily caller list, personal digest | #caller thread, `SLACK_CALLER_DAILY_CHANNEL_ID`, DM |
+| **Reminders** | 30-minute reminder, daily caller list | #caller thread, `SLACK_CALLER_DAILY_CHANNEL_ID` |
 | **Action items** | #caller thread (main post and replies), Daily Plan | `SLACK_CALLER_CHANNEL_ID`, `SLACK_DAILY_PLAN_CHANNEL_ID` |
 | **Transactions** | New transaction with Approve / Reject buttons | `SLACK_TRANSACTIONS_CHANNEL_ID` |
 
@@ -51,8 +51,8 @@ setting unset, that message is skipped. Slack failures are logged and never bloc
 ## 3. People
 
 - **Slack member ID** — each user types theirs in **Profile → Slack** (Slack: your profile → ⋮ → **Copy member
-  ID**, e.g. `U04ABC12345`). It is used to @-mention them and to DM them. One ID belongs to one user.
-  Without one, messages show their name and they get no ping or DM.
+  ID**, e.g. `U04ABC12345`). It is used to @-mention them (and by **Send test DM**). One ID belongs to one
+  user. Without one, messages show their name and they get no ping. There are no per-user digest DMs.
 - **Owner** — the user who created the interview (or the transaction). Their mention leads the message.
 - **Interview manager** — a user role; admins set it on **Users** (edit a user → Role → Interview manager). Every
   active interview manager is cc'd on all #caller posts, replies, reminders and daily lists, and can open any
@@ -116,36 +116,28 @@ cc @owner @im1 @im2
 ```
 
 **Daily caller list** — at 05:00 America/Chicago in `SLACK_CALLER_DAILY_CHANNEL_ID` (e.g. #engineer-caller-test),
-the day's **confirmed** caller rounds, by start time. **`SLACK_CALLER_DAILY_CHANNEL_ID` must be set**, or the list
-is never posted. It is posted once per day, catching up later that day if a tick was missed.
+the day's **caller interviews only** (rounds with a caller requested), by start time, confirmed or not. Rounds
+without a caller, and canceled/rejected/completed rounds, are not listed. Each line tags the round's owner;
+unconfirmed rounds are flagged; the interview managers are cc'd once at the end. **`SLACK_CALLER_DAILY_CHANNEL_ID`
+must be set**, or the list is never posted. It is posted once per day, catching up later that day if a tick was
+missed. This list replaces the old personal digest DMs.
 
 ```
 :alarm_clock: *Caller interviews today* — Wed Oct 7
 • 10:30 AM · Acme · Intro · Ian Meron · caller Sam · Video meeting — @owner · <thread>
+• 11:00 AM · Initech · Tech Round 1 · Ana P · caller TBD · Video meeting · :hourglass_flowing_sand: not confirmed — @owner2 · <thread>
 cc @im1 @im2
 ```
 
-With no rows: `:alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed.`
+With no rows: `:alarm_clock: *Caller interviews today* — Wed Oct 7 · none today.`
 
-**Personal digest** — a private DM at each user's digest time (Profile → Slack: timezone, time, **Send test DM**)
-listing their own interviews (`createdBy`) for the day in their time zone. Each row shows the caller start, else
-"Time TBD"; the company links to the job URL when there is one.
-
-```
-:alarm_clock: *Today's interviews* — Wed Oct 7 · 2 interviews
-• 10:30 AM EDT · Ian Meron · Acme · Intro
-• Time TBD · Maria K · Globex · Final
-<https://app/interviews|Open interviews>
-_Know your why: …_
-```
-
-With none: `:alarm_clock: *Today's interviews* — Wed Oct 7 · none today. Have a rest.` If the test DM fails, open a DM
-with the bot in Slack once and retry.
+**Test DM** — Profile → Slack → **Send test DM** checks the member ID. If it fails, open a DM with the bot in Slack
+once and retry. The Profile timezone still sets the user's local day for in-app alerts and daily caps.
 
 ## 6. Cron
 
 Railway sibling service: start command `python -m app.alerts_tick`, schedule `*/5 * * * *`. Each tick runs the
-30-minute reminders, the daily caller list, then personal digests, then in-app alerts and bid reports. Copy
+30-minute reminders and the daily caller list, then in-app alerts and bid reports. Copy
 `SLACK_BOT_TOKEN`, the `SLACK_CALLER_*` settings and `FRONTEND_ORIGIN` onto that service. Do not cron the uvicorn
 API.
 

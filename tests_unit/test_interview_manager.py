@@ -157,7 +157,7 @@ async def test_blank_slack_id_clears(client):
 async def test_prefs_without_slack_id_leave_it(client):
     pedro = await make_user("Pedro", slack="U04ABC12345")
     async with client(pedro) as c:
-        await c.patch("/integrations/slack/prefs", json={"slackAlertsEnabled": True})
+        await c.patch("/integrations/slack/prefs", json={"slackTimezone": "America/Chicago"})
     assert (await UserExtra.get(pedro.id)).slackUserId == "U04ABC12345"
 
 

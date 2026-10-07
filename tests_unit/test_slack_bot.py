@@ -1,10 +1,7 @@
-"""Unit tests for Slack digest helpers and Know your why."""
+"""Unit tests for Slack bot helpers (labels, flags, time zones)."""
 
 import os
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
@@ -12,16 +9,11 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from app.know_your_why import know_your_why_for_date
 from app.models.interview import InterviewStage
 from app.slack_bot import (
     _country_flag,
-    _frontend_link,
     _profile_label,
     _stage_label,
-    calendar_day_bounds,
-    digest_slot_open,
-    digest_text,
     validate_timezone,
 )
 from app.slack_timezones import (
@@ -29,24 +21,6 @@ from app.slack_timezones import (
     normalize_slack_timezone,
     slack_timezone_catalog,
 )
-
-
-def test_digest_slot_open_inside_window():
-    now = datetime(2026, 7, 28, 8, 2, 0)
-    assert digest_slot_open(now, hour=8, minute=0, window_minutes=5) is True
-
-
-def test_digest_slot_open_outside_window():
-    now = datetime(2026, 7, 28, 8, 6, 0)
-    assert digest_slot_open(now, hour=8, minute=0, window_minutes=5) is False
-    now2 = datetime(2026, 7, 28, 7, 59, 0)
-    assert digest_slot_open(now2, hour=8, minute=0, window_minutes=5) is False
-
-
-def test_calendar_day_bounds():
-    start, end = calendar_day_bounds(date(2026, 7, 28))
-    assert start == datetime(2026, 7, 28, 0, 0, 0)
-    assert end == datetime(2026, 7, 29, 0, 0, 0)
 
 
 def test_validate_timezone_ok():
@@ -119,190 +93,5 @@ def test_stage_label_humanizes():
     assert _stage_label(None) == "—"
 
 
-def test_know_your_why_stable_for_date():
-    a = know_your_why_for_date("2026-07-28")
-    b = know_your_why_for_date(date(2026, 7, 28))
-    assert a == b
-    assert isinstance(a, str) and len(a) > 10
-
-
 NY = ZoneInfo("America/New_York")
 TODAY = date(2026, 10, 7)
-
-
-class _FrozenNow(datetime):
-    """`datetime` whose now() is Wed Oct 7 2026, 8:00 in the asked zone."""
-
-    @classmethod
-    def now(cls, tz=None):
-        return cls(2026, 10, 7, 8, 0, tzinfo=tz)
-
-
-def _digest_iv(company, *, start=None, stage="intro", job_url=None, account_id="acc1"):
-    caller = SimpleNamespace(enabled=True, startsAt=start) if start else None
-    return SimpleNamespace(
-        accountId=account_id, companyName=company, jobUrl=job_url, stage=stage, caller=caller,
-    )
-
-
-def _digest_pair():
-    with_caller = _digest_iv(
-        "Acme", start=datetime(2026, 10, 7, 14, 30, tzinfo=timezone.utc), job_url="https://jobs.example/1"
-    )
-    without_caller = _digest_iv("Globex", stage="final", account_id="acc2")
-    return with_caller, without_caller
-
-
-def test_digest_text_rows():
-    with_caller, without_caller = _digest_pair()
-    text = digest_text(
-        TODAY, [with_caller, without_caller],
-        profiles={"acc1": "Ian Meron", "acc2": "Maria K"}, tz=NY, why="Ship it",
-    )
-    assert text.splitlines() == [
-        ":alarm_clock: *Today's interviews* — Wed Oct 7 · 2 interviews",
-        "• 10:30 AM EDT · Ian Meron · <https://jobs.example/1|Acme> · Intro",
-        "• Time TBD · Maria K · Globex · Final",
-        f"<{_frontend_link('/interviews')}|Open interviews>",
-        "_Know your why: Ship it_",
-    ]
-
-
-def test_digest_text_times_use_the_users_zone():
-    chicago = ZoneInfo("America/Chicago")
-    iv = _digest_iv("Acme", start=datetime(2026, 10, 7, 14, 30, tzinfo=timezone.utc))
-    row = digest_text(TODAY, [iv], profiles={}, tz=chicago, why=None).splitlines()[1]
-    assert row.startswith("• 9:30 AM CDT · ")
-
-
-def test_digest_text_without_why_ends_with_the_link():
-    with_caller, _ = _digest_pair()
-    lines = digest_text(TODAY, [with_caller], profiles={}, tz=NY, why=None).splitlines()
-    assert lines[-1] == f"<{_frontend_link('/interviews')}|Open interviews>"
-    assert not any("Know your why" in line for line in lines)
-
-
-def test_digest_text_missing_profile_and_company_show_a_dash():
-    iv = _digest_iv(None, account_id=None)
-    row = digest_text(TODAY, [iv], profiles={}, tz=NY, why=None).splitlines()[1]
-    assert row == "• Time TBD · — · — · Intro"
-
-
-def test_digest_text_is_one_row_per_interview_in_the_order_given():
-    with_caller, without_caller = _digest_pair()
-    lines = digest_text(TODAY, [without_caller, with_caller], profiles={}, tz=NY, why=None).splitlines()
-    assert lines[1].startswith("• Time TBD") and lines[2].startswith("• 10:30 AM EDT")
-
-
-def test_digest_text_empty_day():
-    assert digest_text(TODAY, [], profiles={}, tz=NY, why=None) == (
-        ":alarm_clock: *Today's interviews* — Wed Oct 7 · none today. Have a rest."
-    )
-    # Nothing else is added on a free day, even with a why.
-    assert len(digest_text(TODAY, [], profiles={}, tz=NY, why="Ship it").splitlines()) == 1
-
-
-def test_digest_text_singular():
-    with_caller, _ = _digest_pair()
-    first = digest_text(TODAY, [with_caller], profiles={}, tz=NY, why=None).splitlines()[0]
-    assert first.endswith("· 1 interview")
-
-
-def test_digest_text_escapes_user_entered_text():
-    iv = _digest_iv("Acme <!channel> & Co", account_id="acc1")
-    row = digest_text(TODAY, [iv], profiles={"acc1": "<!here> Meron"}, tz=NY, why=None).splitlines()[1]
-    assert row == "• Time TBD · &lt;!here&gt; Meron · Acme &lt;!channel&gt; &amp; Co · Intro"
-
-
-def test_digest_text_escapes_only_the_text_of_a_job_link():
-    iv = _digest_iv("Acme <!channel> & Co", job_url="https://jobs.example/1?a=1&b=2")
-    row = digest_text(TODAY, [iv], profiles={}, tz=NY, why=None).splitlines()[1]
-    assert "<https://jobs.example/1?a=1&b=2|Acme &lt;!channel&gt; &amp; Co>" in row
-    assert "<!channel>" not in row
-
-
-def test_digest_text_never_links_a_malformed_job_url():
-    for bad in ("https://x.example/><!channel>", "https://x.example/a|b", "https://x.example/a b"):
-        iv = _digest_iv("Acme", job_url=bad)
-        row = digest_text(TODAY, [iv], profiles={}, tz=NY, why=None).splitlines()[1]
-        assert "<!channel>" not in row and "<http" not in row
-        assert " · Acme · " in row
-    good = digest_text(TODAY, [_digest_iv("Acme", job_url="https://x.example/a?b=1")], profiles={}, tz=NY,
-                       why=None).splitlines()[1]
-    assert "<https://x.example/a?b=1|Acme>" in good
-
-
-@pytest.mark.asyncio
-async def test_digest_empty_day_sends_rest_message():
-    from app.slack_bot import _digest_for_user
-
-    user = SimpleNamespace(
-        id="user1",
-        slackUserId="U123",
-        slackAlertsEnabled=True,
-        slackTimezone="America/New_York",
-        slackDigestHour=8,
-        slackDigestMinute=0,
-    )
-    mark = AsyncMock()
-    send = AsyncMock(return_value=True)
-    find = SimpleNamespace(sort=lambda *_a, **_k: SimpleNamespace(to_list=AsyncMock(return_value=[])))
-    with (
-        patch("app.slack_bot.digest_slot_open", return_value=True),
-        patch("app.slack_bot.datetime", _FrozenNow),
-        patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
-        patch("app.slack_bot._mark_sent", mark),
-        patch("app.slack_bot.send_dm", send),
-        patch("app.slack_bot.Interview.find", return_value=find),
-    ):
-        sent, reason = await _digest_for_user(user)
-    assert sent == 1
-    assert reason is None
-    send.assert_awaited_once()
-    assert send.await_args.kwargs["text"] == (
-        ":alarm_clock: *Today's interviews* — Wed Oct 7 · none today. Have a rest."
-    )
-    assert "blocks" not in send.await_args.kwargs
-    mark.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_digest_lists_only_the_users_own_interviews():
-    from app.slack_bot import _digest_for_user
-
-    user = SimpleNamespace(
-        id="user1",
-        slackUserId="U123",
-        slackAlertsEnabled=True,
-        slackTimezone="America/New_York",
-        slackDigestHour=8,
-        slackDigestMinute=0,
-    )
-    iv = _fake_interview(job_url="https://jobs.example/1")
-    iv.status = None
-    iv.caller = None
-    find = MagicMock(return_value=SimpleNamespace(
-        sort=lambda *_a, **_k: SimpleNamespace(to_list=AsyncMock(return_value=[iv])),
-    ))
-    send = AsyncMock(return_value=True)
-    with (
-        patch("app.slack_bot.digest_slot_open", return_value=True),
-        patch("app.slack_bot.datetime", _FrozenNow),
-        patch("app.slack_bot._already_sent", AsyncMock(return_value=False)),
-        patch("app.slack_bot._mark_sent", AsyncMock()),
-        patch("app.slack_bot._profile_labels", AsyncMock(return_value={"acc1": "Backend"})),
-        patch("app.slack_bot.send_dm", send),
-        patch("app.slack_bot.Interview.find", find),
-    ):
-        sent, _ = await _digest_for_user(user)
-    assert sent == 1
-    query = find.call_args.args[0]
-    assert set(query) == {"createdBy", "scheduledAt"}
-    assert query["createdBy"] == "user1"
-    assert "blocks" not in send.await_args.kwargs
-    lines = send.await_args.kwargs["text"].splitlines()
-    assert lines[0] == ":alarm_clock: *Today's interviews* — Wed Oct 7 · 1 interview"
-    assert lines[1] == "• Time TBD · Backend · <https://jobs.example/1|Acme> · AI Interview"
-    assert lines[-2].endswith("|Open interviews>")
-    assert lines[-1].startswith("_Know your why: ") and lines[-1].endswith("_")
-    assert "as caller" not in "\n".join(lines)

@@ -1,4 +1,4 @@
-"""The 05:00 America/Chicago list of confirmed caller interviews (Slack faked; loader against mongomock)."""
+"""The 05:00 America/Chicago list of the day's caller interviews (Slack faked; loader against mongomock)."""
 
 import asyncio
 import os
@@ -61,7 +61,7 @@ MANAGER = SimpleNamespace(name="Maria", email="m@x.io", slackUserId="U0MANAGER1"
 
 def row(hh, company, **kw):
     base = dict(start=chi(DAY, hh), company=company, stage="Intro", profile="Ian Meron", callerName="Sam",
-                method="Video meeting", mentions="<@U0OWNER001>", link="https://slack.example/p1")
+                method="Video meeting", mentions="<@U0OWNER001>", link="https://slack.example/p1", confirmed=True)
     base.update(kw)
     return base
 
@@ -72,7 +72,7 @@ def test_daily_list_owner_per_line_managers_once():
     assert text.splitlines()[1].startswith("• ")
     assert text.splitlines()[1].endswith("— <@U0OWNER001> · <https://slack.example/p1|thread>")
     assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
-    assert caller_daily_text(DAY, [], []) == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed."
+    assert caller_daily_text(DAY, [], []) == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none today."
 
 
 def test_text_lists_rows_by_start_with_owner_and_link():
@@ -85,6 +85,13 @@ def test_text_lists_rows_by_start_with_owner_and_link():
     assert "Beta" in lines[2]
 
 
+def test_text_flags_unconfirmed_caller_rounds():
+    line = caller_daily_text(DAY, [row(9, "Acme", callerName="TBD", confirmed=False)], []).splitlines()[1]
+    assert line == (f"• {slack_time(chi(DAY, 9), with_day=False)} · Acme · Intro · Ian Meron · caller TBD"
+                    " · Video meeting · :hourglass_flowing_sand: not confirmed — <@U0OWNER001>"
+                    " · <https://slack.example/p1|thread>")
+
+
 def test_text_cc_names_every_manager_and_leaves_out_none():
     two = caller_daily_text(DAY, [row(9, "Acme")], [MANAGER, SimpleNamespace(name="Ana", email="a@x.io", slackUserId=None)])
     assert two.splitlines()[-1] == "cc <@U0MANAGER1> Ana"
@@ -92,7 +99,7 @@ def test_text_cc_names_every_manager_and_leaves_out_none():
 
 
 def test_text_empty_day_is_one_line_even_with_managers():
-    assert caller_daily_text(DAY, [], [MANAGER]) == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed."
+    assert caller_daily_text(DAY, [], [MANAGER]) == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none today."
 
 
 # --- run ------------------------------------------------------------------------------------------
@@ -202,7 +209,7 @@ def test_not_due_before_five():
 def test_catch_up_later_that_day_posts():
     fake = Fake()
     assert fake.run(chi(DAY, 11, 40)) == "posted"
-    assert fake.posts[0][1] == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none confirmed."
+    assert fake.posts[0][1] == ":alarm_clock: *Caller interviews today* — Wed Oct 7 · none today."
 
 
 def test_failed_post_releases_claim():
@@ -231,7 +238,7 @@ async def db():
     return database
 
 
-async def test_only_confirmed_active_rounds_are_loaded(db):
+async def test_active_caller_rounds_are_loaded_confirmed_or_not(db):
     from beanie import PydanticObjectId
 
     from app.models.interview import Interview
@@ -247,12 +254,12 @@ async def test_only_confirmed_active_rounds_are_loaded(db):
     other = caller_round(9)
     tomorrow = (chi(DAY, 9) + timedelta(days=1)).astimezone(timezone.utc)
     await add(other.model_copy(update={"scheduledAt": tomorrow, "at": tomorrow}), company="Tomorrow")
-    # two rounds in one interview: only today's confirmed one is listed
+    # two rounds in one interview: only today's one is listed
     past = (chi(DAY, 9) - timedelta(days=3)).astimezone(timezone.utc)
     await add(caller_round(9).model_copy(update={"scheduledAt": past, "at": past}), caller_round(16), company="Both")
 
     rows = await slack_bot._caller_daily_load(*caller_daily_bounds(DAY, CHI))
-    assert sorted((iv.companyName, e.scheduledAt.hour) for iv, e in rows) == [("Both", 21), ("Yes", 14)]
+    assert sorted((iv.companyName, e.scheduledAt.hour) for iv, e in rows) == [("Both", 21), ("Unconfirmed", 15), ("Yes", 14)]
 
 
 async def test_daily_people_are_the_owner_and_profile_only():
@@ -286,6 +293,25 @@ def test_alert_tick_runs_daily_after_reminders():
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
     assert order == ["reminders", "daily"] and out["caller_daily"] == "posted"
+
+
+def test_unconfirmed_round_is_flagged_in_the_post():
+    fake = Fake(rows=[(IV, caller_round().model_copy(update={"confirmed": False}))])
+    fake.run(chi(DAY, 5, 1))
+    assert ":hourglass_flowing_sand: not confirmed" in fake.posts[0][1]
+
+
+def test_alert_tick_sends_no_dms():
+    send = AsyncMock(return_value=True)
+    with (
+        patch.object(slack_bot, "run_caller_reminders", AsyncMock(return_value={"sent": 2, "failed": 0})),
+        patch.object(slack_bot, "run_caller_daily", AsyncMock(return_value="posted")),
+        patch.object(slack_bot, "slack_bot_configured", lambda: True),
+        patch.object(slack_bot, "send_dm", send),
+    ):
+        out = asyncio.run(slack_bot.run_alert_tick())
+    assert out == {"caller_reminders": 2, "caller_daily": "posted"}
+    send.assert_not_awaited()
 
 
 def test_alert_tick_survives_daily_crash():

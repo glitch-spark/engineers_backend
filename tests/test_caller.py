@@ -1,8 +1,8 @@
-"""Pure unit tests for caller mode: payload validation, time math, digest and channel text.
+"""Pure unit tests for caller mode: payload validation, time math and channel text.
 
 No database needed: `pytest --noconftest tests/test_caller.py`.
 """
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -18,10 +18,8 @@ from app.interview_caller import (
 from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.slack_bot import (
     caller_round_text,
-    digest_text,
     fmt_caller_time,
     slack_time,
-    _by_start,
 )
 
 OWNER = PydanticObjectId()
@@ -112,25 +110,6 @@ def _iv(owner, *, caller=None, company="Acme"):
         stage="intro",
         caller=caller,
     )
-
-
-def test_digest_sorted_by_time_tbd_last():
-    early = InterviewCaller(enabled=True, startsAt=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc))
-    late = InterviewCaller(enabled=True, startsAt=datetime(2026, 9, 29, 18, 0, tzinfo=timezone.utc))
-    own_tbd = _iv(B, company="OwnTBD")
-    own_late = _iv(B, caller=late, company="OwnLate")
-    own_early = _iv(B, caller=early, company="OwnEarly")
-    assert [iv.companyName for iv in _by_start([own_tbd, own_late, own_early])] == ["OwnEarly", "OwnLate", "OwnTBD"]
-
-
-def test_digest_text_is_plain_rows_with_a_count():
-    text = digest_text(
-        date(2026, 9, 29), [_iv(B), _iv(B)], profiles={}, tz=ZoneInfo("America/New_York"), why=None
-    )
-    lines = text.splitlines()
-    assert lines[0] == ":alarm_clock: *Today's interviews* — Tue Sep 29 · 2 interviews"
-    assert [line.startswith("• Time TBD") for line in lines[1:3]] == [True, True]
-    assert "as caller" not in text
 
 
 def _user(name, slack=None):

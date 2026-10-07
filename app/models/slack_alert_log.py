@@ -1,4 +1,4 @@
-"""Dedup log for Slack interview bot alerts (T-30 + daily digest)."""
+"""Dedup log for Slack interview bot alerts (#caller reminders + the daily caller list)."""
 
 from datetime import datetime
 from typing import Optional
@@ -13,8 +13,7 @@ class SlackAlertLog(TimestampedDocument):
     """One row per sent alert. Unique on (userId, kind) prevents cron spam.
 
     kind examples:
-      - t30:<interviewId>
-      - digest:2026-07-28
+      - caller-daily:2026-10-07 (userId = channel sentinel)
       - caller-reminder:<roundId>:<startEpoch> (userId = channel sentinel)
     """
 

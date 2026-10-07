@@ -5,22 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.config import get_settings
 from app.deps import get_current_user
 from app.models import UserExtra
-from app.know_your_why import know_your_why_for_date
 from app.slack_bot import (
     normalize_slack_id,
     normalize_slack_timezone,
-    resolve_user_tz,
     run_alert_tick,
     send_dm,
     slack_bot_configured,
@@ -46,19 +43,8 @@ def _slack_profile_fields(user: UserExtra) -> dict:
     return {
         "slackConnected": connected,
         "slackUserId": (user.slackUserId or "").strip() or None,
-        "slackAlertsEnabled": bool(user.slackAlertsEnabled),
         "slackTimezone": tz_name,
         "slackTimezones": slack_timezone_catalog(),
-        "slackDigestHour": (
-            user.slackDigestHour
-            if user.slackDigestHour is not None
-            else s.SLACK_DIGEST_HOUR
-        ),
-        "slackDigestMinute": (
-            user.slackDigestMinute
-            if user.slackDigestMinute is not None
-            else s.SLACK_DIGEST_MINUTE
-        ),
         "slackBotConfigured": slack_bot_configured(),
     }
 
@@ -66,10 +52,7 @@ def _slack_profile_fields(user: UserExtra) -> dict:
 class SlackPrefsUpdate(BaseModel):
     # The user's Slack member ID (U…); blank clears it.
     slackUserId: Optional[str] = None
-    slackAlertsEnabled: Optional[bool] = None
     slackTimezone: Optional[str] = None
-    slackDigestHour: Optional[int] = Field(default=None, ge=0, le=23)
-    slackDigestMinute: Optional[int] = Field(default=None, ge=0, le=59)
 
 
 @router.get("/status")
@@ -93,8 +76,6 @@ async def slack_prefs(
                 status_code=status.HTTP_409_CONFLICT, detail="That Slack ID is already used by another user",
             )
         user.slackUserId = slack_id
-    if body.slackAlertsEnabled is not None:
-        user.slackAlertsEnabled = body.slackAlertsEnabled
     if body.slackTimezone is not None:
         try:
             user.slackTimezone = validate_timezone(body.slackTimezone)
@@ -103,10 +84,6 @@ async def slack_prefs(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),
             ) from exc
-    if body.slackDigestHour is not None:
-        user.slackDigestHour = body.slackDigestHour
-    if body.slackDigestMinute is not None:
-        user.slackDigestMinute = body.slackDigestMinute
     await user.save()
     return _slack_profile_fields(user)
 
@@ -124,30 +101,12 @@ async def slack_test_dm(user: Annotated[UserExtra, Depends(get_current_user)]) -
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Add your Slack member ID before sending a test DM",
         )
-    why = know_your_why_for_date(datetime.now(resolve_user_tz(user)).date())
     ok = await send_dm(
         slack_id,
-        text="Engineers bot is connected. You'll get a daily interview digest here.",
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*Engineers bot connected*\n"
-                        "You'll get a private DM with today's interviews "
-                        "at your chosen digest time (Profile → Slack)."
-                    ),
-                },
-            },
-            {"type": "divider"},
-            {
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": f"*Know your why*\n_{why}_"},
-                ],
-            },
-        ],
+        text=(
+            ":white_check_mark: *Engineers bot connected* — your member ID works. You'll be tagged in #caller "
+            "threads and the daily caller interviews list."
+        ),
     )
     if not ok:
         raise HTTPException(

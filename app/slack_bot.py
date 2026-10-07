@@ -1,12 +1,13 @@
-"""Slack interview bot: #caller threads, reminders, the daily caller list and personal digests.
+"""Slack interview bot: #caller threads, reminders and the daily caller list.
 
 Uses the workspace Bot Token (chat.postMessage). Users type their Slack member id in Profile; it is
-stored on UserExtra and used to @-mention and DM them. Channel posts: one "Caller needed" thread per
+stored on UserExtra and used to @-mention them (and for the Profile test DM). Channel posts: one "Caller needed" thread per
 interview in the private SLACK_CALLER_CHANNEL_ID, the daily caller list in SLACK_CALLER_DAILY_CHANNEL_ID, and
 each daily plan in SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
 A round with a caller gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner and
-the interview managers. A daily digest DM goes out at each user's chosen time/timezone. Transactions live in
+the interview managers. Each morning the day's caller interviews are listed in SLACK_CALLER_DAILY_CHANNEL_ID,
+tagging each owner and cc'ing the managers; there are no per-user digest DMs. Transactions live in
 app/slack_transactions.py.
 """
 
@@ -32,9 +33,8 @@ from app.interview_caller import (
 from app.interview_normalize import interview_status_value
 
 from app.config import get_settings
-from app.know_your_why import know_your_why_for_date
 from app.models import Account, Interview, UserExtra
-from app.models.interview import InterviewStatus, SlackThread
+from app.models.interview import SlackThread
 from app.models.slack_alert_log import SlackAlertLog
 from app.slack_timezones import (
     format_gmt_offset,
@@ -65,7 +65,7 @@ def normalize_slack_id(raw: Optional[str]) -> Optional[str]:
 
 
 def resolve_user_tz(user: Optional[UserExtra] = None) -> ZoneInfo:
-    """IANA timezone for Slack digest from the fixed GMT-offset allowlist."""
+    """The user's IANA timezone (from the fixed GMT-offset allowlist), for their local day."""
     if user is not None and (user.slackTimezone or "").strip():
         return zoneinfo_for_slack(user.slackTimezone)
     app = (get_settings().APP_TIMEZONE or "").strip()
@@ -150,71 +150,6 @@ def _profile_label(account: Optional[Account]) -> str:
     if account is None:
         return ""
     return (account.name or "").strip()
-
-
-async def _profile_labels(interviews: list[Interview]) -> dict[str, str]:
-    account_ids = {iv.accountId for iv in interviews if iv.accountId}
-    if not account_ids:
-        return {}
-    accounts = await Account.find({"_id": {"$in": list(account_ids)}}).to_list()
-    return {str(a.id): _profile_label(a) for a in accounts}
-
-
-async def _already_sent(user_id: PydanticObjectId, kind: str) -> bool:
-    return await SlackAlertLog.find_one(
-        SlackAlertLog.userId == user_id,
-        SlackAlertLog.kind == kind,
-    ) is not None
-
-
-async def _mark_sent(
-    user_id: PydanticObjectId,
-    kind: str,
-    *,
-    interview_id: Optional[PydanticObjectId] = None,
-) -> None:
-    try:
-        await SlackAlertLog(
-            userId=user_id,
-            kind=kind,
-            interviewId=interview_id,
-            sentAt=datetime.now(timezone.utc),
-        ).insert()
-    except Exception as exc:
-        log.debug("slack_bot mark_sent race kind=%s: %s", kind, exc)
-
-
-def digest_slot_open(
-    now_local: datetime,
-    *,
-    hour: int,
-    minute: int,
-    window_minutes: int = 5,
-) -> bool:
-    """True if now is within [digest_time, digest_time + window)."""
-    slot = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return slot <= now_local < slot + timedelta(minutes=window_minutes)
-
-
-def calendar_day_bounds(day: date) -> tuple[datetime, datetime]:
-    """Naive [day 00:00, next day 00:00) for date-only scheduledAt (stored as T12:00)."""
-    start = datetime(day.year, day.month, day.day, 0, 0, 0)
-    end = start + timedelta(days=1)
-    return start, end
-
-
-async def _linked_users() -> list[UserExtra]:
-    return await UserExtra.find(
-        {"slackUserId": {"$nin": [None, ""]}, "slackAlertsEnabled": {"$ne": False}}
-    ).to_list()
-
-
-_SKIP_STATUSES = {
-    InterviewStatus.completed,
-    InterviewStatus.passed,
-    InterviewStatus.rejected,
-    InterviewStatus.canceled,
-}
 
 
 def _enum_key(value: Any) -> Optional[str]:
@@ -608,97 +543,6 @@ async def delete_daily_plan_message(plan: Any) -> None:
         log.warning("slack_bot daily plan delete failed for plan %s: %s", plan.id, exc)
 
 
-def _caller_start(iv: Interview) -> Optional[datetime]:
-    caller = getattr(iv, "caller", None)
-    if caller is None or not caller.enabled:
-        return None
-    return caller.startsAt
-
-
-def _by_start(interviews: list[Interview]) -> list[Interview]:
-    far = datetime.max.replace(tzinfo=timezone.utc)
-    return sorted(interviews, key=lambda iv: (_caller_start(iv) is None, _caller_start(iv) or far))
-
-
-def _plural(n: int, word: str) -> str:
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
-
-
-def digest_text(
-    day: date,
-    interviews: list[Interview],
-    *,
-    profiles: dict[str, str],
-    tz: ZoneInfo,
-    why: Optional[str],
-) -> str:
-    """The personal digest DM: one row per interview in the order given, the interviews link, then the why."""
-    title = f":alarm_clock: *Today's interviews* — {_day_title(day)}"
-    if not interviews:
-        return f"{title} · none today. Have a rest."
-    lines = [f"{title} · {_plural(len(interviews), 'interview')}"]
-    for iv in interviews:
-        starts = _caller_start(iv)
-        profile = profiles.get(str(iv.accountId), "") if iv.accountId else ""
-        parts = [
-            fmt_caller_time(starts, tz, with_day=False) if starts is not None else "Time TBD",
-            _text(profile),
-            _mrkdwn_link(iv.jobUrl, (iv.companyName or "").strip() or "—"),
-            _stage_label(iv.stage),
-        ]
-        lines.append("• " + " · ".join(parts))
-    lines.append(f"<{_frontend_link('/interviews')}|Open interviews>")
-    if why:
-        lines.append(f"_Know your why: {why}_")
-    return "\n".join(lines)
-
-
-async def run_digest_for_user(user: UserExtra) -> int:
-    """Send daily digest if in slot and not yet sent today. Returns 1 if DM sent."""
-    sent, reason = await _digest_for_user(user)
-    if sent == 0 and reason:
-        logger = log.debug if reason == "outside_slot" else log.info
-        logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
-    return sent
-
-
-async def _digest_for_user(user: UserExtra) -> tuple[int, Optional[str]]:
-    slack_id = (user.slackUserId or "").strip()
-    if not slack_id:
-        return 0, "not_linked"
-    s = get_settings()
-    tz = resolve_user_tz(user)
-    now_local = datetime.now(tz)
-    hour = user.slackDigestHour if user.slackDigestHour is not None else s.SLACK_DIGEST_HOUR
-    minute = user.slackDigestMinute if user.slackDigestMinute is not None else s.SLACK_DIGEST_MINUTE
-    if not digest_slot_open(now_local, hour=hour, minute=minute):
-        return 0, "outside_slot"
-    day = now_local.date()
-    day_key = day.isoformat()
-    kind = f"digest:{day_key}"
-    if await _already_sent(user.id, kind):
-        return 0, "already_sent"
-
-    start_n, end_n = calendar_day_bounds(day)
-    interviews = await Interview.find(
-        {"createdBy": user.id, "scheduledAt": {"$gte": start_n, "$lt": end_n}}
-    ).sort([("scheduledAt", 1)]).to_list()
-    mine = _by_start([iv for iv in interviews if iv.status not in _SKIP_STATUSES])
-    text = digest_text(
-        day,
-        mine,
-        profiles=await _profile_labels(mine),
-        tz=tz,
-        why=know_your_why_for_date(day),
-    )
-    if await send_dm(slack_id, text=text):
-        await _mark_sent(user.id, kind)
-        return 1, None
-    return 0, "dm_failed"
-
-
-# ---------- #caller thread reminder, 30 minutes before ---------------------
-
 CALLER_REMINDER_LEAD = timedelta(minutes=30)
 # SlackAlertLog rows for channel posts (not tied to one user) use this id.
 CALLER_CHANNEL_SENTINEL = PydanticObjectId("000000000000000000000000")
@@ -867,15 +711,16 @@ def _day_title(day: date) -> str:
 
 
 def caller_daily_text(day: date, rows: list[dict[str, Any]], managers: Sequence[UserExtra]) -> str:
-    """The list for `day`: one line per confirmed caller round, by start time, tagging each round's owner,
-    then one cc line for the interview managers."""
+    """The list for `day`: one line per active caller round, by start time, flagging unconfirmed ones and
+    tagging each round's owner, then one cc line for the interview managers."""
     title = f":alarm_clock: *Caller interviews today* — {_day_title(day)}"
     if not rows:
-        return f"{title} · none confirmed."
+        return f"{title} · none today."
     lines = [title]
     for r in sorted(rows, key=lambda r: r["start"]):
         parts = [slack_time(r["start"], with_day=False), r["company"], r["stage"], r["profile"],
-                 f"caller {r['callerName']}", r["method"]]
+                 f"caller {r['callerName']}", r["method"],
+                 None if r["confirmed"] else ":hourglass_flowing_sand: not confirmed"]
         line = "• " + " · ".join(p for p in parts if p)
         if r["mentions"]:
             line += f" — {r['mentions']}"
@@ -890,16 +735,16 @@ def _is_listed(entry: Any, start: datetime, end: datetime) -> bool:
     caller = getattr(entry, "caller", None)
     at = getattr(entry, "scheduledAt", None)
     return bool(
-        caller is not None and caller.enabled and getattr(entry, "confirmed", False) and at is not None
+        caller is not None and caller.enabled and at is not None
         and interview_status_value(getattr(entry, "status", None)) not in ENDED_STATUSES
         and start <= _aware_utc(at) < end
     )
 
 
 async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, Any]]:
-    """(interview, round) for confirmed, active caller rounds starting in [start, end)."""
+    """(interview, round) for active caller rounds starting in [start, end), confirmed or not."""
     found = await Interview.find({"stageHistory": {"$elemMatch": {
-        "caller.enabled": True, "confirmed": True, "status": {"$nin": list(ENDED_STATUSES)},
+        "caller.enabled": True, "status": {"$nin": list(ENDED_STATUSES)},
         "scheduledAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)},
     }}}).to_list()
     return [(iv, e) for iv in found for e in iv.stageHistory if _is_listed(e, start, end)]
@@ -961,7 +806,7 @@ async def run_caller_daily(
     permalink=_caller_daily_permalink,
     configured=_caller_daily_configured,
 ) -> str:
-    """Post the day's confirmed caller interviews once (claim first, release on failure).
+    """Post the day's caller interviews once (claim first, release on failure).
 
     Returns "posted", "not_due", "already_sent", "off" or "failed"."""
     cfg = configured()
@@ -989,6 +834,7 @@ async def run_caller_daily(
                 "method": _METHOD_LABELS.get(entry.caller.method or "", ""),
                 "mentions": _mention(who["owner"]),
                 "link": await permalink(iv, entry),
+                "confirmed": bool(getattr(entry, "confirmed", False)),
             })
         ok = await post(channel, caller_daily_text(day, rows, await managers()))
     except Exception as exc:
@@ -999,41 +845,16 @@ async def run_caller_daily(
     return "posted"
 
 
-async def run_alert_tick() -> dict[str, int]:
-    """Cron entrypoint: #caller thread reminders, the daily caller list, then each linked user's digest."""
+async def run_alert_tick() -> dict[str, Any]:
+    """Cron entrypoint: #caller thread reminders, then the daily caller list. Sends no DMs."""
     try:
         reminders = await run_caller_reminders(datetime.now(timezone.utc))
-    except Exception as exc:  # never block the per-user digest
+    except Exception as exc:  # never block the daily list
         log.exception("slack_bot caller reminders crashed: %s", exc)
         reminders = {"sent": 0, "failed": 0}
-    caller_reminders = reminders["sent"]
     try:
         caller_daily = await run_caller_daily(datetime.now(timezone.utc))
     except Exception as exc:
         log.exception("slack_bot caller daily list crashed: %s", exc)
         caller_daily = "failed"
-    if not slack_bot_configured():
-        return {"users": 0, "digest": 0, "skipped": 1, "caller_reminders": caller_reminders,
-                "caller_daily": caller_daily}
-    users = await _linked_users()
-    digest_total = 0
-    skips = {
-        "outside_slot": 0,
-        "already_sent": 0,
-        "no_interviews": 0,
-        "dm_failed": 0,
-        "not_linked": 0,
-    }
-    for user in users:
-        try:
-            sent, reason = await _digest_for_user(user)
-            digest_total += sent
-            if sent == 0 and reason:
-                if reason in skips:
-                    skips[reason] += 1
-                logger = log.debug if reason == "outside_slot" else log.info
-                logger("slack_bot digest skip user=%s reason=%s", user.id, reason)
-        except Exception as exc:
-            log.exception("slack_bot tick failed for user=%s: %s", user.id, exc)
-    return {"users": len(users), "digest": digest_total, "skipped": 0, "caller_reminders": caller_reminders,
-            "caller_daily": caller_daily, **skips}
+    return {"caller_reminders": reminders["sent"], "caller_daily": caller_daily}
