@@ -159,3 +159,28 @@ def test_snapshot_has_confirmed():
         caller=InterviewCaller(enabled=True, startsAt=START),
     )
     assert round_caller_snapshot(entry)["confirmed"] is True
+
+
+async def test_cancel_clears_confirmed(client):
+    owner = await make_user()
+    iv = await make_interview(owner, confirmed=True)
+    r = await patch(client, owner, iv, {"status": "canceled"})
+    assert r.status_code == 200, r.text
+    assert r.json()["stageHistory"][-1]["confirmed"] is False and r.json()["confirmed"] is False
+
+
+async def test_confirm_canceled_round_is_400(client):
+    owner = await make_user()
+    iv = await make_interview(owner)
+    await patch(client, owner, iv, {"status": "canceled"})
+    r = await patch(client, owner, iv, {"confirmed": True})
+    assert (r.status_code, r.json()["detail"]) == (400, "A canceled or rejected round can't be confirmed")
+
+
+async def test_legacy_put_cancel_clears_confirmed(client):
+    owner = await make_user()
+    iv = await make_interview(owner, confirmed=True)
+    async with client(owner) as c:
+        r = await c.put(f"/interviews/{iv.id}", json={"status": "canceled"})
+    assert r.status_code == 200, r.text
+    assert r.json()["stageHistory"][-1]["confirmed"] is False

@@ -136,3 +136,9 @@ def test_reply_cc_line_tags_manager_and_owner():
     assert reply("confirmed", entry(confirmed=True), snap()).splitlines()[-1] == "cc <@U0MANAGER1> <@U0OWNER001>"
     assert reply("confirmed", entry(confirmed=True), snap(), manager=user("Maria"), owner=user("Pedro")).splitlines()[-1] == "cc Maria Pedro"
     assert reply("confirmed", entry(confirmed=True), snap(), manager=None).splitlines()[-1] == "cc no interview manager assigned <@U0OWNER001>"
+
+
+def test_rescheduled_and_confirmed_reply_says_confirmed():
+    t, t2 = slack_time(START), slack_time(LATER)
+    first = reply("rescheduled", entry(at=LATER, confirmed=True), snap()).splitlines()[0]
+    assert first == f":repeat: *Rescheduled* — {t} → {t2} · confirmed, caller Sam"

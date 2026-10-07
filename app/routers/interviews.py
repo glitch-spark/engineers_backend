@@ -25,6 +25,7 @@ from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.interview import InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus
 from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
+    ENDED_STATUSES,
     CallerError,
     CallerIn,
     build_round_caller,
@@ -347,6 +348,10 @@ def migrate_legacy_stage_fields(iv: Interview) -> bool:
         iv.note = ""
         changed = True
     return changed
+
+
+def _status_value(value) -> Optional[str]:
+    return getattr(value, "value", value)
 
 
 def _sync_top_from_tip(iv: Interview) -> None:
@@ -864,6 +869,8 @@ async def update_interview(
     tip = _tip(iv)
     if tip is not None:
         tip.status = iv.status
+        if _status_value(tip.status) in ENDED_STATUSES:
+            tip.confirmed = False
         if tip.caller is not None and tip.caller.enabled and tip.scheduledAt is not None:
             tip.caller.startsAt = tip.scheduledAt
     _sync_top_from_tip(iv)
@@ -963,11 +970,16 @@ async def update_interview_stage(
             body.caller, starts_at=entry.scheduledAt, owner_id=iv.createdBy,
             previous=entry.caller,
         )
-    if entry.caller is None or not entry.caller.enabled:
-        entry.confirmed = False
+    ended = _status_value(entry.status) in ENDED_STATUSES
+    if entry.caller is None or not entry.caller.enabled or ended:
+        entry.confirmed = False  # a caller is only lined up for an active caller round
     if body.confirmed is not None:
         if body.confirmed and (entry.caller is None or not entry.caller.enabled):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only caller rounds are confirmed")
+        if body.confirmed and ended:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="A canceled or rejected round can't be confirmed",
+            )
         entry.confirmed = body.confirmed
     iv.stageHistory[idx] = entry
 

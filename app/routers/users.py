@@ -49,7 +49,7 @@ async def lookup_users(
     rows = await UserExtra.find(query).to_list()
     return {
         "users": [
-            {"_id": str(u.id), "name": u.name, "email": u.email, "role": u.role}
+            {"_id": str(u.id), "name": u.name, "email": u.email, "role": u.role, "isActive": u.isActive is not False}
             for u in rows
         ]
     }
@@ -59,6 +59,8 @@ async def _manager_for(user: UserExtra, raw: Optional[str]) -> Optional[Pydantic
     """The chosen interview manager: an existing active user other than `user`; None clears it."""
     if raw is None or not str(raw).strip():
         return None
+    if str(raw) == str(user.interviewManagerId):
+        return user.interviewManagerId  # unchanged: a since-deactivated manager doesn't block other edits
     bad = HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Choose another active user")
     if not PydanticObjectId.is_valid(raw) or str(raw) == str(user.id):
         raise bad

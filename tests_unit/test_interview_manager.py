@@ -151,3 +151,23 @@ async def test_oauth_routes_are_gone(client):
         assert (await c.post("/integrations/slack/oauth-start")).status_code in (404, 405)
         assert (await c.get("/integrations/slack/oauth-callback")).status_code in (404, 405)
         assert (await c.delete("/integrations/slack/disconnect")).status_code in (404, 405)
+
+
+async def test_unchanged_inactive_manager_still_saves(client):
+    admin, pedro, maria = await make_user("Root", "admin"), await make_user("Pedro"), await make_user("Maria")
+    pedro.interviewManagerId = maria.id
+    await pedro.save()
+    maria.isActive = False
+    await maria.save()
+    async with client(admin) as c:
+        r = await c.put(f"/users/{pedro.id}", json={"phone": "123", "interviewManagerId": str(maria.id)})
+    assert r.status_code == 200, r.text
+    assert (await UserExtra.get(pedro.id)).interviewManagerId == maria.id
+
+
+async def test_lookup_returns_is_active(client):
+    pedro = await make_user("Pedro")
+    await make_user("Gone", active=False)
+    async with client(pedro) as c:
+        rows = {u["name"]: u for u in (await c.get("/users/lookup")).json()["users"]}
+    assert (rows["Pedro"]["isActive"], rows["Gone"]["isActive"]) == (True, False)

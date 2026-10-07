@@ -472,7 +472,12 @@ async def caller_thread_reply(
         head = f":white_check_mark: *Back on* — {stage} · {when} · needs confirmation"
     elif event == "rescheduled":
         old = slack_time((prev or {}).get("time"))
-        head = f":repeat: *Rescheduled* — {old} → {when} · needs confirmation"
+        if getattr(entry, "confirmed", False):  # rescheduled and confirmed in one save
+            name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
+            tail = f"confirmed, caller {name}"
+        else:
+            tail = "needs confirmation"
+        head = f":repeat: *Rescheduled* — {old} → {when} · {tail}"
     elif event == "confirmed":
         name = (getattr(caller, "callerName", "") or "").strip() or "TBD"
         head = f":white_check_mark: *Confirmed* — {stage} · {when} · caller {name}"
