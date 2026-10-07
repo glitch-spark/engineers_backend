@@ -104,6 +104,13 @@ class InterviewStageEvent(BaseModel):
         return data
 
 
+class SlackThread(BaseModel):
+    """An interview's #caller thread: its main post."""
+
+    channel: str
+    ts: str
+
+
 class Interview(TimestampedDocument):
     accountId: PydanticObjectId
     resumeId: Optional[PydanticObjectId] = None  # legacy; no longer surfaced in UI
@@ -122,6 +129,8 @@ class Interview(TimestampedDocument):
     stageHistory: List[InterviewStageEvent] = []
     caller: Optional[InterviewCaller] = None
     confirmed: bool = False  # mirrors the latest round
+    # The one #caller thread for all rounds (set by the first caller post).
+    slackThread: Optional[SlackThread] = None
 
     # Set when an unmigrated document was resolved on read: questions linked to
     # removed "rejected" rounds must follow on save (routers.interviews._save_interview).

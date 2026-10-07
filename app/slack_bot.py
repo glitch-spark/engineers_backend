@@ -18,19 +18,25 @@ import logging
 import re
 import math
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
 from beanie import PydanticObjectId
 
-from app.interview_caller import ENDED_STATUSES, caller_change_lines, round_caller_snapshot
+from app.interview_caller import (
+    ENDED_STATUSES,
+    caller_change_lines,
+    caller_is_on,
+    caller_thread_event,
+    round_caller_snapshot,
+)
 from app.interview_normalize import interview_status_value
 
 from app.config import get_settings
 from app.know_your_why import know_your_why_for_date
 from app.models import Account, Interview, UserExtra
-from app.models.interview import InterviewStatus
+from app.models.interview import InterviewStatus, SlackThread
 from app.models.slack_alert_log import SlackAlertLog
 from app.slack_timezones import (
     format_gmt_offset,
@@ -498,14 +504,121 @@ def _snapshot_label(key: str, value: Any, mentions: dict[str, str]) -> str:
 _MESSAGE_GONE = {"message_not_found", "channel_not_found", "cant_update_message"}
 
 
-async def _main_post_text(interview: Interview, entry: Any, owner: Optional[UserExtra]) -> str:
+async def _main_post_text(
+    interview: Interview, entry: Any, owner: Optional[UserExtra], manager: Optional[UserExtra] = None,
+) -> str:
     caller = entry.caller
     account = await Account.get(interview.accountId) if interview.accountId else None
-    coworkers = (
-        await UserExtra.find({"_id": {"$in": list(caller.coworkerIds)}}).to_list()
-        if caller.coworkerIds else []
-    )
-    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers)
+    ids = list(caller.coworkerIds) if caller is not None and caller.enabled else []
+    coworkers = await UserExtra.find({"_id": {"$in": ids}}).to_list() if ids else []
+    return caller_round_text(interview, entry, account=account, owner=owner, coworkers=coworkers, manager=manager)
+
+
+async def _owner_and_manager(interview: Any) -> tuple[Optional[UserExtra], Optional[UserExtra]]:
+    """The interview's owner and the owner's interview manager (None when unassigned)."""
+    owner = await UserExtra.get(interview.createdBy)
+    manager_id = getattr(owner, "interviewManagerId", None) if owner else None
+    return owner, (await UserExtra.get(manager_id) if manager_id else None)
+
+
+async def _post_main(channel: str, text: str) -> Optional[str]:
+    res = await _slack_api("chat.postMessage", {
+        "channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False,
+    })
+    return res.get("ts") or None
+
+
+async def sync_caller_thread(
+    interview: Any,
+    before: dict[str, Optional[dict]],
+    *,
+    added: Iterable[str] = (),
+    deleted: Iterable[str] = (),
+) -> bool:
+    """Keep the interview's single #caller thread in step with a write. Never raises.
+
+    `before` holds each round's caller snapshot from before the write; `added` the rounds just appended;
+    `deleted` the rounds being removed (all of them when the interview is deleted, which removes the
+    main post and any older per-round posts). The first round with a caller on creates the thread; an
+    interview that still has per-round posts adopts its latest one. Afterwards the main post is edited to
+    describe the latest round and one thread reply says what changed. Returns True when
+    `interview.slackThread` changed (the caller saves it).
+    """
+    try:
+        channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
+        if not channel or not slack_bot_configured():
+            return False
+        added, deleted = set(added), set(deleted)
+        rounds = [e for e in (interview.stageHistory or []) if e.id]
+        thread = interview.slackThread
+        if rounds and all(e.id in deleted for e in rounds):
+            posts = {thread.ts: thread.channel} if thread else {}
+            for e in rounds:
+                ts = (getattr(e.caller, "slackChannelTs", None) or "").strip()
+                if ts:
+                    posts.setdefault(ts, channel)
+            for ts, ch in posts.items():
+                await _slack_api("chat.delete", {"channel": ch, "ts": ts})
+            return False
+        live = [e for e in rounds if e.id not in deleted]
+        if not live:
+            return False
+        latest = live[-1]
+
+        changed = False
+        if thread is None:
+            legacy = next((e for e in reversed(rounds) if (getattr(e.caller, "slackChannelTs", None) or "").strip()), None)
+            if legacy is not None:
+                thread = SlackThread(channel=channel, ts=legacy.caller.slackChannelTs.strip())
+                interview.slackThread, changed = thread, True
+            else:
+                if not any(caller_is_on(round_caller_snapshot(e)) for e in live):
+                    return False
+                owner, manager = await _owner_and_manager(interview)
+                ts = await _post_main(channel, await _main_post_text(interview, latest, owner, manager))
+                if ts:
+                    interview.slackThread = SlackThread(channel=channel, ts=ts)
+                return bool(ts)
+
+        events, touched = [], False
+        for e in rounds:
+            prev = before.get(e.id)
+            new = None if e.id in deleted else round_caller_snapshot(e)
+            if prev != new or e.id in added or e.id in deleted:
+                touched = True
+            event = caller_thread_event(prev, new, added=e.id in added, removed=e.id in deleted)
+            if event:
+                events.append((event, e, prev))
+        if not touched:
+            return changed
+
+        owner, manager = await _owner_and_manager(interview)
+        text = await _main_post_text(interview, latest, owner, manager)
+        try:
+            await _slack_api("chat.update", {"channel": thread.channel, "ts": thread.ts, "text": text})
+        except RuntimeError as exc:
+            if str(exc) not in _MESSAGE_GONE:
+                raise
+            log.info("slack_bot caller thread %s gone (%s)", thread.ts, exc)
+            ts = await _post_main(thread.channel, text)
+            if ts:
+                interview.slackThread = SlackThread(channel=thread.channel, ts=ts)
+            return bool(ts) or changed
+
+        # One reply per write: a new round says "moved"; otherwise the latest round that changed.
+        pick = next((ev for ev in events if ev[0] == "moved"), events[-1] if events else None)
+        if pick is not None:
+            event, entry, prev = pick
+            reply = await caller_thread_reply(event, entry, prev, owner=owner, manager=manager)
+            if reply:
+                await _slack_api("chat.postMessage", {
+                    "channel": thread.channel, "text": reply, "thread_ts": thread.ts,
+                    "unfurl_links": False, "unfurl_media": False,
+                })
+        return changed
+    except Exception as exc:
+        log.warning("slack_bot caller thread sync failed for %s: %s", getattr(interview, "id", "?"), exc)
+        return False
 
 
 async def _change_lines(prev: Optional[dict], entry: Any) -> list[str]:
@@ -518,70 +631,6 @@ async def _change_lines(prev: Optional[dict], entry: Any) -> list[str]:
     return caller_change_lines(
         prev, new, fmt_time=slack_time, label=lambda k, v: _snapshot_label(k, v, mentions),
     )
-
-
-async def _thread_reply(interview: Interview, entry: Any, kind: str, owner, prev: Optional[dict]) -> Optional[str]:
-    if kind == "canceled":
-        return f":no_entry: *Canceled* — {_stage_label(entry.stage)} · {slack_time(entry.scheduledAt)}"
-    lines = await _change_lines(prev, entry)
-    if kind == "restored":
-        return "\n".join([f":white_check_mark: *Back on* — by {_mention(owner)}", *lines])
-    if not lines:
-        return None
-    return "\n".join([f":pencil2: *Caller details updated* by {_mention(owner)}", *lines])
-
-
-async def notify_round_caller(
-    interview: Interview,
-    entry: Any,
-    kind: str,
-    *,
-    prev: Optional[dict] = None,
-) -> Optional[str]:
-    """Bring a round's #caller post in line with `kind`. Never raises.
-
-    created → new main post; updated / canceled / restored → main post edited
-    in place plus a thread reply saying what changed; deleted → main post
-    removed. A main post deleted by hand in Slack is posted again (not for
-    canceled). Returns the live main post's ts, or None.
-    """
-    try:
-        caller = getattr(entry, "caller", None)
-        channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
-        if caller is None or not channel or not slack_bot_configured():
-            return None
-        parent = (caller.slackChannelTs or "").strip() or None
-        if kind == "deleted":
-            if parent:
-                await _slack_api("chat.delete", {"channel": channel, "ts": parent})
-            return None
-        owner = await UserExtra.get(interview.createdBy)
-        text = await _main_post_text(interview, entry, owner)
-        if parent and kind != "created":
-            try:
-                await _slack_api("chat.update", {"channel": channel, "ts": parent, "text": text})
-            except RuntimeError as exc:
-                if str(exc) not in _MESSAGE_GONE:
-                    raise
-                log.info("slack_bot caller post %s gone (%s)", parent, exc)
-                parent = None
-        if parent and kind != "created":
-            reply = await _thread_reply(interview, entry, kind, owner, prev)
-            if reply:
-                await _slack_api("chat.postMessage", {
-                    "channel": channel, "text": reply, "thread_ts": parent,
-                    "unfurl_links": False, "unfurl_media": False,
-                })
-            return parent
-        if kind == "canceled":
-            return None
-        res = await _slack_api("chat.postMessage", {
-            "channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False,
-        })
-        return res.get("ts") or None
-    except Exception as exc:
-        log.warning("slack_bot round caller post failed kind=%s: %s", kind, exc)
-        return None
 
 
 def _slack_escape(text: str) -> str:
@@ -962,10 +1011,14 @@ async def _reminder_release(key: str) -> None:
 
 
 async def _reminder_post(interview: Any, entry: Any, text: str) -> bool:
-    """Reply in the round's #caller thread, or post to #caller when it has none."""
+    """Reply in the interview's #caller thread (or the round's older post), else post to #caller."""
     channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
+    thread = getattr(interview, "slackThread", None)
+    if thread is not None:
+        channel, parent = thread.channel, thread.ts
+    else:
+        parent = (entry.caller.slackChannelTs or "").strip()
     body = {"channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False}
-    parent = (entry.caller.slackChannelTs or "").strip()
     try:
         try:
             await _slack_api("chat.postMessage", {**body, "thread_ts": parent} if parent else body)

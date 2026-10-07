@@ -28,12 +28,11 @@ from app.interview_caller import (
     CallerError,
     CallerIn,
     build_round_caller,
-    caller_post_kind,
     is_coworker,
     round_caller_snapshot,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
-from app.slack_bot import notify_round_caller
+from app.slack_bot import sync_caller_thread
 
 log = logging.getLogger(__name__)
 
@@ -264,29 +263,13 @@ async def _sync_caller_posts(
     iv: Interview,
     before: dict[str, Optional[dict]],
     *,
+    added: Iterable[str] = (),
     deleted: Iterable[str] = (),
 ) -> None:
-    """Create, edit or delete #caller posts for rounds whose caller details
-    changed since `before` (snapshots taken before the write)."""
+    """Bring the interview's #caller thread in line with a write (snapshots in `before` were taken
+    before it). Rounds being deleted are still in iv.stageHistory; their caller saves the interview."""
     gone = set(deleted)
-    entries = {e.id: e for e in iv.stageHistory if e.id}
-    ts_changed = False
-    for rid in dict.fromkeys([*before, *entries]):
-        entry = entries.get(rid)
-        if entry is None:
-            continue
-        removed = rid in gone
-        new = None if removed else round_caller_snapshot(entry)
-        has_post = bool(entry.caller is not None and (entry.caller.slackChannelTs or "").strip())
-        kind = caller_post_kind(before.get(rid), new, has_post=has_post, round_deleted=removed)
-        if kind is None:
-            continue
-        ts = await notify_round_caller(iv, entry, kind, prev=before.get(rid))
-        if ts and entry.caller is not None and entry.caller.slackChannelTs != ts:
-            entry.caller.slackChannelTs = ts
-            ts_changed = True
-    if ts_changed and not gone:
-        _sync_top_from_tip(iv)
+    if await sync_caller_thread(iv, before, added=added, deleted=gone) and not gone:
         await _save_interview(iv)
 
 
@@ -922,7 +905,7 @@ async def add_interview_stage(
     _sync_top_from_tip(iv)
     await _save_interview(iv)
 
-    await _sync_caller_posts(iv, before)
+    await _sync_caller_posts(iv, before, added={entry.id})
     await _after_save(iv, user=user, extract_stage_ids=[entry.id] if entry.transcript.strip() else [])
     return await _interview_out(iv)
 

@@ -112,33 +112,12 @@ def round_caller_snapshot(entry: Any) -> Optional[dict]:
     }
 
 
-def _is_on(snapshot: Optional[dict]) -> bool:
+def caller_is_on(snapshot: Optional[dict]) -> bool:
     """A caller is requested and the round is not called off."""
     return snapshot is not None and snapshot.get("status") not in ENDED_STATUSES
 
 
-def caller_post_kind(
-    prev: Optional[dict], new: Optional[dict], *, has_post: bool, round_deleted: bool = False,
-) -> Optional[str]:
-    """What a write does to a round's #caller post.
-
-    created → new main post; updated / canceled / restored → main post edited
-    plus a thread reply; deleted → main post removed; None → nothing.
-    `has_post` is whether the round already has a main post.
-    """
-    if round_deleted:
-        return "deleted" if has_post else None
-    was_on, is_on = _is_on(prev), _is_on(new)
-    if not has_post:
-        # Also retries a first post that failed, on the next real change.
-        return "created" if is_on and new != prev else None
-    if was_on and not is_on:
-        return "canceled"
-    if is_on and not was_on:
-        return "restored"
-    if is_on and new != prev:
-        return "updated"
-    return None
+_is_on = caller_is_on
 
 
 def caller_thread_event(
