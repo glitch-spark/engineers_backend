@@ -221,6 +221,17 @@ def test_digest_text_escapes_only_the_text_of_a_job_link():
     assert "<!channel>" not in row
 
 
+def test_digest_text_never_links_a_malformed_job_url():
+    for bad in ("https://x.example/><!channel>", "https://x.example/a|b", "https://x.example/a b"):
+        iv = _digest_iv("Acme", job_url=bad)
+        row = digest_text(TODAY, [iv], profiles={}, tz=NY, why=None).splitlines()[1]
+        assert "<!channel>" not in row and "<http" not in row
+        assert " · Acme · " in row
+    good = digest_text(TODAY, [_digest_iv("Acme", job_url="https://x.example/a?b=1")], profiles={}, tz=NY,
+                       why=None).splitlines()[1]
+    assert "<https://x.example/a?b=1|Acme>" in good
+
+
 @pytest.mark.asyncio
 async def test_digest_empty_day_sends_rest_message():
     from app.slack_bot import _digest_for_user

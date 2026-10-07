@@ -12,7 +12,8 @@ Shared format: plain Slack text. The first line is an emoji, the owner's mention
 bold title, then key facts joined by ` · `. Detail lines are `*Label:* value`. The last line is `cc …` when someone is
 cc'd. Times are Slack date tags, so each reader sees their own time zone. A mention pings the person's Slack member
 ID, or shows their name when they have none. Text typed in the app (company, recruiter, caller, profile and
-transaction text) is escaped, so it cannot ping a channel or add links.
+transaction text) is escaped, so it cannot ping a channel or add a Slack token. Only a well-formed http(s) URL
+becomes a link; a URL with `<`, `>`, `|` or spaces is shown as plain text.
 
 ## 1. Create the Slack App
 

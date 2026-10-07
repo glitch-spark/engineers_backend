@@ -125,6 +125,14 @@ def test_reminder_text_escapes_a_method_value_that_is_not_a_link():
     assert "*Method:* Video meeting — dial &lt;!channel&gt; &amp; hold" in text.splitlines()
 
 
+def test_reminder_text_does_not_link_a_malformed_meeting_link():
+    r = _round(27)
+    r.caller.methodValue = "https://x.example/><!channel>"
+    text = caller_reminder_text(_iv(r), r, now=NOW, owner=OWNER, managers=[], account=None)
+    assert "<!channel>" not in text
+    assert "*Method:* Video meeting — https://x.example/&gt;&lt;!channel&gt;" in text.splitlines()
+
+
 class _Fakes:
     def __init__(self, interviews=(), post_ok=True):
         self.interviews = list(interviews)

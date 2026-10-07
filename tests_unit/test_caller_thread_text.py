@@ -298,3 +298,29 @@ def test_details_reply_escapes_the_changed_values():
 def test_details_reply_keeps_the_time_tag_unescaped():
     text = reply("details", entry(name="Dana", at=LATER), snap(name="TBD"))
     assert f"Time: {slack_time(START)} → {slack_time(LATER)}" in text.splitlines()
+
+
+BAD_URL = "https://x.example/><!channel>"
+
+
+def test_method_text_never_links_a_malformed_url():
+    from app.slack_bot import _method_text
+
+    caller = SimpleNamespace(method="video", methodValue=BAD_URL)
+    assert _method_text(caller) == "Video meeting — https://x.example/&gt;&lt;!channel&gt;"
+    for bad in ("https://x.example/a|b", "https://x.example/a b", "https://x.example/<a>"):
+        text = _method_text(SimpleNamespace(method="video", methodValue=bad))
+        assert "<http" not in text and "<a>" not in text and "|" not in text
+    ok = _method_text(SimpleNamespace(method="video", methodValue="https://x.example/a?b=1"))
+    assert ok == "Video meeting — <https://x.example/a?b=1|https://x.example/a?b=1>"
+
+
+def test_main_post_and_details_do_not_inject_through_a_malformed_meeting_link():
+    e = entry()
+    e.caller.methodValue = BAD_URL
+    text = caller_round_text(IV, e, account=None, owner=OWNER, managers=[MANAGER])
+    assert "<!channel>" not in text
+    assert "*Method:* Video meeting — https://x.example/&gt;&lt;!channel&gt;" in text.splitlines()
+    old = snap()
+    new_text = reply("details", e, old)
+    assert "<!channel>" not in new_text

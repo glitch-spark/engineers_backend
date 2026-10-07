@@ -123,11 +123,16 @@ def _stage_label(stage: Any) -> str:
     return " ".join(part.capitalize() for part in key.split("_"))
 
 
+# Characters that would end a `<url|label>` early or start another Slack token.
+_UNLINKABLE = re.compile(r"[<>|\s]")
+
+
 def _mrkdwn_link(url: Optional[str], label: str) -> str:
-    """`<url|label>` for an http(s) URL, else just the label. Only the label is escaped, never the URL."""
+    """`<url|label>` for a well-formed http(s) URL, else just the escaped label. The label is escaped, the URL
+    is left as is; a URL holding `<`, `>`, `|` or whitespace is never linked, so typed text cannot inject a token."""
     href = (url or "").strip()
     safe = _slack_escape((label or "").strip()).replace("|", " ").strip() or "link"
-    if href.startswith("http://") or href.startswith("https://"):
+    if href.startswith(("http://", "https://")) and not _UNLINKABLE.search(href):
         return f"<{href}|{safe}>"
     return safe
 
