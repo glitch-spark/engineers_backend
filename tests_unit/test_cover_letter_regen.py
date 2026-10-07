@@ -169,6 +169,12 @@ async def test_regen_without_inputs_400(writer, field):
     assert r.status_code == 400 and writer == []
 
 
+async def test_regen_archived_job_400(writer):
+    FakeJobs.store[JOB_ID] = make_job(textArchivedAt=datetime(2026, 10, 7, tzinfo=timezone.utc))
+    r = await regen({})
+    assert r.status_code == 400 and "archived" in r.json()["detail"] and writer == []
+
+
 async def test_regen_unknown_model_400(writer):
     FakeJobs.store[JOB_ID] = make_job()
     r = await regen({"model": "anthropic:nope"})

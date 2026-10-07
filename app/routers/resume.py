@@ -39,6 +39,11 @@ from app.routers._util import doc_to_dict, require_model, to_object_id
 router = APIRouter(prefix="/resume", tags=["resume"])
 log = logging.getLogger(__name__)
 
+ARCHIVED_TEXT_DETAIL = (
+    "This resume is past the retention window: its job description and resume text were archived, "
+    "so it can't answer questions or write a cover letter. Generate a new resume for this job."
+)
+
 _SAFE_FILENAME_SEG = re.compile(r"[^A-Za-z0-9 _\-().]+")
 
 
@@ -480,6 +485,8 @@ async def ask_job_screening(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     if job.accountId is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="job has no profile")
+    if getattr(job, "textArchivedAt", None) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ARCHIVED_TEXT_DETAIL)
     account = await Account.get(job.accountId)
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="profile no longer exists")
@@ -539,6 +546,8 @@ async def regenerate_cover_letter(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     owner = await UserExtra.get(job.userId)
     model_id = require_model("cover_letter", body.model, owner)
+    if getattr(job, "textArchivedAt", None) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ARCHIVED_TEXT_DETAIL)
     if not (job.plainText or "").strip() or not (job.jobDescription or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

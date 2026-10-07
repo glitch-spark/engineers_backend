@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     RESUME_LLM_CONCURRENCY: int = 3
     RESUME_RENDER_CONCURRENCY: int = 2
     RESUME_DAILY_CAP: int = 300
+    # Generated resumes older than this keep metadata + PDF but lose their heavy text (JD, resume text,
+    # cover letter, screening answers), archived to S3 first (app/resume_retention.py). 0 = keep forever.
+    RESUME_TEXT_RETENTION_DAYS: int = 30
     # Reasoning effort for non-resume gpt-5* calls (interview rollup,
     # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for

@@ -70,6 +70,9 @@ class ResumeApplication(TimestampedDocument):
     s3Url: Optional[str] = None
     # Logical reading-order text — use instead of copy-pasting from the PDF.
     plainText: Optional[str] = None
+    # Set when retention moved the heavy text (JD, plainText, cover letter, screening) to this S3 archive.
+    textArchivedAt: Optional[datetime] = None
+    textArchiveKey: Optional[str] = None
 
     screeningQuestions: List[str] = []
     screeningPairs: List[ScreeningPair] = []
