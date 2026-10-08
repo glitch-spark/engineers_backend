@@ -159,3 +159,54 @@ def test_rank_rows_empty():
     from app.dashboard_stats import rank_rows
 
     assert rank_rows([]) == []
+
+
+# --- team dashboard: working days, pro-rated goals, plan logging ----------------------------------
+
+
+def test_working_days_skip_sunday():
+    from app.dashboard_stats import working_days
+
+    assert working_days(date(2026, 10, 5), date(2026, 10, 11)) == [date(2026, 10, d) for d in range(5, 11)]
+    assert working_days(date(2026, 10, 11), date(2026, 10, 11)) == []
+
+
+def test_prorated_goal_full_partial_and_none():
+    from app.dashboard_stats import prorated_goal
+
+    assert prorated_goal({date(2026, 10, 5): 300}, date(2026, 10, 5), date(2026, 10, 11)) == 300
+    # 30 days ending Wed Oct 7: Sep 8 (Tue) .. Oct 7 — week of Sep 7 has 5 working days in range, Oct 5 has 3
+    goals = {date(2026, 9, 7): 300, date(2026, 9, 14): 300, date(2026, 9, 21): 300,
+             date(2026, 9, 28): 300, date(2026, 10, 5): 300}
+    assert prorated_goal(goals, date(2026, 9, 8), date(2026, 10, 7)) == 250 + 900 + 150
+    assert prorated_goal({}, date(2026, 10, 5), date(2026, 10, 11)) is None
+    assert prorated_goal({date(2026, 10, 5): 0}, date(2026, 10, 5), date(2026, 10, 11)) is None
+
+
+def test_percent():
+    from app.dashboard_stats import percent
+
+    assert percent(240, 300) == 80 and percent(5, None) is None and percent(0, 10) == 0
+
+
+def test_logging_ratio_today_counts_only_when_logged():
+    from app.dashboard_stats import logging_ratio
+
+    mon, wed = date(2026, 10, 5), date(2026, 10, 7)
+    assert logging_ratio({mon, date(2026, 10, 6)}, mon, date(2026, 10, 11), wed) == (2, 2)
+    assert logging_ratio({mon, wed}, mon, date(2026, 10, 11), wed) == (2, 3)
+
+
+def test_logging_ratio_sunday_and_past_period():
+    from app.dashboard_stats import logging_ratio
+
+    sun = date(2026, 10, 11)
+    assert logging_ratio(set(), date(2026, 10, 5), sun, sun) == (0, 6)
+    assert logging_ratio({date(2026, 9, 1)}, date(2026, 9, 1), date(2026, 9, 30), date(2026, 10, 7)) == (1, 26)
+
+
+def test_rank_rows_none_ranks_last_together():
+    from app.dashboard_stats import rank_rows
+
+    rows = rank_rows([("a", "A", None), ("b", "B", 0), ("c", "C", None), ("d", "D", 5)])
+    assert [(r["id"], r["rank"]) for r in rows] == [("d", 1), ("b", 2), ("a", 3), ("c", 3)]

@@ -191,10 +191,37 @@ def compare_window(today: date, range_: str) -> tuple[date, date]:
 
 
 def rank_rows(rows: list[tuple]) -> list[dict]:
-    """(id, name, value) rows sorted by value (high first, then name), ranked so ties share a rank (1, 2, 2, 4)."""
-    ordered = sorted(rows, key=lambda r: (-r[2], (r[1] or "").lower()))
+    """(id, name, value) rows sorted by value (high first, then name), ranked so ties share a rank (1, 2, 2, 4).
+    A None value ("no data", e.g. no goal set) ranks after every number; all None rows share one rank."""
+    ordered = sorted(rows, key=lambda r: (r[2] is None, -(r[2] or 0), (r[1] or "").lower()))
     out: list[dict] = []
     for i, (row_id, name, value) in enumerate(ordered):
         rank = out[-1]["rank"] if out and out[-1]["value"] == value else i + 1
         out.append({"id": row_id, "name": name, "value": value, "rank": rank})
     return out
+
+
+def working_days(start: date, end: date) -> list[date]:
+    """Mon-Sat days in [start, end]."""
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)
+            if (start + timedelta(days=i)).weekday() != 6]
+
+
+def prorated_goal(week_goals: dict[date, int], start: date, end: date) -> int | None:
+    """Sum of each week's goal (keyed by its Monday) times the share of its six working days inside [start, end];
+    None when that comes to 0 (no goal set)."""
+    total = 0.0
+    for monday, goal in week_goals.items():
+        inside = working_days(max(monday, start), min(monday + timedelta(days=6), end))
+        total += goal * len(inside) / 6
+    return round(total) or None
+
+
+def percent(done: float, goal: int | None) -> int | None:
+    return round(done / goal * 100) if goal else None
+
+
+def logging_ratio(logged_days: set[date], start: date, end: date, today: date) -> tuple[int, int]:
+    """(days logged, working days) over [start, min(end, today)]; today counts only once it is logged."""
+    days = [d for d in working_days(start, min(end, today)) if d != today or d in logged_days]
+    return sum(1 for d in days if d in logged_days), len(days)
