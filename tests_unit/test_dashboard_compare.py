@@ -5,7 +5,7 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,6 +13,7 @@ from beanie import init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
 from app.models import DailyPlan, Transaction, UserExtra
+from app.models.weekly_plan import WeeklyPlan
 from app.models.plan_common import Counts
 
 pytestmark = pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning")
@@ -23,7 +24,7 @@ TODAY = "2026-10-07"  # Wednesday; week = Oct 5-11
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["dashboard-compare"]
-    await init_beanie(database=database, document_models=[UserExtra, DailyPlan, Transaction])
+    await init_beanie(database=database, document_models=[UserExtra, DailyPlan, Transaction, WeeklyPlan])
     return database
 
 
@@ -34,6 +35,12 @@ async def make_user(name, role="staff", **kw):
 async def plan(user, day, self_bids, bidder_bids):
     await DailyPlan(userId=user.id, date=datetime(2026, 10, day), year=2026, weekNumber=40, done=Counts(bidsSelf=self_bids, bidsBidder=bidder_bids),
                     loggedAt=datetime(2026, 10, day, 20)).insert()
+
+
+async def weekly(user, monday, bids, interviews):
+    start = datetime(monday.year, monday.month, monday.day)
+    await WeeklyPlan(userId=user.id, weekStart=start, weekNumber=40, year=2026, startDate=start,
+                     endDate=start + timedelta(days=6), goal=Counts(bidsSelf=bids, interviewsSelf=interviews)).insert()
 
 
 async def tx(user, day, amount, status="approved"):
@@ -127,3 +134,27 @@ async def test_anonymous_leaderboard_users_stay_anonymous(db):
 async def test_unknown_range_is_422(db):
     pedro = await make_user("Pedro")
     assert (await get(pedro, range="year")).status_code == 422
+
+
+    pedro = await make_user("Pedro")
+    await make_user("Maria")
+    pedro, maria = await make_user("Pedro"), await make_user("Maria")
+    await weekly(pedro, date(2026, 10, 5), bids=60, interviews=4)
+    await plan(pedro, 5, 20, 10)
+    await plan(pedro, 6, 0, 0)  # a 0-bid day still counts as logged
+    body = (await get(pedro, interviews={pedro.id: 2})).json()
+    gb = {x["name"]: x for x in body["metrics"]["goalBids"]["rows"]}
+    assert gb["Pedro"]["value"] == 50 and gb["Maria"]["value"] is None and gb["Maria"]["rank"] == 2
+    assert {x["name"]: x["value"] for x in body["metrics"]["goalInterviews"]["rows"]}["Pedro"] == 50
+    lg = {x["name"]: x for x in body["metrics"]["logged"]["rows"]}
+    assert (lg["Pedro"]["logged"], lg["Pedro"]["workingDays"], lg["Pedro"]["value"]) == (2, 2, 1.0)
+    assert lg["Maria"]["value"] == 0.0 and lg["Maria"]["workingDays"] == 2
+    assert body["metrics"]["logged"]["subject"] == {"rank": 1, "value": 1.0, "outOf": 2}
+
+
+async def test_negative_earnings_rank_below_zero(db):
+    pedro = await make_user("Pedro")
+    await make_user("Maria")
+    await tx(pedro, 6, -50.0)
+    rows = (await get(pedro)).json()["metrics"]["earnings"]["rows"]
+    assert [(x["name"], x["value"]) for x in rows] == [("Maria", 0), ("Pedro", -50.0)]

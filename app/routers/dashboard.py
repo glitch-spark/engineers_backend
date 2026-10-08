@@ -24,10 +24,13 @@ from app.dashboard_stats import (
     bucket_label,
     compare_window,
     local_day_start_utc,
+    logging_ratio,
     month_keys,
     pace,
+    percent,
     percentile,
     pick_bucket,
+    prorated_goal,
     rank_rows,
     streak,
     week_window,
@@ -315,6 +318,65 @@ async def dashboard_net_monthly(
     return {"months": months, "total": round(total, 2)}
 
 
+async def _active_members() -> list[UserExtra]:
+    """Everyone the team views rank: active, non-admin users."""
+    return await UserExtra.find({"role": {"$ne": "admin"}, "isActive": {"$ne": False}}).to_list()
+
+
+async def team_metrics(members: list[UserExtra], start: date, end: date, today: date) -> dict:
+    """Every dashboard metric per member over [start, end]: bids (self/bidder), interviews, net earnings, goal
+    attainment (weekly goals pro-rated to the period), plan logging and the current streak."""
+    ids = [m.id for m in members]
+    out = {uid: {"bids": 0, "bidsSelf": 0, "bidsBidder": 0, "interviews": 0, "earnings": 0.0} for uid in ids}
+
+    for p in await _logged_plans(ids, start, end):
+        row = out[p.userId]
+        row["bidsSelf"] += p.done.bidsSelf
+        row["bidsBidder"] += p.done.bidsBidder
+        row["bids"] += p.done.bidsSelf + p.done.bidsBidder
+    by_day = await interviews_by_day(ids, start, end)
+    for uid in ids:
+        out[uid]["interviews"] = sum(by_day.get(uid, {}).values())
+    # Transaction.date is a naive calendar midnight (see /net-monthly): compare it as-is.
+    rows = await Transaction.aggregate([
+        {"$match": {"userId": {"$in": ids}, "status": "approved",
+                    "date": {"$gte": _midnight(start), "$lt": _midnight(end + timedelta(days=1))}}},
+        {"$group": {"_id": "$userId", "net": {"$sum": "$amount"}}},
+    ]).to_list()
+    for row in rows:
+        out[row["_id"]]["earnings"] = round(float(row["net"]), 2)
+
+    bid_goals: dict = {uid: {} for uid in ids}
+    iv_goals: dict = {uid: {} for uid in ids}
+    monday = start - timedelta(days=start.weekday())
+    while monday <= end:
+        for uid, wp in (await weekly_plans_for(ids, monday)).items():
+            bid_goals[uid][monday] = wp.goal.bidsSelf + wp.goal.bidsBidder
+            iv_goals[uid][monday] = wp.goal.interviewsSelf + wp.goal.interviewsCaller
+        monday += timedelta(days=7)
+
+    logged_days: dict = {uid: set() for uid in ids}
+    for p in await _logged_plans(ids, start, min(end, today)):
+        logged_days[p.userId].add(p.date.date())
+    streak_days: dict = {uid: set() for uid in ids}
+    for p in await _logged_plans(ids, today - timedelta(days=400), today):
+        streak_days[p.userId].add(p.date.date())
+
+    for uid in ids:
+        row = out[uid]
+        row["goalBids"] = prorated_goal(bid_goals[uid], start, end)
+        row["goalInterviews"] = prorated_goal(iv_goals[uid], start, end)
+        row["goalBidsPct"] = percent(row["bids"], row["goalBids"])
+        row["goalInterviewsPct"] = percent(row["interviews"], row["goalInterviews"])
+        row["logged"], row["workingDays"] = logging_ratio(logged_days[uid], start, end, today)
+        row["streak"] = streak(streak_days[uid], today)
+    return out
+
+
+def _logged_value(row: dict) -> Optional[float]:
+    return round(row["logged"] / row["workingDays"], 4) if row["workingDays"] else None
+
+
 @router.get("/compare")
 async def dashboard_compare(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -322,42 +384,29 @@ async def dashboard_compare(
     userId: Optional[str] = Query(None),
     today: Optional[str] = Query(None),
 ) -> dict:
-    """"You vs team": bids, interviews and earnings ranked across active non-admin users over the period.
+    """"You vs team": bids, interviews, earnings, goal attainment and plan logging ranked across active non-admin
+    users over the period.
 
     The subject (the caller, or the user an admin picked) is reported separately; an admin viewing nobody has
-    no subject rank. Bids are logged Daily Plan bids, interviews come from interview records, earnings are the
-    net of approved transactions dated in the period — the same numbers as the other dashboard cards."""
+    no subject rank. All numbers come from `team_metrics`, the same as the admin team table."""
     sid = await _subject_id(user, userId)
+    day = _today(today)
     try:
-        start, end = compare_window(_today(today), range_)
+        start, end = compare_window(day, range_)
     except ValueError:
         raise HTTPException(status_code=422, detail="invalid range")
 
-    members = await UserExtra.find({"role": {"$ne": "admin"}, "isActive": {"$ne": False}}).to_list()
-    ids = [m.id for m in members]
-
-    bids = {uid: 0 for uid in ids}
-    for p in await _logged_plans(ids, start, end):
-        bids[p.userId] = bids.get(p.userId, 0) + p.done.bidsSelf + p.done.bidsBidder
-    by_day = await interviews_by_day(ids, start, end)
-    interviews = {uid: sum(by_day.get(uid, {}).values()) for uid in ids}
-    # Transaction.date is a naive calendar midnight (see /net-monthly): compare it as-is.
-    rows = await Transaction.aggregate([
-        {"$match": {"userId": {"$in": ids}, "status": "approved",
-                    "date": {"$gte": _midnight(start), "$lt": _midnight(end + timedelta(days=1))}}},
-        {"$group": {"_id": "$userId", "net": {"$sum": "$amount"}}},
-    ]).to_list()
-    earnings = {row["_id"]: round(float(row["net"]), 2) for row in rows}
-
+    members = await _active_members()
     people = {m.id: m for m in members}
+    stats = await team_metrics(members, start, end, day)
 
-    def ranked(values: dict) -> dict:
-        board = rank_rows([(uid, _display_name(people[uid]), values.get(uid, 0)) for uid in ids])
+    def ranked(value_of, extra=lambda row: {}) -> dict:
+        board = rank_rows([(uid, _display_name(people[uid]), value_of(row)) for uid, row in stats.items()])
         mine = next((r for r in board if r["id"] == sid), None)
         return {
             "rows": [
                 {"userId": str(r["id"]), "name": r["name"], "image": people[r["id"]].image or None,
-                 "value": r["value"], "rank": r["rank"]}
+                 "value": r["value"], "rank": r["rank"], **extra(stats[r["id"]])}
                 for r in board
             ],
             "subject": {"rank": mine["rank"] if mine else None, "value": mine["value"] if mine else None,
@@ -369,5 +418,12 @@ async def dashboard_compare(
         "from": start.isoformat(),
         "to": end.isoformat(),
         "subjectId": str(sid),
-        "metrics": {"bids": ranked(bids), "interviews": ranked(interviews), "earnings": ranked(earnings)},
+        "metrics": {
+            "bids": ranked(lambda r: r["bids"]),
+            "interviews": ranked(lambda r: r["interviews"]),
+            "earnings": ranked(lambda r: r["earnings"]),
+            "goalBids": ranked(lambda r: r["goalBidsPct"]),
+            "goalInterviews": ranked(lambda r: r["goalInterviewsPct"]),
+            "logged": ranked(_logged_value, lambda r: {"logged": r["logged"], "workingDays": r["workingDays"]}),
+        },
     }
