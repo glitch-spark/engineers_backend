@@ -427,3 +427,53 @@ async def dashboard_compare(
             "logged": ranked(_logged_value, lambda r: {"logged": r["logged"], "workingDays": r["workingDays"]}),
         },
     }
+
+
+def _team_goal_pct(stats: dict, done_key: str, goal_key: str) -> Optional[int]:
+    """Team done ÷ team goal over the members who have a goal (no goal is left out, not counted as 0%)."""
+    with_goal = [row for row in stats.values() if row[goal_key]]
+    return percent(sum(row[done_key] for row in with_goal), sum(row[goal_key] for row in with_goal))
+
+
+@router.get("/team")
+async def dashboard_team(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    range_: str = Query("week", alias="range"),
+    today: Optional[str] = Query(None),
+) -> dict:
+    """Admins' "All users" view: team totals and one row per active non-admin user, by bids (high first)."""
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
+    day = _today(today)
+    try:
+        start, end = compare_window(day, range_)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid range")
+
+    members = await _active_members()
+    stats = await team_metrics(members, start, end, day)
+    users = [
+        {"userId": str(m.id), "name": _display_name(m), "image": m.image or None,
+         **{k: stats[m.id][k] for k in ("bids", "bidsSelf", "bidsBidder", "interviews", "earnings", "goalBidsPct",
+                                        "goalInterviewsPct", "logged", "workingDays", "streak")}}
+        for m in members
+    ]
+    users.sort(key=lambda u: (-u["bids"], u["name"].lower()))
+    rows = stats.values()
+    return {
+        "range": range_,
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "totals": {
+            "bids": sum(r["bids"] for r in rows),
+            "bidsSelf": sum(r["bidsSelf"] for r in rows),
+            "bidsBidder": sum(r["bidsBidder"] for r in rows),
+            "interviews": sum(r["interviews"] for r in rows),
+            "earnings": round(sum(r["earnings"] for r in rows), 2),
+            "goalBidsPct": _team_goal_pct(stats, "bids", "goalBids"),
+            "goalInterviewsPct": _team_goal_pct(stats, "interviews", "goalInterviews"),
+            "logged": sum(r["logged"] for r in rows),
+            "workingDays": sum(r["workingDays"] for r in rows),
+        },
+        "users": users,
+    }
