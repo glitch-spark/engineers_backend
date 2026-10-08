@@ -136,9 +136,9 @@ async def test_unknown_range_is_422(db):
     assert (await get(pedro, range="year")).status_code == 422
 
 
+async def test_compare_has_goal_and_logging_metrics(db):
     pedro = await make_user("Pedro")
     await make_user("Maria")
-    pedro, maria = await make_user("Pedro"), await make_user("Maria")
     await weekly(pedro, date(2026, 10, 5), bids=60, interviews=4)
     await plan(pedro, 5, 20, 10)
     await plan(pedro, 6, 0, 0)  # a 0-bid day still counts as logged
