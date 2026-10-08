@@ -172,3 +172,29 @@ def month_keys(today: date, n: int = 12) -> list[str]:
             y -= 1
     keys.reverse()
     return keys
+
+
+CompareRange = Literal["week", "month", "30d"]
+
+
+def compare_window(today: date, range_: str) -> tuple[date, date]:
+    """[start, end] calendar days for the "You vs team" card: the Mon-Sun week, the month to date, or the
+    last 30 days ending today."""
+    if range_ == "week":
+        monday, _saturday, sunday = week_window(today)
+        return monday, sunday
+    if range_ == "month":
+        return today.replace(day=1), today
+    if range_ == "30d":
+        return today - timedelta(days=29), today
+    raise ValueError(f"unknown range: {range_}")
+
+
+def rank_rows(rows: list[tuple]) -> list[dict]:
+    """(id, name, value) rows sorted by value (high first, then name), ranked so ties share a rank (1, 2, 2, 4)."""
+    ordered = sorted(rows, key=lambda r: (-r[2], (r[1] or "").lower()))
+    out: list[dict] = []
+    for i, (row_id, name, value) in enumerate(ordered):
+        rank = out[-1]["rank"] if out and out[-1]["value"] == value else i + 1
+        out.append({"id": row_id, "name": name, "value": value, "rank": rank})
+    return out

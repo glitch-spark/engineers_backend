@@ -126,3 +126,36 @@ def test_month_keys_rolls_over_year():
 
 def test_local_day_start_utc_new_york():
     assert local_day_start_utc(date(2026, 9, 28), ZoneInfo("America/New_York")) == datetime(2026, 9, 28, 4, 0)
+
+
+# --- compare: period windows and ranking -------------------------------------------------------
+
+
+def test_compare_window_week_month_and_30_days():
+    from app.dashboard_stats import compare_window
+
+    wed = date(2026, 10, 7)
+    assert compare_window(wed, "week") == (date(2026, 10, 5), date(2026, 10, 11))
+    assert compare_window(wed, "month") == (date(2026, 10, 1), wed)
+    assert compare_window(wed, "30d") == (date(2026, 9, 8), wed)
+
+
+def test_compare_window_rejects_unknown_range():
+    from app.dashboard_stats import compare_window
+
+    with pytest.raises(ValueError):
+        compare_window(date(2026, 10, 7), "year")
+
+
+def test_rank_rows_sorts_desc_and_ties_share_a_rank():
+    from app.dashboard_stats import rank_rows
+
+    rows = rank_rows([("a", "Zed", 5), ("b", "Amy", 9), ("c", "Bob", 5), ("d", "Cat", 0)])
+    assert [(r["id"], r["rank"]) for r in rows] == [("b", 1), ("c", 2), ("a", 2), ("d", 4)]
+    assert rows[0] == {"id": "b", "name": "Amy", "value": 9, "rank": 1}
+
+
+def test_rank_rows_empty():
+    from app.dashboard_stats import rank_rows
+
+    assert rank_rows([]) == []

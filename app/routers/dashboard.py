@@ -22,11 +22,13 @@ from app.dashboard_stats import (
     bucket_for,
     bucket_keys,
     bucket_label,
+    compare_window,
     local_day_start_utc,
     month_keys,
     pace,
     percentile,
     pick_bucket,
+    rank_rows,
     streak,
     week_window,
 )
@@ -40,6 +42,7 @@ from app.interview_rounds import (
 from app.models import DailyPlan, Transaction, UserExtra
 from app.plan_auto import interviews_by_day, weekly_plans_for
 from app.routers._util import to_object_id
+from app.routers.metrics import _display_name
 from app.routers.transactions import _TOTALS_GROUP
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -310,3 +313,61 @@ async def dashboard_net_monthly(
         total += net
 
     return {"months": months, "total": round(total, 2)}
+
+
+@router.get("/compare")
+async def dashboard_compare(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    range_: str = Query("week", alias="range"),
+    userId: Optional[str] = Query(None),
+    today: Optional[str] = Query(None),
+) -> dict:
+    """"You vs team": bids, interviews and earnings ranked across active non-admin users over the period.
+
+    The subject (the caller, or the user an admin picked) is reported separately; an admin viewing nobody has
+    no subject rank. Bids are logged Daily Plan bids, interviews come from interview records, earnings are the
+    net of approved transactions dated in the period — the same numbers as the other dashboard cards."""
+    sid = await _subject_id(user, userId)
+    try:
+        start, end = compare_window(_today(today), range_)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid range")
+
+    members = await UserExtra.find({"role": {"$ne": "admin"}, "isActive": {"$ne": False}}).to_list()
+    ids = [m.id for m in members]
+
+    bids = {uid: 0 for uid in ids}
+    for p in await _logged_plans(ids, start, end):
+        bids[p.userId] = bids.get(p.userId, 0) + p.done.bidsSelf + p.done.bidsBidder
+    by_day = await interviews_by_day(ids, start, end)
+    interviews = {uid: sum(by_day.get(uid, {}).values()) for uid in ids}
+    # Transaction.date is a naive calendar midnight (see /net-monthly): compare it as-is.
+    rows = await Transaction.aggregate([
+        {"$match": {"userId": {"$in": ids}, "status": "approved",
+                    "date": {"$gte": _midnight(start), "$lt": _midnight(end + timedelta(days=1))}}},
+        {"$group": {"_id": "$userId", "net": {"$sum": "$amount"}}},
+    ]).to_list()
+    earnings = {row["_id"]: round(float(row["net"]), 2) for row in rows}
+
+    people = {m.id: m for m in members}
+
+    def ranked(values: dict) -> dict:
+        board = rank_rows([(uid, _display_name(people[uid]), values.get(uid, 0)) for uid in ids])
+        mine = next((r for r in board if r["id"] == sid), None)
+        return {
+            "rows": [
+                {"userId": str(r["id"]), "name": r["name"], "image": people[r["id"]].image or None,
+                 "value": r["value"], "rank": r["rank"]}
+                for r in board
+            ],
+            "subject": {"rank": mine["rank"] if mine else None, "value": mine["value"] if mine else None,
+                        "outOf": len(board)},
+        }
+
+    return {
+        "range": range_,
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "subjectId": str(sid),
+        "metrics": {"bids": ranked(bids), "interviews": ranked(interviews), "earnings": ranked(earnings)},
+    }
