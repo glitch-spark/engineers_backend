@@ -442,3 +442,49 @@ async def test_delete_removes_the_post(client, slack):
     assert r.status_code == 200
     assert slack == [("chat.delete", {"channel": "C-TX", "ts": "111.222"})]
     assert await Transaction.get(row.id) is None
+
+
+# --- coin wallet address -----------------------------------------------------------------------
+
+
+def test_coin_address_in_method_line_escaped():
+    lines = transaction_text(tx(payMethod="coin", cardLast4=None, coinAddress="0xAbC<!here>"), OWNER, OWNER).splitlines()
+    assert "*Method:* Coin · 0xAbC&lt;!here&gt;" in lines
+
+
+def test_coin_without_address_and_card_ignore_it():
+    assert "*Method:* Coin" in transaction_text(tx(payMethod="coin", cardLast4=None, coinAddress=None), OWNER, OWNER).splitlines()
+    assert "*Method:* Card ••1234" in transaction_text(tx(coinAddress="0xstale"), OWNER, OWNER).splitlines()
+
+
+async def test_create_and_edit_coin_address(client, slack):
+    pedro = await make_user("Pedro")
+    async with client(pedro) as c:
+        r = await c.post("/transactions", json={
+            "date": "2026-10-07", "amount": 10, "payMethod": "coin", "coinAddress": "  0x12ab9f3c  "})
+        assert r.status_code == 201, r.text
+        tx_id = r.json()["_id"]
+        assert r.json()["coinAddress"] == "0x12ab9f3c"
+        r = await c.put(f"/transactions/{tx_id}", json={"coinAddress": "bc1qnew"})
+        assert r.status_code == 200 and r.json()["coinAddress"] == "bc1qnew"
+        r = await c.put(f"/transactions/{tx_id}", json={"coinAddress": "  "})
+        assert r.status_code == 200 and r.json()["coinAddress"] is None
+        r = await c.put(f"/transactions/{tx_id}", json={"coinAddress": "bc1qagain"})
+        r = await c.put(f"/transactions/{tx_id}", json={"payMethod": "card", "cardLast4": "4242"})
+        assert r.status_code == 200 and r.json()["coinAddress"] is None
+
+
+async def test_card_payment_ignores_coin_address(client, slack):
+    pedro = await make_user("Pedro")
+    async with client(pedro) as c:
+        r = await c.post("/transactions", json={
+            "date": "2026-10-07", "amount": 10, "payMethod": "card", "cardLast4": "1234", "coinAddress": "0xabc"})
+    assert r.status_code == 201 and r.json()["coinAddress"] is None
+
+
+async def test_coin_address_too_long_is_400(client, slack):
+    pedro = await make_user("Pedro")
+    async with client(pedro) as c:
+        r = await c.post("/transactions", json={
+            "date": "2026-10-07", "amount": 10, "payMethod": "coin", "coinAddress": "x" * 201})
+    assert r.status_code == 400

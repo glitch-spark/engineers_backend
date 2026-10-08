@@ -36,6 +36,20 @@ def _clean_card_label(value: Optional[str]) -> Optional[str]:
     return text or None
 
 
+COIN_ADDRESS_MAX = 200
+
+
+def _clean_coin_address(value: Optional[str]) -> Optional[str]:
+    """A trimmed wallet address, None when blank. Raises 400 when longer than COIN_ADDRESS_MAX."""
+    text = (value or "").strip()
+    if len(text) > COIN_ADDRESS_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"coinAddress must be at most {COIN_ADDRESS_MAX} characters",
+        )
+    return text or None
+
+
 def _validate_pay_method(pay_method: Optional[str], card_last4: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Normalize + validate (payMethod, cardLast4). Accepts legacy 'crypto'
     spelling as an alias for 'coin' so older clients keep working. When
@@ -72,6 +86,7 @@ class TransactionCreate(BaseModel):
     payMethod: Optional[str] = None
     cardLast4: Optional[str] = None
     cardLabel: Optional[str] = None
+    coinAddress: Optional[str] = None
     billingCycle: Optional[str] = "monthly"
     payerId: Optional[str] = None
 
@@ -90,6 +105,7 @@ class TransactionUpdate(BaseModel):
     payMethod: Optional[str] = None
     cardLast4: Optional[str] = None
     cardLabel: Optional[str] = None
+    coinAddress: Optional[str] = None
     billingCycle: Optional[str] = None
     payerId: Optional[str] = None
 
@@ -385,6 +401,7 @@ async def create_transaction(
     pay_method, card_last4 = _validate_pay_method(body.payMethod, body.cardLast4)
     billing_cycle = _validate_billing_cycle(body.billingCycle) or "monthly"
     card_label = _clean_card_label(body.cardLabel) if pay_method == "card" else None
+    coin_address = _clean_coin_address(body.coinAddress) if pay_method == "coin" else None
     payer_id = await _resolve_payer_id(body.payerId, user.id)
 
     tx = Transaction(
@@ -397,6 +414,7 @@ async def create_transaction(
         payMethod=pay_method,
         cardLast4=card_last4,
         cardLabel=card_label,
+        coinAddress=coin_address,
         billingCycle=billing_cycle,
         payerId=payer_id,
     )
@@ -465,6 +483,10 @@ async def update_transaction(
             tx.cardLast4 = l4
         if body.cardLabel is not None:
             tx.cardLabel = _clean_card_label(body.cardLabel) if tx.payMethod == "card" else None
+        if body.coinAddress is not None:
+            tx.coinAddress = _clean_coin_address(body.coinAddress) if tx.payMethod in ("coin", "crypto") else None
+        if tx.payMethod == "card":
+            tx.coinAddress = None
         if body.billingCycle is not None:
             tx.billingCycle = _validate_billing_cycle(body.billingCycle) or tx.billingCycle
         if body.payerId is not None:

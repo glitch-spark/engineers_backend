@@ -29,6 +29,8 @@ class Transaction(TimestampedDocument):
     cardLast4: Optional[str] = None
     # Optional nickname for the card (may duplicate across last-4s).
     cardLabel: Optional[str] = None
+    # Wallet address paid from or to when payMethod == "coin" (optional; None for card payments).
+    coinAddress: Optional[str] = None
     # Recurring vs one-off. Default monthly so historical rows and older
     # clients keep the previous "everything is a monthly card charge" meaning.
     billingCycle: Optional[BillingCycle] = "monthly"

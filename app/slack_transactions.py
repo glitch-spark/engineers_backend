@@ -38,7 +38,8 @@ def fmt_usd(n: float) -> str:
 def _method(tx: Any) -> str:
     pay = getattr(tx, "payMethod", None)
     if pay in ("coin", "crypto"):  # 'crypto' is the legacy spelling
-        return "Coin"
+        address = (getattr(tx, "coinAddress", None) or "").strip()
+        return f"Coin · {_slack_escape(address)}" if address else "Coin"
     if pay != "card":
         return ""
     last4 = (getattr(tx, "cardLast4", None) or "").strip()
