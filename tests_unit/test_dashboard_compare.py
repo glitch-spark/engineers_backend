@@ -136,20 +136,10 @@ async def test_unknown_range_is_422(db):
     assert (await get(pedro, range="year")).status_code == 422
 
 
-async def test_compare_has_goal_and_logging_metrics(db):
+async def test_compare_has_only_bids_interviews_and_earnings(db):
     pedro = await make_user("Pedro")
-    await make_user("Maria")
     await weekly(pedro, date(2026, 10, 5), bids=60, interviews=4)
-    await plan(pedro, 5, 20, 10)
-    await plan(pedro, 6, 0, 0)  # a 0-bid day still counts as logged
-    body = (await get(pedro, interviews={pedro.id: 2})).json()
-    gb = {x["name"]: x for x in body["metrics"]["goalBids"]["rows"]}
-    assert gb["Pedro"]["value"] == 50 and gb["Maria"]["value"] is None and gb["Maria"]["rank"] == 2
-    assert {x["name"]: x["value"] for x in body["metrics"]["goalInterviews"]["rows"]}["Pedro"] == 50
-    lg = {x["name"]: x for x in body["metrics"]["logged"]["rows"]}
-    assert (lg["Pedro"]["logged"], lg["Pedro"]["workingDays"], lg["Pedro"]["value"]) == (2, 2, 1.0)
-    assert lg["Maria"]["value"] == 0.0 and lg["Maria"]["workingDays"] == 2
-    assert body["metrics"]["logged"]["subject"] == {"rank": 1, "value": 1.0, "outOf": 2}
+    assert set((await get(pedro)).json()["metrics"]) == {"bids", "interviews", "earnings"}
 
 
 async def test_negative_earnings_rank_below_zero(db):

@@ -378,10 +378,6 @@ async def team_metrics(
     return out
 
 
-def _logged_value(row: dict) -> Optional[float]:
-    return round(row["logged"] / row["workingDays"], 4) if row["workingDays"] else None
-
-
 @router.get("/compare")
 async def dashboard_compare(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -389,8 +385,7 @@ async def dashboard_compare(
     userId: Optional[str] = Query(None),
     today: Optional[str] = Query(None),
 ) -> dict:
-    """"You vs team": bids, interviews, earnings, goal attainment and plan logging ranked across active non-admin
-    users over the period.
+    """"You vs team": bids, interviews and earnings ranked across active non-admin users over the period.
 
     The subject (the caller, or the user an admin picked) is reported separately; an admin viewing nobody has
     no subject rank. All numbers come from `team_metrics`, the same as the admin team table."""
@@ -405,13 +400,13 @@ async def dashboard_compare(
     people = {m.id: m for m in members}
     stats = await team_metrics(members, start, end, day)
 
-    def ranked(value_of, extra=lambda row: {}) -> dict:
-        board = rank_rows([(uid, _display_name(people[uid]), value_of(row)) for uid, row in stats.items()])
+    def ranked(key: str) -> dict:
+        board = rank_rows([(uid, _display_name(people[uid]), row[key]) for uid, row in stats.items()])
         mine = next((r for r in board if r["id"] == sid), None)
         return {
             "rows": [
                 {"userId": str(r["id"]), "name": r["name"], "image": people[r["id"]].image or None,
-                 "value": r["value"], "rank": r["rank"], **extra(stats[r["id"]])}
+                 "value": r["value"], "rank": r["rank"]}
                 for r in board
             ],
             "subject": {"rank": mine["rank"] if mine else None, "value": mine["value"] if mine else None,
@@ -424,12 +419,9 @@ async def dashboard_compare(
         "to": end.isoformat(),
         "subjectId": str(sid),
         "metrics": {
-            "bids": ranked(lambda r: r["bids"]),
-            "interviews": ranked(lambda r: r["interviews"]),
-            "earnings": ranked(lambda r: r["earnings"]),
-            "goalBids": ranked(lambda r: r["goalBidsPct"]),
-            "goalInterviews": ranked(lambda r: r["goalInterviewsPct"]),
-            "logged": ranked(_logged_value, lambda r: {"logged": r["logged"], "workingDays": r["workingDays"]}),
+            "bids": ranked("bids"),
+            "interviews": ranked("interviews"),
+            "earnings": ranked("earnings"),
         },
     }
 
