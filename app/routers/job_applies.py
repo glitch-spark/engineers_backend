@@ -860,6 +860,26 @@ async def delete_run(run_id: str, user: Annotated[UserExtra, Depends(get_current
 # ---------- rows ----------
 
 
+@router.get("/runs/{run_id}/tailored")
+async def list_ready_tailored(
+    run_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    accountId: str = Query(..., min_length=1),
+) -> dict:
+    """Ids of one profile's completed tailored resumes across the whole run (every page and bucket), for
+    "Select profile" before a bulk download."""
+    run = await _owned_run(run_id, user)
+    if len(accountId) != 24 or not PydanticObjectId.is_valid(accountId):  # 24 hex: keeps the field path a plain id
+        return {"jobIds": []}
+    key = f"tailored.{accountId}"
+    rows = JobApplyRow.get_motor_collection().find({"runId": run.id, key: {"$exists": True}}, {key: 1})
+    ids = [d["tailored"][accountId] async for d in rows]
+    if not ids:
+        return {"jobIds": []}
+    done = ResumeApplication.get_motor_collection().find({"_id": {"$in": ids}, "status": "completed"}, {"_id": 1})
+    return {"jobIds": [str(d["_id"]) async for d in done]}
+
+
 @router.get("/runs/{run_id}/rows")
 async def list_rows(
     run_id: str,
