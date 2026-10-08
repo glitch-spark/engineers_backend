@@ -51,3 +51,9 @@ async def test_team_rows_and_totals(db):
 async def test_team_bad_range_is_422(db):
     root = await make_user("Root", "admin")
     assert (await get_team(root, range="year")).status_code == 422
+
+
+async def test_team_shows_real_names_to_admins(db):
+    root = await make_user("Root", "admin")
+    await make_user("Secret", leaderboardAnon=True)
+    assert [u["name"] for u in (await get_team(root)).json()["users"]] == ["Secret"]

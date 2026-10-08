@@ -323,9 +323,12 @@ async def _active_members() -> list[UserExtra]:
     return await UserExtra.find({"role": {"$ne": "admin"}, "isActive": {"$ne": False}}).to_list()
 
 
-async def team_metrics(members: list[UserExtra], start: date, end: date, today: date) -> dict:
+async def team_metrics(
+    members: list[UserExtra], start: date, end: date, today: date, *, with_streak: bool = False,
+) -> dict:
     """Every dashboard metric per member over [start, end]: bids (self/bidder), interviews, net earnings, goal
-    attainment (weekly goals pro-rated to the period), plan logging and the current streak."""
+    attainment (weekly goals pro-rated to the period), plan logging, and — with `with_streak` — the current streak
+    (a 400-day plan scan, so only the team table asks for it)."""
     ids = [m.id for m in members]
     out = {uid: {"bids": 0, "bidsSelf": 0, "bidsBidder": 0, "interviews": 0, "earnings": 0.0} for uid in ids}
 
@@ -359,8 +362,9 @@ async def team_metrics(members: list[UserExtra], start: date, end: date, today: 
     for p in await _logged_plans(ids, start, min(end, today)):
         logged_days[p.userId].add(p.date.date())
     streak_days: dict = {uid: set() for uid in ids}
-    for p in await _logged_plans(ids, today - timedelta(days=400), today):
-        streak_days[p.userId].add(p.date.date())
+    if with_streak:
+        for p in await _logged_plans(ids, today - timedelta(days=400), today):
+            streak_days[p.userId].add(p.date.date())
 
     for uid in ids:
         row = out[uid]
@@ -369,7 +373,8 @@ async def team_metrics(members: list[UserExtra], start: date, end: date, today: 
         row["goalBidsPct"] = percent(row["bids"], row["goalBids"])
         row["goalInterviewsPct"] = percent(row["interviews"], row["goalInterviews"])
         row["logged"], row["workingDays"] = logging_ratio(logged_days[uid], start, end, today)
-        row["streak"] = streak(streak_days[uid], today)
+        if with_streak:
+            row["streak"] = streak(streak_days[uid], today)
     return out
 
 
@@ -451,9 +456,10 @@ async def dashboard_team(
         raise HTTPException(status_code=422, detail="invalid range")
 
     members = await _active_members()
-    stats = await team_metrics(members, start, end, day)
+    stats = await team_metrics(members, start, end, day, with_streak=True)
     users = [
-        {"userId": str(m.id), "name": _display_name(m), "image": m.image or None,
+        # Admins manage these people, so real names here (the leaderboard's anonymity applies to /compare).
+        {"userId": str(m.id), "name": (m.name or m.email or "").strip() or _display_name(m), "image": m.image or None,
          **{k: stats[m.id][k] for k in ("bids", "bidsSelf", "bidsBidder", "interviews", "earnings", "goalBidsPct",
                                         "goalInterviewsPct", "logged", "workingDays", "streak")}}
         for m in members

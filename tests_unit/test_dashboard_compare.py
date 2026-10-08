@@ -158,3 +158,18 @@ async def test_negative_earnings_rank_below_zero(db):
     await tx(pedro, 6, -50.0)
     rows = (await get(pedro)).json()["metrics"]["earnings"]["rows"]
     assert [(x["name"], x["value"]) for x in rows] == [("Maria", 0), ("Pedro", -50.0)]
+
+
+async def test_compare_skips_the_streak_scan(db):
+    from app.routers import dashboard
+
+    pedro = await make_user("Pedro")
+    real, starts = dashboard._logged_plans, []
+
+    async def spy(ids, start, end):
+        starts.append(start)
+        return await real(ids, start, end)
+
+    with patch.object(dashboard, "_logged_plans", spy):
+        assert (await get(pedro, range="30d")).status_code == 200
+    assert min(starts) == date(2026, 9, 8)  # never the 400-day streak window
