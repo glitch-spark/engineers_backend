@@ -8,6 +8,7 @@ from app.deps import get_current_user, require_admin
 from app.models import UserExtra
 from app.models.user_extra import UserRole
 from app.routers._util import ci_regex, doc_to_dict, to_object_id
+from app.slack_bot import normalize_slack_id
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -26,6 +27,8 @@ class UserUpdate(BaseModel):
     phone: Optional[str] = None
     birthday: Optional[str] = None
     isActive: Optional[bool] = None
+    # The user's Slack member ID (U…); blank clears it. Left out = unchanged.
+    slackUserId: Optional[str] = None
 
 
 def _parse_dt(s: str) -> Optional[datetime]:
@@ -149,6 +152,15 @@ async def update_user(
             user.birthday = parsed
     if body.isActive is not None:
         user.isActive = body.isActive
+    if "slackUserId" in body.model_fields_set:
+        try:
+            slack_id = normalize_slack_id(body.slackUserId)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        # One Slack account → one Engineers user (same rule as Profile → Slack).
+        if slack_id and await UserExtra.find_one({"slackUserId": slack_id, "_id": {"$ne": user.id}}):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="That Slack ID is already used by another user")
+        user.slackUserId = slack_id
 
     await user.save()
     return doc_to_dict(user)

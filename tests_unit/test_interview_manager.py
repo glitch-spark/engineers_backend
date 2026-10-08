@@ -175,3 +175,50 @@ async def test_lookup_returns_is_active(client):
     async with client(pedro) as c:
         rows = {u["name"]: u for u in (await c.get("/users/lookup")).json()["users"]}
     assert (rows["Pedro"]["isActive"], rows["Gone"]["isActive"]) == (True, False)
+
+
+# --- admin sets a user's Slack member ID -------------------------------------------------------------
+
+
+async def test_admin_sets_normalizes_and_clears_slack_id(client):
+    admin, pedro = await make_user("Root", "admin"), await make_user("Pedro")
+    async with client(admin) as c:
+        r = await c.put(f"/users/{pedro.id}", json={"slackUserId": " u04abc12345 "})
+        assert r.status_code == 200, r.text
+        assert r.json()["slackUserId"] == "U04ABC12345"
+        assert (await UserExtra.get(pedro.id)).slackUserId == "U04ABC12345"
+        r = await c.put(f"/users/{pedro.id}", json={"slackUserId": "  "})
+        assert r.status_code == 200 and r.json()["slackUserId"] is None
+    assert (await UserExtra.get(pedro.id)).slackUserId is None
+
+
+async def test_admin_slack_id_bad_format_is_400(client):
+    admin, pedro = await make_user("Root", "admin"), await make_user("Pedro")
+    async with client(admin) as c:
+        r = await c.put(f"/users/{pedro.id}", json={"slackUserId": "@pedro"})
+    assert r.status_code == 400
+    assert (await UserExtra.get(pedro.id)).slackUserId is None
+
+
+async def test_admin_slack_id_taken_is_409(client):
+    admin = await make_user("Root", "admin")
+    await make_user("Maria", slack="U04ABC12345")
+    pedro = await make_user("Pedro")
+    async with client(admin) as c:
+        r = await c.put(f"/users/{pedro.id}", json={"slackUserId": "U04ABC12345"})
+    assert (r.status_code, r.json()["detail"]) == (409, "That Slack ID is already used by another user")
+    assert (await UserExtra.get(pedro.id)).slackUserId is None
+
+
+async def test_admin_edit_without_slack_id_keeps_it(client):
+    admin, pedro = await make_user("Root", "admin"), await make_user("Pedro", slack="U04ABC12345")
+    async with client(admin) as c:
+        assert (await c.put(f"/users/{pedro.id}", json={"name": "Pedro S"})).status_code == 200
+        assert (await c.put(f"/users/{pedro.id}", json={"slackUserId": "U04ABC12345"})).status_code == 200
+    assert (await UserExtra.get(pedro.id)).slackUserId == "U04ABC12345"
+
+
+async def test_staff_cannot_set_slack_id_for_users(client):
+    pedro, maria = await make_user("Pedro"), await make_user("Maria")
+    async with client(pedro) as c:
+        assert (await c.put(f"/users/{maria.id}", json={"slackUserId": "U04ABC12345"})).status_code == 403
