@@ -58,6 +58,8 @@ from app.models import (
     DailyPlan,
     UserExtra,
     WeeklyPlan,
+    EvalJobDescription,
+    ResumePromptEval,
 )
 from app.models.slack_alert_log import SlackAlertLog
 
@@ -91,6 +93,8 @@ DOCUMENT_MODELS = [
     Bidder,
     BidReport,
     Bid,
+    EvalJobDescription,
+    ResumePromptEval,
 ]
 
 
@@ -340,4 +344,12 @@ async def init_db():
             log.info("seeded %d recurring charges from transactions", seeded)
     except Exception as exc:  # noqa: BLE001
         log.warning("recurring charge seed failed: %s", exc)
+    try:
+        from app.prompt_eval.seed_jds import seed_eval_jds
+
+        inserted = await seed_eval_jds()
+        if inserted:
+            log.info("seeded %d eval job descriptions", inserted)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("eval job description seed failed: %s", exc)
     return client
