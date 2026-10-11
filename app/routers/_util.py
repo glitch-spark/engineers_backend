@@ -6,7 +6,7 @@ from beanie import Document, PydanticObjectId
 from fastapi import HTTPException, status
 
 from app.model_catalog import ModelNotAvailable, Task, validate_requested
-from app.models import UserExtra
+from app.models import Account, UserExtra
 
 
 def to_object_id(value: str) -> PydanticObjectId:
@@ -18,6 +18,15 @@ def to_object_id(value: str) -> PydanticObjectId:
 
 def ci_regex(value: str) -> dict:
     return {"$regex": re.escape(value), "$options": "i"}
+
+
+async def load_owned_account(account_id: str, user: UserExtra) -> Account:
+    """The profile, when it exists and `user` owns it (admins see every profile); otherwise 404."""
+    account = await Account.get(to_object_id(account_id))
+    is_admin = user.role == "admin"
+    if account is None or (not is_admin and str(account.createdBy) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    return account
 
 
 # Never serialized, whatever route the document goes out through.

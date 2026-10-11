@@ -27,6 +27,7 @@ from app.routers import (
     job_applies,
     metrics,
     profile,
+    prompt_eval,
     reports,
     resume,
     skills,
@@ -117,6 +118,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(reports.router)
     app.include_router(resume.router)
+    app.include_router(prompt_eval.router)
     app.include_router(job_applies.router)
     app.include_router(slack_bot.router)
     app.include_router(slack_bot.cron_router)
