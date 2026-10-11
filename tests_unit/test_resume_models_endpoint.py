@@ -24,6 +24,7 @@ def settings(**over):
         RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
         COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
         SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
+        JUDGE_DEFAULT_MODEL="anthropic:claude-opus-5-5",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -97,6 +98,17 @@ async def test_models_cover_letter_excludes_haiku(use_settings, make_client):
     assert ids and not [i for i in ids if "haiku" in i]
     assert "anthropic:claude-fable-5-1" in ids
     assert r.json()["defaultId"] == "anthropic:claude-opus-5-5"
+
+
+async def test_models_judge_task_lists_strong_models(use_settings, make_client):
+    async with make_client() as client:
+        r = await client.get("/resume/models", params={"task": "judge"})
+    assert r.status_code == 200
+    ids = [m["id"] for m in r.json()["models"]]
+    assert ids and not [i for i in ids if "haiku" in i]
+    assert "anthropic:claude-fable-5-1" in ids
+    assert r.json()["defaultId"] == "anthropic:claude-opus-5-5"
+    assert sum(1 for m in r.json()["models"] if m["isDefault"]) == 1
 
 
 async def test_models_empty_when_nothing_configured(use_settings, make_client):

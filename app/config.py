@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     RESUME_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
     COVER_LETTER_DEFAULT_MODEL: str = "anthropic:claude-opus-5-5"
     SCREENING_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
+    # Judge for the resume prompt evaluator (scores generated resumes against JDs in a fresh context).
+    JUDGE_DEFAULT_MODEL: str = "anthropic:claude-opus-5-5"
     # Reasoning effort for the resume rewrite (gpt-5* only). Mechanical
     # text-replace needs little reasoning — "low" cuts hidden reasoning
     # tokens (billed at output rate) ~5-10x vs the medium default.
@@ -67,6 +69,13 @@ class Settings(BaseSettings):
     RESUME_LLM_CONCURRENCY: int = 3
     RESUME_RENDER_CONCURRENCY: int = 2
     RESUME_DAILY_CAP: int = 300
+    # Resume prompt evaluator (app/prompt_eval): JDs evaluated at once per run; each holds one slot for
+    # its generate + judge calls.
+    PROMPT_EVAL_CONCURRENCY: int = 4
+    # Optional Redis for LLM result caching (resume output, judge verdicts). Blank = no Redis; the app
+    # works the same, just recomputes. TTL in seconds (default 30 days).
+    REDIS_URL: Optional[str] = None
+    LLM_CACHE_TTL_SECONDS: int = 30 * 24 * 3600
     # Generated resumes older than this keep metadata + PDF but lose their heavy text (JD, resume text,
     # cover letter, screening answers), archived to S3 first (app/resume_retention.py). 0 = keep forever.
     RESUME_TEXT_RETENTION_DAYS: int = 30

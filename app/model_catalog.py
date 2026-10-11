@@ -12,7 +12,7 @@ from typing import Literal, Optional
 from app.config import get_settings
 from app.models import UserExtra
 
-Task = Literal["resume", "cover_letter", "screening"]
+Task = Literal["resume", "cover_letter", "screening", "judge"]
 Tier = Literal["budget", "balanced", "premium"]
 Provider = Literal["anthropic", "openai"]
 
@@ -20,14 +20,15 @@ PROVIDER_ORDER: tuple[Provider, ...] = ("anthropic", "openai")
 PROVIDER_LABEL: dict[Provider, str] = {"anthropic": "Anthropic", "openai": "OpenAI"}
 
 # Reasoning/thinking depth per task (Anthropic output_config.effort, OpenAI reasoning.effort).
-TASK_EFFORT: dict[Task, str] = {"resume": "low", "cover_letter": "high", "screening": "low"}
+TASK_EFFORT: dict[Task, str] = {"resume": "low", "cover_letter": "high", "screening": "low", "judge": "high"}
 
 # Typical (input, output) tokens for one task run, for the UI cost estimate. Cover letter covers
-# the whole draft + critique + revise pipeline.
+# the whole draft + critique + revise pipeline. Judge = one resume (plain text) + one JD + rubric → JSON verdict.
 TASK_TOKEN_PROFILE: dict[Task, tuple[int, int]] = {
     "resume": (6000, 5000),
     "cover_letter": (21000, 1700),
     "screening": (4000, 800),
+    "judge": (7000, 1200),
 }
 
 
@@ -120,6 +121,14 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
         (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.4-mini", "Balanced"),
         (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-6-luna", "Cheapest"),
     ],
+    # Judge (resume prompt evaluator): scores a generated resume against a JD in a fresh context. Strong
+    # models only; it should be at least as capable as the model that wrote the resume.
+    ("judge", "anthropic"): [
+        (_A + "opus-5-5", "Recommended"), (_A + "fable-5-1", "Max quality"), (_A + "sonnet-5-5", "Lower cost"),
+    ],
+    ("judge", "openai"): [
+        (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5.6-sol", "Older flagship"), (_O + "gpt-5.5", "Older flagship"),
+    ],
 }
 
 
@@ -168,13 +177,17 @@ def get_model(model_id: str, user: Optional[UserExtra] = None) -> Optional[Model
     return spec if spec is not None and _provider_configured(spec.provider) else None
 
 
+_DEFAULT_SETTING: dict[Task, str] = {
+    "resume": "RESUME_DEFAULT_MODEL",
+    "cover_letter": "COVER_LETTER_DEFAULT_MODEL",
+    "screening": "SCREENING_DEFAULT_MODEL",
+    "judge": "JUDGE_DEFAULT_MODEL",
+}
+
+
 def _configured_default(task: Task) -> str:
-    settings = get_settings()
-    return {
-        "resume": settings.RESUME_DEFAULT_MODEL,
-        "cover_letter": settings.COVER_LETTER_DEFAULT_MODEL,
-        "screening": settings.SCREENING_DEFAULT_MODEL,
-    }[task]
+    # Looked up by name so only the asked-for setting has to exist (tests stub settings per task).
+    return getattr(get_settings(), _DEFAULT_SETTING[task])
 
 
 def _openai_recommendation(task: Task) -> str:
