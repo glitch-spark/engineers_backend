@@ -16,3 +16,4 @@ beautifulsoup4>=4.13
 tzdata>=2024.1
 openpyxl>=3.1
 rapidfuzz>=3.9
+redis>=5,<6

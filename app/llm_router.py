@@ -38,6 +38,7 @@ class LlmResult:
     fallback_reason: Optional[str] = None
     model_id: str = ""  # provider-prefixed catalog id, e.g. "anthropic:claude-sonnet-5-5"
     cost_usd: Optional[float] = None  # None when the model's price is unknown
+    cached: bool = False  # a stored output answered; no model call was made
 
 
 # Purposes whose output must not vary between runs of the same input (structured extraction, not writing).
