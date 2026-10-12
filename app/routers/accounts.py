@@ -297,16 +297,21 @@ async def create_account(
     return doc_to_dict(acc)
 
 
+async def _editable_account(account_id: str, user: UserExtra) -> Account:
+    """The profile if `user` may change it: its creator, or any admin (archive, edit, delete). 404 otherwise."""
+    acc = await Account.get(to_object_id(account_id))
+    if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    return acc
+
+
 @router.put("/{account_id}")
 async def update_account(
     account_id: str,
     body: AccountUpdate,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    oid = to_object_id(account_id)
-    acc = await Account.get(oid)
-    if acc is None or str(acc.createdBy) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    acc = await _editable_account(account_id, user)
 
     if body.name is not None:
         acc.name = body.name
@@ -356,9 +361,7 @@ async def upload_resume(
 ) -> dict:
     """Add (or replace, by filename) one resume: the browser-extracted text goes in MongoDB, the original
     file in S3 when configured. Returns the full account like PUT."""
-    acc = await Account.get(to_object_id(account_id))
-    if acc is None or str(acc.createdBy) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    acc = await _editable_account(account_id, user)
     fn = _sanitize_filename(file.filename or "")
     ext = os.path.splitext(fn)[1].lower()
     if not fn or len(fn) > MAX_FILENAME_LEN or ext not in resume_files.ALLOWED_TYPES:
@@ -415,10 +418,7 @@ async def delete_account(
     account_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    oid = to_object_id(account_id)
-    acc = await Account.get(oid)
-    if acc is None or str(acc.createdBy) != str(user.id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    acc = await _editable_account(account_id, user)
     files = [r.s3Key for r in acc.resumes if r.s3Key]
     await acc.delete()
     await resume_files.delete_resume_files(files)

@@ -274,6 +274,37 @@ async def test_week_endpoint_access(make_client):
     assert await names(admin) == ["Ana", "Zed"]
 
 
+async def test_week_rows_name_the_owner(make_client):
+    pedro, admin = await make_user("Pedro"), await make_user("Root", role="admin")
+    await make_bidder(pedro, "Ana")
+    r = await make_client(admin).get("/bids/week", params={"week": "2026-10-10"})
+    [row] = r.json()["bidders"]
+    assert (row["ownerId"], row["ownerName"]) == (str(pedro.id), "Pedro")
+
+
+async def test_week_endpoint_owner_filter(make_client):
+    pedro, maria, admin = await make_user("Pedro"), await make_user("Maria"), await make_user("Root", role="admin")
+    await make_bidder(pedro, "Ana")
+    await make_bidder(maria, "Zed")
+
+    async def names(user, owner):
+        r = await make_client(user).get("/bids/week", params={"week": "2026-10-10", "ownerId": owner})
+        assert r.status_code == 200, r.text
+        return [b["name"] for b in r.json()["bidders"]]
+
+    assert await names(admin, str(maria.id)) == ["Zed"]
+    assert await names(admin, str(pedro.id)) == ["Ana"]
+    # Staff only ever see their own bidders: another owner's id narrows to nothing, never widens.
+    assert await names(pedro, str(maria.id)) == []
+    assert await names(pedro, str(pedro.id)) == ["Ana"]
+
+
+async def test_week_endpoint_bad_owner_id_is_400(make_client):
+    admin = await make_user("Root", role="admin")
+    r = await make_client(admin).get("/bids/week", params={"week": "2026-10-10", "ownerId": "nope"})
+    assert r.status_code == 400
+
+
 async def test_week_endpoint_include_archived(make_client):
     pedro = await make_user("Pedro")
     await make_bidder(pedro, "Ana")

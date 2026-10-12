@@ -21,6 +21,7 @@ from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.bid import Bid
 from app.models.bidder import Bidder
+from app.routers._util import to_object_id
 
 router = APIRouter(prefix="/bids", tags=["bids"])
 
@@ -234,9 +235,14 @@ def _pay_week_param(week: Optional[str], sched, now: datetime) -> PayWeek:
         raise HTTPException(status_code=400, detail="invalid week") from None
 
 
-async def _visible_bidders(user) -> list[Bidder]:
-    """The user's bidders (all of them for an admin), archived included, by name."""
+async def _visible_bidders(user, owner_id: Optional[PydanticObjectId] = None) -> list[Bidder]:
+    """The user's bidders (all of them for an admin), archived included, by name. `owner_id` narrows to one
+    owner's bidders; for staff it can only narrow their own list, never widen it."""
     scope = {} if user.role == "admin" else {"createdBy": user.id}
+    if owner_id is not None:
+        if "createdBy" in scope and scope["createdBy"] != owner_id:
+            return []
+        scope["createdBy"] = owner_id
     return await Bidder.find(scope).sort("name").to_list()
 
 
@@ -245,11 +251,14 @@ async def bids_week(
     user: Annotated[UserExtra, Depends(get_current_user)],
     week: Optional[str] = None,
     includeArchived: bool = False,
+    ownerId: Optional[str] = None,
 ) -> dict:
-    """The pay-week board: each bidder's approved / pending / rejected per day, and the week's totals and pay."""
+    """The pay-week board: each bidder's approved / pending / rejected per day, and the week's totals and pay.
+    `ownerId` limits it to one user's bidders (the admin owner filter)."""
     sched, now = schedule_from_settings(), _now()
     pw = _pay_week_param(week, sched, now)
-    bidders = [b for b in await _visible_bidders(user) if includeArchived or b.archivedAt is None]
+    owner = to_object_id(ownerId) if ownerId else None
+    bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
     return await week_board(bidders, pw, now, sched, get_bid_storage(), FOLDER_CACHE)
 
 
