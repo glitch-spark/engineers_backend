@@ -25,7 +25,7 @@ def test_seed_has_at_least_five_jds_per_role_in_role_order():
     assert [s.role for s in SEED_JDS] == sorted((s.role for s in SEED_JDS), key=EVAL_ROLES.index)
     assert len({s.key for s in SEED_JDS}) == len(SEED_JDS), "seed keys must be unique"
     assert len({s.title for s in SEED_JDS}) == len(SEED_JDS), "titles must be unique"
-    assert MAX_JDS_PER_RUN >= 5 * 5
+    assert MAX_JDS_PER_RUN >= len(SEED_JDS), "the whole library must fit in one run"
 
 
 def test_original_roles_keep_their_short_seed_key_so_existing_databases_do_not_duplicate():

@@ -19,8 +19,8 @@ EVAL_ROLES: tuple[EvalRole, ...] = (
 )
 ROLE_ORDER: dict[str, int] = {role: index for index, role in enumerate(EVAL_ROLES)}
 
-# Cost guardrail: one run = this many resume generations + judge calls at most (five roles' worth).
-MAX_JDS_PER_RUN = 25
+# Cost guardrail: one run = this many resume generations + judge calls at most (the whole seed library).
+MAX_JDS_PER_RUN = 50
 
 
 class EvalJobDescription(TimestampedDocument):
