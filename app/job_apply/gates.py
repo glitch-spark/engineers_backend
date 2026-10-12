@@ -18,32 +18,52 @@ _REGION_COUNTRIES = {
     "Asia": "IN PK BD LK NP PH VN ID MY SG TH CN JP KR TW HK KH MM LA MN KZ UZ",
 }
 COUNTRY_REGION: dict[str, str] = {c: region for region, cs in _REGION_COUNTRIES.items() for c in cs.split()}
+# Profile region (Account.region) -> the countries it stands for.
+_PROFILE_REGION_COUNTRIES: dict[str, frozenset[str]] = {r: frozenset(cs.split()) for r, cs in _REGION_COUNTRIES.items()}
 
-_ALL = frozenset(_REGION_COUNTRIES)
-_REGION_COVER: dict[str, frozenset[str]] = {
-    "worldwide": _ALL,
-    "anywhere": _ALL,
-    "global": _ALL,
-    "americas": frozenset({"US", "Canada", "Latam"}),
-    "north america": frozenset({"US", "Canada"}),
-    "latam": frozenset({"Latam"}),
-    "latin america": frozenset({"Latam"}),
-    "south america": frozenset({"Latam"}),
-    "emea": frozenset({"EU"}),
-    "europe": frozenset({"EU"}),
-    "eu": frozenset({"EU"}),
-    "apac": frozenset({"Asia"}),
-    "asia": frozenset({"Asia"}),
+_LATAM = _PROFILE_REGION_COUNTRIES["Latam"]
+_EUROPE = _PROFILE_REGION_COUNTRIES["EU"]
+_ASIA = _PROFILE_REGION_COUNTRIES["Asia"]
+_SOUTH_AMERICA = frozenset("AR BO BR CL CO EC GY PY PE SR UY VE".split())
+_AFRICA = frozenset(
+    "DZ AO BJ BW BF BI CV CM CF TD KM CG CD CI DJ EG GQ ER SZ ET GA GM GH GN GW KE LS LR LY MG MW ML MR MU MA MZ NA "
+    "NE NG RW ST SN SC SL SO ZA SS SD TZ TG TN UG ZM ZW".split()
+)
+_UK_IE = frozenset({"GB", "UK", "IE"})
+_NORTH_AMERICA = frozenset({"US", "CA"})
+
+# Region named in a posting -> the profile countries it admits; None admits everyone.
+_REGION_COVER: dict[str, Optional[frozenset[str]]] = {
+    "worldwide": None,
+    "anywhere": None,
+    "global": None,
+    "americas": _NORTH_AMERICA | _LATAM,  # also "America" / "the Americas" (see _REGION_NEEDLES)
+    "north america": _NORTH_AMERICA,
+    "latam": _LATAM,
+    "latin america": _LATAM,
+    "south america": _SOUTH_AMERICA,
+    "europe": _EUROPE,
+    "eu": _EUROPE,
+    "european union": _EUROPE - {"GB", "UK"},
+    "emea": _EUROPE | _AFRICA,
+    "africa": _AFRICA,
+    "apac": _ASIA,
+    "asia": _ASIA,
     "us": frozenset({"US"}),
     "usa": frozenset({"US"}),
     "united states": frozenset({"US"}),
-    "canada": frozenset({"Canada"}),
+    "canada": frozenset({"CA"}),
+    "uk": _UK_IE,
+    "united kingdom": _UK_IE,
+    "ireland": _UK_IE,
 }
+# A country named in a posting also admits these neighbours.
+_SAME_COUNTRY: dict[str, frozenset[str]] = {"GB": _UK_IE, "IE": _UK_IE}
 
 
 _COUNTRY_NAMES = {
     "united states": "US", "united states of america": "US", "usa": "US", "u.s.": "US", "u.s.a.": "US", "u.s": "US",
-    "america": "US", "canada": "CA", "united kingdom": "GB", "uk": "GB", "u.k.": "GB", "great britain": "GB",
+    "canada": "CA", "united kingdom": "GB", "uk": "GB", "u.k.": "GB", "great britain": "GB",
     "england": "GB", "scotland": "GB", "britain": "GB", "ireland": "IE", "germany": "DE", "france": "FR",
     "spain": "ES", "portugal": "PT", "italy": "IT", "netherlands": "NL", "the netherlands": "NL", "belgium": "BE",
     "poland": "PL", "sweden": "SE", "norway": "NO", "denmark": "DK", "finland": "FI", "switzerland": "CH",
@@ -88,9 +108,9 @@ def normalize_country(value: str) -> Optional[str]:
 
 _REGION_NEEDLES = (
     ("worldwide", "worldwide"), ("anywhere", "anywhere"), ("global", "global"), ("latin america", "latam"),
-    ("latam", "latam"), ("south america", "latam"), ("north america", "north america"),
-    ("americas", "americas"), ("emea", "emea"), ("european union", "europe"), ("europe", "europe"),
-    ("apac", "apac"), ("asia", "asia"),
+    ("latam", "latam"), ("south america", "south america"), ("north america", "north america"),
+    ("america", "americas"), ("emea", "emea"), ("european union", "european union"), ("europe", "europe"),
+    ("united kingdom", "uk"), ("ireland", "uk"), ("africa", "africa"), ("apac", "apac"), ("asia", "asia"),
 )
 
 
@@ -99,8 +119,12 @@ def region_key(value: str) -> Optional[str]:
     v = " ".join((value or "").lower().replace("-", " ").split())
     if v in _REGION_COVER:
         return v
+    if "european union" in v:
+        return "european union"
     if re.search(r"\beu\b", v):  # "Western EU", "EU only"
         return "europe"
+    if re.search(r"\buk\b", v):  # "UK & Ireland", "UK only" (not "Ukraine")
+        return "uk"
     # A time-zone window given as the location ("CET +/-2", "GMT±3", "EST hours") means the region around it.
     if re.search(r"\b(?:gmt|cet|cest|bst|wet|eet|eest)\b", v):
         return "emea"
@@ -115,24 +139,28 @@ def _recognised(loc: Location) -> bool:
     return normalize_country(loc.value) is not None
 
 
-def _profile_region(country: Optional[str], region: Optional[str]) -> Optional[str]:
-    return region or COUNTRY_REGION.get((country or "").upper())
-
-
 def covers(loc: Location, country: Optional[str], region: Optional[str]) -> bool:
-    """Does one allowed-location entry admit a profile living in `country` / `region`?"""
+    """Does one allowed-location entry admit a profile living in `country` / `region`? The profile's country decides
+    when it has one; a profile with only a region matches when the entry admits any of that region's countries."""
     country = (country or "").upper() or None
-    prof_region = _profile_region(country, region)
+    if country == "UK":
+        country = "GB"
+    region_countries = _PROFILE_REGION_COUNTRIES.get(region or "", frozenset())
     if loc.kind == "region":
         key = region_key(loc.value)
-        return key is not None and prof_region in _REGION_COVER[key]
+        if key is None:
+            return False
+        admitted = _REGION_COVER[key]
+        if admitted is None:
+            return bool(country or region)
+        return country in admitted if country else bool(region_countries & admitted)
     value = normalize_country(loc.value)
     if value is None:
         return False
     if country:
-        return value == ("GB" if country == "UK" else country)
+        return country in _SAME_COUNTRY.get(value, frozenset({value}))
     # Profile has only a region: a country entry counts when that country lies in the region.
-    return prof_region is not None and COUNTRY_REGION.get(value) == prof_region
+    return value in region_countries
 
 
 def _describe(locs: list[Location]) -> str:

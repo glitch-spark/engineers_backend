@@ -28,16 +28,19 @@ NO_LOCATION = "none"
 # region_key() result -> the label used in group keys. US / Canada are countries, so they get ISO-2 codes.
 _REGION_LABEL = {
     "worldwide": "Worldwide", "anywhere": "Worldwide", "global": "Worldwide", "americas": "Americas",
-    "north america": "North America", "latam": "Latam", "latin america": "Latam", "south america": "Latam",
-    "emea": "EMEA", "europe": "Europe", "eu": "EU", "apac": "APAC", "asia": "Asia",
+    "north america": "North America", "latam": "Latam", "latin america": "Latam",
+    "south america": "South America", "emea": "EMEA", "europe": "Europe", "eu": "EU",
+    "european union": "European Union", "africa": "Africa", "apac": "APAC", "asia": "Asia",
 }
-_REGION_COUNTRY = {"us": "US", "usa": "US", "united states": "US", "canada": "CA"}
+_REGION_COUNTRY = {
+    "us": "US", "usa": "US", "united states": "US", "canada": "CA", "uk": "GB", "united kingdom": "GB", "ireland": "IE",
+}
 
 # Target candidate markets, in display order. A job is in every market whose candidates it accepts.
 MARKETS: tuple[str, ...] = ("US", "UKEU", "LATAM")
 _LABEL_MARKETS = {
     "Worldwide": MARKETS, "Americas": ("US", "LATAM"), "North America": ("US",), "Latam": ("LATAM",),
-    "EMEA": ("UKEU",), "Europe": ("UKEU",), "EU": ("UKEU",),
+    "South America": ("LATAM",), "EMEA": ("UKEU",), "Europe": ("UKEU",), "EU": ("UKEU",), "European Union": ("UKEU",),
 }
 _PROFILE_REGION_MARKET = {"US": "US", "EU": "UKEU", "Latam": "LATAM"}  # Account.region -> market
 
