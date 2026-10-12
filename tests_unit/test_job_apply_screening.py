@@ -106,6 +106,9 @@ def test_group_key():
     assert group_key([r("Western EU")]) == "Europe" and group_key([r("Central Europe")]) == "Europe"
     assert group_key([r("CET +/-2")]) == "EMEA" and group_key([r("GMT±3")]) == "EMEA"
     assert group_key([r("EST hours")]) == "North America"
+    assert group_key([r("South America")]) == "South America" and group_key([r("America")]) == "Americas"
+    assert group_key([r("European Union")]) == "European Union" and group_key([r("UK")]) == "GB"
+    assert group_key([r("Ireland"), c("GB")]) == "GB+IE" and group_key([r("Africa")]) == "Africa"
 
 
 class _Row:
@@ -144,6 +147,8 @@ def test_markets_for():
     assert markets_for("EU+US") == ["US", "UKEU"]
     assert markets_for("CA") == [] and markets_for("APAC") == [] and markets_for("IL") == [] and markets_for("Remote") == []
     assert markets_for("none") == []
+    assert markets_for("South America") == ["LATAM"] and markets_for("European Union") == ["UKEU"]
+    assert markets_for("GB+IE") == ["UKEU"] and markets_for("Africa") == []
 
 
 def test_profile_market():

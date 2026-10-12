@@ -62,6 +62,59 @@ def test_covers_country_in_profile_region():
     assert covers(Location(kind="region", value="latam"), "AR", None)
 
 
+def test_region_rules():
+    def pg(kind, value, c, r):
+        g = profile_gates(ex(allowedLocations=[Location(kind=kind, value=value)]), country=c, region=r)
+        return by_name(g)["location"].result
+
+    cases = [
+        # (kind, value, profile country, profile region, expected)
+        ("region", "Worldwide", "AU", None, "pass"),
+        ("region", "anywhere", "BR", "Latam", "pass"),
+        ("region", "LATAM", "BR", "Latam", "pass"),
+        ("region", "Latin America", "MX", "Latam", "pass"),
+        ("region", "LATAM & Caribbean", "CO", "Latam", "pass"),
+        ("region", "LatAm", "US", "US", "fail"),
+        ("region", "South America", "BR", "Latam", "pass"),
+        ("region", "South America", "AR", "Latam", "pass"),
+        ("region", "South America", "MX", "Latam", "fail"),
+        ("region", "North America", "CA", None, "pass"),
+        ("region", "North America", "MX", "Latam", "fail"),
+        ("region", "America", "BR", "Latam", "pass"),
+        ("region", "the Americas", "US", "US", "pass"),
+        ("region", "Americas", "CA", None, "pass"),
+        ("region", "Eu", "GB", "EU", "pass"),
+        ("region", "Europe", "IE", "EU", "pass"),
+        ("region", "EU", "NL", "EU", "pass"),
+        ("region", "European Union", "GB", "EU", "fail"),
+        ("region", "European Union", "IE", "EU", "pass"),
+        ("region", "European Union", "FI", "EU", "pass"),
+        ("region", "UK", "GB", "EU", "pass"),
+        ("region", "UK", "IE", None, "pass"),
+        ("region", "UK", "NL", "EU", "fail"),
+        ("region", "EMEA", "ZA", None, "pass"),
+        ("region", "EMEA", "NL", "EU", "pass"),
+        ("region", "EMEA", "US", "US", "fail"),
+        ("country", "GB", "IE", "EU", "pass"),
+        ("country", "IE", "GB", "EU", "pass"),
+        ("country", "GB", "NL", "EU", "fail"),
+        ("country", "MX", "BR", "Latam", "fail"),  # a single country stays that country
+        ("country", "BR", "BR", None, "pass"),
+        ("region", "South America", None, "Latam", "pass"),  # region-only profile: overlap is enough
+        ("country", "BR", None, "Latam", "pass"),
+    ]
+    for kind, value, c, r, want in cases:
+        assert pg(kind, value, c, r) == want, (kind, value, c, r)
+
+
+def test_america_is_a_region():
+    from app.job_apply.gates import normalize_country, region_key
+
+    assert normalize_country("America") is None and region_key("America") == "americas"
+    assert region_key("Ukraine") is None and region_key("UK & Ireland") == "uk"
+    assert region_key("European Union") == "european union" and region_key("Western EU") == "europe"
+
+
 def test_work_auth_gate():
     g = profile_gates(ex(workAuthorization=WorkAuth(restricted=True, countries=["US"])), country="BR", region="Latam")
     assert by_name(g)["workAuth"].result == "fail"

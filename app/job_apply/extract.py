@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v5"
+PROMPT_VERSION = "job-extract-v6"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -84,8 +84,9 @@ Rules:
   -> North America, Europe. "Europe and the Americas only" -> Europe, Americas. "Remote Global" or "can be done
   globally" -> Worldwide. "Location: Europe" with nothing else -> Europe (not Worldwide). "Within UTC to UTC+8"
   -> EMEA, APAC. "Location: Remote" with nothing else -> empty list.
-  Regions: Worldwide, Americas, North America, Latam, EMEA, Europe, EU, APAC, Asia. Countries as ISO-3166 alpha-2
-  codes. Empty list only when the posting gives no location at all.
+  Regions: Worldwide, Americas, North America, South America, Latam, EMEA, Europe, European Union, EU, Africa, APAC,
+  Asia. Keep "South America" and "European Union" as written (not Latam / Europe); "America" or "the Americas" is
+  Americas. Countries as ISO-3166 alpha-2 codes. Empty list only when the posting gives no location at all.
 - workAuthorization.restricted: true for "citizens only", "must be authorized to work in X without sponsorship",
   "no visa sponsorship"; countries are ISO-2 codes.
 - clearance.level "required" covers "must hold" AND "must be able to obtain" a security clearance.
@@ -272,8 +273,10 @@ _LOCATION_RULES: list[tuple[re.Pattern, Location]] = [
     (re.compile(r"\b(?:work|remote|hire) (?:from )?anywhere\b|\bworldwide\b|\bglobal(?:ly)? remote\b", re.I), Location(kind="region", value="Worldwide")),
     (re.compile(r"\b(?:US|USA|U\.S\.|United States)(?:[- ]based)? only\b|\bremote[- ,(]+(?:US|USA|U\.S\.|United States)\b|\b(?:within|in|from) the (?:US|U\.S\.|United States)\b"), Location(kind="country", value="US")),
     (re.compile(r"\bCanada only\b|\bremote[- ,(]+Canada\b|\b(?:within|in|from) Canada\b"), Location(kind="country", value="CA")),
-    (re.compile(r"\bLATAM\b|\bLatin America\b|\bSouth America\b", re.I), Location(kind="region", value="Latam")),
+    (re.compile(r"\bLATAM\b|\bLatin America\b", re.I), Location(kind="region", value="Latam")),
+    (re.compile(r"\bSouth America\b", re.I), Location(kind="region", value="South America")),
     (re.compile(r"\bEMEA\b"), Location(kind="region", value="EMEA")),
+    (re.compile(r"\b(?:within|in|from) the European Union\b|\bEuropean Union only\b"), Location(kind="region", value="European Union")),
     (re.compile(r"\bremote[- ,(]+Europe\b|\b(?:within|in|from) Europe\b|\bEurope only\b|\bEU only\b"), Location(kind="region", value="Europe")),
     (re.compile(r"\bAPAC\b"), Location(kind="region", value="APAC")),
     (re.compile(r"\bNorth America\b"), Location(kind="region", value="North America")),

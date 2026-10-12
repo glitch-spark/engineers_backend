@@ -236,7 +236,7 @@ async def test_extract_job_keeps_remote_and_unknown():
 def test_prompt_version_is_current():
     from app.job_apply.extract import PROMPT_VERSION
 
-    assert PROMPT_VERSION == "job-extract-v5"  # v4: work mode only when stated; v5: remoteAreas
+    assert PROMPT_VERSION == "job-extract-v6"  # v4: work mode only when stated; v5: remoteAreas; v6: more regions
 
 
 def test_parse_remote_areas():
