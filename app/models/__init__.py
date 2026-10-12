@@ -14,6 +14,7 @@ from app.models.job_apply import (
 from app.models.resume_application import ResumeApplication
 from app.models.resume_cache import ResumeLLMCache
 from app.models.notification import Notification
+from app.models.prompt_eval import EvalJobDescription, ResumePromptEval
 from app.models.recurring_charge import RecurringCharge
 from app.models.slack_alert_log import SlackAlertLog
 from app.models.transaction import Transaction
@@ -29,6 +30,7 @@ __all__ = [
     "BidReport",
     "Bidder",
     "DailyPlan",
+    "EvalJobDescription",
     "GlobalPrompt",
     "Interview",
     "InterviewChatLog",
@@ -46,6 +48,7 @@ __all__ = [
     "RecurringCharge",
     "ResumeApplication",
     "ResumeLLMCache",
+    "ResumePromptEval",
     "Skill",
     "SlackAlertLog",
     "Transaction",

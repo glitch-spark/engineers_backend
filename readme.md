@@ -41,10 +41,15 @@ uvicorn app.main:app --reload
 | `ANTHROPIC_API_KEY` | no | Enables the Anthropic presets in the resume / cover letter / screening model picker; hidden without it. `OPENAI_API_KEY` enables the OpenAI presets the same way |
 | `ANTHROPIC_WORKSPACE_ID` | no | Only for user-level Anthropic keys (`sk-ant-usr-…`), which are not tied to a workspace: the workspace id (`wrkspc_…`) sent with every request |
 | `RESUME_DEFAULT_MODEL`, `COVER_LETTER_DEFAULT_MODEL`, `SCREENING_DEFAULT_MODEL` | no | Default model per task when a request doesn't pick one (provider-prefixed ids); defaults `anthropic:claude-sonnet-5-5`, `anthropic:claude-opus-5-5`, `anthropic:claude-sonnet-5-5` |
+| `JUDGE_DEFAULT_MODEL` | no | Judge for the resume prompt evaluator (Resumes → Prompt Eval): scores each generated resume against a JD in a fresh context; default `anthropic:claude-opus-5-5` |
+| `PROMPT_EVAL_CONCURRENCY` | no | Job descriptions evaluated at once per eval run (each holds one slot for its generate + judge calls); default 4 |
+| `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for LLM results: generated resume output (looked up before the 7-day Mongo cache) and judge verdicts, keyed by content hash + model lane. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |
 | `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
 | `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |
 
 ## Layout
+
+**Resume prompt evaluator** (`app/prompt_eval/`, `app/routers/prompt_eval.py`, `/resume/eval`): scores a profile's resume prompt against a shared library of role-tagged sample job descriptions (`eval_job_descriptions`, seeded once on boot with five postings per role, including Senior and Staff SWE, editable in-app; seeds are never overwritten). A run (`resume_prompt_evals`) generates one resume per JD in parallel without rendering a PDF, then the judge model scores job match (location and work authorization ignored) and believability; rows and per-role averages are kept so runs can be compared. Runs still `running` after 20 minutes are reported failed.
 
 ```
 app/

@@ -39,6 +39,7 @@ from app.main import app as fastapi_app  # noqa: E402
 from app.models import (  # noqa: E402
     Account,
     DailyPlan,
+    EvalJobDescription,
     Interview,
     JobApplicationLog,
     JobApplyRow,
@@ -49,6 +50,7 @@ from app.models import (  # noqa: E402
     Notification,
     RecurringCharge,
     ResumeApplication,
+    ResumePromptEval,
     Transaction,
     UserExtra,
     WeeklyPlan,
@@ -80,6 +82,7 @@ async def db_clean(app) -> AsyncIterator[None]:
     for model in (
         UserExtra, Transaction, Account, WeeklyPlan, DailyPlan, Interview, Notification, RecurringCharge,
         JobApplyRun, JobApplyRow, JobExtractionCache, JobInfo, JobPostingCache, JobApplicationLog, ResumeApplication,
+        EvalJobDescription, ResumePromptEval,
     ):
         await model.delete_all()
     yield

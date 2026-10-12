@@ -11,7 +11,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
 from app.db import init_db
-from app import resume_queue
+from app import redis_cache, resume_queue
 from app.job_apply import worker as job_apply_worker
 from app.routers import (
     accounts,
@@ -27,6 +27,7 @@ from app.routers import (
     job_applies,
     metrics,
     profile,
+    prompt_eval,
     reports,
     resume,
     skills,
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
         sweep.cancel()
     if queue:
         queue.cancel()
+    await redis_cache.close()
 
 
 def create_app() -> FastAPI:
@@ -116,6 +118,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(reports.router)
     app.include_router(resume.router)
+    app.include_router(prompt_eval.router)
     app.include_router(job_applies.router)
     app.include_router(slack_bot.router)
     app.include_router(slack_bot.cron_router)

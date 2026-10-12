@@ -34,7 +34,7 @@ from app.resume_service import (
     s3_enabled,
     trim_jd,
 )
-from app.routers._util import doc_to_dict, require_model, to_object_id
+from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
 log = logging.getLogger(__name__)
@@ -57,12 +57,7 @@ def _build_filename(profile_name: str, company: str) -> str:
     return f"{_safe_filename_segment(profile_name)}/Resume ({_safe_filename_segment(company)}).pdf"
 
 
-async def _load_owned_account(account_id: str, user: UserExtra) -> Account:
-    account = await Account.get(to_object_id(account_id))
-    is_admin = user.role == "admin"
-    if account is None or (not is_admin and str(account.createdBy) != str(user.id)):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    return account
+_load_owned_account = load_owned_account  # shared with app/routers/prompt_eval.py
 
 
 # ---------- Job lifecycle (async generation) ---------------------------------
@@ -200,7 +195,7 @@ async def _run_job(
                 jd=jd,
                 questions=questions,
                 screening_prompt=resolved_screening,
-                owner=owner,
+                owner=owner,
                 model_id=job.screeningModelId,
             )
             _add_cost(job, screening_result.cost_usd)
@@ -456,7 +451,7 @@ async def screening_answers(
         jd=body.jobDescription or "",
         questions=questions,
         screening_prompt=screening,
-        owner=user,
+        owner=user,
         model_id=model_id,
     )
     return {"pairs": result.pairs}
@@ -508,7 +503,7 @@ async def ask_job_screening(
         questions=questions,
         screening_prompt=screening_prompt,
         resume_text=job.plainText or "",
-        owner=owner,
+        owner=owner,
         model_id=model_id,
     )
 

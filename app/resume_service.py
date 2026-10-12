@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
 from playwright.async_api import async_playwright
 
+from app import redis_cache
 from app.config import get_settings
 from app.html_sanitize import (
     body_html_for_llm,
@@ -320,17 +321,31 @@ def _resume_cache_key(prompt: str, lane: str) -> str:
     ).hexdigest()
 
 
+def _cached_llm_result(spec, output: str, model: str) -> LlmResult:
+    return LlmResult(
+        text=output,
+        provider=spec.provider,
+        model=model,
+        usage={"input": 0, "output": 0, "reasoning": 0},
+        fallback_used=False,
+        model_id=spec.id,
+        cost_usd=0.0,
+        cached=True,
+    )
+
+
 async def _resume_llm_output(
     prompt: str,
     user: Optional[UserExtra],
     template: str,
     model_id: Optional[str] = None,
 ) -> LlmResult:
-    """Return LLM output with provider metadata. Uses a content-hash cache per model lane.
+    """Return LLM output with provider metadata. Uses a content-hash cache per model lane:
+    Redis (long TTL, optional) → Mongo `ResumeLLMCache` (7 days) → the model.
 
     Only the preferred model's lane is checked, so a fallback entry never shadows the model the
     user asked for (it gets retried next time). On a miss the router walks its fallback chain
-    and the output is stored under the lane of the model that actually answered."""
+    and the output is stored (in both caches) under the lane of the model that actually answered."""
 
     def _validate(text: str) -> None:
         _validate_llm_html(_finalize_resume_html(template, text))
@@ -338,25 +353,38 @@ async def _resume_llm_output(
     chain = fallback_chain("resume", model_id, user)
     if chain:
         preferred = chain[0]
-        cache_key = _resume_cache_key(prompt, cache_lane(preferred, "resume", user))
+        lane = cache_lane(preferred, "resume", user)
+        redis_key = redis_cache.cache_key("resume", lane, prompt)
+        hit = await redis_cache.get_json(redis_key)
+        if hit and (hit.get("output") or "").strip():
+            log.info("resume LLM redis HIT key=%s model=%s", redis_key[-12:], hit.get("model"))
+            return _cached_llm_result(preferred, hit["output"], hit.get("model") or preferred.api_model)
+        cache_key = _resume_cache_key(prompt, lane)
         cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
         if cached is not None:
             log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
-            return LlmResult(
-                text=cached.output,
-                provider=preferred.provider,
-                model=cached.model,
-                usage={"input": 0, "output": 0, "reasoning": 0},
-                fallback_used=False,
-                model_id=preferred.id,
-                cost_usd=0.0,
-            )
+            await redis_cache.set_json(redis_key, {
+                "output": cached.output,
+                "model": cached.model,
+                "model_id": preferred.id,
+                "provider": preferred.provider,
+                "fallback": bool(getattr(cached, "isFallback", False)),
+            })
+            return _cached_llm_result(preferred, cached.output, cached.model)
 
     result = await complete("resume", prompt, user, model_id=model_id, validate=_validate)
 
     answered = next((s for s in chain if s.id == result.model_id), None)
     if answered is not None:
-        cache_key = _resume_cache_key(prompt, cache_lane(answered, "resume", user))
+        lane = cache_lane(answered, "resume", user)
+        await redis_cache.set_json(redis_cache.cache_key("resume", lane, prompt), {
+            "output": result.text,
+            "model": result.model,
+            "model_id": result.model_id,
+            "provider": result.provider,
+            "fallback": result.fallback_used,
+        })
+        cache_key = _resume_cache_key(prompt, lane)
         try:
             await ResumeLLMCache(
                 promptHash=cache_key,
@@ -551,6 +579,44 @@ def _render_slots() -> asyncio.Semaphore:
     return _render_sem
 
 
+def plain_text_from_html(html: str) -> str:
+    """The resume as the judge / screening sees it: text with runs of blank lines collapsed."""
+    return re.sub(
+        r"\n{3,}", "\n\n",
+        BeautifulSoup(html, "html.parser").get_text("\n").strip(),
+    )
+
+
+async def generate_resume_html(
+    account: Account,
+    job_description: str,
+    prompt_body: Optional[str] = None,
+    owner: Optional[UserExtra] = None,
+    model_id: Optional[str] = None,
+) -> tuple[str, LlmResult]:
+    """The LLM half of the pipeline, without rendering: the model rewrites the
+    style-stripped body text (or a content-hash cache hit reuses a prior output),
+    and the body is spliced back into the template shell with the original CSS.
+    Returns the finished HTML document and the LLM result (model, usage, cached)."""
+    template = (account.styleTemplate or "").strip()
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No HTML template on this profile. Upload one on the "
+                   "Resume Styles tab first.",
+        )
+
+    llm_body = wrap_body_for_llm(body_html_for_llm(template))
+    prompt = _build_resume_prompt(account, job_description, llm_body, prompt_body=prompt_body)
+    llm_result = await _resume_llm_output(prompt, owner, template, model_id)
+
+    # Model returns rewritten body only; CSS is reattached from the uploaded
+    # template (head styles via splice, body-origin styles via reinjection).
+    out_html = _finalize_resume_html(template, llm_result.text)
+    _validate_llm_html(out_html)
+    return out_html, llm_result
+
+
 async def generate_resume(
     account: Account,
     job_description: str,
@@ -560,33 +626,17 @@ async def generate_resume(
     job_id: Optional[str] = None,
     model_id: Optional[str] = None,
 ) -> GeneratedResume:
-    """Run the full pipeline: LLM rewrites style-stripped body text (or a
-    content-hash cache hit reuses a prior output, skipping the call), the body
-    is spliced back into the template shell with original CSS restored,
-    Playwright renders the HTML to PDF, optional S3 upload."""
-    template = (account.styleTemplate or "").strip()
-    if not template:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No HTML template on this profile. Upload one on the "
-                   "Resume Styles tab first.",
-        )
-
+    """Run the full pipeline: `generate_resume_html` (LLM rewrite or cache hit,
+    CSS restored), then Playwright renders the HTML to PDF, optional S3 upload."""
     log.info(
         "Generating resume for account=%s (%s) company=%s",
         account.name, account.id, company,
     )
 
-    llm_body = wrap_body_for_llm(body_html_for_llm(template))
-    prompt = _build_resume_prompt(account, job_description, llm_body, prompt_body=prompt_body)
-    llm_result = await _resume_llm_output(prompt, owner, template, model_id)
-    raw = llm_result.text
+    out_html, llm_result = await generate_resume_html(
+        account, job_description, prompt_body=prompt_body, owner=owner, model_id=model_id,
+    )
     usage = llm_result.usage
-
-    # Model returns rewritten body only; CSS is reattached from the uploaded
-    # template (head styles via splice, body-origin styles via reinjection).
-    out_html = _finalize_resume_html(template, raw)
-    _validate_llm_html(out_html)
 
     async with _render_slots():
         pdf_bytes = await _html_to_pdf(
@@ -595,10 +645,7 @@ async def generate_resume(
             margin_pt=_resolve_margin_pt(account),
         )
     s3_key, _region = await asyncio.to_thread(_maybe_upload_to_s3, pdf_bytes, account.name, company, job_id)
-    plain_text = re.sub(
-        r"\n{3,}", "\n\n",
-        BeautifulSoup(out_html, "html.parser").get_text("\n").strip(),
-    )
+    plain_text = plain_text_from_html(out_html)
     return GeneratedResume(
         pdf_bytes=pdf_bytes,
         s3_key=s3_key,

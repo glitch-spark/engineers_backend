@@ -19,6 +19,7 @@ def settings(**over):
         RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
         COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
         SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
+        JUDGE_DEFAULT_MODEL="anthropic:claude-opus-5-5",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -55,6 +56,9 @@ EXPECTED = {
     ("resume", "openai"): [O + "gpt-5-mini", O + "gpt-5.4-mini", O + "gpt-4o-mini", O + "gpt-6-luna"],
     ("cover_letter", "openai"): [O + "gpt-5.6-sol", O + "gpt-6-astra", O + "gpt-5.5", O + "gpt-5.6-terra"],
     ("screening", "openai"): [O + "gpt-5.4-mini", O + "gpt-6-astra", O + "gpt-5-mini", O + "gpt-6-luna"],
+    # Judge (prompt evaluator): strong models only, fresh-context scoring.
+    ("judge", "anthropic"): [A + "opus-5-5", A + "fable-5-1", A + "sonnet-5-5"],
+    ("judge", "openai"): [O + "gpt-6-astra", O + "gpt-5.6-sol", O + "gpt-5.5"],
 }
 
 
@@ -102,6 +106,7 @@ def test_defaults_per_task(use_settings):
     assert mc.default_model_id("resume", None) == A + "sonnet-5-5"
     assert mc.default_model_id("screening", None) == A + "sonnet-5-5"
     assert mc.default_model_id("cover_letter", None) == A + "opus-5-5"
+    assert mc.default_model_id("judge", None) == A + "opus-5-5"
 
 
 def test_default_falls_back_to_the_openai_recommendation_without_anthropic(use_settings):
@@ -109,6 +114,19 @@ def test_default_falls_back_to_the_openai_recommendation_without_anthropic(use_s
     assert mc.default_model_id("resume", None) == O + "gpt-5-mini"
     assert mc.default_model_id("cover_letter", None) == O + "gpt-5.6-sol"
     assert mc.default_model_id("screening", None) == O + "gpt-5.4-mini"
+    assert mc.default_model_id("judge", None) == O + "gpt-6-astra"
+
+
+def test_judge_task_effort_is_high_and_has_a_token_profile(use_settings):
+    assert mc.TASK_EFFORT["judge"] == "high"
+    tokens_in, tokens_out = mc.TASK_TOKEN_PROFILE["judge"]
+    assert tokens_in > 0 and tokens_out > 0
+    assert mc.cache_lane(mc.get_model(A + "opus-5-5", None), "judge", None) == "anthropic:claude-opus-5-5:high"
+
+
+def test_haiku_cannot_judge(use_settings):
+    with pytest.raises(mc.ModelNotAvailable):
+        mc.validate_requested("judge", A + "haiku-4-5", None)
     use_settings(ANTHROPIC_API_KEY=None, OPENAI_API_KEY=None)
     assert mc.default_model_id("resume", None) is None
 

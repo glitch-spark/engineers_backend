@@ -4,3 +4,6 @@ import os
 # per-module os.environ.setdefault("AUTH_SECRET", "unit-test-secret") lines are no-ops.
 if len(os.environ.get("AUTH_SECRET", "")) < 32:
     os.environ["AUTH_SECRET"] = "unit-test-secret-" + "x" * 32
+
+# Unit tests never talk to Redis: a blank URL (env wins over .env) turns app.redis_cache into a no-op.
+os.environ["REDIS_URL"] = ""
