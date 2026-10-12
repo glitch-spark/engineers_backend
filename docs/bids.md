@@ -127,6 +127,11 @@ block the other steps.
 - If Slack is not configured, rows are saved and the claim is released, so the report posts
   once the channel and token are set (while still inside the 6 hour window).
 - No active bidders: the period is marked done without posting.
+- Reviews after the post: where each report was posted is kept in `bidreportposts`. A review that
+  changes a reported day's or week's approved / pending / rejected counts marks that post dirty,
+  and the next tick edits the message in place (`chat.update`, footer `· updated <time>`); nothing
+  new is posted in the thread. A failed edit is retried next tick; a report deleted in Slack is
+  forgotten. Reports posted before this change are not tracked and stay as posted.
 - Windows are built from local wall-clock times, so a day crossing a DST change is
   23 or 25 hours long.
 
@@ -137,7 +142,7 @@ curl -X POST -H "x-cron-secret: $SLACK_BOT_CRON_SECRET" $APP_BASE_URL/internal/b
 ```
 
 The response lists the status per kind: `not-due`, `done`, `no-bidders`, `posted`,
-`saved:slack-not-configured` or `failed:post`.
+`saved:slack-not-configured` or `failed:post`, plus `refreshed` (posts edited after reviews) when Slack is configured.
 
 ## 5. Bidder extension
 

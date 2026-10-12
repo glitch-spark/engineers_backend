@@ -13,6 +13,7 @@ from app.bids.windows import BidSchedule
 from app.config import Settings, get_settings
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
+from app.models.bid_report_post import BidReportPost
 from app.models.bidder import Bidder
 
 
@@ -117,7 +118,8 @@ async def count_by_status(
 async def refresh_report_rows(bid: Bid) -> None:
     """Recount the stored daily and weekly report rows of this bid's bidder whose period holds the bid.
 
-    Rows counted from folders (no `pending`) are left as they were."""
+    Rows counted from folders (no `pending`) are left as they were. A row whose counts changed marks its
+    period's Slack post dirty, so the next cron tick edits it in place."""
     at = _naive_utc(bid.firstAt)
     coll = BidReport.get_motor_collection()
     stale = await coll.find({
@@ -126,7 +128,12 @@ async def refresh_report_rows(bid: Bid) -> None:
     for row in stale:
         counts = await count_by_status([bid.bidderId], row["periodStart"], row["periodEnd"])
         approved, pending, rejected = counts[str(bid.bidderId)]
+        if (row.get("count"), row.get("pending"), row.get("rejected")) == (approved, pending, rejected):
+            continue
         await coll.update_one({"_id": row["_id"]}, {"$set": {
             "count": approved, "pending": pending, "rejected": rejected,
             "amount": round(approved * row["rate"], 2), "updatedAt": datetime.utcnow(),
         }})
+        await BidReportPost.get_motor_collection().update_one(
+            {"kind": row["kind"], "periodKey": row["periodKey"]}, {"$set": {"dirty": True}, "$inc": {"rev": 1}},
+        )
