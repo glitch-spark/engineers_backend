@@ -26,8 +26,9 @@ and model variants can be compared side by side, including a radar chart with on
 
 - The eval launches from the **profile edit page** and also has its own **Prompt Eval** tab under Resume
   (`/resume/eval`): all runs, run detail, compare, and the job-description library.
-- Sample JDs live in Mongo, are edited in-app, and are **seeded** once with one realistic JD per role
-  (fullstack, frontend, backend, ai, ml, llm, data, test).
+- Sample JDs live in Mongo, are edited in-app, and are **seeded** once with five realistic JDs per role
+  (fullstack, frontend, backend, ai, ml, llm, data, test, senior_swe, staff_swe); one module per role under
+  `app/prompt_eval/seed_jds/`.
 - The eval form prefills the profile's prompt; the text can be edited and run **without saving**. "Save to profile"
   is a separate action. Every run snapshots the exact prompt it used.
 - Match and believability per role are shown as a **radar chart** (axes = roles); compare overlays runs.

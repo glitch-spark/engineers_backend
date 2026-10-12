@@ -49,7 +49,7 @@ uvicorn app.main:app --reload
 
 ## Layout
 
-**Resume prompt evaluator** (`app/prompt_eval/`, `app/routers/prompt_eval.py`, `/resume/eval`): scores a profile's resume prompt against a shared library of role-tagged sample job descriptions (`eval_job_descriptions`, seeded once on boot with one posting per role and editable in-app; seeds are never overwritten). A run (`resume_prompt_evals`) generates one resume per JD in parallel without rendering a PDF, then the judge model scores job match (location and work authorization ignored) and believability; rows and per-role averages are kept so runs can be compared. Runs still `running` after 20 minutes are reported failed.
+**Resume prompt evaluator** (`app/prompt_eval/`, `app/routers/prompt_eval.py`, `/resume/eval`): scores a profile's resume prompt against a shared library of role-tagged sample job descriptions (`eval_job_descriptions`, seeded once on boot with five postings per role, including Senior and Staff SWE, editable in-app; seeds are never overwritten). A run (`resume_prompt_evals`) generates one resume per JD in parallel without rendering a PDF, then the judge model scores job match (location and work authorization ignored) and believability; rows and per-role averages are kept so runs can be compared. Runs still `running` after 20 minutes are reported failed.
 
 ```
 app/

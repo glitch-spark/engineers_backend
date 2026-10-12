@@ -48,8 +48,9 @@ async def test_seed_present_after_boot_and_idempotent(client, staff_user, auth_h
     r = await client.get("/resume/eval/jds", headers=auth_header(staff_user))
     assert r.status_code == 200
     body = r.json()
-    assert len(body["jds"]) == 8 and body["roles"][0] == "fullstack"
-    assert [j["role"] for j in body["jds"]] == list(body["roles"])  # role order
+    assert len(body["jds"]) == len(SEED_JDS) and body["roles"][0] == "fullstack"
+    roles = body["roles"]
+    assert [j["role"] for j in body["jds"]] == sorted((j["role"] for j in body["jds"]), key=roles.index)  # role order
     assert all(j["seedKey"] for j in body["jds"])
 
 

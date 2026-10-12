@@ -13,12 +13,14 @@ from pymongo import ASCENDING, DESCENDING, IndexModel
 
 from app.models.base import TimestampedDocument
 
-EvalRole = Literal["fullstack", "frontend", "backend", "ai", "ml", "llm", "data", "test"]
-EVAL_ROLES: tuple[EvalRole, ...] = ("fullstack", "frontend", "backend", "ai", "ml", "llm", "data", "test")
+EvalRole = Literal["fullstack", "frontend", "backend", "ai", "ml", "llm", "data", "test", "senior_swe", "staff_swe"]
+EVAL_ROLES: tuple[EvalRole, ...] = (
+    "fullstack", "frontend", "backend", "ai", "ml", "llm", "data", "test", "senior_swe", "staff_swe",
+)
 ROLE_ORDER: dict[str, int] = {role: index for index, role in enumerate(EVAL_ROLES)}
 
-# Cost guardrail: one run = this many resume generations + judge calls at most.
-MAX_JDS_PER_RUN = 12
+# Cost guardrail: one run = this many resume generations + judge calls at most (five roles' worth).
+MAX_JDS_PER_RUN = 25
 
 
 class EvalJobDescription(TimestampedDocument):
