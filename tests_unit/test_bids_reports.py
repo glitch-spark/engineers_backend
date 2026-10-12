@@ -19,6 +19,7 @@ from app.bids.windows import BidSchedule
 from app.config import get_settings
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
+from app.models.bid_report_post import BidReportPost
 from app.models.bidder import Bidder
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals, not bids code
@@ -39,7 +40,7 @@ def bidder(name, folder, rate=0.5):
 
 class FakeStore:
     def __init__(self, bidders):
-        self.bidders, self.rows, self.done = bidders, [], set()
+        self.bidders, self.rows, self.done, self.posts = bidders, [], set(), {}
 
     async def claim(self, key):
         if key in self.done:
@@ -52,6 +53,11 @@ class FakeStore:
     async def active_bidders(self): return self.bidders
     async def profile_names(self, ids): return {}
     async def owners(self, ids): return {str(OWNER): Owner("Pedro", "Pedro")}
+    async def save_post(self, kind, pk, channel, ts):
+        self.posts[(kind, pk)] = SimpleNamespace(kind=kind, periodKey=pk, channel=channel, ts=ts, rev=0, dirty=False)
+    async def dirty_posts(self): return [p for p in self.posts.values() if p.dirty]
+    async def mark_synced(self, post, ts): post.ts, post.dirty = ts, False
+    async def drop_post(self, post): del self.posts[(post.kind, post.periodKey)]
 
 
 class FakeStorage:
@@ -72,10 +78,21 @@ class Poster:
         if self.fail:
             raise RuntimeError("slack down")
         self.sent.append(text)
+        return "C1", [f"{len(self.sent)}.0"]
 
 
-async def tick(now, store, storage, post):
-    return await run_bid_reports_tick(now, store=store, storage=storage, post=post, sched=SCHED)
+class Editor:
+    def __init__(self, error=None): self.error, self.calls = error, []
+
+    async def __call__(self, channel, ts, text, messages):
+        if self.error:
+            raise RuntimeError(self.error)
+        self.calls.append((channel, ts, text))
+        return ts
+
+
+async def tick(now, store, storage, post, edit=None):
+    return await run_bid_reports_tick(now, store=store, storage=storage, post=post, edit=edit, sched=SCHED)
 
 
 async def test_not_due_after_catch_up_window():
@@ -143,7 +160,7 @@ async def test_saturday_evening_runs_daily_and_weekly():
     now = datetime(2026, 10, 3, 23, 35, tzinfo=timezone.utc)
     store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
     got = await tick(now, store, FakeStorage({"s3://b/ana/": 3}), post)
-    assert got == {"daily": "posted", "weekly": "posted"}
+    assert (got["daily"], got["weekly"]) == ("posted", "posted")
     assert {"bids-daily:2026-10-03", "bids-weekly:2026-10-03"} <= store.done
 
 
@@ -165,7 +182,7 @@ START, END = datetime(2026, 10, 1, 23, 30, tzinfo=timezone.utc), DAILY_CUTOFF  #
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["bid-reports-unit"]
-    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport])
+    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, BidReportPost])
     return database
 
 
@@ -238,3 +255,99 @@ async def test_tick_counts_records_end_to_end(db, monkeypatch):
     got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({}), post)
     assert got["daily"] == "posted"
     assert (store.rows[0].count, store.rows[0].pending, store.rows[0].rejected) == (1, 1, 0)
+
+
+# --- the posted report is edited in place once a review recounts its rows ---
+
+async def test_post_remembers_where_the_report_lives():
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), Poster())
+    post = store.posts[("daily", "2026-10-02")]
+    assert (post.channel, post.ts, post.dirty) == ("C1", ["1.0"], False)
+
+
+async def test_changed_report_is_edited_in_place_on_a_later_tick():
+    store, post, edit = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster(), Editor()
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post, edit)
+    assert edit.calls == []  # nothing changed yet
+
+    store.rows[0].count = 7  # a review recounted the row
+    store.posts[("daily", "2026-10-02")].dirty = True
+    later = DAILY_CUTOFF + timedelta(hours=7)  # past the catch-up window: edits still go out
+    got = await tick(later, store, FakeStorage({}), post, edit)
+    assert got["refreshed"] == 1 and len(post.sent) == 1  # no new message, no thread reply
+    ((channel, ts, text),) = edit.calls
+    assert (channel, ts) == ("C1", ["1.0"]) and text == "Daily bids — Fri Oct 2: 7 bids"
+    assert store.posts[("daily", "2026-10-02")].dirty is False
+
+    again = await tick(later + timedelta(minutes=5), store, FakeStorage({}), post, edit)
+    assert again["refreshed"] == 0 and len(edit.calls) == 1
+
+
+async def test_report_deleted_in_slack_is_forgotten():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
+    store.posts[("daily", "2026-10-02")].dirty = True
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=10), store, FakeStorage({}), post, Editor("message_not_found"))
+    assert got["refreshed"] == 0 and store.posts == {}
+
+
+async def test_failed_edit_is_retried_on_the_next_tick():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
+    store.posts[("daily", "2026-10-02")].dirty = True
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=10), store, FakeStorage({}), post, Editor("ratelimited"))
+    assert got["refreshed"] == 0 and store.posts[("daily", "2026-10-02")].dirty is True
+    edit = Editor()
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=15), store, FakeStorage({}), post, edit)
+    assert got["refreshed"] == 1 and len(edit.calls) == 1
+
+
+async def test_review_recount_marks_the_posted_report_changed(db, monkeypatch):
+    records_start(monkeypatch, "2026-10-01")
+    ana = await stored_bidder()
+    await add_bid(ana, "j1", "approved")
+    (row,) = await reports.build_rows("daily", START, END, "2026-10-02", [ana], {}, FakeStorage({}), SCHED)
+    await reports.BeanieReportStore().save_rows([row])
+    await reports.BeanieReportStore().save_post("daily", "2026-10-02", "C1", ["1.0"])
+
+    await records.refresh_report_rows(await Bid.find_one(Bid.bidderId == ana.id))  # nothing changed
+    post = await BidReportPost.find_one(BidReportPost.periodKey == "2026-10-02")
+    assert (post.dirty, post.rev) == (False, 0)
+
+    await add_bid(ana, "j2", "approved")
+    await records.refresh_report_rows(await Bid.find_one(Bid.bidderId == ana.id))
+    post = await BidReportPost.find_one(BidReportPost.periodKey == "2026-10-02")
+    assert (post.dirty, post.rev) == (True, 1)
+    assert (await BidReport.find_one(BidReport.bidderId == ana.id)).count == 2
+
+
+async def test_mark_synced_keeps_a_report_changed_mid_edit(db):
+    store = reports.BeanieReportStore()
+    await store.save_post("daily", "2026-10-02", "C1", ["1.0"])
+    coll = BidReportPost.get_motor_collection()
+    await coll.update_one({}, {"$set": {"dirty": True}, "$inc": {"rev": 1}})
+    (seen,) = await store.dirty_posts()
+    await coll.update_one({}, {"$inc": {"rev": 1}})  # a review lands while the edit is in flight
+    await store.mark_synced(seen, ["1.0"])
+    assert [p.rev for p in await store.dirty_posts()] == [2]
+    (seen,) = await store.dirty_posts()
+    await store.mark_synced(seen, ["1.0", "2.0"])
+    assert await store.dirty_posts() == []
+    assert (await BidReportPost.find_one()).ts == ["1.0", "2.0"]
+
+
+async def test_update_report_edits_each_message_and_fits_a_new_length(monkeypatch):
+    calls = []
+
+    async def fake_api(method, body):
+        calls.append((method, body.get("ts"), body.get("thread_ts")))
+        return {"ok": True, "ts": "9.0"}
+    monkeypatch.setattr(reports, "_slack_api", fake_api)
+
+    assert await reports.update_report("C1", ["1.0", "2.0"], "t", [[{"b": 1}]]) == ["1.0"]
+    assert calls == [("chat.update", "1.0", None), ("chat.delete", "2.0", None)]
+
+    calls.clear()
+    assert await reports.update_report("C1", ["1.0"], "t", [[{"b": 1}], [{"b": 2}]]) == ["1.0", "9.0"]
+    assert calls == [("chat.update", "1.0", None), ("chat.postMessage", None, "1.0")]

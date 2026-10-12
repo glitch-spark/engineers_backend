@@ -59,6 +59,7 @@ from app.models import (
     UserExtra,
     WeeklyPlan,
 )
+from app.models.bid_report_post import BidReportPost
 from app.models.slack_alert_log import SlackAlertLog
 
 DOCUMENT_MODELS = [
@@ -90,6 +91,7 @@ DOCUMENT_MODELS = [
     JobApplicationLog,
     Bidder,
     BidReport,
+    BidReportPost,
     Bid,
 ]
 

@@ -4,7 +4,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from app.bids.windows import Kind
@@ -94,8 +94,10 @@ def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow]) -> lis
 
 
 def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[BidReportRow],
-                  owners: Mapping[str, Owner], tz: ZoneInfo, app_url: str) -> tuple[str, list[list[dict]]]:
-    """Return (fallback_text, messages); messages[0] is the channel post, the rest are thread replies."""
+                  owners: Mapping[str, Owner], tz: ZoneInfo, app_url: str,
+                  updated_at: Optional[datetime] = None) -> tuple[str, list[list[dict]]]:
+    """Return (fallback_text, messages); messages[0] is the channel post, the rest are thread replies.
+    `updated_at` is set when a posted report is edited after a review, and shown in the footer."""
     start, end = start.astimezone(tz), end.astimezone(tz)
     ok = [r for r in rows if not r.error]
     total = sum(r.count or 0 for r in ok)
@@ -112,6 +114,9 @@ def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[Bid
         footer_total = f"*Total: {_label(_bids(total), ok)} · {money}*"
         fallback = f"Weekly bids & pay — week ending {_date(end)}: {_label(_bids(total), ok)} · {money}"
     footer = f"{footer_total} · <{app_url}/bidders|View in app>"
+    if updated_at is not None:
+        updated_at = updated_at.astimezone(tz)
+        footer += f" · updated {updated_at:%a} {_time(updated_at)}"
 
     by_owner: dict[str, list[BidReportRow]] = defaultdict(list)
     for r in rows:

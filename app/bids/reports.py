@@ -2,7 +2,8 @@
 
 Called from the 5-minute cron (app/alerts_tick.py) and the HTTP fallback (app/routers/bidders.py).
 A period is reported at most once: rows are unique on (kind, periodKey, bidderId) and the post is
-recorded in SlackAlertLog under `bids-<kind>:<periodKey>`.
+recorded in SlackAlertLog under `bids-<kind>:<periodKey>`. Where the post lives is kept in BidReportPost;
+a review that recounts a row marks it dirty and a later tick edits the post in place.
 """
 
 import logging
@@ -19,9 +20,10 @@ from app.bids.windows import BidSchedule, Kind, latest_cutoff, period_key, sched
 from app.config import get_settings
 from app.models import Account, UserExtra
 from app.models.bid_report import BidReport, BidReportRow
+from app.models.bid_report_post import BidReportPost
 from app.models.bidder import Bidder
 from app.models.slack_alert_log import SlackAlertLog
-from app.slack_bot import CALLER_CHANNEL_SENTINEL, _mention, _slack_api
+from app.slack_bot import _MESSAGE_GONE, CALLER_CHANNEL_SENTINEL, _mention, _slack_api
 
 log = logging.getLogger("bids.reports")
 
@@ -41,6 +43,10 @@ class ReportStore(Protocol):
     async def active_bidders(self) -> list: ...
     async def profile_names(self, ids: list[PydanticObjectId]) -> dict[str, str]: ...
     async def owners(self, ids: list[PydanticObjectId]) -> dict[str, Owner]: ...
+    async def save_post(self, kind: Kind, period_key: str, channel: str, ts: list[str]) -> None: ...
+    async def dirty_posts(self) -> list: ...
+    async def mark_synced(self, post, ts: list[str]) -> None: ...
+    async def drop_post(self, post) -> None: ...
 
 
 def _only_duplicates(e: BulkWriteError) -> bool:
@@ -96,6 +102,26 @@ class BeanieReportStore:
         users = await UserExtra.find({"_id": {"$in": ids}}).to_list()
         return {str(u.id): Owner(name=u.name or u.email or "", label=_mention(u)) for u in users}
 
+    async def save_post(self, kind: Kind, period_key: str, channel: str, ts: list[str]) -> None:
+        await BidReportPost.get_motor_collection().update_one(
+            {"kind": kind, "periodKey": period_key},
+            {"$set": {"channel": channel, "ts": ts, "dirty": False, "updatedAt": datetime.utcnow()},
+             "$setOnInsert": {"rev": 0, "createdAt": datetime.utcnow()}},
+            upsert=True,
+        )
+
+    async def dirty_posts(self) -> list[BidReportPost]:
+        return await BidReportPost.find(BidReportPost.dirty == True).to_list()  # noqa: E712
+
+    async def mark_synced(self, post: BidReportPost, ts: list[str]) -> None:
+        """Save the edited post's ts; clear dirty only if no review bumped rev since `post` was read."""
+        coll, now = BidReportPost.get_motor_collection(), datetime.utcnow()
+        await coll.update_one({"_id": post.id}, {"$set": {"ts": ts, "updatedAt": now}})
+        await coll.update_one({"_id": post.id, "rev": post.rev}, {"$set": {"dirty": False}})
+
+    async def drop_post(self, post: BidReportPost) -> None:
+        await post.delete()
+
 
 async def build_rows(
     kind: Kind,
@@ -135,18 +161,84 @@ def bids_slack_configured() -> bool:
     return bool((s.SLACK_BIDS_CHANNEL_ID or "").strip() and (s.SLACK_BOT_TOKEN or "").strip())
 
 
-async def post_report(text: str, messages: list[list[dict]]) -> None:
-    """Post messages[0] to the bids channel and the rest as replies in its thread. Raises on failure."""
+_FLAGS = {"unfurl_links": False, "unfurl_media": False}
+
+
+async def post_report(text: str, messages: list[list[dict]]) -> tuple[str, list[str]]:
+    """Post messages[0] to the bids channel and the rest as replies in its thread. Raises on failure.
+
+    Returns the channel and the ts of every message, so the report can be edited later."""
     channel = (get_settings().SLACK_BIDS_CHANNEL_ID or "").strip()
-    flags = {"unfurl_links": False, "unfurl_media": False}
     first = await _slack_api(
-        "chat.postMessage", {"channel": channel, "text": text, "blocks": messages[0], **flags},
+        "chat.postMessage", {"channel": channel, "text": text, "blocks": messages[0], **_FLAGS},
     )
+    ts = [first["ts"]]
     for blocks in messages[1:]:
-        await _slack_api(
+        reply = await _slack_api(
             "chat.postMessage",
-            {"channel": channel, "thread_ts": first["ts"], "text": text, "blocks": blocks, **flags},
+            {"channel": channel, "thread_ts": ts[0], "text": text, "blocks": blocks, **_FLAGS},
         )
+        ts.append(reply["ts"])
+    return first.get("channel") or channel, ts
+
+
+async def update_report(channel: str, ts: list[str], text: str, messages: list[list[dict]]) -> list[str]:
+    """Edit a posted report in place and return the ts of its messages now. Nothing new is said in the thread:
+    only when the report grew past a message (50 blocks) is the extra part posted there, as on first post."""
+    for t, blocks in zip(ts, messages):
+        await _slack_api("chat.update", {"channel": channel, "ts": t, "text": text, "blocks": blocks})
+    kept = ts[:len(messages)]
+    for blocks in messages[len(ts):]:
+        reply = await _slack_api(
+            "chat.postMessage",
+            {"channel": channel, "thread_ts": ts[0], "text": text, "blocks": blocks, **_FLAGS},
+        )
+        kept.append(reply["ts"])
+    for t in ts[len(messages):]:
+        await _slack_api("chat.delete", {"channel": channel, "ts": t})
+    return kept
+
+
+async def _render(
+    kind: Kind, start: datetime, end: datetime, rows: list[BidReportRow], store: ReportStore, sched: BidSchedule,
+    updated_at: Optional[datetime] = None,
+) -> tuple[str, list[list[dict]]]:
+    owners = await store.owners(list({r.ownerId for r in rows}))
+    return format_report(
+        kind, start, end, rows, owners, sched.tz, get_settings().FRONTEND_ORIGIN.rstrip("/"), updated_at,
+    )
+
+
+def _utc(dt: datetime) -> datetime:
+    """Stored datetimes come back naive UTC."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+async def refresh_posts(now: datetime, sched: BidSchedule, store: ReportStore, edit) -> int:
+    """Edit every posted report whose rows a review recounted since; returns how many were edited.
+
+    A failed edit is left dirty for the next tick; a report deleted in Slack is forgotten."""
+    edited = 0
+    for post in await store.dirty_posts():
+        try:
+            rows = await store.load_rows(post.kind, post.periodKey)
+            if not rows:
+                await store.drop_post(post)
+                continue
+            text, messages = await _render(
+                post.kind, _utc(rows[0].periodStart), _utc(rows[0].periodEnd), rows, store, sched, now,
+            )
+            ts = await edit(post.channel, post.ts, text, messages)
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc) in _MESSAGE_GONE:
+                log.info("bid %s report %s gone from Slack (%s)", post.kind, post.periodKey, exc)
+                await store.drop_post(post)
+            else:
+                log.warning("bid %s report edit failed for %s: %s", post.kind, post.periodKey, exc)
+            continue
+        await store.mark_synced(post, ts)
+        edited += 1
+    return edited
 
 
 async def _run_kind(
@@ -172,19 +264,20 @@ async def _run_kind(
         if post is None:
             await store.release(key)
             return "saved:slack-not-configured"
-        owners = await store.owners(list({r.ownerId for r in rows}))
-        text, messages = format_report(
-            kind, start, end, rows, owners, sched.tz, get_settings().FRONTEND_ORIGIN.rstrip("/"),
-        )
+        text, messages = await _render(kind, start, end, rows, store, sched)
     except Exception:
         await store.release(key)  # let the next tick retry
         raise
     try:
-        await post(text, messages)
+        channel, ts = await post(text, messages)
     except Exception as exc:
         await store.release(key)
         log.warning("bid %s report post failed for %s: %s", kind, pk, exc)
         return "failed:post"
+    try:
+        await store.save_post(kind, pk, channel, ts)
+    except Exception as exc:  # the report is out and the claim stands; it just won't be edited after reviews
+        log.warning("bid %s report %s posted but not tracked: %s", kind, pk, exc)
     return "posted"
 
 
@@ -194,16 +287,20 @@ async def run_bid_reports_tick(
     store: Optional[ReportStore] = None,
     storage: Optional[BidStorage] = None,
     post=None,
+    edit=None,
     sched: Optional[BidSchedule] = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     sched = sched or schedule_from_settings()
     store = store or BeanieReportStore()
     storage = storage or get_bid_storage()
     if post is None and bids_slack_configured():
         post = post_report
-    result: dict[str, str] = {}
+    result: dict[str, Any] = {}
     for kind in KINDS:
         result[kind] = await _run_kind(kind, now, sched, store, storage, post)
         log.info("bid %s report: %s", kind, result[kind])
+    if post is not None:  # Slack is configured (or a test posts)
+        result["refreshed"] = await refresh_posts(now, sched, store, edit or update_report)
+        log.info("bid reports edited after reviews: %s", result["refreshed"])
     return result

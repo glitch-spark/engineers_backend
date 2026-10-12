@@ -124,3 +124,9 @@ def test_rows_without_pending_keep_the_folder_line():
     _, weekly = format_report("weekly", START, END, [counted("weekly", None, None)], OWNERS, CT, "https://app.example")
     assert texts(weekly)[1] == "*<@U1>* — 2 bids · *$1.00*\n• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00"
     assert texts(weekly)[2].startswith("*Total: 2 bids · $1.00*")
+
+
+def test_refreshed_report_footer_says_when_it_was_updated():
+    updated = datetime(2026, 10, 3, 14, 5, tzinfo=timezone.utc)  # Sat 9:05 AM CDT
+    _, messages = format_report("daily", START, END, [row(PEDRO, "Ana", 3)], OWNERS, CT, "https://a", updated_at=updated)
+    assert texts(messages)[-1] == "*Total: 3 bids · 1 bidder* · <https://a/bidders|View in app> · updated Sat 9:05 AM"
