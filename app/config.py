@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     # Resume prompt evaluator (app/prompt_eval): JDs evaluated at once per run; each holds one slot for
     # its generate + judge calls.
     PROMPT_EVAL_CONCURRENCY: int = 4
-    # Optional Redis for LLM result caching (resume output, judge verdicts). Blank = no Redis; the app
+    # Optional Redis for prompt-eval judge verdicts (resumes use the Mongo cache only). Blank = no Redis; the app
     # works the same, just recomputes. TTL in seconds (default 30 days).
     REDIS_URL: Optional[str] = None
     LLM_CACHE_TTL_SECONDS: int = 30 * 24 * 3600

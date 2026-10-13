@@ -43,7 +43,7 @@ uvicorn app.main:app --reload
 | `RESUME_DEFAULT_MODEL`, `COVER_LETTER_DEFAULT_MODEL`, `SCREENING_DEFAULT_MODEL` | no | Default model per task when a request doesn't pick one (provider-prefixed ids); defaults `anthropic:claude-sonnet-5-5`, `anthropic:claude-opus-5-5`, `anthropic:claude-sonnet-5-5` |
 | `JUDGE_DEFAULT_MODEL` | no | Judge for the resume prompt evaluator (Resumes → Prompt Eval): scores each generated resume against a JD in a fresh context; default `anthropic:claude-opus-5-5` |
 | `PROMPT_EVAL_CONCURRENCY` | no | Job descriptions evaluated at once per eval run (each holds one slot for its generate + judge calls); default 4 |
-| `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for LLM results: generated resume output (looked up before the 7-day Mongo cache) and judge verdicts, keyed by content hash + model lane. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |
+| `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for prompt-eval judge verdicts, keyed by content hash + model lane. Generated resumes are never stored in Redis; they use only the 7-day Mongo cache. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |
 | `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
 | `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |
 
