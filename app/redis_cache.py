@@ -1,4 +1,5 @@
-"""Optional Redis cache for LLM results (generated resume output, judge verdicts).
+"""Optional Redis cache for prompt-eval judge verdicts. Generated resumes are not cached here: they
+use only the 7-day Mongo `ResumeLLMCache` (app/resume_service.py).
 
 Keyed by a content hash of everything that determines the output (model lane + full prompt), with a
 long TTL (`LLM_CACHE_TTL_SECONDS`, default 30 days), so identical work is never paid for twice.

@@ -27,7 +27,6 @@ from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
 from playwright.async_api import async_playwright
 
-from app import redis_cache
 from app.config import get_settings
 from app.html_sanitize import (
     body_html_for_llm,
@@ -341,11 +340,11 @@ async def _resume_llm_output(
     model_id: Optional[str] = None,
 ) -> LlmResult:
     """Return LLM output with provider metadata. Uses a content-hash cache per model lane:
-    Redis (long TTL, optional) → Mongo `ResumeLLMCache` (7 days) → the model.
+    Mongo `ResumeLLMCache` (7 days) → the model. Generated resumes are never put in Redis.
 
     Only the preferred model's lane is checked, so a fallback entry never shadows the model the
     user asked for (it gets retried next time). On a miss the router walks its fallback chain
-    and the output is stored (in both caches) under the lane of the model that actually answered."""
+    and the output is stored under the lane of the model that actually answered."""
 
     def _validate(text: str) -> None:
         _validate_llm_html(_finalize_resume_html(template, text))
@@ -353,38 +352,17 @@ async def _resume_llm_output(
     chain = fallback_chain("resume", model_id, user)
     if chain:
         preferred = chain[0]
-        lane = cache_lane(preferred, "resume", user)
-        redis_key = redis_cache.cache_key("resume", lane, prompt)
-        hit = await redis_cache.get_json(redis_key)
-        if hit and (hit.get("output") or "").strip():
-            log.info("resume LLM redis HIT key=%s model=%s", redis_key[-12:], hit.get("model"))
-            return _cached_llm_result(preferred, hit["output"], hit.get("model") or preferred.api_model)
-        cache_key = _resume_cache_key(prompt, lane)
+        cache_key = _resume_cache_key(prompt, cache_lane(preferred, "resume", user))
         cached = await ResumeLLMCache.find_one(ResumeLLMCache.promptHash == cache_key)
         if cached is not None:
             log.info("resume LLM cache HIT key=%s model=%s", cache_key[:12], cached.model)
-            await redis_cache.set_json(redis_key, {
-                "output": cached.output,
-                "model": cached.model,
-                "model_id": preferred.id,
-                "provider": preferred.provider,
-                "fallback": bool(getattr(cached, "isFallback", False)),
-            })
             return _cached_llm_result(preferred, cached.output, cached.model)
 
     result = await complete("resume", prompt, user, model_id=model_id, validate=_validate)
 
     answered = next((s for s in chain if s.id == result.model_id), None)
     if answered is not None:
-        lane = cache_lane(answered, "resume", user)
-        await redis_cache.set_json(redis_cache.cache_key("resume", lane, prompt), {
-            "output": result.text,
-            "model": result.model,
-            "model_id": result.model_id,
-            "provider": result.provider,
-            "fallback": result.fallback_used,
-        })
-        cache_key = _resume_cache_key(prompt, lane)
+        cache_key = _resume_cache_key(prompt, cache_lane(answered, "resume", user))
         try:
             await ResumeLLMCache(
                 promptHash=cache_key,
