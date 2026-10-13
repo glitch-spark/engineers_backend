@@ -14,7 +14,7 @@ from app.alerts import app_week_key
 from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.daily_plan import DailyPlan
-from app.models.plan_common import BidsIn, ChecklistItems, Counts
+from app.models.plan_common import BidsIn, ChecklistItems, Counts, bids_of
 from app.dashboard_stats import app_tz
 from app.models.plan_common import monday_of
 from app.plan_auto import day_goal, effective_daily_done, empty_day, interview_counts, weekly_plans_for
@@ -132,9 +132,9 @@ async def put_day(
         plan = DailyPlan(userId=user.id, date=_midnight(when), year=year, weekNumber=week_number)
     # Keep the goal this day was followed up against, even if the week's daily goal changes later.
     goal, _items = day_goal(plan, weekly)
-    plan.goal = Counts(bidsSelf=goal.bidsSelf, bidsBidder=goal.bidsBidder)
+    plan.goal = Counts(**bids_of(goal))
     plan.goalItems = body.goalItems
-    plan.done = Counts(bidsSelf=body.done.bidsSelf, bidsBidder=body.done.bidsBidder)
+    plan.done = Counts(**bids_of(body.done))
     plan.notes = body.notes
     if plan.loggedAt is None:
         plan.loggedAt = datetime.now(timezone.utc).replace(tzinfo=None)

@@ -112,5 +112,14 @@ def test_weekly_done_sums_logged_days_bids_and_week_interviews():
     assert done == Counts(bidsSelf=10, bidsBidder=3, interviewsSelf=3, interviewsCaller=1)
 
 
+def test_weekly_done_sums_self_regions_and_keeps_pre_split_totals():
+    days = [
+        (date(2026, 9, 28), Counts(bidsSelf=5), True),  # followed up before the split
+        (date(2026, 9, 29), Counts(bidsSelf=6, bidsSelfUs=4, bidsSelfLatam=2), True),
+    ]
+    done = weekly_done(days, {"self": 0, "caller": 0})
+    assert (done.bidsSelf, done.bidsSelfUs, done.bidsSelfEu, done.bidsSelfLatam) == (11, 4, 0, 2)
+
+
 def test_weekly_done_empty_week():
     assert weekly_done([], {"self": 0, "caller": 0}) == Counts()

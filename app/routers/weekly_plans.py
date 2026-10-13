@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from app.alerts import app_week_key
 from app.deps import get_current_user
 from app.models import UserExtra
-from app.models.plan_common import BidsIn, ChecklistItem, ChecklistItems, Counts
+from app.models.plan_common import BidsIn, ChecklistItem, ChecklistItems, Counts, CountsIn, bids_of
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import day_goal, week_snapshot
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
 
 
 class WeekIn(BaseModel):
-    goal: Counts = Field(default_factory=Counts)
+    goal: CountsIn = Field(default_factory=CountsIn)
     goalItems: ChecklistItems = []
     dailyGoal: BidsIn = Field(default_factory=BidsIn)
     dailyGoalItems: ChecklistItems = []
@@ -129,9 +129,9 @@ async def put_week(
             startDate=start,
             endDate=start + timedelta(days=7) - timedelta(milliseconds=1),
         )
-    plan.goal = body.goal
+    plan.goal = Counts(**body.goal.model_dump())
     plan.goalItems = body.goalItems
-    plan.dailyGoal = Counts(bidsSelf=body.dailyGoal.bidsSelf, bidsBidder=body.dailyGoal.bidsBidder)
+    plan.dailyGoal = Counts(**bids_of(body.dailyGoal))
     # Daily lines are a template: ticks happen on each day.
     plan.dailyGoalItems = [ChecklistItem(text=i.text) for i in body.dailyGoalItems]
     plan.recapNotes = body.recapNotes

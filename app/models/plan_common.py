@@ -1,14 +1,16 @@
 """Goal vs Done building blocks shared by Daily and Weekly plans.
 
-Plans track bids (self, bidder) and interviews (self, caller). Goals are
-typed; bids Done is typed per day; interviews Done always comes from the
-Interviews page (`app.plan_auto`).
+Plans track bids (self, bidder) and interviews (self, caller). Self bids are
+split by region (US, EU, LATAM); `bidsSelf` stays the self total, so plans
+from before the split (total only) still add up. Goals are typed; bids Done
+is typed per day; interviews Done always comes from the Interviews page
+(`app.plan_auto`).
 """
 
 from datetime import date, timedelta
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 MAX_ITEMS = 20
 MAX_ITEM_LENGTH = 200
@@ -16,18 +18,44 @@ MAX_ITEM_LENGTH = 200
 Count = Annotated[int, Field(ge=0)]
 
 
-class Counts(BaseModel):
-    bidsSelf: Count = 0
+SELF_REGIONS = ("bidsSelfUs", "bidsSelfEu", "bidsSelfLatam")
+BID_FIELDS = ("bidsSelf", *SELF_REGIONS, "bidsBidder")
+
+
+class Bids(BaseModel):
+    bidsSelf: Count = 0  # self total: the regions' sum, or a pre-split total
+    bidsSelfUs: Count = 0
+    bidsSelfEu: Count = 0
+    bidsSelfLatam: Count = 0
     bidsBidder: Count = 0
+
+
+class Counts(Bids):
     interviewsSelf: Count = 0
     interviewsCaller: Count = 0
 
 
-class BidsIn(BaseModel):
+def bids_of(c: Bids) -> dict[str, int]:
+    """The bid fields of `c`, to copy into another Counts."""
+    return {f: getattr(c, f) for f in BID_FIELDS}
+
+
+class _SelfTotal(BaseModel):
+    @model_validator(mode="after")
+    def self_total_from_regions(self):
+        """Typed self bids: once any region is set, the total is their sum."""
+        regions = sum(getattr(self, f) for f in SELF_REGIONS)
+        if regions:
+            self.bidsSelf = regions
+        return self
+
+
+class BidsIn(Bids, _SelfTotal):
     """Bids typed on a day (goal in the morning, Done at follow-up)."""
 
-    bidsSelf: Count = 0
-    bidsBidder: Count = 0
+
+class CountsIn(Counts, _SelfTotal):
+    """A typed goal (bids and interviews)."""
 
 
 class ChecklistItem(BaseModel):
