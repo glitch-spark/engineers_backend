@@ -69,6 +69,13 @@ def test_daily_plan_text_minimal():
     assert lines[1:-1] == ["*10/1 (Thu)*", "Bids: self 0/0 · bidder 0/0", "Interviews: self 0 · caller 0"]
 
 
+def test_daily_plan_text_splits_self_bids_by_region():
+    plan = _plan(goal=Counts(bidsSelf=150, bidsSelfUs=80, bidsSelfEu=40, bidsSelfLatam=30, bidsBidder=100))
+    done = Counts(bidsSelf=130, bidsSelfUs=70, bidsSelfEu=40, bidsSelfLatam=20, bidsBidder=100)
+    lines = daily_plan_text(plan, _owner(), done=done).splitlines()
+    assert lines[2] == "Bids: self 130/150 (US 70/80 · EU 40/40 · LATAM 20/30) · bidder 100/100"
+
+
 def test_daily_plan_text_defaults_done_to_stored_done():
     assert "Bids: self 140/150 · bidder 100/100" in daily_plan_text(_plan(), _owner())
 

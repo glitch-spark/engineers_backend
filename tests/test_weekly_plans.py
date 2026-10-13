@@ -35,9 +35,9 @@ async def test_put_and_get_week(client, staff_user, auth_header):
     assert r.status_code == 200, r.text
     week = r.json()
     assert week["weekStart"] == WEEK and week["exists"] is True
-    assert week["goal"] == {"bidsSelf": 750, "bidsBidder": 500, "interviewsSelf": 10, "interviewsCaller": 5}
+    assert week["goal"] == {"bidsSelf": 750, "bidsSelfUs": 0, "bidsSelfEu": 0, "bidsSelfLatam": 0, "bidsBidder": 500, "interviewsSelf": 10, "interviewsCaller": 5}
     assert [i["done"] for i in week["goalItems"]] == [False, True]
-    assert week["dailyGoal"] == {"bidsSelf": 85, "bidsBidder": 125, "interviewsSelf": 0, "interviewsCaller": 0}
+    assert week["dailyGoal"] == {"bidsSelf": 85, "bidsSelfUs": 0, "bidsSelfEu": 0, "bidsSelfLatam": 0, "bidsBidder": 125, "interviewsSelf": 0, "interviewsCaller": 0}
     assert [i["text"] for i in week["dailyGoalItems"]] == ["Seek caller", "Bidder review"]
     assert "planNotes" not in week
 
@@ -75,7 +75,7 @@ async def test_week_done_from_logged_days_and_interviews(client, staff_user, aut
                     caller={"enabled": True, "startsAt": datetime(2026, 10, 1, 15)}).insert()
 
     week = (await client.get(f"/weekly-plans/{WEEK}", headers=h)).json()
-    assert week["done"] == {"bidsSelf": 11, "bidsBidder": 3, "interviewsSelf": 1, "interviewsCaller": 1}
+    assert week["done"] == {"bidsSelf": 11, "bidsSelfUs": 0, "bidsSelfEu": 0, "bidsSelfLatam": 0, "bidsBidder": 3, "interviewsSelf": 1, "interviewsCaller": 1}
     assert week["stages"] == {"self": {"intro": 1}, "caller": {"final": 1}}
     days = {d["date"]: d for d in week["days"]}
     assert "2026-10-04" in days

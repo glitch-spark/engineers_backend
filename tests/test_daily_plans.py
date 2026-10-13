@@ -43,7 +43,7 @@ async def test_day_shows_the_weeks_daily_goal(client, staff_user, auth_header):
     await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body())
     day = (await client.get(f"/daily-plans/{DAY}", headers=h)).json()
     assert day["exists"] is False and day["loggedAt"] is None
-    assert day["goal"] == {"bidsSelf": 150, "bidsBidder": 100, "interviewsSelf": 0, "interviewsCaller": 0}
+    assert day["goal"] == {"bidsSelf": 150, "bidsSelfUs": 0, "bidsSelfEu": 0, "bidsSelfLatam": 0, "bidsBidder": 100, "interviewsSelf": 0, "interviewsCaller": 0}
     assert day["goalItems"] == [{"text": "Seek caller", "done": False}, {"text": "Bidder review", "done": False}]
 
 
@@ -79,6 +79,22 @@ async def test_follow_up_logs_posts_and_keeps_its_goal(client, staff_user, auth_
     await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up(notes="edited"))
     stored = await DailyPlan.find_one({"userId": staff_user.id})
     assert stored.loggedAt == first_logged and stored.notes == "edited"
+
+
+async def test_self_bids_by_region(client, staff_user, auth_header):
+    h = auth_header(staff_user)
+    await client.put(f"/weekly-plans/{WEEK}", headers=h, json=_week_body(
+        dailyGoal={"bidsSelfUs": 80, "bidsSelfEu": 40, "bidsSelfLatam": 30, "bidsBidder": 100}))
+    with patch("app.routers.daily_plans.sync_daily_plan_message", new=AsyncMock(return_value=None)):
+        # A stale total is replaced by the regions' sum.
+        r = await client.put(f"/daily-plans/{DAY}", headers=h, json=_follow_up(
+            done={"bidsSelf": 1, "bidsSelfUs": 70, "bidsSelfEu": 40, "bidsSelfLatam": 20, "bidsBidder": 100}))
+    day = r.json()
+    goal, done = day["goal"], day["done"]
+    assert (goal["bidsSelf"], goal["bidsSelfUs"], goal["bidsSelfEu"], goal["bidsSelfLatam"]) == (150, 80, 40, 30)
+    assert (done["bidsSelf"], done["bidsSelfUs"], done["bidsSelfEu"], done["bidsSelfLatam"]) == (130, 70, 40, 20)
+    week = (await client.get(f"/weekly-plans/{WEEK}", headers=h)).json()
+    assert (week["done"]["bidsSelf"], week["done"]["bidsSelfLatam"]) == (130, 20)
 
 
 async def test_future_day_cannot_be_followed_up(client, staff_user, auth_header):

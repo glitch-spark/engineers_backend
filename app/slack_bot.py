@@ -470,6 +470,21 @@ def _plan_day_label(day: datetime, offset: int = 0, sep: str = "") -> str:
     return f"{d.month}/{d.day}{sep}({d.strftime('%a')})"
 
 
+_REGION_LABELS = (("bidsSelfUs", "US"), ("bidsSelfEu", "EU"), ("bidsSelfLatam", "LATAM"))
+
+
+def _self_bids_text(done: Any, goal: Any) -> str:
+    """`self 140/150`, plus the US / EU / LATAM split once one is typed."""
+    text = f"self {done.bidsSelf}/{goal.bidsSelf}"
+    split = [
+        f"{label} {getattr(done, f, 0)}/{getattr(goal, f, 0)}"
+        for f, label in _REGION_LABELS
+    ]
+    if any(getattr(c, f, 0) for c in (done, goal) for f, _ in _REGION_LABELS):
+        text += f" ({' · '.join(split)})"
+    return text
+
+
 def daily_plan_text(plan: Any, owner: Optional[UserExtra], done: Any = None) -> str:
     """The day's follow-up: bids Goal → Done, interviews held, goal lines and notes.
 
@@ -481,7 +496,7 @@ def daily_plan_text(plan: Any, owner: Optional[UserExtra], done: Any = None) -> 
     lines = [
         f":spiral_note_pad: {_mention(owner)}'s *Daily Plan*",
         f"*{_plan_day_label(plan.date, sep=' ')}*",
-        f"Bids: self {done.bidsSelf}/{goal.bidsSelf} · bidder {done.bidsBidder}/{goal.bidsBidder}",
+        f"Bids: {_self_bids_text(done, goal)} · bidder {done.bidsBidder}/{goal.bidsBidder}",
         f"Interviews: self {done.interviewsSelf} · caller {done.interviewsCaller}",
     ]
     for item in plan.goalItems or []:
