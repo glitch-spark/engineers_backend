@@ -14,7 +14,7 @@ from app.bids.records import _naive_utc, count_by_status, uses_records
 from app.bids.schemas import _iso_utc, bidder_status
 from app.bids.storage import BidStorage, count_folder_windows
 from app.bids.windows import BidSchedule, latest_cutoff, period_key, window_for
-from app.models import Account
+from app.models import Account, UserExtra
 from app.models.bid import Bid
 from app.models.bidder import Bidder
 
@@ -135,6 +135,8 @@ async def week_board(
 
     ids = list({b.profileId for b in bidders if b.profileId})
     profiles = {a.id: a.name for a in await Account.find({"_id": {"$in": ids}}).to_list()} if ids else {}
+    owner_ids = list({b.createdBy for b in bidders})
+    owners = {u.id: u.name for u in await UserExtra.find({"_id": {"$in": owner_ids}}).to_list()} if owner_ids else {}
 
     rows = []
     for b in bidders:
@@ -161,6 +163,7 @@ async def week_board(
         rows.append({
             "id": bid_id, "name": b.name, "status": bidder_status(b), "country": b.country,
             "profileName": profiles.get(b.profileId), "rate": b.rate, "days": days, "week": week,
+            "ownerId": str(b.createdBy), "ownerName": owners.get(b.createdBy),
         })
 
     pays = [r["week"]["pay"] for r in rows if r["week"]["pay"] is not None]
