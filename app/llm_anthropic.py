@@ -15,11 +15,19 @@ from app.config import get_settings
 ANTHROPIC_TIMEOUT_SECONDS = 300
 
 
-class ModelRefused(RuntimeError):
+class _BilledRejection(RuntimeError):
+    """A response that was generated (and billed) but can't be used; `usage` keeps its tokens."""
+
+    def __init__(self, message: str, usage: Optional[dict] = None):
+        super().__init__(message)
+        self.usage = usage
+
+
+class ModelRefused(_BilledRejection):
     """The model declined the request (stop_reason == "refusal")."""
 
 
-class OutputTruncated(RuntimeError):
+class OutputTruncated(_BilledRejection):
     """The output hit max_tokens, so it can't be trusted as a complete document."""
 
 
@@ -50,13 +58,13 @@ async def anthropic_complete(
         kwargs["output_config"] = {"effort": effort}
     async with client.messages.stream(**kwargs) as stream:
         message = await stream.get_final_message()
-    if message.stop_reason == "refusal":
-        raise ModelRefused(f"{api_model} declined the request")
-    if message.stop_reason == "max_tokens":
-        raise OutputTruncated(f"{api_model} output was cut off at max_tokens")
-    text = "".join(block.text for block in message.content if block.type == "text").strip()
     usage = {
         "input": int(message.usage.input_tokens or 0),
         "output": int(message.usage.output_tokens or 0),
     }
+    if message.stop_reason == "refusal":
+        raise ModelRefused(f"{api_model} declined the request", usage)
+    if message.stop_reason == "max_tokens":
+        raise OutputTruncated(f"{api_model} output was cut off at max_tokens", usage)
+    text = "".join(block.text for block in message.content if block.type == "text").strip()
     return text, usage

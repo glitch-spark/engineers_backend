@@ -15,6 +15,7 @@ import httpx
 from beanie import PydanticObjectId
 from beanie.odm.utils.encoder import Encoder
 
+from app import ai_usage
 from app.job_apply import extract as extract_mod
 from app.job_apply import fetch as fetch_mod
 from app.job_apply import jd_store
@@ -525,7 +526,8 @@ async def run_worker(run_id: PydanticObjectId) -> None:
         await _ensure_running(run_id)
         await _fetch_stage(run, rows, check)
         await _ensure_running(run_id)
-        await _extract_stage(run, rows, user, check)
+        with ai_usage.usage_scope(user_id=run.userId, ref_id=run_id):  # extraction tasks inherit the scope
+            await _extract_stage(run, rows, user, check)
         await _ensure_running(run_id)
         if run.phase == "screen":
             if not run.autoStart:  # wait for the user to pick profiles per location group (POST /start)

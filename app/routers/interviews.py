@@ -11,6 +11,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
+from app import ai_usage
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
@@ -1266,6 +1267,10 @@ async def analyze_interviews(
             if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
                 rollup_kwargs["reasoning"] = {"effort": settings.AI_REASONING_EFFORT}
             rollup_res = await client.responses.create(**rollup_kwargs)
+            await ai_usage.record(
+                provider="openai", model=settings.RESUME_OPENAI_MODEL, usage=ai_usage.openai_usage(rollup_res),
+                feature="interview_analyze", user_id=user.id,
+            )
             rollup_raw = rollup_res.output_text or ""
             rollup_parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", rollup_raw.strip(), flags=re.MULTILINE))
         except Exception as exc:  # noqa: BLE001
@@ -1399,6 +1404,10 @@ async def analyze_chat(
         completion = await client.chat.completions.create(**chat_kwargs)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc))
+    await ai_usage.record(
+        provider="openai", model=settings.RESUME_OPENAI_MODEL, usage=ai_usage.openai_usage(completion),
+        feature="analyze_chat", user_id=user.id,
+    )
 
     choice = completion.choices[0] if completion.choices else None
     reply = (choice.message.content if choice and choice.message else "") or ""

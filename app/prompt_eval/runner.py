@@ -17,6 +17,7 @@ from typing import Optional
 from beanie import PydanticObjectId
 from beanie.odm.utils.encoder import Encoder
 
+from app import ai_usage
 from app.config import get_settings
 from app.models import Account, EvalJobDescription, ResumePromptEval, UserExtra
 from app.models.prompt_eval import EVAL_ROLES, EvalRow, RoleScore
@@ -140,9 +141,10 @@ async def _run_row(
         row.status = "generating"
         await _persist_row(run.id, index, row)
 
-        html, gen = await generate_resume_html(
-            account, jd_text, prompt_body=run.promptBody or None, owner=owner, model_id=run.resumeModelId,
-        )
+        with ai_usage.usage_scope(user_id=run.userId, feature="eval_resume", ref_id=run.id):
+            html, gen = await generate_resume_html(
+                account, jd_text, prompt_body=run.promptBody or None, owner=owner, model_id=run.resumeModelId,
+            )
         row.genModelId = gen.model_id or None
         row.genProvider = gen.provider
         row.genModel = gen.model
@@ -156,9 +158,11 @@ async def _run_row(
         row.status = "judging"
         await _persist_row(run.id, index, row)
 
-        verdict, jr = await judge_resume(
-            resume_text=row.resumeText, job_description=jd_text, role=row.role, user=owner, model_id=run.judgeModelId,
-        )
+        with ai_usage.usage_scope(user_id=run.userId, feature="eval_judge", ref_id=run.id):
+            verdict, jr = await judge_resume(
+                resume_text=row.resumeText, job_description=jd_text, role=row.role, user=owner,
+                model_id=run.judgeModelId,
+            )
         row.judgeModelId = jr.model_id or None
         row.judgeProvider = jr.provider
         row.judgeModel = jr.model

@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, Field
 
+from app import ai_usage
 from app.config import get_settings
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK, STAGE_LABELS
 from app.deps import get_current_user
@@ -210,6 +211,11 @@ async def stream_ai_review(
         except Exception as exc:
             yield _sse({"message": str(exc)}, event="error")
             return
+        await ai_usage.record(
+            provider="openai", model=model_name,
+            usage={"input": prompt_tokens, "output": completion_tokens},
+            feature="ai_review", user_id=user.id,
+        )
 
         run = AiReviewRun(
             interviewIds=iv_oids,
@@ -409,6 +415,10 @@ async def interview_chat(
         )
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    await ai_usage.record(
+        provider="openai", model=model_name, usage=ai_usage.openai_usage(completion),
+        feature="interview_chat", user_id=user.id, ref_id=oid,
+    )
 
     choice = completion.choices[0] if completion.choices else None
     reply = (choice.message.content if choice and choice.message else "") or ""

@@ -32,6 +32,7 @@ STALE_INDEXES: dict[str, list[str]] = {
 from app.models import (
     Account,
     AiReviewRun,
+    AiUsageEvent,
     AnalyzeChatLog,
     Bid,
     BidReport,
@@ -97,6 +98,7 @@ DOCUMENT_MODELS = [
     Bid,
     EvalJobDescription,
     ResumePromptEval,
+    AiUsageEvent,
 ]
 
 

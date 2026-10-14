@@ -244,6 +244,20 @@ def usage_cost(spec: ModelSpec, usage: dict) -> float:
     ) / 1_000_000
 
 
+_BY_API_MODEL = {s.api_model: s for s in _SPECS}
+
+
+def spec_for_api_model(api_model: Optional[str]) -> Optional[ModelSpec]:
+    """The catalog entry for a bare provider model name (e.g. "gpt-4o-mini"), configured or not."""
+    return _BY_API_MODEL.get((api_model or "").strip())
+
+
+def api_model_cost(api_model: Optional[str], usage: dict) -> Optional[float]:
+    """USD for `usage` on a model named by its API name; None when the catalog has no price for it."""
+    spec = spec_for_api_model(api_model)
+    return usage_cost(spec, usage) if spec is not None else None
+
+
 def estimate_call_cost(spec: ModelSpec, task: Task) -> float:
     tokens_in, tokens_out = TASK_TOKEN_PROFILE[task]
     return usage_cost(spec, {"input": tokens_in, "output": tokens_out})

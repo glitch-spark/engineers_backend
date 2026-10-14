@@ -16,6 +16,7 @@ from app.job_apply import worker as job_apply_worker
 from app.routers import (
     accounts,
     ai_review,
+    ai_usage,
     auth as auth_router,
     bidder_ext,
     bidders,
@@ -114,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(global_prompt.router)
     app.include_router(interview_prep.router)
     app.include_router(ai_review.router)
+    app.include_router(ai_usage.router)
     app.include_router(metrics.router)
     app.include_router(dashboard.router)
     app.include_router(reports.router)

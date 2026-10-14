@@ -16,6 +16,7 @@ import logging
 import re
 from typing import List, Optional
 
+from app import ai_usage
 from app.config import get_settings
 from app.models import Interview, InterviewQuestion
 
@@ -100,6 +101,10 @@ async def extract_and_score(interview: Interview, stage_id: Optional[str] = None
             model=settings.EXTRACTION_MODEL,
             input=extract_prompt,
         )
+        await ai_usage.record(
+            provider="openai", model=settings.EXTRACTION_MODEL, usage=ai_usage.openai_usage(ext_res),
+            feature="interview_extract", user_id=interview.createdBy, ref_id=interview.id,
+        )
         ext_raw = ext_res.output_text or ""
     except Exception as exc:  # noqa: BLE001
         log.exception("extract failed for interview %s: %s", interview.id, exc)
@@ -141,6 +146,10 @@ async def extract_and_score(interview: Interview, stage_id: Optional[str] = None
         if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
             sc_kwargs["reasoning"] = {"effort": "minimal"}
         sc_res = await client.responses.create(**sc_kwargs)
+        await ai_usage.record(
+            provider="openai", model=settings.RESUME_OPENAI_MODEL, usage=ai_usage.openai_usage(sc_res),
+            feature="interview_score", user_id=interview.createdBy, ref_id=interview.id,
+        )
         sc_raw = sc_res.output_text or ""
         sc_parsed = json.loads(_strip_fences(sc_raw))
         scores_by_i = {
