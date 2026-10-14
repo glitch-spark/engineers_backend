@@ -110,3 +110,18 @@ def test_openai_usage_reads_responses_and_chat_shapes():
     assert ai_usage.openai_usage(responses) == {"input": 7, "output": 5, "reasoning": 2}
     assert ai_usage.openai_usage(chat) == {"input": 3, "output": 4}
     assert ai_usage.openai_usage(SimpleNamespace(usage=None)) == {}
+
+
+async def test_truncated_anthropic_output_is_recorded_from_the_exception(db, monkeypatch):
+    from app.llm_anthropic import OutputTruncated
+
+    truncated = OutputTruncated("cut off")
+    truncated.usage = {"input": 100, "output": 16000}
+    script(monkeypatch, {
+        "anthropic:claude-haiku-4-5": truncated,
+        "anthropic:claude-sonnet-5-5": ("good", USAGE),
+    })
+    await llm_router.complete("resume", "p", None, model_id="anthropic:claude-haiku-4-5")
+    first, second = await events()
+    assert (first.model, first.ok, first.outputTokens) == ("claude-haiku-4-5", False, 16000)
+    assert (second.model, second.ok) == ("claude-sonnet-5-5", True)

@@ -123,3 +123,34 @@ async def test_dry_run_writes_nothing(db):
     summary = await backfill(db, until=UNTIL, dry_run=True)
     assert summary["events"] == 1 and summary["costUsd"] == pytest.approx(0.05)
     assert await ledger(db) == []
+
+
+async def test_until_defaults_to_the_first_live_event_and_cannot_pass_it(db):
+    first_live = datetime(2026, 10, 14, 10)
+    await db.ai_usage_events.insert_one({"createdAt": first_live, "feature": "resume", "source": "live"})
+    await job(db, estimatedCostUsd=0.05, coverLetterLlmModel="gpt-5.6-sol", coverLetterText="Dear")
+    await job(db, createdAt=datetime(2026, 10, 14, 11), estimatedCostUsd=9.0)  # after live recording began
+    summary = await backfill(db)
+    assert summary["until"] == first_live and summary["events"] == 1
+    with pytest.raises(ValueError, match="live"):
+        await backfill(db, until=datetime(2026, 10, 14, 12))
+
+
+async def test_without_live_events_until_is_required(db):
+    with pytest.raises(ValueError, match="--until"):
+        await backfill(db)
+
+
+async def test_jobs_and_evals_that_ran_after_until_are_left_to_the_live_ledger(db):
+    late = datetime(2026, 10, 14, 13)
+    letter = {"coverLetterLlmModel": "gpt-5.6-sol", "coverLetterText": "Dear"}
+    await job(db, estimatedCostUsd=0.01, status="completed", completedAt=DAY, **letter)
+    await job(db, estimatedCostUsd=0.02, status="completed", completedAt=late, **letter)  # queued across the deploy
+    await job(db, estimatedCostUsd=0.04, status="in_progress", **letter)                  # still running
+    await job(db, estimatedCostUsd=0.08, status="failed", **letter)                       # finished, no completedAt
+    row = {"genModel": "claude-sonnet-5-5", "genInputTokens": 100, "genOutputTokens": 50, "genCostUsd": 0.5}
+    await db.resume_prompt_evals.insert_one({"createdAt": DAY, "status": "done", "finishedAt": late, "rows": [row]})
+    await db.resume_prompt_evals.insert_one({"createdAt": DAY, "status": "running", "rows": [row]})
+    summary = await backfill(db, until=UNTIL)
+    assert summary["byFeature"]["cover_letter"]["costUsd"] == pytest.approx(0.09)
+    assert "eval_resume" not in summary["byFeature"]

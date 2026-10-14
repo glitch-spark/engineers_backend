@@ -131,3 +131,12 @@ async def test_no_workspace_header_when_not_configured(monkeypatch, key):
     )
     await llm_anthropic.anthropic_complete("claude-sonnet-5-5", "p")
     assert "default_headers" not in calls[0]["client_kwargs"]
+
+
+async def test_rejected_outputs_carry_their_billed_usage(monkeypatch, key):
+    for stop_reason, exc_type in (("max_tokens", llm_anthropic.OutputTruncated), ("refusal", llm_anthropic.ModelRefused)):
+        message = msg([SimpleNamespace(type="text", text="cut")], stop_reason=stop_reason, usage=(100, 16000))
+        monkeypatch.setattr(llm_anthropic, "AsyncAnthropic", make_client(message, []))
+        with pytest.raises(exc_type) as info:
+            await llm_anthropic.anthropic_complete("claude-opus-5-5", "p")
+        assert info.value.usage == {"input": 100, "output": 16000}

@@ -183,6 +183,7 @@ async def complete(
             last_exc = exc
             first_reason = first_reason or _failure_reason(spec, exc)
             log.warning("%s via %s failed: %s", task, spec.id, exc)
+            usage = usage or getattr(exc, "usage", None)  # truncated / refused responses carry theirs
             if usage is not None:  # answered but rejected: the tokens were still paid for
                 await ai_usage.record(
                     provider=spec.provider, model=spec.api_model, usage=usage, feature=task,

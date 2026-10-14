@@ -146,3 +146,26 @@ async def test_two_days_still_bucket_by_hour_and_bucket_can_be_forced(db):
 async def test_bad_ranges_are_422(db, params):
     root = await make_user("Root", "admin")
     assert (await get(root, params)).status_code == 422
+
+
+async def test_z_suffix_parses_without_python_311_fromisoformat(db, monkeypatch):
+    """The production image runs Python 3.10, whose fromisoformat rejects a trailing "Z"."""
+    from app.routers import ai_usage as router_mod
+
+    class Py310Datetime(datetime):
+        @classmethod
+        def fromisoformat(cls, value):
+            if value.endswith("Z"):
+                raise ValueError(f"Invalid isoformat string: {value!r}")
+            return super().fromisoformat(value)
+
+    monkeypatch.setattr(router_mod, "datetime", Py310Datetime)
+    root = await make_user("Root", "admin")
+    assert (await get(root, OCT14)).status_code == 200
+
+
+async def test_a_local_year_across_dst_is_accepted(db):
+    # Nov 1 2025 -> Nov 1 2026 local in New York is 366 days and one hour of UTC.
+    root = await make_user("Root", "admin")
+    params = {"from": "2025-11-01T04:00:00.000Z", "to": "2026-11-02T05:00:00.000Z", "tz": "America/New_York"}
+    assert (await get(root, params)).status_code == 200

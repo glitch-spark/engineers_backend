@@ -11,14 +11,15 @@ Sources and how each is attributed:
   - aireviewruns, analyzechatlogs, interviewchatlogs: priced from their stored tokens.
 Job-posting extraction and interview analysis stored nothing, so their history can't be rebuilt.
 
-Every event is dated at its source record's createdAt and marked source="backfill". Only records created
-before --until (the deploy time of the live ledger) are used, and existing backfill events in the window are
-deleted first, so the script can be rerun.
+Every event is dated at its source record's createdAt and marked source="backfill". --until defaults to the
+first live ledger event and can't be later than it; jobs and eval runs count only if they finished before it
+(ones that ran after were recorded live). Existing backfill events in the window are deleted first, so the
+script can be rerun. Interview-chat history misses each chat's opening brief, which was never logged.
 
 Run:
     cd engineers_backend
-    .venv/Scripts/python -m scripts.backfill_ai_usage --until 2026-10-15T12:00:00Z --dry-run
-    .venv/Scripts/python -m scripts.backfill_ai_usage --until 2026-10-15T12:00:00Z
+    .venv/Scripts/python -m scripts.backfill_ai_usage --dry-run
+    .venv/Scripts/python -m scripts.backfill_ai_usage
 """
 
 from __future__ import annotations
@@ -131,9 +132,19 @@ async def build_events(db, until: datetime, since: Optional[datetime] = None) ->
     if since is not None:
         window["$gte"] = since
     events: list[dict] = []
-    async for job in db.resumeapplications.find({"createdAt": window}, _JOB_FIELDS):
+    # Jobs / eval runs count only when they finished before `until`: one queued across the deploy ran with
+    # live recording on, and one still running will be recorded live as it goes.
+    jobs = {"createdAt": window, "$or": [
+        {"completedAt": {"$lt": until}},
+        {"completedAt": None, "status": {"$nin": ["queued", "in_progress"]}},
+    ]}
+    async for job in db.resumeapplications.find(jobs, _JOB_FIELDS):
         events.extend(_job_events(job))
-    async for run in db.resume_prompt_evals.find({"createdAt": window}, _EVAL_FIELDS):
+    runs = {"createdAt": window, "$or": [
+        {"finishedAt": {"$lt": until}},
+        {"finishedAt": None, "status": {"$ne": "running"}},
+    ]}
+    async for run in db.resume_prompt_evals.find(runs, _EVAL_FIELDS):
         events.extend(_eval_events(run))
     for coll, feature, user_key, ref_key in _CHAT_SOURCES:
         fields = {k: 1 for k in ("createdAt", "model", "promptTokens", "completionTokens", user_key)}
@@ -162,7 +173,26 @@ def summarize(events: list[dict]) -> dict:
     }
 
 
-async def backfill(db, until: datetime, since: Optional[datetime] = None, dry_run: bool = False) -> dict:
+async def _first_live(db) -> Optional[datetime]:
+    first = await db.ai_usage_events.find({"source": "live"}).sort([("createdAt", 1)]).limit(1).to_list(length=1)
+    return first[0]["createdAt"] if first else None
+
+
+async def backfill(
+    db, until: Optional[datetime] = None, since: Optional[datetime] = None, dry_run: bool = False
+) -> dict:
+    """`until` defaults to the first live ledger event, and may not be later than it (that span would be
+    counted twice)."""
+    first_live = await _first_live(db)
+    if until is None:
+        if first_live is None:
+            raise ValueError("no live usage events yet: pass --until (when live recording was deployed)")
+        until = first_live
+    elif first_live is not None and until > first_live:
+        raise ValueError(
+            f"--until {until.isoformat()}Z is after the first live event ({first_live.isoformat()}Z): "
+            "records in between would be counted twice"
+        )
     events = await build_events(db, until, since)
     if not dry_run:
         window: dict = {"$lt": until}
@@ -171,17 +201,17 @@ async def backfill(db, until: datetime, since: Optional[datetime] = None, dry_ru
         await db.ai_usage_events.delete_many({"source": "backfill", "createdAt": window})
         for i in range(0, len(events), 1000):
             await db.ai_usage_events.insert_many(events[i:i + 1000])
-    return summarize(events)
+    return {**summarize(events), "until": until}
 
 
 def _instant(raw: str) -> datetime:
-    value = datetime.fromisoformat(raw)
+    value = datetime.fromisoformat(raw.replace("Z", "+00:00"))  # Python 3.10 rejects "Z"
     return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--until", required=True, help="ISO instant the live ledger started (records before it are used)")
+    ap.add_argument("--until", help="ISO instant: use records finished before it (default: the first live event)")
     ap.add_argument("--since", help="ISO instant: only records from here on (default: all history)")
     ap.add_argument("--dry-run", action="store_true", help="print totals without writing")
     args = ap.parse_args()
@@ -191,8 +221,15 @@ async def main() -> int:
     from app.config import get_settings
 
     db = AsyncIOMotorClient(get_settings().MONGODB_URI).get_default_database()
-    summary = await backfill(db, _instant(args.until), _instant(args.since) if args.since else None, args.dry_run)
-    print(f"{'DRY RUN: ' if args.dry_run else ''}{summary['events']} events, ${summary['costUsd']:.2f}")
+    try:
+        summary = await backfill(
+            db, _instant(args.until) if args.until else None, _instant(args.since) if args.since else None, args.dry_run
+        )
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    print(f"{'DRY RUN: ' if args.dry_run else ''}{summary['events']} events before {summary['until'].isoformat()}Z, "
+          f"${summary['costUsd']:.2f}")
     for feature, f in sorted(summary["byFeature"].items(), key=lambda kv: -kv[1]["costUsd"]):
         print(f"  {feature:<16} {f['calls']:>6} calls  ${f['costUsd']:>9.2f}  (estimated ${f['estimatedCostUsd']:.2f})")
     return 0
