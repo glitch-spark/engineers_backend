@@ -10,6 +10,7 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
+from app import ai_usage
 from app.config import get_settings
 from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
@@ -266,18 +267,19 @@ def _add_cost(job: ResumeApplication, cost: Optional[float]) -> None:
         job.estimatedCostUsd = (job.estimatedCostUsd or 0.0) + cost
 
 
-def run_job_doc(job: ResumeApplication):
+async def run_job_doc(job: ResumeApplication) -> None:
     """Run a claimed queue job with the inputs stored on it (used by app/resume_queue.py)."""
-    return _run_job(
-        job_id=job.id,
-        account_id=job.accountId,
-        user_id=job.userId,
-        jd=job.jobDescription,
-        company=job.companyName,
-        questions=list(job.screeningQuestions or []),
-        prompt_body_override=job.promptOverride,
-        generate_cover_letter=bool(job.generateCoverLetter),
-    )
+    with ai_usage.usage_scope(user_id=job.userId, ref_id=job.id):
+        await _run_job(
+            job_id=job.id,
+            account_id=job.accountId,
+            user_id=job.userId,
+            jd=job.jobDescription,
+            company=job.companyName,
+            questions=list(job.screeningQuestions or []),
+            prompt_body_override=job.promptOverride,
+            generate_cover_letter=bool(job.generateCoverLetter),
+        )
 
 
 async def _mark_failed(job: ResumeApplication, message: str, started: float) -> None:
@@ -497,15 +499,16 @@ async def ask_job_screening(
     if not screening_prompt and owner:
         screening_prompt = (owner.screeningPromptBody or "").strip()
 
-    screening_result = await _run_screening(
-        account=account,
-        jd=job.jobDescription or "",
-        questions=questions,
-        screening_prompt=screening_prompt,
-        resume_text=job.plainText or "",
-        owner=owner,
-        model_id=model_id,
-    )
+    with ai_usage.usage_scope(user_id=job.userId, ref_id=job_id):
+        screening_result = await _run_screening(
+            account=account,
+            jd=job.jobDescription or "",
+            questions=questions,
+            screening_prompt=screening_prompt,
+            resume_text=job.plainText or "",
+            owner=owner,
+            model_id=model_id,
+        )
 
     _add_cost(job, screening_result.cost_usd)
     job.screeningLlmProvider = screening_result.llm_provider
@@ -556,15 +559,16 @@ async def regenerate_cover_letter(
     hook = (body.hook or "").strip() if body.hook is not None else (job.coverLetterHook or "")
 
     try:
-        cl = await write_cover_letter(
-            resume_text=job.plainText or "",
-            job_description=job.jobDescription or "",
-            company=job.companyName,
-            prompt_body=prompt_body,
-            user=owner,
-            model_id=model_id,
-            hook=hook or None,
-        )
+        with ai_usage.usage_scope(user_id=job.userId, ref_id=job_id):
+            cl = await write_cover_letter(
+                resume_text=job.plainText or "",
+                job_description=job.jobDescription or "",
+                company=job.companyName,
+                prompt_body=prompt_body,
+                user=owner,
+                model_id=model_id,
+                hook=hook or None,
+            )
     except Exception as exc:  # noqa: BLE001 — surface any provider failure; the job stays as it was
         log.warning("cover-letter regeneration failed for job %s: %s", job_id, exc)
         raise HTTPException(

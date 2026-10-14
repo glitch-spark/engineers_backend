@@ -10,6 +10,7 @@ from typing import Callable, Literal, Optional
 
 from openai import AsyncOpenAI
 
+from app import ai_usage
 from app.config import get_settings
 from app.llm_anthropic import anthropic_complete
 from app.model_catalog import (
@@ -106,8 +107,18 @@ async def complete_with_fallback(
 
     openai_model = _openai_model_for(purpose, settings)
     text, usage = await _openai_responses(prompt, openai_model, temperature=_temperature_for(purpose))
-    if validate:
-        validate(text)
+    try:
+        if validate:
+            validate(text)
+    except Exception:
+        await ai_usage.record(
+            provider="openai", model=openai_model, usage=usage, feature=purpose,
+            user_id=ai_usage.user_id_of(user), ok=False,
+        )
+        raise
+    await ai_usage.record(
+        provider="openai", model=openai_model, usage=usage, feature=purpose, user_id=ai_usage.user_id_of(user),
+    )
     log.info(
         "%s via OpenAI model=%s in=%s out=%s",
         purpose,
@@ -161,6 +172,7 @@ async def complete(
     first_reason: Optional[str] = None
     last_exc: Optional[Exception] = None
     for index, spec in enumerate(chain):
+        usage = None  # set once the provider answered: from then on the call is billed
         try:
             text, usage = await _call_spec(spec, prompt, task, user)
             if not (text or "").strip():
@@ -171,7 +183,16 @@ async def complete(
             last_exc = exc
             first_reason = first_reason or _failure_reason(spec, exc)
             log.warning("%s via %s failed: %s", task, spec.id, exc)
+            if usage is not None:  # answered but rejected: the tokens were still paid for
+                await ai_usage.record(
+                    provider=spec.provider, model=spec.api_model, usage=usage, feature=task,
+                    user_id=ai_usage.user_id_of(user), ok=False, fallback_used=index > 0,
+                )
             continue
+        await ai_usage.record(
+            provider=spec.provider, model=spec.api_model, usage=usage, feature=task,
+            user_id=ai_usage.user_id_of(user), fallback_used=index > 0,
+        )
         log.info(
             "%s via %s in=%s out=%s fallback=%s",
             task, spec.id, usage.get("input", "?"), usage.get("output", "?"), index > 0,
