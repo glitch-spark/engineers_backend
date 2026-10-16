@@ -30,7 +30,12 @@ def _caller(enabled=True):
 
 
 def _day(interviews_self=0, interviews_caller=0, stages=None):
-    return {"self": interviews_self, "caller": interviews_caller, "stages": stages or {"self": {}, "caller": {}}}
+    return {
+        "self": interviews_self,
+        "caller": interviews_caller,
+        "stages": stages or {"self": {}, "caller": {}},
+        "rounds": {"self": {}, "caller": {}},
+    }
 
 
 def _plan(done=None, logged=True):
@@ -52,30 +57,38 @@ def test_split_rounds_caller_is_per_round():
     )
     rounds = split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC)
     assert rounds == [
-        (date(2026, 9, 29), "intro", False),
-        (date(2026, 10, 1), "tech", True),
-        (date(2026, 10, 2), "final", False),
+        (date(2026, 9, 29), "intro", False, "intro"),
+        (date(2026, 10, 1), "tech", True, "tech_round_1"),
+        (date(2026, 10, 2), "final", False, "final"),
+    ]
+
+
+def test_split_rounds_keeps_exact_stage_of_legacy_values():
+    iv = _iv("hiring_manager", datetime(2026, 10, 2, 15), history=[("tech2", datetime(2026, 10, 1, 15))])
+    assert split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC) == [
+        (date(2026, 10, 1), "tech", False, "tech_round_2"),
+        (date(2026, 10, 2), "hiring", False, "cultural"),
     ]
 
 
 def test_split_rounds_latest_round_uses_interview_caller():
     iv = _iv("intro", datetime(2026, 10, 1, 15), caller=_caller())
     assert split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC) == [
-        (date(2026, 10, 1), "intro", True)
+        (date(2026, 10, 1), "intro", True, "intro")
     ]
 
 
 def test_split_rounds_disabled_caller_is_self():
     iv = _iv("intro", datetime(2026, 10, 1, 15), caller=_caller(enabled=False))
     assert split_rounds_by_day(iv, datetime(2026, 9, 28), datetime(2026, 10, 5), UTC) == [
-        (date(2026, 10, 1), "intro", False)
+        (date(2026, 10, 1), "intro", False, "intro")
     ]
 
 
 def test_split_rounds_ny_saturday_late_round_is_saturday():
     iv = _iv("final", datetime(2026, 10, 4, 3, 30))  # Sat 23:30 in New York
     assert split_rounds_by_day(iv, datetime(2026, 9, 28, 4), datetime(2026, 10, 5, 4), NY) == [
-        (date(2026, 10, 3), "final", False)
+        (date(2026, 10, 3), "final", False, "final")
     ]
 
 
@@ -87,7 +100,7 @@ def test_split_rounds_skips_excluded_and_canceled_rounds():
     assert split_rounds_by_day(canceled, *window) == []
     # A rejected round still happened, so it counts (same as the dashboard tiles).
     rejected = _iv("panel", datetime(2026, 10, 1), status="rejected")
-    assert split_rounds_by_day(rejected, *window) == [(date(2026, 10, 1), "panel", False)]
+    assert split_rounds_by_day(rejected, *window) == [(date(2026, 10, 1), "panel", False, "panel")]
 
 
 def test_effective_daily_done_bids_typed_interviews_from_records():
