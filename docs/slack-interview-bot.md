@@ -112,7 +112,7 @@ colons line up. Each daily goal line is its own section, and *Extra* (the note) 
    Bidder  : 167 / 150
 
 2️⃣ Interviews
-   Self    : 2   1 Intro · 1 Tech round 1
+   Self    : 2   Intro(1) · Tech round 1(1)
    Caller  : 0
 
 3️⃣ Caller Collaboration
