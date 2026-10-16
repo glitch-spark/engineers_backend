@@ -165,7 +165,7 @@ async def load_interviews_for_window(user_ids: list, start: datetime, end: datet
 
 
 def split_rounds_by_day(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
-    """(local date, breakdown group, is_caller) for each round held in the window.
+    """(local date, breakdown group, is_caller, stage) for each round held in the window.
 
     Same rules as `count_interview_rounds` (canceled rounds, AI interviews and
     home assessments don't count). A round is a caller round when it has an
@@ -179,5 +179,5 @@ def split_rounds_by_day(iv: Interview, start: datetime, end: datetime, tz) -> li
         if not group:
             continue
         day = _as_aware(dt).astimezone(tz).date()
-        out.append((day, group, bool(caller is not None and getattr(caller, "enabled", False))))
+        out.append((day, group, bool(caller is not None and getattr(caller, "enabled", False)), stage))
     return out

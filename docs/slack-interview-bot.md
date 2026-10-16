@@ -98,8 +98,32 @@ Every change also adds one reply, owner first, ending with `cc @im1 @im2`:
 The manager arranges the caller and comments in the thread; the owner (or an admin) then ticks **Confirmed** on
 the round in the app. The bot does not read thread replies. Deleting the interview deletes its main post.
 
-**Daily Plan** (`SLACK_DAILY_PLAN_CHANNEL_ID`) is edited in place as the plan changes. Its first line is
-`:spiral_note_pad: @owner's *Daily Plan*`.
+**Daily Plan** (`SLACK_DAILY_PLAN_CHANNEL_ID`) is edited in place as the plan changes. The heading and the
+report link sit outside a code block (so the mention and link work); the numbered sections sit inside it so their
+colons line up. Each daily goal line is its own section, and *Extra* (the note) is left out when there is no note:
+
+````
+:spiral_note_pad: @owner · *Daily Plan* · Thu 10/15
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣ Bids
+   Self    : 159 / 150
+             US 94/90 · EU 38/30 · LATAM 27/30
+   Bidder  : 167 / 150
+
+2️⃣ Interviews
+   Self    : 2   1 Intro · 1 Tech round 1
+   Caller  : 0
+
+3️⃣ Caller Collaboration
+   Status  : ✅ Completed
+
+4️⃣ Extra
+   Engineer Daily Standup Update
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+:link: Open Report
+````
 
 ## 5. Reminders
 

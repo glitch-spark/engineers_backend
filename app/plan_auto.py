@@ -20,7 +20,7 @@ from app.models.plan_common import BID_FIELDS, ChecklistItem, Counts, bids_of
 
 
 def empty_day() -> dict:
-    return {"self": 0, "caller": 0, "stages": {"self": {}, "caller": {}}}
+    return {"self": 0, "caller": 0, "stages": {"self": {}, "caller": {}}, "rounds": {"self": {}, "caller": {}}}
 
 
 def _midnight(d: date) -> datetime:
@@ -28,18 +28,23 @@ def _midnight(d: date) -> datetime:
 
 
 async def interview_counts(user_ids: list, start: date, end: date) -> dict:
-    """{userId: {local date: {"self", "caller", "stages": {"self": {...}, "caller": {...}}}}}."""
+    """{userId: {local date: {"self", "caller", "stages": {...}, "rounds": {...}}}}.
+
+    `stages` counts rounds by breakdown group and `rounds` by exact stage, each
+    split into {"self": {...}, "caller": {...}}.
+    """
     tz = app_tz()
     start_utc = local_day_start_utc(start, tz)
     end_utc = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     out: dict = {uid: {} for uid in user_ids}
     for iv in await load_interviews_for_window(user_ids, start_utc, end_utc):
         days = out.setdefault(iv.createdBy, {})
-        for day, group, is_caller in split_rounds_by_day(iv, start_utc, end_utc, tz):
+        for day, group, is_caller, stage in split_rounds_by_day(iv, start_utc, end_utc, tz):
             who = "caller" if is_caller else "self"
             entry = days.setdefault(day, empty_day())
             entry[who] += 1
             entry["stages"][who][group] = entry["stages"][who].get(group, 0) + 1
+            entry["rounds"][who][stage] = entry["rounds"][who].get(stage, 0) + 1
     return out
 
 

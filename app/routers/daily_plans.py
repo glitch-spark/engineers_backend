@@ -67,9 +67,9 @@ async def _find(uid, day: date) -> Optional[DailyPlan]:
     return await DailyPlan.find_one({"userId": uid, "date": _midnight(day)})
 
 
-async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts) -> None:
+async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: dict) -> None:
     """Post or edit the day's follow-up message; remember where it lives."""
-    posted = await sync_daily_plan_message(plan, owner, done=done)
+    posted = await sync_daily_plan_message(plan, owner, done=done, rounds=rounds)
     if posted and posted != (plan.slackChannel, plan.slackTs):
         plan.slackChannel, plan.slackTs = posted
         await plan.save()
@@ -144,7 +144,7 @@ async def put_day(
         await plan.save()
 
     auto_day = (await _interviews(user.id, when, when)).get(when, empty_day())
-    await _sync_slack(plan, user, effective_daily_done(plan, auto_day))
+    await _sync_slack(plan, user, effective_daily_done(plan, auto_day), auto_day["rounds"])
     return _day_out(user.id, when, plan, auto_day, weekly)
 
 

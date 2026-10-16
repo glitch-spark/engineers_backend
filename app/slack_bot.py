@@ -464,53 +464,113 @@ def _text(value: Optional[str], default: str = "—") -> str:
     return _slack_escape((value or "").strip()) or default
 
 
-def _plan_day_label(day: datetime, offset: int = 0, sep: str = "") -> str:
-    """Matches the SPA's planDayLabel, e.g. `9/27(Sun)`, or `9/27 (Sun)` with `sep=" "`."""
-    d = day + timedelta(days=offset)
-    return f"{d.month}/{d.day}{sep}({d.strftime('%a')})"
-
-
 _REGION_LABELS = (("bidsSelfUs", "US"), ("bidsSelfEu", "EU"), ("bidsSelfLatam", "LATAM"))
 
 
-def _self_bids_text(done: Any, goal: Any) -> str:
-    """`self 140/150`, plus the US / EU / LATAM split once one is typed."""
-    text = f"self {done.bidsSelf}/{goal.bidsSelf}"
-    split = [
-        f"{label} {getattr(done, f, 0)}/{getattr(goal, f, 0)}"
-        for f, label in _REGION_LABELS
-    ]
-    if any(getattr(c, f, 0) for c in (done, goal) for f, _ in _REGION_LABELS):
-        text += f" ({' · '.join(split)})"
-    return text
+# Interview stages in pipeline order, labelled as on the Interviews board.
+_ROUND_LABELS = {
+    "intro": "Intro",
+    "tech_round_1": "Tech round 1",
+    "tech_round_2": "Tech round 2",
+    "live_coding": "Live Coding",
+    "system_design": "System Design",
+    "cultural": "Hiring Manager",
+    "panel": "Panel",
+    "final": "Final",
+}
+_ROUND_ORDER = list(_ROUND_LABELS)
+
+_PLAN_DIVIDER = "━" * 30
+_PLAN_INDENT = " " * 3
+_PLAN_VALUE_INDENT = _PLAN_INDENT + " " * 10  # under the value after `Label   : `
 
 
-def daily_plan_text(plan: Any, owner: Optional[UserExtra], done: Any = None) -> str:
-    """The day's follow-up: bids Goal → Done, interviews held, goal lines and notes.
+def _plan_number(n: int) -> str:
+    """Keycap emoji for 1–10 (they render inside a code block), `11.` after that."""
+    if n == 10:
+        return "🔟"
+    return f"{n}️⃣" if n < 10 else f"{n}."
 
-    `done` is the day's Done with interviews from interview records; it
-    defaults to what the plan stores.
+
+def _plan_row(label: str, value: str) -> str:
+    return f"{_PLAN_INDENT}{label:<8}: {value}"
+
+
+def _plan_block_text(value: Optional[str]) -> str:
+    """User text inside the post's code block: escaped, and without backticks
+    that could close the block early."""
+    return _slack_escape((value or "").strip()).replace("`", "ˋ")
+
+
+def _rounds_text(count: int, rounds: Optional[dict]) -> str:
+    """`2   1 Intro · 1 Tech round 1`: rounds held, then by stage in pipeline order."""
+    by_stage = sorted(
+        ((stage, n) for stage, n in (rounds or {}).items() if n),
+        key=lambda s: (_ROUND_ORDER.index(s[0]) if s[0] in _ROUND_LABELS else len(_ROUND_ORDER), s[0]),
+    )
+    if not by_stage:
+        return str(count)
+    stages = " · ".join(f"{n} {_ROUND_LABELS.get(stage) or _stage_label(stage)}" for stage, n in by_stage)
+    return f"{count}   {stages}"
+
+
+def daily_plan_text(
+    plan: Any, owner: Optional[UserExtra], done: Any = None, rounds: Optional[dict] = None
+) -> str:
+    """The day's follow-up: bids Done / Goal, interviews held, goal lines and notes.
+
+    The sections sit in a code block so their colons line up; the heading (with
+    the owner's mention) and the report link stay outside it. `done` is the
+    day's Done with interviews from interview records; it defaults to what the
+    plan stores. `rounds` is {"self": {stage: n}, "caller": {stage: n}}.
     """
     goal = plan.goal
     done = done if done is not None else plan.done
-    lines = [
-        f":spiral_note_pad: {_mention(owner)}'s *Daily Plan*",
-        f"*{_plan_day_label(plan.date, sep=' ')}*",
-        f"Bids: {_self_bids_text(done, goal)} · bidder {done.bidsBidder}/{goal.bidsBidder}",
-        f"Interviews: self {done.interviewsSelf} · caller {done.interviewsCaller}",
-    ]
+    rounds = rounds or {}
+    day = f"{plan.date.strftime('%a')} {plan.date.month}/{plan.date.day}"
+    sections: list[list[str]] = []
+
+    bids = [_plan_row("Self", f"{done.bidsSelf} / {goal.bidsSelf}")]
+    if any(getattr(c, f, 0) for c in (done, goal) for f, _ in _REGION_LABELS):
+        split = " · ".join(f"{label} {getattr(done, f, 0)}/{getattr(goal, f, 0)}" for f, label in _REGION_LABELS)
+        bids.append(f"{_PLAN_VALUE_INDENT}{split}")
+    bids.append(_plan_row("Bidder", f"{done.bidsBidder} / {goal.bidsBidder}"))
+    sections.append(["Bids", *bids])
+
+    sections.append([
+        "Interviews",
+        _plan_row("Self", _rounds_text(done.interviewsSelf, rounds.get("self"))),
+        _plan_row("Caller", _rounds_text(done.interviewsCaller, rounds.get("caller"))),
+    ])
+
     for item in plan.goalItems or []:
-        lines.append(f"{'✓' if item.done else '○'} {_slack_escape(item.text)}")
-    notes = (plan.notes or "").strip()
+        status = "✅ Completed" if item.done else "❌ Not Done"
+        sections.append([_plan_block_text(item.text), _plan_row("Status", status)])
+
+    notes = [line.rstrip() for line in _plan_block_text(plan.notes).splitlines()]
     if notes:
-        lines.append(_slack_escape(notes))
+        sections.append(["Extra", *(f"{_PLAN_INDENT}{line}" if line else "" for line in notes)])
+
+    body: list[str] = []
+    for n, (title, *rows) in enumerate(sections, start=1):
+        if body:
+            body.append("")
+        body += [f"{_plan_number(n)} {title}", *rows]
+
     monday = (plan.date - timedelta(days=plan.date.weekday())).date().isoformat()
-    lines.append(f"<{_frontend_link(f'/report?week={monday}')}|Open Report>")
-    return "\n".join(lines)
+    return "\n".join([
+        f":spiral_note_pad: {_mention(owner)} · *Daily Plan* · {day}",
+        "```",
+        _PLAN_DIVIDER,
+        *body,
+        _PLAN_DIVIDER,
+        "```",
+        f":link: <{_frontend_link(f'/report?week={monday}')}|Open Report>",
+    ])
 
 
 async def sync_daily_plan_message(
-    plan: Any, owner: Optional[UserExtra], done: Any = None
+    plan: Any, owner: Optional[UserExtra], done: Any = None, rounds: Optional[dict] = None
 ) -> Optional[tuple[str, str]]:
     """Post the plan to SLACK_DAILY_PLAN_CHANNEL_ID, or edit the existing post
     in place. Never raises. Returns the live post's (channel, ts), or None when
@@ -519,7 +579,7 @@ async def sync_daily_plan_message(
     try:
         if not slack_bot_configured():
             return None
-        text = daily_plan_text(plan, owner, done=done)
+        text = daily_plan_text(plan, owner, done=done, rounds=rounds)
         channel = (plan.slackChannel or "").strip()
         ts = (plan.slackTs or "").strip()
         if channel and ts:

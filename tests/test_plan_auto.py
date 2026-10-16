@@ -39,6 +39,7 @@ async def test_interview_counts_by_day_self_and_caller(staff_user, staff_user_2)
     assert mine[date(2026, 9, 29)]["stages"]["self"] == {"intro": 1}
     assert mine[date(2026, 10, 1)]["caller"] == 1
     assert mine[date(2026, 10, 1)]["stages"]["caller"] == {"tech": 1}
+    assert mine[date(2026, 10, 1)]["rounds"]["caller"] == {"tech_round_1": 1}
     assert counts[staff_user_2.id][date(2026, 10, 1)]["self"] == 1
 
 
