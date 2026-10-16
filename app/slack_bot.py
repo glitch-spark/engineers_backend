@@ -503,14 +503,14 @@ def _plan_block_text(value: Optional[str]) -> str:
 
 
 def _rounds_text(count: int, rounds: Optional[dict]) -> str:
-    """`2   1 Intro · 1 Tech round 1`: rounds held, then by stage in pipeline order."""
+    """`2   Intro(1) · Tech round 1(1)`: rounds held, then by stage in pipeline order."""
     by_stage = sorted(
         ((stage, n) for stage, n in (rounds or {}).items() if n),
         key=lambda s: (_ROUND_ORDER.index(s[0]) if s[0] in _ROUND_LABELS else len(_ROUND_ORDER), s[0]),
     )
     if not by_stage:
         return str(count)
-    stages = " · ".join(f"{n} {_ROUND_LABELS.get(stage) or _stage_label(stage)}" for stage, n in by_stage)
+    stages = " · ".join(f"{_ROUND_LABELS.get(stage) or _stage_label(stage)}({n})" for stage, n in by_stage)
     return f"{count}   {stages}"
 
 

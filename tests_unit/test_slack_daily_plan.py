@@ -54,8 +54,8 @@ def test_daily_plan_text_follow_up():
         "   Bidder  : 100 / 100",
         "",
         "2️⃣ Interviews",
-        "   Self    : 2   1 Intro · 1 Tech round 1",
-        "   Caller  : 1   1 System Design",
+        "   Self    : 2   Intro(1) · Tech round 1(1)",
+        "   Caller  : 1   System Design(1)",
         "",
         "3️⃣ Seek caller",
         "   Status  : ✅ Completed",
@@ -115,7 +115,7 @@ def test_daily_plan_text_interview_stages_follow_pipeline_order():
     done = Counts(interviewsSelf=7)
     rounds = {"self": {"final": 1, "cultural": 2, "tech_round_2": 1, "live_coding": 1, "intro": 1, "panel": 1}}
     text = daily_plan_text(_plan(), _owner(), done=done, rounds=rounds)
-    assert "   Self    : 7   1 Intro · 1 Tech round 2 · 1 Live Coding · 2 Hiring Manager · 1 Panel · 1 Final" in text
+    assert "   Self    : 7   Intro(1) · Tech round 2(1) · Live Coding(1) · Hiring Manager(2) · Panel(1) · Final(1)" in text
 
 
 def test_daily_plan_text_multiline_note_is_indented():
