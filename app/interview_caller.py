@@ -20,6 +20,9 @@ class CallerIn(BaseModel):
     # reader their own time).
     enabled: bool = False
     callerName: Optional[str] = None
+    # From the caller list; "" = not assigned. The router resolves it and sets callerName. When both are left
+    # out, the round keeps the caller it has.
+    callerId: Optional[str] = None
     method: Optional[str] = None
     methodValue: Optional[str] = None
 
@@ -51,9 +54,14 @@ def build_round_caller(
     if method is not None and method not in CALLER_METHODS:
         raise CallerError("invalid caller method")
 
+    if body.callerId is None and body.callerName is None and previous is not None:
+        caller_id, name = previous.callerId, previous.callerName
+    else:
+        caller_id, name = (body.callerId or None), (body.callerName or "").strip() or "TBD"
     return InterviewCaller(
         enabled=True,
-        callerName=(body.callerName or "").strip() or "TBD",
+        callerName=name,
+        callerId=caller_id,
         startsAt=_as_utc(starts_at),
         method=method,
         methodValue=(body.methodValue or "").strip(),
