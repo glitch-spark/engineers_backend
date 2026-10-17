@@ -8,6 +8,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from app.job_apply.schema import GateResult, JobExtraction, Location  # noqa: E402
 from app.job_apply.screening import (  # noqa: E402
     APPROVABLE,
+    BUCKETS,
     WORTH,
     bucket,
     build_report,
@@ -73,6 +74,22 @@ def test_approved_job_is_worth_applying():
                   verified=False) == "valid"
 
 
+def test_invalid_role_overrules_checks_and_approval():
+    # a person moved it out of Worth applying: it stays in Invalid role whatever the checks say, even if approved
+    def inv(**kw):
+        return bucket(status="extracted", status_reason=None, gates=gates(), group_key="GB", marked_invalid=True, **kw)
+
+    assert inv(force_include=False) == "invalid_role"
+    assert inv(force_include=True) == "invalid_role"
+    assert bucket(status="excluded", status_reason=None, gates=gates(remote="fail"), group_key="GB",
+                  force_include=True, marked_invalid=True) == "invalid_role"
+
+
+def test_invalid_role_bucket_sits_after_clearance():
+    assert BUCKETS[BUCKETS.index("clearance") + 1] == "invalid_role"
+    assert "invalid_role" not in APPROVABLE and "invalid_role" not in WORTH
+
+
 def test_approval_needs_a_description_to_work_on():
     # no readable posting yet (fetch / read failed, or not a job page): approval changes nothing until the
     # description is pasted in Job info and the job is read again
@@ -119,7 +136,7 @@ class _Row:
         self.postedDate = posted
         self.status, self.statusReason = status, None
         self.gates, self.screen, self.groupKey, self.forceInclude = [], None, "GB", False
-        self.jdStructured = None
+        self.jdStructured, self.markedInvalid = None, False
 
 
 def test_rescreen_max_age():
@@ -128,6 +145,13 @@ def test_rescreen_max_age():
     assert row.status == "extracted" and row.screen == "valid" and row.statusReason is None
     rescreen(row, run_date=RUN, max_age_days=30)
     assert row.status == "excluded" and row.screen == "too_old" and "posted 40 days ago" in row.statusReason
+
+
+def test_rescreen_keeps_a_job_in_invalid_role():
+    row = _Row(RUN - timedelta(days=5))
+    row.markedInvalid = True
+    rescreen(row, run_date=RUN, max_age_days=60)
+    assert row.screen == "invalid_role"
 
 
 def test_rescreen_leaves_scored_and_failed_status():
@@ -177,7 +201,7 @@ def test_build_report():
     )
     # a Needs-a-check job isn't worth applying to (or scored) until a person approves it
     assert rep["total"] == 8 and rep["worth"] == 2 and rep["check"] == 1 and rep["maxAgeDays"] == 30
-    assert rep["buckets"]["closed"] == 1 and rep["buckets"]["other_location"] == 3 and len(rep["buckets"]) == 10
+    assert rep["buckets"]["closed"] == 1 and rep["buckets"]["other_location"] == 3 and len(rep["buckets"]) == 11
     # the three target markets always show, then "not stated" when it has jobs; a Worldwide job is in every market
     assert rep["groups"] == [
         {"key": "US", "jobs": 1, "fits": ["a"]},
