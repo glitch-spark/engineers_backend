@@ -73,19 +73,21 @@ Drives which fields the resume LLM rewrites (and how). One prompt per role; Job 
 Column order: … Profile · Sample resumes (.pdf) · HTML template · **Prompt** · Tailored.
 
 ```
-│ HTML template        │ Prompt                                            │ Tailored        │
-│ ⧉ Blake modern.html  │ [ DevOps            ▾]  Suggested                  │ [✨ Tailor]      │
-│                      │ Kubernetes · Terraform · AWS · Helm · CI/CD · Go  │                 │
-│ ⧉ Two-column.html    │ Default                                           │ ✨ Tailored 88   │
-│                      │                                                   │                 │
+│ Job                                          │ … │ HTML template       │ Prompt                    │ Tailored       │
+│ Senior DevOps Engineer                       │   │ ⧉ Blake modern.html │ [ DevOps        ▾]        │ [✨ Tailor]     │
+│ Acme  open ↗  📄                             │   │                     │ Suggested                 │                │
+│ [DevOps] Kubernetes · Terraform · AWS · Helm │   │ ⧉ Two-column.html   │ Default                   │ ✨ Tailored 88  │
+│          CI/CD · Go · Python                 │   │                     │                           │                │
 ```
 
-- **Select** of the profile's prompts (name; role in grey after it), value = the user's choice for this job × profile,
-  else the suggestion. Changing it saves immediately (spinner in the cell; toast on error, value restored).
-- **"Suggested"** tag when the value is the suggestion. Choosing the suggested prompt again clears the user's choice.
-- **Keyword marks**: up to **7** small chips of the main-stack skills that matched (required/core first), wrapping to a
-  second line if needed. Hover on the tag/chips: "DevOps job — title says DevOps; skills Kubernetes, Terraform, …".
-  No role match → no chips, the default is selected, tag reads "Default".
+- **Job cell marks** (once per job, under the company line): the job's detected **role** tag (e.g. `DevOps`) and up
+  to **7** small chips of the main-stack skills that matched (required/core first), wrapping to a second line if
+  needed. Hover: "DevOps job — title says DevOps; skills Kubernetes, Terraform, …". No role match → no role tag; the
+  top required/core skills still show as chips.
+- **Prompt cell**: a select of the profile's prompts (name; role in grey after it), value = the user's choice for this
+  job × profile, else the suggestion. Changing it saves immediately (spinner in the cell; toast on error, value
+  restored). Under it a **"Suggested"** tag when the value is the suggestion (hover: "Matches the DevOps job"), or
+  "Default" when no prompt matches the job's role. Choosing the suggested prompt again clears the user's choice.
 - **One prompt** on the profile → its name as plain text (no select), no tag.
 - The **Tailored** chip's tooltip adds "Tailored with <prompt name>".
 - The bulk **Tailor resumes** dialog gets one line: "Each job uses the prompt selected in its Prompt column."
@@ -128,7 +130,8 @@ defaultPromptId: Optional[str] = None
 - `PUT /accounts/{id}` ← accepts `resumePrompts` + `defaultPromptId` (whole list); returns the saved list with ids.
 - Job Applies run (`_run_out(with_profiles=True)`) → each profile adds `prompts: [{id, name, role}]` and
   `defaultPromptId`.
-- Job Applies row summary → `prompt: {accountId: {suggestedId, chosenId, role, marks: [str]}}`.
+- Job Applies row summary → `jobRole: {role, marks: [str]}` (once per job) and `prompt: {accountId: {suggestedId,
+  chosenId}}`.
 - `PUT /job-applies/rows/{id}/prompt` ← `{accountId, promptId}`; choosing the suggestion clears the choice. Returns the
   row summary.
 
@@ -144,8 +147,9 @@ defaultPromptId: Optional[str] = None
 - Score per role = title hits × 3 + skill hits from `extraction.terms` (required/core × 2, other tiers × 1), each
   keyword once. The job's role is the top score if ≥ 2 (a title hit alone qualifies); a tie goes to the role named in
   the title, else no role.
-- **Marks**: up to 7 matched skill keywords for that role (role words that only appear in the title are left out),
-  required/core first, in the job's own spelling.
+- **Marks** (shown in the Job cell): up to 7 main-stack skills — the matched keywords for that role first, then other
+  required/core skills — in the job's own spelling; role words that only appear in the title are left out. With no
+  role, the top required/core skills.
 - **Pick**: the profile's prompts with that role → the default if among them, else the most recently updated; no role
   or no match → the default.
 - Computed per request from `row.title` and `row.extraction` (list projection adds `extraction.title`,
@@ -165,7 +169,7 @@ defaultPromptId: Optional[str] = None
 
 - Frontend: `tsc -b --noEmit`; headless-browser checks with a mocked backend — profile prompt tabs (add, rename, role,
   default, delete rules, validation, unsaved •, 70/30 and stacked layouts) and the Prompt column (suggested value,
-  marks ≤ 7, change → saved, one-prompt plain text, tailor uses it).
+  Job-cell role tag + marks ≤ 7, change → saved, one-prompt plain text, tailor uses it).
 - Backend (written first, mongomock): prompt save / validation / lazy migration / `resumePromptBody` sync both ways;
   suggestion (title, skills, ties, no role → default, marks order and limit); row `prompt` summary; choice save /
   clear / deleted-prompt fallback; `run.profiles[].prompts`; tailoring puts the chosen body in `promptOverride` with
