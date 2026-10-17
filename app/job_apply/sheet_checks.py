@@ -11,7 +11,7 @@ CHECKS_HEADER = [
 STATUS_LABEL = {  # same words as the app's screening report
     "valid": "Worth applying", "check": "Needs a check", "closed": "Closed", "not_fetched": "Not fetched",
     "read_failed": "Couldn't read", "not_job": "Not a job page", "clearance": "Clearance required",
-    "onsite": "On-site / hybrid", "too_old": "Too old", "other_location": "Other locations",
+    "invalid_role": "Invalid role", "onsite": "On-site / hybrid", "too_old": "Too old", "other_location": "Other locations",
 }
 WORK_MODE = {"remote": "Remote", "hybrid": "Hybrid", "onsite": "On-site", "unknown": "Not stated"}
 

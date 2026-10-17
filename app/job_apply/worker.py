@@ -28,7 +28,8 @@ from app.job_apply.scoring import build_idf
 from app.job_apply.sections import substantive_text
 from app.models.account import Account
 from app.models.job_apply import (
-    CACHE_DAYS, JobApplyRow, JobApplyRun, JobApproval, JobExtractionCache, JobInfo, JobPostingCache, ProfileGates,
+    CACHE_DAYS, JobApplyRow, JobApplyRun, JobApproval, JobExtractionCache, JobInfo, JobInvalidRole, JobPostingCache,
+    ProfileGates,
 )
 from app.models.user_extra import UserExtra
 
@@ -88,7 +89,7 @@ def _screen(row: JobApplyRow) -> None:
         status=row.status, status_reason=row.statusReason, gates=row.gates or [],
         group_key=row.groupKey, force_include=row.forceInclude,
         is_job=row.extraction.isJobPosting if row.extraction is not None else True,
-        verified=row.jdStructured is not False,
+        verified=row.jdStructured is not False, marked_invalid=row.markedInvalid,
     )
 
 
@@ -121,7 +122,7 @@ _FETCH_FIELDS = (
 )
 _EXTRACT_FIELDS = (
     "extraction", "extractionSource", "gates", "postedDate", "title", "company", "status", "statusReason", "screen", "groupKey",
-    "infoAt", "forceInclude",
+    "infoAt", "forceInclude", "markedInvalid",
 )
 _SCORE_FIELDS = ("scores", "profileGates", "bestByProfile", "topScore", "tailorOnly", "scoredAt", "status")
 
@@ -301,6 +302,8 @@ async def _extract_one(row: JobApplyRow, run: JobApplyRun, user: Optional[UserEx
     row.company = row.company or ex.company
     if not row.forceInclude and row.url and await JobApproval.find_one(JobApproval.url == row.url):
         row.forceInclude = True  # someone approved this link into Worth applying
+    if not row.markedInvalid and row.url and await JobInvalidRole.find_one(JobInvalidRole.url == row.url):
+        row.markedInvalid = True  # someone moved this link to Invalid role
     if blocked(gates):
         row.status, row.statusReason = "excluded", failing_reasons(gates)
     else:
@@ -465,9 +468,9 @@ async def reapply_info(run: JobApplyRun, row: JobApplyRow) -> None:
 
 
 async def sync_corrections(run: JobApplyRun) -> int:
-    """Re-read the rows of a finished run whose URL was corrected or approved after they were read, so a person with
-    the run already open sees other people's corrections and approvals. Rows already applied to are left alone.
-    Returns how many changed."""
+    """Re-read the rows of a finished run whose URL was corrected, approved or moved to Invalid role after they were
+    read, so a person with the run already open sees other people's corrections and approvals. Rows already applied
+    to are left alone. Returns how many changed."""
     key = str(run.id)
     if run.status in ("queued", "running") or key in _syncing:
         return 0
@@ -479,11 +482,13 @@ async def sync_corrections(run: JobApplyRun) -> int:
             return 0
         infos = {i.url: i for i in await JobInfo.find({"url": {"$in": urls}}).to_list()}
         approved = {a.url for a in await JobApproval.find({"url": {"$in": urls}}).to_list()}
+        invalid = {m.url for m in await JobInvalidRole.find({"url": {"$in": urls}}).to_list()}
         stale = [
             r for r in rows
             if not r.appliedResumes and r.status not in ("pending", "fetched") and (
                 (r.url in infos and not same_time(r.infoAt, infos[r.url].editedAt))
                 or (r.url in approved and not r.forceInclude and r.jdText)
+                or (r.url in invalid and not r.markedInvalid and r.jdText)
             )
         ]
         if not stale:

@@ -1,14 +1,16 @@
 """Job Applies: upload a sheet of job postings, score selected resumes, suggest one resume per profile."""
 import asyncio
+import base64
 import json
 import logging
+import os
 from datetime import date, datetime, timezone
 from typing import Annotated, Any, Optional
 
 import httpx
 from pymongo import UpdateOne
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
@@ -21,6 +23,7 @@ from app.job_apply.screening import (
     APPROVABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen, scoring_key,
 )
 from app.job_apply.resume_parse import health
+from app.job_apply.scoring import band as score_band
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
 from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, WorkAuth, WorkMode
@@ -32,11 +35,13 @@ from app.models.job_apply import (
     JobApplyRun,
     JobInfo,
     JobApproval,
+    JobInvalidRole,
     ProfileGates,
     RunCounts,
     RunSelection,
 )
 from app.routers._util import doc_to_dict, require_model, to_object_id
+from app.routers.resume import _build_zip, _safe_folder
 
 log = logging.getLogger(__name__)
 
@@ -80,9 +85,7 @@ async def _run_tailored_ids(run: JobApplyRun) -> list:
 
 
 async def _suggested_count(run: JobApplyRun) -> int:
-    return await JobApplyRow.find(
-        {"runId": run.id, "$or": [{"topScore": {"$gte": run.threshold}}, {"tailorOnly.0": {"$exists": True}}]}
-    ).count()
+    return await JobApplyRow.find(await _rows_query(run, view="suggested")).count()
 
 
 async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
@@ -166,11 +169,12 @@ class _RowListView(BaseModel):
     screen: Optional[str] = None
     groupKey: Optional[str] = None
     forceInclude: bool = False
+    markedInvalid: bool = False
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
-            "screen": 1, "groupKey": 1, "forceInclude": 1,
+            "screen": 1, "groupKey": 1, "forceInclude": 1, "markedInvalid": 1,
             "jdSource": 1, "jdStructured": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
             "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
@@ -238,11 +242,16 @@ def _row_summary(
     tailored_docs: Optional[dict[str, dict]] = None,
 ) -> dict:
     ex = row.extraction
-    suggestions = [
-        _suggestion(s) for s in row.bestByProfile
-        if s.total >= threshold and (not account_id or s.accountId == account_id)
+    # Every profile's best uploaded resume, even below the minimum score: the app shows it next to Tailor.
+    suggestions = [_suggestion(s) for s in row.bestByProfile if not account_id or s.accountId == account_id]
+    marks = _applied_marks(row, [s for s in suggestions if s["total"] >= threshold])
+    # Every uploaded resume's score, best first within each profile (a profile can have several template resumes).
+    resume_scores = [
+        {"accountId": s.accountId, "resumeId": s.resumeId, "filename": s.filename, "total": s.total,
+         "band": score_band(s.total)}
+        for s in sorted(row.scores, key=lambda s: -s.total)
+        if not account_id or s.accountId == account_id
     ]
-    marks = _applied_marks(row, suggestions)
     uploaded = {s.accountId: s.total for s in row.bestByProfile}
     tailored = (_tailored_out((tailored_docs or {}).get(str(jid))) for jid in row.tailored.values())
     return {
@@ -257,6 +266,7 @@ def _row_summary(
         "groupKey": row.groupKey,
         "markets": markets_for(row.groupKey),
         "forceInclude": row.forceInclude,
+        "markedInvalid": row.markedInvalid,
         "jdSource": row.jdSource,
         "jdStructured": row.jdStructured,
         "postedDate": row.postedDate.isoformat() if row.postedDate else None,
@@ -269,6 +279,7 @@ def _row_summary(
         "profileGates": [pg.model_dump() for pg in row.profileGates],
         "topScore": row.topScore,
         "suggestions": suggestions,
+        "resumeScores": resume_scores,
         "appliedResumes": marks,
         "applied": bool(marks),
         # Applications to this URL recorded in other runs (permanent applied log).
@@ -343,21 +354,21 @@ def _marked_profiles(row, threshold: int) -> set[str]:
 
 
 def _applications(row, threshold: int, ctx: _AppContext, account_id: str = "") -> list[dict]:
-    """The job's applications: one per profile it's open to that has a matching uploaded resume, has no uploaded
+    """The job's applications: one per profile it's open to that has a scored uploaded resume, has no uploaded
     resumes (tailor-only), or has a tailored resume for it. State, in order: `applied` (marked in this run, or
-    this URL with this profile in another run), `ready` (tailored resume done, else the matching uploaded one),
-    `tailoring`, `needsResume`. A ready application carries the file to apply with."""
-    matching: dict[str, Any] = {}
+    this URL with this profile in another run), `ready` (tailored resume done, else an uploaded one at or above the
+    minimum score), `tailoring`, `needsResume` (no uploaded resume, or only ones below the minimum: tailor one).
+    A ready application carries the file to apply with; `score` is the best uploaded resume's, even below."""
+    best: dict[str, Any] = {}
     for s in row.bestByProfile:
-        if s.total >= threshold:
-            matching.setdefault(s.accountId, s)
+        best.setdefault(s.accountId, s)
     marked = _marked_profiles(row, threshold)
     out = []
     for acc in _open_profiles(row):
         if account_id and acc != account_id:
             continue
         t = ctx.tailored.get(str(row.tailored[acc])) if acc in row.tailored else None
-        s = matching.get(acc)
+        s = best.get(acc)
         if not (s or t or acc in row.tailorOnly):
             continue
         app: dict[str, Any] = {"accountId": acc, "score": s.total if s else None}
@@ -367,7 +378,7 @@ def _applications(row, threshold: int, ctx: _AppContext, account_id: str = "") -
             app.update(state="ready", tailoredJobId=str(t["_id"]), filename=t.get("pdfFilename") or "Tailored resume")
         elif t and t.get("status") in ("queued", "in_progress"):
             app["state"] = "tailoring"
-        elif s:
+        elif s and s.total >= threshold:
             app.update(state="ready", resumeId=s.resumeId, filename=s.filename)
         else:
             app["state"] = "needsResume"
@@ -389,12 +400,14 @@ async def _application_counts(run: JobApplyRun, sheet_id: Optional[str] = None) 
     ctx = await _app_context(run, rows)
     counts = dict.fromkeys(("applied", "ready", "tailoring", "needsResume"), 0)
     per_profile = {str(s.accountId): {"toGo": 0, "ready": 0} for s in run.selection}
-    jobs = to_export = exported_ready = 0
+    jobs = to_export = exported_ready = good_enough = ready_tailored = 0
     for row in rows:
         apps = _applications(row, run.threshold, ctx)
         pending = [a for a in apps if a["state"] != "applied"]
         jobs += bool(pending)
+        good_enough += sum(a["score"] is not None and a["score"] >= run.threshold for a in pending)
         ready = [a for a in pending if a["state"] == "ready"]
+        ready_tailored += sum(bool(a.get("tailoredJobId")) for a in ready)
         to_export += sum(not exported_to(row, a["accountId"], sheet_id) for a in ready)
         exported_ready += sum(a["accountId"] in row.exported for a in ready)
         for a in apps:
@@ -409,6 +422,12 @@ async def _application_counts(run: JobApplyRun, sheet_id: Optional[str] = None) 
         "toGo": counts["ready"] + counts["tailoring"] + counts["needsResume"],
         "toExport": to_export,  # applications with a resume to send, not yet in the saved sheet
         "exportedReady": exported_ready,  # ...already in a sheet: they can still go to another one
+        # Applications to go, split by the minimum score: the uploaded resume is good enough, or one is tailored.
+        "noTailorNeeded": good_enough,
+        "tailorNeeded": counts["ready"] + counts["tailoring"] + counts["needsResume"] - good_enough,
+        # Ready applications by the file they send: a template resume at or above the minimum, or a tailored one.
+        "readyTemplate": counts["ready"] - ready_tailored,
+        "readyTailored": ready_tailored,
         **counts,
         "byProfile": [
             {"accountId": acc, "name": names.get(acc, "(deleted profile)"), **n} for acc, n in per_profile.items()
@@ -449,9 +468,10 @@ async def _rows_query(
     """The rows filter behind the table and the counts. To apply / Applied is per application, filtered after
     (see `_applications`)."""
     q: dict[str, Any] = {"runId": run.id}
-    floor = max(run.threshold, min_score or 0)
     if view == "suggested":
-        q["$or"] = [{"topScore": {"$gte": floor}}, {"tailorOnly.0": {"$exists": True}}]
+        # Every job a profile can take, whatever its scores: below the minimum score it is tailored, not hidden.
+        q["$or"] = [{"topScore": {"$ne": None}}, {"tailorOnly.0": {"$exists": True}}]
+        q["screen"] = {"$ne": "invalid_role"}  # a person moved it out of Worth applying after it was scored
     elif view == "excluded":
         # Failed a job check, or no profile can take it (every scored profile blocked by location/work
         # authorization, and no tailor-only profile open to it).
@@ -465,7 +485,7 @@ async def _rows_query(
         q["topScore"] = {"$gte": min_score}
     if account_id:
         by_profile = {"$or": [
-            {"bestByProfile": {"$elemMatch": {"accountId": account_id, **({"total": {"$gte": floor}} if view == "suggested" else {})}}},
+            {"bestByProfile": {"$elemMatch": {"accountId": account_id}}},
             {"tailorOnly": account_id},
         ]}
         q = {"$and": [q, by_profile]}
@@ -673,12 +693,13 @@ class _RescreenView(BaseModel):
     screen: Optional[str] = None
     groupKey: Optional[str] = None
     forceInclude: bool = False
+    markedInvalid: bool = False
     jdStructured: Optional[bool] = None
 
     class Settings:
         projection = {
             "_id": 1, "status": 1, "statusReason": 1, "extraction": 1, "postedDate": 1, "gates": 1, "screen": 1,
-            "groupKey": 1, "forceInclude": 1, "jdStructured": 1,
+            "groupKey": 1, "forceInclude": 1, "markedInvalid": 1, "jdStructured": 1,
         }
 
 
@@ -965,7 +986,7 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     is_job = row.extraction.isJobPosting if row.extraction is not None else True
     base = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
-        is_job=is_job, verified=row.jdStructured is not False,
+        is_job=is_job, verified=row.jdStructured is not False, marked_invalid=row.markedInvalid,
     )
     if body.include and base not in APPROVABLE:
         raise HTTPException(
@@ -973,6 +994,8 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
             detail=(
                 "This job is already worth applying to."
                 if base == "valid"
+                else "Move this job out of Invalid role first."
+                if base == "invalid_role"
                 else "Paste the job description in Job info first: there is nothing to approve until the job has been read."
             ),
         )
@@ -980,6 +1003,7 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
     row.screen = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey,
         force_include=row.forceInclude, is_job=is_job, verified=row.jdStructured is not False,
+        marked_invalid=row.markedInvalid,
     )
     await JobApplyRow.get_motor_collection().update_one(
         {"_id": row.id}, {"$set": {"forceInclude": row.forceInclude, "screen": row.screen, "updatedAt": datetime.utcnow()}}
@@ -995,6 +1019,46 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
             )
         else:
             await JobApproval.find(JobApproval.url == row.url).delete()
+    return _row_summary(row, run.threshold)
+
+
+class InvalidBody(BaseModel):
+    invalid: bool
+
+
+@router.put("/rows/{row_id}/invalid")
+async def mark_invalid_row(row_id: str, body: InvalidBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Move a Worth applying job to Invalid role (or back): a person checked it and it isn't a role to apply for. Any
+    time, since several people check the same links: before scoring it isn't scored, after scoring it leaves the
+    Suggested list (its score stays for an undo). It overrules an approval, which is still there when undone."""
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    if body.invalid and row.screen not in WORTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Only jobs in Worth applying can be moved to Invalid role."
+        )
+    row.markedInvalid = body.invalid
+    row.screen = bucket(
+        status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey,
+        force_include=row.forceInclude, verified=row.jdStructured is not False, marked_invalid=row.markedInvalid,
+        is_job=row.extraction.isJobPosting if row.extraction is not None else True,
+    )
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id}, {"$set": {"markedInvalid": row.markedInvalid, "screen": row.screen, "updatedAt": datetime.utcnow()}}
+    )
+    if row.url:  # shared per link, like an approval (see worker.sync_corrections)
+        if body.invalid:
+            await JobInvalidRole.get_motor_collection().update_one(
+                {"url": row.url},
+                {"$set": {"url": row.url, "markedBy": user.id, "markedByName": user.name or user.email or "",
+                          "markedAt": datetime.utcnow(), "updatedAt": datetime.utcnow()},
+                 "$setOnInsert": {"createdAt": datetime.utcnow()}},
+                upsert=True,
+            )
+        else:
+            await JobInvalidRole.find(JobInvalidRole.url == row.url).delete()
     return _row_summary(row, run.threshold)
 
 
@@ -1396,8 +1460,9 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
 @router.post("/runs/{run_id}/tailor-all")
 async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Queue a tailored resume for each suggested job (or just the `rowIds` given) × each chosen profile the job is
-    open to and that hasn't applied to it yet, unless that profile already has one (a failed one is redone in place),
-    up to the daily cap; redoing a failed one adds no job, so the cap doesn't limit it. `dryRun` only counts."""
+    open to, that hasn't applied to it yet and has no uploaded resume at or above the minimum score (that one is
+    good enough to send), unless that profile already has one (a failed one is redone in place), up to the daily
+    cap; redoing a failed one adds no job, so the cap doesn't limit it. `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
     resume_model = JOB_APPLIES_RESUME_MODEL
@@ -1415,6 +1480,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     queued = skipped = other = 0
     for row in rows:
         done = _marked_profiles(row, run.threshold) | {acc for url, acc in ctx.logged if url == row.url}
+        done |= {s.accountId for s in row.bestByProfile if s.total >= run.threshold}  # uploaded one is good enough
         for acc in [a for a in _open_profiles(row) if a in chosen and a not in done]:
             current = existing.get(str(row.tailored.get(acc)))
             if current and current.get("status") != "failed":
@@ -1442,6 +1508,180 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
             queued += 1
             remaining -= 0 if retry else 1
     return {"queued": queued, "skippedCap": skipped, "skipped": other}
+
+
+# ---------- resume downloads ----------
+# The same files and folders as the Resume page: <Profile>/<Company>/Resume.pdf, into a folder the user picks or, where
+# the browser can't write folders, one zip.
+
+
+class DownloadBody(BaseModel):
+    """What to download: the selected jobs (`rowIds`, optionally one profile's), tailored resumes picked by hand, and
+    explicit files (a single download: {kind: "uploaded", rowId, accountId, resumeId} or {kind: "tailored",
+    tailoredJobId})."""
+
+    rowIds: list[str] = Field(default_factory=list, max_length=1000)
+    accountId: str = ""
+    tailoredJobIds: list[str] = Field(default_factory=list, max_length=500)
+    files: list[dict[str, str]] = Field(default_factory=list, max_length=200)
+
+
+def _resume_ext(resume) -> str:
+    ext = os.path.splitext(resume.s3Key or resume.filename or "")[1].lower()
+    return ext if ext in resume_files.ALLOWED_TYPES else ".pdf"
+
+
+async def fetch_tailored_pdf(job: ResumeApplication) -> bytes:
+    if job.s3Key:
+        return await _stored_file(job.s3Key)
+    if job.pdfData:
+        return base64.b64decode(job.pdfData)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This tailored resume isn't ready.")
+
+
+def _company(row) -> str:
+    return row.company or row.title or "company"
+
+
+async def _download_plan(run: JobApplyRun, body: DownloadBody) -> tuple[list[dict], int]:
+    """The files to download and how many applications were skipped (below the minimum score, nothing tailored yet).
+    Per job x profile: its tailored resume when ready, else its highest template resume at or above the minimum score.
+    Each file: {kind, folder, filename, ids...}; a folder already used gets " (2)", " (3)", ... so nothing is
+    overwritten."""
+    rows = []
+    if body.rowIds:
+        ids = [to_object_id(i) for i in body.rowIds]
+        rows = await JobApplyRow.find({"_id": {"$in": ids}, "runId": run.id}).sort("+rowIndex").to_list()
+    tailored = await _tailored_docs([i for r in rows for i in _tailored_ids(r)])
+    acc_ids = {s.accountId for r in rows for s in r.scores} | {a for r in rows for a in _open_profiles(r)}
+    acc_ids |= {f.get("accountId", "") for f in body.files if f.get("kind") == "uploaded"}
+    accounts = {
+        str(a.id): a
+        for a in await Account.find({"_id": {"$in": [to_object_id(a) for a in acc_ids if a]}}).to_list()
+    }
+
+    planned: list[dict] = []  # before folders are made unique
+    skipped = 0
+
+    def uploaded(row, acc: str, resume_id: str) -> Optional[dict]:
+        account = accounts.get(acc)
+        resume = next((r for r in account.resumes if str(r.id) == resume_id), None) if account else None
+        if resume is None or not resume.s3Key:
+            return None
+        return {"kind": "uploaded", "rowId": str(row.id), "accountId": acc, "resumeId": resume_id,
+                "profile": account.name, "company": _company(row), "ext": _resume_ext(resume), "key": resume.s3Key}
+
+    def tailored_file(doc: dict) -> dict:
+        return {"kind": "tailored", "tailoredJobId": str(doc["_id"]), "profile": doc.get("profileName") or "profile",
+                "company": doc.get("companyName") or "company", "ext": ".pdf"}
+
+    for row in rows:
+        for acc in _open_profiles(row):
+            if body.accountId and acc != body.accountId:
+                continue
+            t = tailored.get(str(row.tailored[acc])) if acc in row.tailored else None
+            if t and t.get("status") == "completed":
+                planned.append(tailored_file(t))
+                continue
+            mine = sorted((s for s in row.scores if s.accountId == acc), key=lambda s: -s.total)
+            best = next((s for s in mine if s.total >= run.threshold), None)
+            file = uploaded(row, acc, best.resumeId) if best else None
+            if file:
+                planned.append(file)
+            elif mine or acc in row.tailorOnly:
+                skipped += 1
+
+    # Then the tailored resumes picked by hand and the explicit files, in the order given.
+    picks = [{"kind": "tailored", "tailoredJobId": str(i)} for i in body.tailoredJobIds] + list(body.files)
+    wanted = [f.get("tailoredJobId", "") for f in picks if f.get("kind") == "tailored"]
+    docs = await _tailored_docs([to_object_id(i) for i in wanted]) if wanted else {}
+    for f in picks:
+        if f.get("kind") == "tailored":
+            doc = docs.get(f.get("tailoredJobId", ""))
+            if doc is None or str(doc.get("userId")) != str(run.userId):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That tailored resume isn't in this run.")
+            if doc.get("status") == "completed":
+                planned.append(tailored_file(doc))
+            continue
+        row = await JobApplyRow.find_one({"_id": to_object_id(f.get("rowId", "")), "runId": run.id})
+        acc = f.get("accountId", "")
+        file = uploaded(row, acc, f.get("resumeId", "")) if row and acc in {pg.accountId for pg in row.profileGates} else None
+        if file is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That resume isn't in this run.")
+        planned.append(file)
+
+    out, seen, used = [], set(), {}
+    for f in planned:
+        ident = f.get("tailoredJobId") or (f["rowId"], f["accountId"], f["resumeId"])
+        if ident in seen:  # e.g. a tailored resume both on a selected job and picked by hand
+            continue
+        seen.add(ident)
+        base = f"{_safe_folder(f.pop('profile'))}/{_safe_folder(f.pop('company'))}"
+        used[base] = used.get(base, 0) + 1
+        f["folder"] = base if used[base] == 1 else f"{base} ({used[base]})"
+        f["filename"] = f"Resume{f.pop('ext')}"
+        out.append(f)
+    return out, skipped
+
+
+@router.post("/runs/{run_id}/download-files")
+async def download_files(run_id: str, body: DownloadBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """The resumes to download and where each goes (`folder`/`filename`); the app fetches and writes them into the
+    folder the user picked. `skipped`: applications with no resume to send yet (they need tailoring)."""
+    run = await _owned_run(run_id, user)
+    files, skipped = await _download_plan(run, body)
+    return {"files": [{k: v for k, v in f.items() if k != "key"} for f in files], "skipped": skipped}
+
+
+@router.post("/runs/{run_id}/download-zip")
+async def download_zip(run_id: str, body: DownloadBody, user: Annotated[UserExtra, Depends(get_current_user)]):
+    """The same resumes as one zip with the same folders, for browsers that can't write into a folder."""
+    run = await _owned_run(run_id, user)
+    files, _ = await _download_plan(run, body)
+    entries: list[tuple[str, bytes]] = []
+    for f in files:
+        try:
+            if f["kind"] == "tailored":
+                job = await ResumeApplication.get(to_object_id(f["tailoredJobId"]))
+                data = await fetch_tailored_pdf(job) if job else None
+            else:
+                data = await _stored_file(f["key"])
+        except HTTPException:
+            data = None  # a file that can't be read is left out, like the Resume page's zip
+        if data:
+            entries.append((f"{f['folder']}/{f['filename']}", data))
+    if not entries:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="None of those resumes can be downloaded.")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=_build_zip(entries),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="resumes-{stamp}.zip"'},
+    )
+
+
+@router.get("/rows/{row_id}/resume-file")
+async def row_resume_file(
+    row_id: str,
+    accountId: str = Query(...),
+    resumeId: str = Query(...),
+    user: Annotated[UserExtra, Depends(get_current_user)] = None,
+):
+    """One template resume's file for this job, with `X-Folder: <Profile>/<Company>` like the Resume page's download."""
+    row = await _owned_row(row_id, user)
+    account = await Account.get(to_object_id(accountId)) if accountId in {pg.accountId for pg in row.profileGates} else None
+    resume = next((r for r in account.resumes if str(r.id) == resumeId), None) if account else None
+    if resume is None or not resume.s3Key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+    ext = _resume_ext(resume)
+    return Response(
+        content=await _stored_file(resume.s3Key),
+        media_type=resume_files.ALLOWED_TYPES[ext],
+        headers={
+            "Content-Disposition": f'attachment; filename="Resume{ext}"',
+            "X-Folder": f"{_safe_folder(account.name)}/{_safe_folder(_company(row))}",
+        },
+    )
 
 
 # ---------- export to Google Sheets ----------
@@ -1526,7 +1766,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
 
     out: list[list] = []
     marks: list[tuple] = []
-    waiting = already = no_file = 0
+    waiting = already = no_file = tailoring = with_tailored = 0
     for row in rows:
         for app in _applications(row, run.threshold, ctx):
             acc = app["accountId"]
@@ -1537,9 +1777,11 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 continue
             if app["state"] != "ready":
                 waiting += 1  # tailoring, or needs a tailored resume: exported once it's done
+                tailoring += app["state"] == "tailoring"
                 continue
             if app.get("tailoredJobId"):
                 link = file_links.file_url("tailored", app["tailoredJobId"])
+                with_tailored += 1
             else:
                 resume = resumes.get(app["resumeId"])
                 if not resume or not resume.s3Key:
@@ -1577,7 +1819,11 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
     return {
         "ready": len(out),
         "added": 0 if body.dryRun else len(out),
-        "waiting": waiting,  # applications without their tailored resume yet
+        "readyTemplate": len(out) - with_tailored,  # rows sending a template resume at or above the minimum score
+        "readyTailored": with_tailored,  # rows sending a tailored resume
+        "waiting": waiting,  # applications without their tailored resume yet:
+        "needsTailoring": waiting - tailoring,  # ... nothing tailored yet (no template at or above the minimum)
+        "tailoring": tailoring,  # ... being tailored now
         "alreadyExported": already,
         "noFile": no_file,
         "sheetTitle": info["title"],

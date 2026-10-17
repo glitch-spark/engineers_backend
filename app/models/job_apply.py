@@ -19,8 +19,8 @@ RowStatus = Literal["pending", "fetched", "extracted", "scored", "excluded", "fe
 # location group, then scores only those job x profile pairs.
 RunPhase = Literal["screen", "score"]
 ScreenBucket = Literal[
-    "valid", "check", "closed", "not_fetched", "read_failed", "not_job", "clearance", "onsite", "too_old",
-    "other_location",
+    "valid", "check", "closed", "not_fetched", "read_failed", "not_job", "clearance", "invalid_role", "onsite",
+    "too_old", "other_location",
 ]
 
 # Runs and their rows are deleted by MongoDB this long after upload (TTL index on expiresAt).
@@ -114,6 +114,7 @@ class JobApplyRow(TimestampedDocument):
     screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
     groupKey: Optional[str] = None  # normalised allowed locations, e.g. "GB", "EU+US", "none"
     forceInclude: bool = False  # a person approved this job: it is Worth applying whatever the checks said
+    markedInvalid: bool = False  # a person moved it out of Worth applying: Invalid role, even over an approval
     title: str = ""
     company: str = ""
     sheetCompany: str = ""  # the company written in the uploaded sheet: kept over fetched, AI and corrected names
@@ -222,6 +223,20 @@ class JobApproval(TimestampedDocument):
 
     class Settings:
         name = "job_approval"
+        indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
+
+
+class JobInvalidRole(TimestampedDocument):
+    """A person moved this job link from Worth applying to Invalid role, for everyone who uses the link: other runs
+    pick it up like an approval (`JobApproval`). Undoing it removes this record."""
+
+    url: str
+    markedBy: Optional[PydanticObjectId] = None
+    markedByName: str = ""
+    markedAt: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "job_invalid_role"
         indexes = [IndexModel([("url", ASCENDING)], unique=True, name="url")]
 
 

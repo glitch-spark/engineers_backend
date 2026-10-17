@@ -64,7 +64,7 @@ def test_every_status_label():
     assert labels == {
         "valid": "Worth applying", "check": "Needs a check", "closed": "Closed", "not_fetched": "Not fetched",
         "read_failed": "Couldn't read", "not_job": "Not a job page", "clearance": "Clearance required",
-        "onsite": "On-site / hybrid", "too_old": "Too old", "other_location": "Other locations",
+        "invalid_role": "Invalid role", "onsite": "On-site / hybrid", "too_old": "Too old", "other_location": "Other locations",
     }
     assert cells(row(screen=None, extraction=None))["Status"] == "Not checked yet"
 

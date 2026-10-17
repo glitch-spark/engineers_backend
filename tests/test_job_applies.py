@@ -171,15 +171,19 @@ async def test_create_run_and_results(client, staff_user, auth_header):
     assert len(detail["scores"]) == 2 and detail["scores"][0]["components"]
 
 
-async def test_threshold_patch_changes_suggestions(client, staff_user, auth_header):
+async def test_threshold_patch_moves_applications_to_tailoring(client, staff_user, auth_header):
     h = auth_header(staff_user)
     acc = await make_account(staff_user)
     run_id = (await create_run(client, h, acc)).json()["runId"]
     await worker.run_worker(PydanticObjectId(run_id))
     r = await client.patch(f"/job-applies/runs/{run_id}", headers=h, json={"threshold": 100})
     assert r.status_code == 200 and r.json()["threshold"] == 100
-    rows = (await client.get(f"/job-applies/runs/{run_id}/rows", headers=h)).json()["rows"]
-    assert all(x["suggestions"] == [] for x in rows)
+    # the scores stay listed (below the minimum they are tailored, not hidden) ...
+    rows = (await client.get(f"/job-applies/runs/{run_id}/rows?view=suggested", headers=h)).json()["rows"]
+    assert rows and all(x["suggestions"] for x in rows)
+    # ... and every application now needs a tailored resume
+    apps = (await client.get(f"/job-applies/runs/{run_id}", headers=h)).json()["applications"]
+    assert apps["noTailorNeeded"] == 0 and apps["tailorNeeded"] == apps["toGo"] > 0
 
 
 async def test_location_gate_excludes_profile(client, staff_user, auth_header):
@@ -647,8 +651,7 @@ async def test_mark_other_uploaded_resume(client, staff_user, auth_header):
     _, rows, _, weak = await _two_profile_run(client, h, staff_user)
     row = rows["https://jobs.example.com/remote"]
     detail = (await client.get(f"/job-applies/rows/{row['_id']}", headers=h)).json()
-    shown = {x["resumeId"] for x in row["suggestions"]}
-    other = next(x for x in detail["scores"] if x["resumeId"] not in shown)  # scored, below the threshold
+    other = next(x for x in detail["scores"] if x["total"] < 60)  # scored, below the threshold
     r = await client.put(f"/job-applies/rows/{row['_id']}/applied", headers=h,
                          json={"accountId": other["accountId"], "resumeId": other["resumeId"], "applied": True})
     assert r.status_code == 200 and r.json()["appliedResumes"][0]["resumeId"] == other["resumeId"]

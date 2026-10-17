@@ -72,10 +72,12 @@ def bucket(
     force_include: bool,
     is_job: bool = True,
     verified: bool = True,
+    marked_invalid: bool = False,
 ) -> Optional[ScreenBucket]:
     """The one bucket a job lands in, first match wins (spec §3.1). None while it is still being fetched or read.
     `force_include` is a person's approval: a job that has been read (and is a job posting) is then Worth applying,
-    whatever the checks said."""
+    whatever the checks said. `marked_invalid` is a person moving it out of Worth applying: Invalid role, even over
+    an approval."""
     if status in ("pending", "fetched"):
         return None
     if status == "fetch_failed":
@@ -84,6 +86,8 @@ def bucket(
         return "read_failed"
     if not is_job:
         return "not_job"  # an error page, cookie notice or job list read in place of a posting
+    if marked_invalid:
+        return "invalid_role"
     if force_include:
         return "valid"
     result = {g.name: g.result for g in gates}
@@ -134,7 +138,7 @@ def rescreen(row: Any, *, run_date: date, max_age_days: int) -> None:
         status=row.status, status_reason=row.statusReason, gates=row.gates or [],
         group_key=row.groupKey, force_include=row.forceInclude,
         is_job=row.extraction.isJobPosting if row.extraction is not None else True,
-        verified=row.jdStructured is not False,
+        verified=row.jdStructured is not False, marked_invalid=row.markedInvalid,
     )
 
 
