@@ -52,6 +52,8 @@ class InterviewCaller(BaseModel):
 
     enabled: bool = False
     callerName: str = "TBD"
+    # The caller from the caller list (app.models.caller); None = not assigned yet, or a name typed before the list.
+    callerId: Optional[str] = None
     # Exact start in UTC; None means the time is still TBD.
     startsAt: Optional[datetime] = None
     timezone: Optional[str] = None  # legacy, no longer written: Slack shows each reader their own time

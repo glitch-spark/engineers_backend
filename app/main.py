@@ -21,6 +21,7 @@ from app.routers import (
     bidder_ext,
     bidders,
     bids,
+    callers,
     dashboard,
     global_prompt,
     interview_prep,
@@ -111,6 +112,7 @@ def create_app() -> FastAPI:
     app.include_router(weekly_plans.router)
     app.include_router(daily_plans.router)
     app.include_router(interviews.router)
+    app.include_router(callers.router)
     app.include_router(skills.router)
     app.include_router(global_prompt.router)
     app.include_router(interview_prep.router)

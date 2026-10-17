@@ -35,6 +35,7 @@ from app.interview_caller import (
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
+from app.routers.callers import get_caller, is_caller_manager, require_caller_manager
 
 log = logging.getLogger(__name__)
 
@@ -195,6 +196,24 @@ def _round_caller(
         return build_round_caller(body, starts_at=starts_at, previous=previous)
     except CallerError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+async def _resolve_caller(body: Optional[CallerIn]) -> Optional[CallerIn]:
+    """A caller picked from the caller list gets the list's name; "" means not assigned yet."""
+    if body is None or body.callerId is None:
+        return body
+    if not body.callerId:
+        return body.model_copy(update={"callerName": "TBD"})
+    caller = await get_caller(body.callerId)
+    if caller is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That caller is no longer on the list.")
+    return body.model_copy(update={"callerId": str(caller.id), "callerName": caller.name})
+
+
+def _assignment(caller: Optional[InterviewCaller]) -> tuple:
+    if caller is None:
+        return (None, "TBD")
+    return (caller.callerId, (caller.callerName or "").strip() or "TBD")
 
 
 def mark_previous_passed(history: list[InterviewStageEvent]) -> bool:
@@ -505,8 +524,11 @@ def flatten_rounds(
     to_dt: datetime,
     stage: str = "",
     status: str = "",
+    caller_only: bool = False,
+    caller_id: str = "",
 ) -> list[dict]:
-    """Calendar rows: one per round dated in [from_dt, to_dt), filtered on the round itself."""
+    """Calendar rows: one per round dated in [from_dt, to_dt), filtered on the round itself.
+    caller_only keeps caller rounds; caller_id keeps one caller's ("unassigned": no caller yet)."""
     lo, hi = _utc_naive(from_dt), _utc_naive(to_dt)
     want_stage = _normalize_stage(stage) if stage else None
     rows = []
@@ -523,6 +545,15 @@ def flatten_rounds(
             if status and normalize_status(e.get("status")) != status:
                 continue
             caller = e.get("caller") or {}
+            on = bool(caller.get("enabled"))
+            cid = caller.get("callerId") if on else None
+            cname = ((caller.get("callerName") or "").strip() or "TBD") if on else None
+            if (caller_only or caller_id) and not on:
+                continue
+            if caller_id == "unassigned" and (cid or cname != "TBD"):
+                continue
+            if caller_id and caller_id != "unassigned" and cid != caller_id:
+                continue
             rows.append({
                 "interviewId": str(iv.get("_id")),
                 "roundId": e.get("id"),
@@ -534,7 +565,9 @@ def flatten_rounds(
                 "profileLabel": (account.get("name") or account.get("email") or "").strip() or None,
                 "ownerId": owner_id,
                 "ownerName": iv.get("ownerName") or iv.get("ownerEmail"),
-                "hasCaller": bool(caller.get("enabled")),
+                "hasCaller": on,
+                "callerId": cid,
+                "callerName": cname,
             })
     rows.sort(key=lambda r: r["scheduledAt"])
     return rows
@@ -610,8 +643,11 @@ async def list_interview_rounds(
     stage: str = Query(""),
     status_: str = Query("", alias="status"),
     creatorId: str = Query(""),
+    callerOnly: bool = Query(False),
+    callerId: str = Query(""),
 ) -> dict:
-    """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list."""
+    """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list.
+    callerOnly / callerId narrow it to caller rounds (the Callers calendar)."""
     f_dt, t_dt = parse_date(from_), parse_date(to)
     if f_dt is None or t_dt is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from and to are required")
@@ -619,14 +655,19 @@ async def list_interview_rounds(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="range must be 1 to 45 days")
     if status_ and status_ not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
-    query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": f_dt, "$lt": t_dt}}}}
+    in_range: dict[str, Any] = {"scheduledAt": {"$gte": f_dt, "$lt": t_dt}}
+    if callerOnly or callerId:
+        in_range["caller.enabled"] = True
+    query: dict[str, Any] = {"stageHistory": {"$elemMatch": in_range}}
     if accountId:
         query["accountId"] = to_object_id(accountId)
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
     rows = await Interview.find(query).to_list()
     out = await _populate_account(await populate_owner(rows, field="createdBy"))
-    rounds = flatten_rounds(out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_)
+    rounds = flatten_rounds(
+        out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_, caller_only=callerOnly, caller_id=callerId,
+    )
     # The interviews behind the rounds, so a click can open the side panel
     # (GET /{id} is limited to owner/admin/interview manager; this feed is not).
     shown = {r["interviewId"] for r in rounds}
@@ -725,7 +766,9 @@ async def create_interview(
     if not company:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="companyName is required")
     account_oid = await _account_for_write(body.accountId, user)
-    entry = _build_round(body.round or _legacy_round(body), user=user, source="create")
+    first = body.round or _legacy_round(body)
+    first.caller = await _resolve_caller(first.caller)
+    entry = _build_round(first, user=user, source="create")
 
     # History is appended after construction: the model's read-time resolver
     # only understands raw dicts.
@@ -855,6 +898,7 @@ async def add_interview_stage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="rejected is a status; set status on the current round",
         )
+    body.caller = await _resolve_caller(body.caller)
     entry = _build_round(body, user=user, source="stage")
     prev_tip = _tip(iv)
     if prev_tip is not None and _normalize_stage(prev_tip.stage) == entry.stage:
@@ -870,6 +914,36 @@ async def add_interview_stage(
 
     await _sync_caller_posts(iv, before, added={entry.id})
     await _after_save(iv, extract_stage_ids=[entry.id] if entry.transcript.strip() else [])
+    return await _interview_out(iv)
+
+
+class CallerAssignIn(BaseModel):
+    callerId: str = ""  # "" = not assigned yet
+
+
+@router.put("/{iv_id}/stages/{stage_id}/caller")
+async def assign_round_caller(
+    iv_id: str,
+    stage_id: str,
+    body: CallerAssignIn,
+    user: Annotated[UserExtra, Depends(require_caller_manager)],
+) -> dict:
+    """Admins and interview managers assign the caller of any interview's caller round."""
+    iv = await Interview.get(to_object_id(iv_id))
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    before = _round_snapshots(iv)
+    migrate_legacy_stage_fields(iv)
+    idx = _find_stage(iv, stage_id)
+    entry = iv.stageHistory[idx]
+    if entry.caller is None or not entry.caller.enabled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This round has no caller request.")
+    picked = await _resolve_caller(CallerIn(enabled=True, callerId=body.callerId))
+    entry.caller = entry.caller.model_copy(update={"callerId": picked.callerId or None, "callerName": picked.callerName})
+    iv.stageHistory[idx] = entry
+    _sync_top_from_tip(iv)
+    await _save_interview(iv)
+    await _sync_caller_posts(iv, before)
     return await _interview_out(iv)
 
 
@@ -922,7 +996,14 @@ async def update_interview_stage(
     if body.note is not None:
         entry.note = body.note
     if body.caller is not None:
-        entry.caller = _round_caller(body.caller, starts_at=entry.scheduledAt, previous=entry.caller)
+        previous = entry.caller
+        entry.caller = _round_caller(await _resolve_caller(body.caller), starts_at=entry.scheduledAt, previous=previous)
+        # The creator picks a caller when adding a round; after that the caller managers assign it.
+        if not is_caller_manager(user) and _assignment(entry.caller) != _assignment(previous):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only Admin or an interview manager can change the caller.",
+            )
     ended = _status_value(entry.status) in ENDED_STATUSES
     if entry.caller is None or not entry.caller.enabled or ended:
         entry.confirmed = False  # a caller is only lined up for an active caller round

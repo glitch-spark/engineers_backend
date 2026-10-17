@@ -5,6 +5,7 @@ from app.models.analyze_chat_log import AnalyzeChatLog
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
+from app.models.caller import Caller
 from app.models.interview import Interview
 from app.models.interview_chat_log import InterviewChatLog
 from app.models.interview_prep import InterviewPrompt, InterviewTemplateAnswer
@@ -32,6 +33,7 @@ __all__ = [
     "Bid",
     "BidReport",
     "Bidder",
+    "Caller",
     "DailyPlan",
     "EvalJobDescription",
     "GlobalPrompt",

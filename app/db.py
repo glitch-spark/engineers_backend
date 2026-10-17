@@ -37,6 +37,7 @@ from app.models import (
     Bid,
     BidReport,
     Bidder,
+    Caller,
     GlobalPrompt,
     Interview,
     InterviewChatLog,
@@ -101,6 +102,7 @@ DOCUMENT_MODELS = [
     EvalJobDescription,
     ResumePromptEval,
     AiUsageEvent,
+    Caller,
 ]
 
 
@@ -341,7 +343,15 @@ async def init_db():
     await _migrate_job_apply_urls(database)
     await _migrate_job_apply_screening(database)
     await _migrate_run_retention(database)
+    callers_new = "callers" not in await database.list_collection_names()
     await init_beanie(database=database, document_models=DOCUMENT_MODELS)
+    if callers_new:  # the starting caller list, once: a list emptied later stays empty
+        try:
+            from app.routers.callers import seed_callers
+
+            log.info("seeded %d callers", await seed_callers())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("caller seed failed: %s", exc)
     try:
         from app.alerts_service import seed_recurring_charges_from_transactions
 
