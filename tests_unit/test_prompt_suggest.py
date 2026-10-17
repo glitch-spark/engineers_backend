@@ -77,3 +77,21 @@ def test_suggest_prompt():
     assert suggest_prompt(prompts, "ops-old", "devops") == "ops-old"     # ... unless the default is one of them
     assert suggest_prompt(prompts, "default", "data") == "default"       # no prompt for the role
     assert suggest_prompt(prompts, "default", None) == "default"         # no role
+
+
+def test_react_native_is_mobile_not_frontend():
+    assert job_role("React Native Developer", []).role == "mobile"
+    m = job_role("Senior React Native Engineer", [t("React Native", "required"), t("TypeScript", "core")])
+    assert m.role == "mobile" and m.reason.startswith("Mobile job")
+
+
+def test_role_detection_is_fast_enough_for_a_200_row_page():
+    import time
+    terms = [t(f"Skill{i}", "required") for i in range(20)] + [t("Kubernetes", "required"), t("React", "core"),
+                                                              t("CI/CD", "core"), t("Python", "required"), t("AWS", "core")]
+    for term in terms:
+        term.aliases = [term.term + " dev"]
+    start = time.perf_counter()
+    for _ in range(200):
+        job_role("Senior Platform Engineer, Cloud Infrastructure", terms)
+    assert time.perf_counter() - start < 0.5

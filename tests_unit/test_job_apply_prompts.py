@@ -210,3 +210,22 @@ async def test_empty_prompt_body_falls_back(db):
 def test_tailored_out_has_prompt_name():
     out = _tailored_out({"_id": "6a0000000000000000000000", "accountId": "a", "status": "completed", "promptName": "DevOps"})
     assert out["promptName"] == "DevOps"
+
+
+async def test_concurrent_choices_for_two_profiles_both_stick(db, monkeypatch):
+    owner, blake, sam, _, job_a, _ = await _setup()
+    from app.routers import job_applies as ja
+    stale = await JobApplyRow.get(job_a.id)  # read before Sam's choice lands, like a concurrent request
+    sam_extra = [{"id": "default", "name": "Default", "role": None, "body": "s"},
+                 {"id": "new-1", "name": "Data", "role": "data", "body": "data"}]
+    apply_prompts(sam, sam_extra, "default")
+    await sam.save()
+    await choose_prompt(str(job_a.id), PromptChoiceBody(accountId=str(sam.id), promptId=_id(sam, "Data")), owner)
+
+    async def stale_row(row_id, user):
+        return stale
+
+    monkeypatch.setattr(ja, "_owned_row", stale_row)
+    await choose_prompt(str(job_a.id), PromptChoiceBody(accountId=str(blake.id), promptId="default"), owner)
+
+    assert (await JobApplyRow.get(job_a.id)).promptChoice == {str(sam.id): _id(sam, "Data"), str(blake.id): "default"}

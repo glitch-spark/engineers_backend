@@ -102,8 +102,20 @@ def _prompt_info(account: Optional[Account]) -> dict:
 PromptCtx = dict[str, tuple[list[ResumePrompt], str]]
 
 
+class _AccountPromptsView(BaseModel):
+    """Just what suggestions need from a profile (no resumes, template or prompt texts): runs poll every few seconds."""
+    id: PydanticObjectId = Field(alias="_id")
+    resumePrompts: list[ResumePrompt] = Field(default_factory=list)
+    defaultPromptId: Optional[str] = None
+    resumePromptBody: Optional[str] = None
+
+    class Settings:
+        projection = {"_id": 1, "resumePrompts.id": 1, "resumePrompts.name": 1, "resumePrompts.role": 1,
+                      "resumePrompts.updatedAt": 1, "defaultPromptId": 1}
+
+
 async def _prompt_ctx(run: JobApplyRun) -> PromptCtx:
-    accounts = await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()
+    accounts = await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).project(_AccountPromptsView).to_list()
     return {str(a.id): prompts_view(a) for a in accounts}
 
 
@@ -1110,15 +1122,15 @@ async def choose_prompt(row_id: str, body: PromptChoiceBody, user: Annotated[Use
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That prompt is not one of this profile's prompts.")
     prompts, default_id = prompt_ctx[body.accountId]
     suggested = suggest_prompt(prompts, default_id, _job_role(row).role)
-    choice = dict(row.promptChoice)
+    # One profile's entry only, so a choice saved for another profile at the same time isn't overwritten.
+    key = f"promptChoice.{body.accountId}"  # accountId is one of the run's profiles (checked above)
     if body.promptId == suggested:
-        choice.pop(body.accountId, None)
+        update = {"$unset": {key: ""}, "$set": {"updatedAt": datetime.utcnow()}}
     else:
-        choice[body.accountId] = body.promptId
-    row.promptChoice = choice
-    await JobApplyRow.get_motor_collection().update_one(
-        {"_id": row.id}, {"$set": {"promptChoice": choice, "updatedAt": datetime.utcnow()}}
-    )
+        update = {"$set": {key: body.promptId, "updatedAt": datetime.utcnow()}}
+    await JobApplyRow.get_motor_collection().update_one({"_id": row.id}, update)
+    fresh = await JobApplyRow.get(row.id)
+    row.promptChoice = fresh.promptChoice if fresh else {}
     return _row_summary(row, run.threshold if run else 75, prompt_ctx=prompt_ctx)
 
 

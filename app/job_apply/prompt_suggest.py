@@ -36,9 +36,22 @@ class RoleMatch:
     reason: str = ""
 
 
+_KEYWORD_ROLE = {kw: role for role, keywords in ROLE_KEYWORDS.items() for kw in keywords}
+# Every keyword as a whole word or phrase, longest first so overlapping ones resolve to the longer ("react native" is
+# Mobile, not also "react"); "go" isn't found in "good", but "ci/cd" and "next.js" are.
+_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:" + "|".join(re.escape(k) for k in sorted(_KEYWORD_ROLE, key=len, reverse=True)) + r")(?![a-z0-9])"
+)
+
+
 def _find(text: str, keyword: str) -> Optional[re.Match]:
-    """`keyword` as a whole word or phrase (so "go" isn't found in "good", but "ci/cd" and "next.js" are)."""
+    """`keyword` (any word or phrase) as a whole word in `text`."""
     return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text)
+
+
+def _keywords_in(text: str) -> list[tuple[int, str]]:
+    """(position, keyword) of each role keyword in lowercase `text`, in one pass."""
+    return [(m.start(), m.group()) for m in _PATTERN.finditer(text)]
 
 
 def _weight(term: Term) -> int:
@@ -49,20 +62,24 @@ def job_role(title: str, terms: Sequence[Term]) -> RoleMatch:
     """The job's role (None without enough signal), up to 7 main-stack marks, and why."""
     low_title = (title or "").lower()
     skills = [s for s in terms if not s.soft]
+    in_title: dict[str, int] = {}  # keyword -> first position in the title
+    for pos, kw in _keywords_in(low_title):
+        in_title.setdefault(kw, pos)
+    by_skill: dict[str, Term] = {}  # keyword -> the heaviest skill naming it (keywords in the title are left out)
+    for skill in sorted(skills, key=_weight, reverse=True):
+        for name in (skill.term, *skill.aliases):
+            for _, kw in _keywords_in(name.lower()):
+                if kw not in in_title:
+                    by_skill.setdefault(kw, skill)
     scored = []
-    for role, keywords in ROLE_KEYWORDS.items():
-        title_hits = [(m.start(), m.group()) for kw in keywords if (m := _find(low_title, kw))]
-        in_title = {kw for kw in keywords if _find(low_title, kw)}
+    for role in ROLE_KEYWORDS:
+        title_hits = sorted((pos, kw) for kw, pos in in_title.items() if _KEYWORD_ROLE[kw] == role)
         skill_hits: list[Term] = []
-        for kw in keywords:
-            if kw in in_title:
-                continue  # already in the title, which the job row shows
-            term = next((s for s in sorted(skills, key=_weight, reverse=True)
-                         if any(_find(n.lower(), kw) for n in (s.term, *s.aliases))), None)
-            if term is not None and term not in skill_hits:
-                skill_hits.append(term)
+        for kw, skill in by_skill.items():
+            if _KEYWORD_ROLE[kw] == role and skill not in skill_hits:
+                skill_hits.append(skill)
         score = _TITLE_WEIGHT * len(title_hits) + sum(_weight(s) for s in skill_hits)
-        first = min((pos for pos, _ in title_hits), default=len(low_title) + 1)
+        first = title_hits[0][0] if title_hits else len(low_title) + 1
         scored.append((score, -first, role, title_hits, skill_hits))
     best = max(s[0] for s in scored)
     top = [s for s in scored if s[0] == best]
@@ -77,7 +94,7 @@ def job_role(title: str, terms: Sequence[Term]) -> RoleMatch:
     marks = _top_skills(skills, role_marks, low_title)
     parts = []
     if title_hits:
-        pos, word = min(title_hits)
+        pos, word = title_hits[0]
         parts.append(f"title says {title[pos:pos + len(word)]}")
     if role_marks:
         parts.append(f"skills {', '.join(role_marks[:2])}")
