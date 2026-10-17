@@ -114,6 +114,8 @@ class JobApplyRow(TimestampedDocument):
     screen: Optional[ScreenBucket] = None  # set once the row is fetched and read (or fails to be)
     groupKey: Optional[str] = None  # normalised allowed locations, e.g. "GB", "EU+US", "none"
     forceInclude: bool = False  # a person approved this job: it is Worth applying whatever the checks said
+    # The resume prompt a person chose per profile (accountId -> prompt id); otherwise the one suggested from the job.
+    promptChoice: Dict[str, str] = Field(default_factory=dict)
     markedInvalid: bool = False  # a person moved it out of Worth applying: Invalid role, even over an approval
     title: str = ""
     company: str = ""

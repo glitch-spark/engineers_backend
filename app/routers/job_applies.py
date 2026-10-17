@@ -24,9 +24,12 @@ from app.job_apply.screening import (
 )
 from app.job_apply.resume_parse import health
 from app.job_apply.scoring import band as score_band
+from app.job_apply.prompt_suggest import job_role, suggest_prompt
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
-from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, WorkAuth, WorkMode
+from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, Term, WorkAuth, WorkMode
+from app.models.account import ResumePrompt
+from app.resume_prompts import prompts_view
 from app.models.job_apply import (
     AppliedMark,
     file_key,
@@ -88,6 +91,39 @@ async def _suggested_count(run: JobApplyRun) -> int:
     return await JobApplyRow.find(await _rows_query(run, view="suggested")).count()
 
 
+def _prompt_info(account: Optional[Account]) -> dict:
+    if account is None:
+        return {"prompts": [], "defaultPromptId": None}
+    prompts, default_id = prompts_view(account)
+    return {"prompts": [{"id": p.id, "name": p.name, "role": p.role} for p in prompts], "defaultPromptId": default_id}
+
+
+# accountId -> (that profile's resume prompts, its default prompt id)
+PromptCtx = dict[str, tuple[list[ResumePrompt], str]]
+
+
+async def _prompt_ctx(run: JobApplyRun) -> PromptCtx:
+    accounts = await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()
+    return {str(a.id): prompts_view(a) for a in accounts}
+
+
+def _job_role(row):
+    ex = row.extraction
+    return job_role(row.title or (ex.title if ex else ""), list(ex.terms) if ex else [])
+
+
+def _chosen_id(row, account_id: str, prompts: list[ResumePrompt]) -> Optional[str]:
+    """The prompt a person chose for this job and profile, if it still exists."""
+    chosen = (getattr(row, "promptChoice", None) or {}).get(account_id)
+    return chosen if chosen and any(p.id == chosen for p in prompts) else None
+
+
+def _effective_prompt(row, account_id: str, prompts: list[ResumePrompt], default_id: str) -> ResumePrompt:
+    """The prompt tailoring uses for this job and profile: the person's choice, else the suggestion, else the default."""
+    pid = _chosen_id(row, account_id, prompts) or suggest_prompt(prompts, default_id, _job_role(row).role)
+    return next((p for p in prompts if p.id == pid), None) or next(p for p in prompts if p.id == default_id)
+
+
 def _template_info(account: Optional[Account]) -> dict:
     has = bool(account and (account.styleTemplate or "").strip())
     return {"hasTemplate": has, "templateName": (account.styleTemplateName or "HTML template") if has else None}
@@ -109,6 +145,8 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
                 "region": accounts[i].region if i in accounts else None,
                 # The HTML template tailored resumes are written into; without one the profile can't be tailored.
                 **_template_info(accounts.get(i)),
+                # Its resume prompts (no text) and default, for the Prompt column.
+                **_prompt_info(accounts.get(i)),
             }
             for i in ids
         ]
@@ -138,6 +176,8 @@ class _SuggestionView(BaseModel):
 
 
 class _ExtractionView(BaseModel):
+    title: str = ""
+    terms: list[Term] = Field(default_factory=list)
     workMode: str = "unknown"
     allowedLocations: list[Location] = Field(default_factory=list)
     timezoneNote: Optional[str] = None
@@ -177,11 +217,13 @@ class _RowListView(BaseModel):
     groupKey: Optional[str] = None
     forceInclude: bool = False
     markedInvalid: bool = False
+    promptChoice: dict[str, str] = Field(default_factory=dict)
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
-            "screen": 1, "groupKey": 1, "forceInclude": 1, "markedInvalid": 1,
+            "screen": 1, "groupKey": 1, "forceInclude": 1, "markedInvalid": 1, "promptChoice": 1,
+            "extraction.title": 1, "extraction.terms": 1,
             "jdSource": 1, "jdStructured": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
             "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
@@ -247,8 +289,10 @@ def _row_summary(
     account_id: str = "",
     previous: Optional[list] = None,
     tailored_docs: Optional[dict[str, dict]] = None,
+    prompt_ctx: Optional[PromptCtx] = None,
 ) -> dict:
     ex = row.extraction
+    match = _job_role(row)
     # Every profile's best uploaded resume, even below the minimum score: the app shows it next to Tailor.
     suggestions = [_suggestion(s) for s in row.bestByProfile if not account_id or s.accountId == account_id]
     marks = _applied_marks(row, [s for s in suggestions if s["total"] >= threshold])
@@ -300,7 +344,20 @@ def _row_summary(
         "openProfiles": _open_profiles(row),
         # Profiles whose row for this job is already in the Google Sheet.
         "exportedProfiles": list(row.exported),
+        # The job's role and main-stack keywords (from its title and skills), and why.
+        "jobRole": {"role": match.role, "marks": match.marks, "reason": match.reason},
+        **({"prompt": _prompt_state(row, prompt_ctx, match.role)} if prompt_ctx is not None else {}),
     }
+
+
+def _prompt_state(row, prompt_ctx: PromptCtx, role: Optional[str]) -> dict:
+    """Per profile: the prompt suggested for this job and the person's choice (None = none, or deleted since)."""
+    out = {}
+    for acc in _open_profiles(row):
+        if acc in prompt_ctx:
+            prompts, default_id = prompt_ctx[acc]
+            out[acc] = {"suggestedId": suggest_prompt(prompts, default_id, role), "chosenId": _chosen_id(row, acc, prompts)}
+    return out
 
 
 # ---------- applications (job × profile) ----------
@@ -936,8 +993,9 @@ async def list_rows(
                 "accountId": entry.get("accountId"),
             })
     out = []
+    prompt_ctx = await _prompt_ctx(run)
     for r in rows:
-        summary = _row_summary(r, run.threshold, accountId, previous.get(r.url), ctx.tailored)
+        summary = _row_summary(r, run.threshold, accountId, previous.get(r.url), ctx.tailored, prompt_ctx)
         apps = _applications(r, run.threshold, ctx, accountId)
         # [{accountId, state}] per profile this job is for; the job is done when all are applied.
         summary["applications"] = [{"accountId": a["accountId"], "state": a["state"]} for a in apps]
@@ -953,7 +1011,8 @@ async def _row_detail(row: JobApplyRow) -> dict:
     run = await JobApplyRun.get(row.runId)
     tailored = await _tailored_docs(_tailored_ids(row))
     await tailored_score.backfill(tailored)
-    out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored)
+    prompt_ctx = await _prompt_ctx(run) if run else None
+    out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored, prompt_ctx=prompt_ctx)
     out["scores"] = [s.model_dump(mode="json") for s in sorted(row.scores, key=lambda s: s.total, reverse=True)]
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None
     out["jdText"] = row.jdText
@@ -1031,6 +1090,34 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
 
 class InvalidBody(BaseModel):
     invalid: bool
+
+
+class PromptChoiceBody(BaseModel):
+    accountId: str
+    promptId: str
+
+
+@router.put("/rows/{row_id}/prompt")
+async def choose_prompt(row_id: str, body: PromptChoiceBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Choose the resume prompt a profile tailors this job with. Choosing the suggested prompt clears the choice, so
+    the job follows the suggestion again."""
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    prompt_ctx = await _prompt_ctx(run) if run else {}
+    if body.accountId not in prompt_ctx or not any(p.id == body.promptId for p in prompt_ctx[body.accountId][0]):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That prompt is not one of this profile's prompts.")
+    prompts, default_id = prompt_ctx[body.accountId]
+    suggested = suggest_prompt(prompts, default_id, _job_role(row).role)
+    choice = dict(row.promptChoice)
+    if body.promptId == suggested:
+        choice.pop(body.accountId, None)
+    else:
+        choice[body.accountId] = body.promptId
+    row.promptChoice = choice
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": row.id}, {"$set": {"promptChoice": choice, "updatedAt": datetime.utcnow()}}
+    )
+    return _row_summary(row, run.threshold if run else 75, prompt_ctx=prompt_ctx)
 
 
 @router.put("/rows/{row_id}/invalid")
