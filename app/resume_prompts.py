@@ -44,7 +44,7 @@ def legacy_name(body: Optional[str]) -> str:
 def _upgrade(unit: ResumePrompt, account: Any) -> ResumePrompt:
     """A stored unit in today's shape: a single `role` as `roles`; no template yet → the profile template."""
     update: dict = {"roles": list(unit.roles) or ([unit.role] if unit.role else []), "role": None}
-    if unit.templateHtml is None:
+    if unit.templateHtml is None and unit.templateName is None:
         update.update(templateHtml=account.styleTemplate or "", templateName=account.styleTemplateName or "",
                       pageFormat=account.pageFormat or "A4")
     return unit.model_copy(update=update)
@@ -60,7 +60,8 @@ def prompts_view(account: Any) -> tuple[list[ResumePrompt], str]:
         unit = ResumePrompt(id=LEGACY_ID, name=legacy_name(body), body=body, templateHtml=account.styleTemplate or "",
                             templateName=account.styleTemplateName or "", pageFormat=account.pageFormat or "A4")
         return [unit], LEGACY_ID
-    before_templates = all(u.templateHtml is None for u in stored)
+    # Saved before units had templates: neither template field was ever stored (saves now always store both).
+    before_templates = all(u.templateHtml is None and u.templateName is None for u in stored)
     units = [_upgrade(u, account) for u in stored]
     ids = {u.id for u in units}
     if before_templates and LEGACY_ID in ids:

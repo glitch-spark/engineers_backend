@@ -81,9 +81,11 @@ async def test_run_profiles_list_their_prompts(db):
 
     profiles = {p["name"]: p for p in (await _run_out(run, with_profiles=True))["profiles"]}
 
-    assert [(p["name"], p["role"]) for p in profiles["Blake"]["prompts"]] == [("Default", None), ("DevOps", "devops")]
+    assert [(p["name"], p["roles"], p["hasTemplate"]) for p in profiles["Blake"]["prompts"]] == [
+        ("Default", [], True), ("DevOps", ["devops"], False)]  # a new unit starts without a template
     assert profiles["Blake"]["defaultPromptId"] == "default"
-    assert profiles["Sam"]["prompts"] == [{"id": "default", "name": "Default", "role": None}]
+    assert profiles["Sam"]["prompts"] == [
+        {"id": "default", "name": "Default", "roles": [], "hasTemplate": True, "templateName": None}]
 
 
 async def test_row_summary_has_job_role_and_suggestion(db):
@@ -91,7 +93,7 @@ async def test_row_summary_has_job_role_and_suggestion(db):
 
     out = _row_summary(job_a, run.threshold, prompt_ctx=await _prompt_ctx(run))
 
-    assert out["jobRole"]["role"] == "devops" and out["jobRole"]["marks"] == ["Kubernetes", "AWS"]
+    assert out["jobRole"]["roles"] == ["devops"] and "DevOps — title says DevOps" in out["jobRole"]["reason"]
     assert out["prompt"][str(blake.id)] == {"suggestedId": _id(blake, "DevOps"), "chosenId": None}
     assert out["prompt"][str(sam.id)] == {"suggestedId": "default", "chosenId": None}
 
@@ -132,7 +134,7 @@ async def test_job_without_extraction_suggests_the_default(db):
 
     out = _row_summary(job_b, run.threshold, prompt_ctx=await _prompt_ctx(run))
 
-    assert out["jobRole"] == {"role": None, "marks": [], "reason": ""}
+    assert out["jobRole"] == {"roles": [], "reason": ""}
     assert out["prompt"][str(blake.id)]["suggestedId"] == "default"
 
 
@@ -229,3 +231,21 @@ async def test_concurrent_choices_for_two_profiles_both_stick(db, monkeypatch):
     await choose_prompt(str(job_a.id), PromptChoiceBody(accountId=str(blake.id), promptId="default"), owner)
 
     assert (await JobApplyRow.get(job_a.id)).promptChoice == {str(sam.id): _id(sam, "Data"), str(blake.id): "default"}
+
+
+async def test_a_unit_with_both_job_roles_is_suggested(db):
+    units = [
+        {"id": "default", "name": "Default", "roles": [], "body": "d"},
+        {"id": "new-1", "name": "DevOps", "roles": ["devops"], "body": "v"},
+        {"id": "new-2", "name": "Full stack + DevOps", "roles": ["fullstack", "devops"], "body": "fd"},
+    ]
+    owner, blake, _, run, job_a, _ = await _setup(units)
+    job_a.title = "Full Stack Engineer"
+    job_a.extraction = JobExtraction(title="Full Stack Engineer", terms=[Term(term="Kubernetes", tier="required"),
+                                                                         Term(term="Terraform", tier="required")])
+    await job_a.save()
+
+    out = _row_summary(await JobApplyRow.get(job_a.id), run.threshold, prompt_ctx=await _prompt_ctx(run))
+
+    assert set(out["jobRole"]["roles"]) == {"fullstack", "devops"}
+    assert out["prompt"][str(blake.id)]["suggestedId"] == _id(blake, "Full stack + DevOps")

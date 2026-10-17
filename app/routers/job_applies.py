@@ -24,7 +24,7 @@ from app.job_apply.screening import (
 )
 from app.job_apply.resume_parse import health
 from app.job_apply.scoring import band as score_band
-from app.job_apply.prompt_suggest import job_role, suggest_prompt
+from app.job_apply.prompt_suggest import job_roles, suggest_unit
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
 from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, Term, WorkAuth, WorkMode
@@ -95,7 +95,11 @@ def _prompt_info(account: Optional[Account]) -> dict:
     if account is None:
         return {"prompts": [], "defaultPromptId": None}
     prompts, default_id = prompts_view(account)
-    return {"prompts": [{"id": p.id, "name": p.name, "role": p.role} for p in prompts], "defaultPromptId": default_id}
+    return {
+        "prompts": [{"id": p.id, "name": p.name, "roles": list(p.roles), "hasTemplate": bool(p.templateHtml),
+                     "templateName": p.templateName or None} for p in prompts],
+        "defaultPromptId": default_id,
+    }
 
 
 # accountId -> (that profile's resume prompts, its default prompt id)
@@ -108,9 +112,13 @@ class _AccountPromptsView(BaseModel):
     resumePrompts: list[ResumePrompt] = Field(default_factory=list)
     defaultPromptId: Optional[str] = None
     resumePromptBody: Optional[str] = None
+    styleTemplate: Optional[str] = None  # not loaded: units only need their roles here
+    styleTemplateName: Optional[str] = None
+    pageFormat: str = "A4"
 
     class Settings:
         projection = {"_id": 1, "resumePrompts.id": 1, "resumePrompts.name": 1, "resumePrompts.role": 1,
+                      "resumePrompts.roles": 1, "resumePrompts.templateName": 1, "styleTemplateName": 1, "pageFormat": 1,
                       "resumePrompts.updatedAt": 1, "defaultPromptId": 1}
 
 
@@ -121,7 +129,7 @@ async def _prompt_ctx(run: JobApplyRun) -> PromptCtx:
 
 def _job_role(row):
     ex = row.extraction
-    return job_role(row.title or (ex.title if ex else ""), list(ex.terms) if ex else [])
+    return job_roles(row.title or (ex.title if ex else ""), list(ex.terms) if ex else [])
 
 
 def _chosen_id(row, account_id: str, prompts: list[ResumePrompt]) -> Optional[str]:
@@ -132,7 +140,7 @@ def _chosen_id(row, account_id: str, prompts: list[ResumePrompt]) -> Optional[st
 
 def _effective_prompt(row, account_id: str, prompts: list[ResumePrompt], default_id: str) -> ResumePrompt:
     """The prompt tailoring uses for this job and profile: the person's choice, else the suggestion, else the default."""
-    pid = _chosen_id(row, account_id, prompts) or suggest_prompt(prompts, default_id, _job_role(row).role)
+    pid = _chosen_id(row, account_id, prompts) or suggest_unit(prompts, default_id, _job_role(row).roles)
     return next((p for p in prompts if p.id == pid), None) or next(p for p in prompts if p.id == default_id)
 
 
@@ -359,18 +367,18 @@ def _row_summary(
         # Profiles whose row for this job is already in the Google Sheet.
         "exportedProfiles": list(row.exported),
         # The job's role and main-stack keywords (from its title and skills), and why.
-        "jobRole": {"role": match.role, "marks": match.marks, "reason": match.reason},
-        **({"prompt": _prompt_state(row, prompt_ctx, match.role)} if prompt_ctx is not None else {}),
+        "jobRole": {"roles": match.roles, "reason": match.reason},
+        **({"prompt": _prompt_state(row, prompt_ctx, match.roles)} if prompt_ctx is not None else {}),
     }
 
 
-def _prompt_state(row, prompt_ctx: PromptCtx, role: Optional[str]) -> dict:
+def _prompt_state(row, prompt_ctx: PromptCtx, roles: list[str]) -> dict:
     """Per profile: the prompt suggested for this job and the person's choice (None = none, or deleted since)."""
     out = {}
     for acc in _open_profiles(row):
         if acc in prompt_ctx:
             prompts, default_id = prompt_ctx[acc]
-            out[acc] = {"suggestedId": suggest_prompt(prompts, default_id, role), "chosenId": _chosen_id(row, acc, prompts)}
+            out[acc] = {"suggestedId": suggest_unit(prompts, default_id, roles), "chosenId": _chosen_id(row, acc, prompts)}
     return out
 
 
@@ -1121,7 +1129,7 @@ async def choose_prompt(row_id: str, body: PromptChoiceBody, user: Annotated[Use
     if body.accountId not in prompt_ctx or not any(p.id == body.promptId for p in prompt_ctx[body.accountId][0]):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That prompt is not one of this profile's prompts.")
     prompts, default_id = prompt_ctx[body.accountId]
-    suggested = suggest_prompt(prompts, default_id, _job_role(row).role)
+    suggested = suggest_unit(prompts, default_id, _job_role(row).roles)
     # One profile's entry only, so a choice saved for another profile at the same time isn't overwritten.
     key = f"promptChoice.{body.accountId}"  # accountId is one of the run's profiles (checked above)
     if body.promptId == suggested:
