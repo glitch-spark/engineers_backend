@@ -6,7 +6,7 @@ from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
 from beanie import PydanticObjectId
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_serializer, field_validator, model_validator
 from pymongo import IndexModel
 
 from app.interview_normalize import normalize_status, resolve_interview
@@ -68,6 +68,14 @@ class InterviewCaller(BaseModel):
         return v
 
 
+def _utc_json(v: Optional[datetime]) -> Optional[str]:
+    """ISO with a UTC offset. Mongo hands back naive UTC datetimes, and a browser reads an offset-less string as its own
+    local time; the value itself stays naive in Python, where the rest of the code compares it."""
+    if v is None:
+        return None
+    return (v if v.tzinfo else v.replace(tzinfo=dt_timezone.utc)).isoformat().replace("+00:00", "Z")
+
+
 class InterviewStageEvent(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     stage: str
@@ -86,6 +94,10 @@ class InterviewStageEvent(BaseModel):
     caller: Optional[InterviewCaller] = None
     # A caller round whose caller is lined up (set by the owner or an admin). Cleared when the time changes.
     confirmed: bool = False
+
+    @field_serializer("at", "scheduledAt", "endsAt", when_used="json")
+    def _times_utc(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_json(v)
 
     @field_validator("status", mode="before")
     @classmethod
@@ -130,6 +142,10 @@ class Interview(TimestampedDocument):
     confirmed: bool = False  # mirrors the latest round
     # The one #caller thread for all rounds (set by the first caller post).
     slackThread: Optional[SlackThread] = None
+
+    @field_serializer("scheduledAt", "endsAt", when_used="json")
+    def _times_utc(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_json(v)
 
     # Set when an unmigrated document was resolved on read: questions linked to
     # removed "rejected" rounds must follow on save (routers.interviews._save_interview).
