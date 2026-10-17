@@ -306,3 +306,60 @@ def test_tailored_out_has_template_name():
     out = _tailored_out({"_id": "6a0000000000000000000000", "accountId": "a", "status": "completed",
                          "promptName": "DevOps", "templateName": "devops.html"})
     assert out["templateName"] == "devops.html"
+
+
+async def test_run_job_without_override_uses_the_default_units_prompt(db, monkeypatch):
+    owner, blake, _, run, job_a, _ = await _setup()
+    blake.resumePromptBody = "stale body"  # a mirror left from an earlier default
+    await blake.save()
+    job = await ResumeApplication(userId=owner.id, accountId=blake.id, profileName="Blake", companyName="Acme",
+                                  companyNameLower="acme", jobDescription="jd", status="queued").insert()
+    resume_router, seen = await _capture_generation(monkeypatch)
+
+    await resume_router.run_job_doc(job)
+
+    assert seen["prompt_body"] == "default text"
+
+
+async def test_tailor_all_loads_each_profile_once(db, monkeypatch):
+    owner, blake, _, run, job_a, _ = await _setup()
+    rows = [job_a] + [await JobApplyRow(runId=run.id, userId=owner.id, rowIndex=10 + i, url=f"https://x.io/{i}",
+                                        title="Senior DevOps Engineer", company="Acme", status="scored", screen="valid",
+                                        jdText="DevOps job", extraction=DEVOPS_JOB, profileGates=job_a.profileGates,
+                                        tailorOnly=[str(blake.id)]).insert() for i in range(4)]
+    calls = []
+    real_get = Account.get
+
+    async def counting_get(*a, **kw):
+        calls.append(a)
+        return await real_get(*a, **kw)
+
+    monkeypatch.setattr(Account, "get", counting_get)
+    await tailor_all(str(run.id), TailorAllBody(accountIds=[str(blake.id)], rowIds=[str(r.id) for r in rows]), owner)
+
+    assert len(calls) <= 1
+
+
+async def test_run_payload_does_not_load_unit_templates(db, monkeypatch):
+    _, blake, _, run, _, _ = await _setup()
+    from app.routers import job_applies as ja
+    projections = []
+    real_find = Account.find
+
+    def spy_find(*a, **kw):
+        query = real_find(*a, **kw)
+        real_project = query.project
+
+        def project(model):
+            projections.append(getattr(getattr(model, "Settings", None), "projection", {}))
+            return real_project(model)
+
+        query.project = project
+        return query
+
+    monkeypatch.setattr(Account, "find", spy_find)
+    out = await ja._run_out(run, with_profiles=True)
+
+    assert projections and all("resumePrompts.templateHtml" not in p and "resumePrompts" not in p for p in projections)
+    blake_out = next(p for p in out["profiles"] if p["name"] == "Blake")
+    assert [u["hasTemplate"] for u in blake_out["prompts"]] == [True, True] and blake_out["hasTemplate"] is True

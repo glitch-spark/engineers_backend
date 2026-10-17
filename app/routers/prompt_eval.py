@@ -22,6 +22,7 @@ from app.models.prompt_eval import (
     PromptSource,
 )
 from app.prompt_eval import runner
+from app.resume_prompts import default_prompt_body
 from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume/eval", tags=["prompt-eval"])
@@ -135,7 +136,7 @@ def resolve_prompt(body_prompt: Optional[str], account: Account, user: UserExtra
     """Which prompt a run uses: the text in the request, else the profile's, else the user's global one."""
     if body_prompt is not None:
         return "custom", body_prompt.strip()
-    profile = (getattr(account, "resumePromptBody", None) or "").strip()
+    profile = default_prompt_body(account).strip()
     if profile:
         return "profile", profile
     global_prompt = (getattr(user, "resumePromptBody", None) or "").strip()

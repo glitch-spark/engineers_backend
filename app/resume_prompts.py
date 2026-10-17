@@ -19,6 +19,9 @@ MAX_PROMPTS = 10
 MAX_NAME = 60
 MAX_BODY = 30000
 MAX_TEMPLATE_BYTES = 2 * 1024 * 1024
+# All of a profile's templates (the default's counted twice: it is mirrored into styleTemplate), well under
+# MongoDB's 16 MB document limit.
+MAX_TOTAL_TEMPLATE_BYTES = 8 * 1024 * 1024
 DEFAULT_NAME = "Default"
 LEGACY_ID = "default"
 _ROLES = set(get_args(PromptRole))
@@ -45,8 +48,9 @@ def _upgrade(unit: ResumePrompt, account: Any) -> ResumePrompt:
     """A stored unit in today's shape: a single `role` as `roles`; no template yet → the profile template."""
     update: dict = {"roles": list(unit.roles) or ([unit.role] if unit.role else []), "role": None}
     if unit.templateHtml is None and unit.templateName is None:
-        update.update(templateHtml=account.styleTemplate or "", templateName=account.styleTemplateName or "",
-                      pageFormat=account.pageFormat or "A4")
+        update.update(templateHtml=getattr(account, "styleTemplate", None) or "",
+                      templateName=getattr(account, "styleTemplateName", None) or "",
+                      pageFormat=getattr(account, "pageFormat", None) or "A4")
     return unit.model_copy(update=update)
 
 
@@ -54,11 +58,13 @@ def prompts_view(account: Any) -> tuple[list[ResumePrompt], str]:
     """(units, default unit id). An older profile reads as one unit, the default; units saved before they had
     templates get the profile template, with the "default" unit as the default; otherwise a missing or stale default
     id falls back to the first unit."""
-    stored = list(account.resumePrompts or [])
+    stored = list(getattr(account, "resumePrompts", None) or [])
     if not stored:
-        body = account.resumePromptBody or ""
-        unit = ResumePrompt(id=LEGACY_ID, name=legacy_name(body), body=body, templateHtml=account.styleTemplate or "",
-                            templateName=account.styleTemplateName or "", pageFormat=account.pageFormat or "A4")
+        body = getattr(account, "resumePromptBody", None) or ""
+        unit = ResumePrompt(id=LEGACY_ID, name=legacy_name(body), body=body,
+                            templateHtml=getattr(account, "styleTemplate", None) or "",
+                            templateName=getattr(account, "styleTemplateName", None) or "",
+                            pageFormat=getattr(account, "pageFormat", None) or "A4")
         return [unit], LEGACY_ID
     # Saved before units had templates: neither template field was ever stored (saves now always store both).
     before_templates = all(u.templateHtml is None and u.templateName is None for u in stored)
@@ -66,11 +72,19 @@ def prompts_view(account: Any) -> tuple[list[ResumePrompt], str]:
     ids = {u.id for u in units}
     if before_templates and LEGACY_ID in ids:
         return units, LEGACY_ID  # the previous template + master prompt stay the default
-    return units, account.defaultPromptId if account.defaultPromptId in ids else units[0].id
+    default_id = getattr(account, "defaultPromptId", None)
+    return units, default_id if default_id in ids else units[0].id
 
 
 def find_prompt(account: Any, prompt_id: Optional[str]) -> Optional[ResumePrompt]:
     return next((p for p in prompts_view(account)[0] if p.id == prompt_id), None) if prompt_id else None
+
+
+def default_prompt_body(account: Any) -> str:
+    """The default unit's prompt. Readers of the single prompt use this rather than `resumePromptBody`, which a
+    profile saved before units had templates may still hold from an earlier default."""
+    units, default_id = prompts_view(account)
+    return next((u.body for u in units if u.id == default_id), "") or ""
 
 
 def unit_template(unit: ResumePrompt) -> tuple[Optional[str], str]:
@@ -128,6 +142,7 @@ def apply_prompts(account: Any, prompts: list[dict], default_id: Optional[str]) 
             if len(html.encode("utf-8")) > MAX_TEMPLATE_BYTES:
                 raise PromptError("An HTML template can be up to 2 MB")
             html, tname = sanitize_template_html(html), str(raw.get("templateName") or "")
+        tname = (tname or "HTML template") if html else ""  # a name iff there is a template
         fmt = raw.get("pageFormat") or (old.pageFormat if old else None) or account.pageFormat or "A4"
         if fmt not in _FORMATS:
             raise PromptError(f"Page format must be one of {', '.join(sorted(_FORMATS))}")
@@ -138,6 +153,9 @@ def apply_prompts(account: Any, prompts: list[dict], default_id: Optional[str]) 
     chosen = renamed.get(default_id or "", default_id)
     if chosen not in {p.id for p in out}:
         raise PromptError("Pick one of the units as the default")
+    total = sum(len((u.templateHtml or "").encode("utf-8")) * (2 if u.id == chosen else 1) for u in out)
+    if total > MAX_TOTAL_TEMPLATE_BYTES:
+        raise PromptError("A profile's HTML templates can be up to 8 MB in total: remove or shrink some templates")
     _mirror_default(account, out, chosen)
 
 

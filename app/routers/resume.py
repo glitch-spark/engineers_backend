@@ -35,7 +35,7 @@ from app.resume_service import (
     s3_enabled,
     trim_jd,
 )
-from app.resume_prompts import find_prompt, unit_template
+from app.resume_prompts import default_prompt_body, find_prompt, unit_template
 from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -144,7 +144,7 @@ async def _run_job(
     # Resolve resume content-prompt: per-generation > account > user > default.
     resolved_prompt_body = (prompt_body_override or "").strip()
     if not resolved_prompt_body:
-        resolved_prompt_body = (account.resumePromptBody or "").strip()
+        resolved_prompt_body = default_prompt_body(account).strip()
     if not resolved_prompt_body:
         resolved_prompt_body = (owner.resumePromptBody or "").strip() if owner else ""
     # Empty → no content guidance sent to the LLM (system rules only).

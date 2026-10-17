@@ -134,6 +134,7 @@ def _account_out(acc: Account) -> dict:
         **doc_to_dict(acc),
         "resumePrompts": [p.model_dump(mode="json") for p in prompts],
         "defaultPromptId": default_id,
+        "resumePromptBody": next((p.body for p in prompts if p.id == default_id), "") or None,
     }
 
 

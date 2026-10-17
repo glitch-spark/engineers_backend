@@ -256,3 +256,39 @@ async def test_account_list_strips_unit_bodies_and_templates(db):
 
     (unit,) = out["accounts"][0]["resumePrompts"] if "accounts" in out else out["data"][0]["resumePrompts"]
     assert "templateHtml" not in unit and "body" not in unit and unit["templateName"] == "Master.html"
+
+
+# ---------- final-review fixes ----------
+
+
+async def test_profile_saved_before_templates_reads_the_master_prompt_everywhere(db):
+    from app.routers.prompt_eval import resolve_prompt
+    from app.resume_prompts import default_prompt_body
+    owner = await _owner()
+    acc = await Account(name="Blake", createdBy=owner.id, styleTemplate=OLD_TEMPLATE, resumePromptBody="ops body",
+                        resumePrompts=[ResumePrompt(id="default", name="Master", body="master body"),
+                                       ResumePrompt(id="ops", name="DevOps", role="devops", body="ops body")],
+                        defaultPromptId="ops").insert()
+
+    assert default_prompt_body(acc) == "master body"
+    assert resolve_prompt(None, acc, owner) == ("profile", "master body")
+    assert (await get_account(str(acc.id), owner))["resumePromptBody"] == "master body"
+
+
+async def test_total_template_size_is_capped(db):
+    owner = await _owner()
+    big = [_unit(i, f"U{i}", html="<html><body>" + "x" * (1900 * 1024) + "</body></html>") for i in range(5)]
+
+    with pytest.raises(PromptError) as err:
+        apply_prompts(Account(name="Blake", createdBy=owner.id), big, "new-0")
+    assert "8 MB" in str(err.value)
+
+
+async def test_a_template_without_a_file_name_still_counts_as_a_template(db):
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id)
+
+    apply_prompts(acc, [{**_unit(1, "A"), "templateName": ""}, {**_unit(2, "B"), "templateHtml": "", "templateName": "x.html"}], "new-1")
+
+    a, b = acc.resumePrompts
+    assert (a.templateName, b.templateName) == ("HTML template", "")  # name set iff there is a template

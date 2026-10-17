@@ -28,7 +28,7 @@ from app.job_apply.prompt_suggest import job_roles, suggest_unit
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
 from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, Term, WorkAuth, WorkMode
-from app.models.account import ResumePrompt
+from app.models.account import Resume, ResumePrompt
 from app.resume_prompts import prompts_view
 from app.models.job_apply import (
     AppliedMark,
@@ -96,7 +96,9 @@ def _prompt_info(account: Optional[Account]) -> dict:
         return {"prompts": [], "defaultPromptId": None}
     prompts, default_id = prompts_view(account)
     return {
-        "prompts": [{"id": p.id, "name": p.name, "roles": list(p.roles), "hasTemplate": bool(p.templateHtml),
+        # Run payloads load units without their HTML (see _RunAccountView): a saved unit has a template name iff it
+        # has a template.
+        "prompts": [{"id": p.id, "name": p.name, "roles": list(p.roles), "hasTemplate": bool(p.templateHtml or p.templateName),
                      "templateName": p.templateName or None} for p in prompts],
         "defaultPromptId": default_id,
     }
@@ -104,6 +106,29 @@ def _prompt_info(account: Optional[Account]) -> dict:
 
 # accountId -> (that profile's resume prompts, its default prompt id)
 PromptCtx = dict[str, tuple[list[ResumePrompt], str]]
+
+
+class _RunAccountView(BaseModel):
+    """A run's profiles as the run page needs them: names, the default template and every unit's name / roles /
+    template name, but not the units' HTML or prompt texts (runs poll every few seconds while tailoring)."""
+    id: PydanticObjectId = Field(alias="_id")
+    name: str = ""
+    country: Optional[str] = None
+    region: Optional[str] = None
+    styleTemplate: Optional[str] = None
+    styleTemplateName: Optional[str] = None
+    pageFormat: str = "A4"
+    resumePromptBody: Optional[str] = None
+    resumePrompts: list[ResumePrompt] = Field(default_factory=list)
+    defaultPromptId: Optional[str] = None
+    resumes: list[Resume] = Field(default_factory=list)  # for the resumes' readability badges
+
+    class Settings:
+        projection = {"_id": 1, "name": 1, "country": 1, "region": 1, "styleTemplate": 1, "styleTemplateName": 1,
+                      "resumes": 1,
+                      "pageFormat": 1, "defaultPromptId": 1, "resumePrompts.id": 1, "resumePrompts.name": 1,
+                      "resumePrompts.role": 1, "resumePrompts.roles": 1, "resumePrompts.templateName": 1,
+                      "resumePrompts.pageFormat": 1, "resumePrompts.updatedAt": 1}
 
 
 class _AccountPromptsView(BaseModel):
@@ -156,7 +181,7 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
     out["retryable"] = await JobApplyRow.find(_retryable_query(run.id)).count()
     if with_profiles:
         ids = [s.accountId for s in run.selection]
-        accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).to_list()}
+        accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).project(_RunAccountView).to_list()}
         out["profiles"] = [
             {
                 "accountId": str(i),
@@ -1489,11 +1514,17 @@ async def _tailor_row(
     cover_letter: bool,
     resume_model: Optional[str] = None,
     cover_letter_model: Optional[str] = None,
+    accounts: Optional[dict] = None,
 ) -> ResumeApplication:
+    """`accounts`: profiles already loaded (accountId → Account), shared across the jobs of one tailor-all."""
     account_id = account_id or _best_profile(row, run)
     if account_id not in {str(s.accountId) for s in run.selection}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick one of this run's profiles.")
-    account = await Account.get(PydanticObjectId(account_id))
+    account = accounts.get(account_id) if accounts is not None else None
+    if account is None:
+        account = await Account.get(PydanticObjectId(account_id))
+        if accounts is not None and account is not None:
+            accounts[account_id] = account
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
     # The prompt selected in the Prompt column: the person's choice, else the one suggested from the job.
@@ -1601,6 +1632,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     ctx = await _app_context(run, rows)
     existing = ctx.tailored
     remaining = await resume_queue.remaining_today(owner)
+    accounts: dict = {}  # each profile loaded once for all of this tailor-all's jobs
     queued = skipped = other = 0
     for row in rows:
         done = _marked_profiles(row, run.threshold) | {acc for url, acc in ctx.logged if url == row.url}
@@ -1620,7 +1652,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
             try:
                 await _tailor_row(
                     row, run, owner, acc, body.coverLetter,
-                    resume_model=resume_model, cover_letter_model=cover_letter_model,
+                    resume_model=resume_model, cover_letter_model=cover_letter_model, accounts=accounts,
                 )
             except HTTPException as exc:
                 if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
