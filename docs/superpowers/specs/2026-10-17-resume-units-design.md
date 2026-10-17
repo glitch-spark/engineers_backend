@@ -92,12 +92,18 @@ class ResumePrompt(BaseModel):
     updatedAt: datetime
 ```
 
-- **Lazy migration** (no script), in `prompts_view`:
-  - no units → one unit from the legacy fields: name from the prompt heading (as today), roles [], body =
-    `resumePromptBody`, template = `styleTemplate` / `styleTemplateName`, `pageFormat` = the profile's.
-  - a stored unit with `templateHtml is None` → the profile's `styleTemplate` / name / format (prompts saved before
-    units existed keep working).
+- **Lazy migration** (no script), in `prompts_view`. For every existing profile, **the previous HTML template + the
+  master prompt form one unit, and that unit is the default**:
+  - no units → one unit from the legacy fields: id `default`, name from the prompt heading (as today), roles [],
+    body = `resumePromptBody`, template = `styleTemplate` / `styleTemplateName`, `pageFormat` = the profile's; it is
+    the default.
+  - prompts saved before units existed (no stored unit has a `templateHtml` yet): the unit with id `default` (the
+    master prompt) gets the previous template and **is the default**, whatever `defaultPromptId` says; other units
+    with `templateHtml is None` also get a copy of the previous template so they keep working (they can upload their
+    own later).
   - a stored `role` → `roles = [role]`.
+  - After the profile's next save every unit stores its own `templateHtml`, and `defaultPromptId` is the user's choice
+    from then on.
 - **Default sync**: after every save, the legacy fields mirror the default unit — `resumePromptBody`, `styleTemplate`,
   `styleTemplateName`, `pageFormat`. Every reader of those fields (Generate page, Prompt Eval, screening, lookup
   badges, `_parse_selection`) keeps working on the default unit. A write of `styleTemplate` / `resumePromptBody` alone
