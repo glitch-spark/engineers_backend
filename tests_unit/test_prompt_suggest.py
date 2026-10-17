@@ -98,3 +98,8 @@ def test_suggest_unit_ties_go_to_the_default_then_the_latest():
     units = [_unit("a", ["devops"], 1), _unit("b", ["devops"], 2), _unit("c", ["devops"], 9)]
     assert suggest_unit(units, "a", ["devops"]) == "a"
     assert suggest_unit(units, "x", ["devops"]) == "c"
+
+
+def test_a_role_in_the_title_is_always_shown_and_comes_first():
+    skills = [t("Kubernetes", "required"), t("Terraform", "required"), t("Helm", "core"), t("CI/CD", "required")]
+    assert job_roles("Senior Full Stack Engineer", skills).roles == ["fullstack", "devops"]

@@ -53,8 +53,9 @@ def _weight(term: Term) -> int:
 
 
 def job_roles(title: str, terms: Sequence[Term]) -> RoleMatch:
-    """The job's roles: each with a score of at least 2 and at least half the top score, at most MAX_ROLES, strongest
-    first (ties: first named in the title). Title hits count 3, required / core skills 2, other skills 1."""
+    """The job's roles, at most MAX_ROLES: those the title names (in title order), then those found only in the skills
+    with a score of at least 2 and at least half the top score (strongest first). Title hits count 3, required / core
+    skills 2, other skills 1."""
     low_title = (title or "").lower()
     in_title: dict[str, int] = {}  # keyword -> first position in the title
     for pos, kw in _keywords_in(low_title):
@@ -78,7 +79,11 @@ def job_roles(title: str, terms: Sequence[Term]) -> RoleMatch:
     top = max(s[0] for s in scored)
     if top < 2:
         return RoleMatch()
-    picked = sorted((s for s in scored if s[0] >= 2 and 2 * s[0] >= top), key=lambda s: (-s[0], s[1]))[:MAX_ROLES]
+    # A role the title names is always shown, first (in title order): it is what the job calls itself. Roles found
+    # only in the skills follow, strongest first, when they reach half the top score.
+    in_title_roles = sorted((s for s in scored if s[3]), key=lambda s: s[1])
+    from_skills = sorted((s for s in scored if not s[3] and s[0] >= 2 and 2 * s[0] >= top), key=lambda s: -s[0])
+    picked = (in_title_roles + from_skills)[:MAX_ROLES]
     reasons = []
     for _, _, role, title_hits, skill_hits in picked:
         parts = []
