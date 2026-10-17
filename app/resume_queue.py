@@ -77,12 +77,13 @@ async def remaining_today(user: UserExtra) -> int:
     return max(0, _daily_cap() - await daily_count(user))
 
 
-def _check_inputs(jd: str, account: Account) -> None:
+def _check_inputs(jd: str, account: Account, template_html: Optional[str] = None) -> None:
+    """`template_html`: the resume unit's template being used; None = the profile's (default unit's)."""
     if len((jd or "").encode("utf-8")) > MAX_JD_BYTES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"jobDescription exceeds {MAX_JD_BYTES} bytes")
     if not (jd or "").strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This job has no description to tailor to.")
-    if not (account.styleTemplate or "").strip():
+    if not (template_html if template_html is not None else account.styleTemplate or "").strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
@@ -100,6 +101,8 @@ async def enqueue_generation(
     prompt_body: Optional[str] = None,
     prompt_id: Optional[str] = None,
     prompt_name: Optional[str] = None,
+    template_html: Optional[str] = None,
+    template_name: Optional[str] = None,
     cover_letter: bool = False,
     source: Literal["generator", "job_applies"] = "generator",
     job_apply_row_id: Optional[PydanticObjectId] = None,
@@ -108,8 +111,10 @@ async def enqueue_generation(
     screening_model: Optional[str] = None,
     cover_letter_hook: Optional[str] = None,
 ) -> ResumeApplication:
-    """Validate and queue one generation. The caller has already checked the user may use `account`."""
-    _check_inputs(jd, account)
+    """Validate and queue one generation. The caller has already checked the user may use `account`.
+    `template_html` (checked, not stored: the runner looks the unit up by `prompt_id`) / `template_name`: the resume
+    unit's template."""
+    _check_inputs(jd, account, template_html)
     cap = _daily_cap()
     if await daily_count(user) >= cap:
         raise HTTPException(
@@ -136,6 +141,7 @@ async def enqueue_generation(
         promptOverride=(prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None,
         promptId=prompt_id,
         promptName=prompt_name,
+        templateName=template_name,
         jobApplyRowId=job_apply_row_id,
         resumeModelId=(resume_model or "").strip() or None,
         coverLetterModelId=(cover_letter_model or "").strip() or None,
@@ -160,6 +166,8 @@ async def requeue_failed(
     prompt_body: Optional[str] = None,
     prompt_id: Optional[str] = None,
     prompt_name: Optional[str] = None,
+    template_html: Optional[str] = None,
+    template_name: Optional[str] = None,
 ) -> Optional[ResumeApplication]:
     """Re-run a failed Job Applies generation in place with fresh inputs (including the prompt now selected), so a retry keeps one entry in Generated
     Resumes (and adds nothing to the daily count). None when that profile's job is gone or isn't failed."""
@@ -168,7 +176,7 @@ async def requeue_failed(
     job = await ResumeApplication.find_one({"_id": job_id, "accountId": account.id, "status": "failed"})
     if job is None:
         return None
-    _check_inputs(jd, account)
+    _check_inputs(jd, account, template_html)
     _reset_failed_job_fields(job)
     company = (company or "").strip() or "Company"
     job.profileName = account.name or "profile"
@@ -181,7 +189,7 @@ async def requeue_failed(
     job.resumeModelId = (resume_model or "").strip() or None
     job.coverLetterModelId = (cover_letter_model or "").strip() or None
     job.promptOverride = (prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None
-    job.promptId, job.promptName = prompt_id, prompt_name
+    job.promptId, job.promptName, job.templateName = prompt_id, prompt_name, template_name
     job.attempts = 0
     job.leaseAt = None
     job.updatedAt = datetime.utcnow()
@@ -200,7 +208,7 @@ _running: set[asyncio.Task] = set()
 
 # Fields the queue (claim, heartbeat, applied marks) owns; the runner never writes them back.
 _QUEUE_OWNED = frozenset({"_id", "id", "createdAt", "leaseAt", "attempts", "countsAsBid", "source", "jobApplyRowId",
-                          "promptOverride", "promptId", "promptName", "resumeModelId", "coverLetterModelId",
+                          "promptOverride", "promptId", "promptName", "templateName", "resumeModelId", "coverLetterModelId",
                           "screeningModelId", "coverLetterHook"})
 
 

@@ -286,6 +286,7 @@ def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
         "match": doc.get("matchScore"),
         # The profile's resume prompt it was tailored with (None for older ones).
         "promptName": doc.get("promptName"),
+        "templateName": doc.get("templateName"),
     }
 
 
@@ -1497,7 +1498,10 @@ async def _tailor_row(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
     # The prompt selected in the Prompt column: the person's choice, else the one suggested from the job.
     prompt = _effective_prompt(row, account_id, *prompts_view(account))
-    with_prompt = {"prompt_body": prompt.body or None, "prompt_id": prompt.id, "prompt_name": prompt.name}
+    if not prompt.templateHtml:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This resume unit has no HTML template.")
+    with_prompt = {"prompt_body": prompt.body or None, "prompt_id": prompt.id, "prompt_name": prompt.name,
+                   "template_html": prompt.templateHtml, "template_name": prompt.templateName or "HTML template"}
     previous = row.tailored.get(account_id)
     if previous:  # a failed one is re-run in place, not replaced by another job
         retried = await resume_queue.requeue_failed(

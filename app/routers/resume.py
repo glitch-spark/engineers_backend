@@ -35,6 +35,7 @@ from app.resume_service import (
     s3_enabled,
     trim_jd,
 )
+from app.resume_prompts import find_prompt, unit_template
 from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -135,6 +136,10 @@ async def _run_job(
         await _mark_failed(job, "account no longer exists", started)
         return
     owner = await UserExtra.get(user_id)
+    # The resume unit the job was queued with (Job Applies): its HTML template and page format. No unit, or a unit
+    # deleted / emptied since → the profile's (default unit's) template.
+    unit = find_prompt(account, job.promptId) if job.promptId else None
+    template_html, page_format = unit_template(unit) if unit is not None and unit.templateHtml else (None, None)
 
     # Resolve resume content-prompt: per-generation > account > user > default.
     resolved_prompt_body = (prompt_body_override or "").strip()
@@ -158,7 +163,7 @@ async def _run_job(
 
         result = await generate_resume(
             account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id),
-            model_id=job.resumeModelId,
+            model_id=job.resumeModelId, template_html=template_html, page_format=page_format,
         )
         _add_cost(job, result.cost_usd)
         job.inputTokens = result.input_tokens

@@ -128,6 +128,7 @@ class ResumeApplication(TimestampedDocument):
     # Which of the profile's resume prompts promptOverride came from (Job Applies), to show it on the job.
     promptId: Optional[str] = None
     promptName: Optional[str] = None
+    templateName: Optional[str] = None  # the unit's HTML template, for display
     jobApplyRowId: Optional[PydanticObjectId] = None
     # Job Applies: this resume scored against that row's job (app/job_apply/tailored_score.py); absent = not scored yet.
     matchScore: Optional[TailoredMatch] = None

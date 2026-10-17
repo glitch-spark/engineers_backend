@@ -55,7 +55,8 @@ async def _setup(blake_prompts=None):
     blake = Account(name="Blake", createdBy=owner.id, styleTemplate="<html>{{resume}}</html>")
     apply_prompts(blake, blake_prompts or [
         {"id": "default", "name": "Default", "role": None, "body": "default text"},
-        {"id": "new-1", "name": "DevOps", "role": "devops", "body": "devops text"},
+        {"id": "new-1", "name": "DevOps", "role": "devops", "body": "devops text",
+         "templateHtml": "<html><body>{{devops}}</body></html>", "templateName": "devops.html"},
     ], "default")
     await blake.insert()
     sam = await Account(name="Sam", createdBy=owner.id, styleTemplate="<html>{{resume}}</html>",
@@ -82,7 +83,7 @@ async def test_run_profiles_list_their_prompts(db):
     profiles = {p["name"]: p for p in (await _run_out(run, with_profiles=True))["profiles"]}
 
     assert [(p["name"], p["roles"], p["hasTemplate"]) for p in profiles["Blake"]["prompts"]] == [
-        ("Default", [], True), ("DevOps", ["devops"], False)]  # a new unit starts without a template
+        ("Default", [], True), ("DevOps", ["devops"], True)]
     assert profiles["Blake"]["defaultPromptId"] == "default"
     assert profiles["Sam"]["prompts"] == [
         {"id": "default", "name": "Default", "roles": [], "hasTemplate": True, "templateName": None}]
@@ -249,3 +250,59 @@ async def test_a_unit_with_both_job_roles_is_suggested(db):
 
     assert set(out["jobRole"]["roles"]) == {"fullstack", "devops"}
     assert out["prompt"][str(blake.id)]["suggestedId"] == _id(blake, "Full stack + DevOps")
+
+
+# ---------- tailoring with the unit's template ----------
+
+
+async def _capture_generation(monkeypatch):
+    from app.routers import resume as resume_router
+    seen = {}
+
+    async def fake_generate(account, jd, company, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop after capturing")  # the job is marked failed; we only need the inputs
+
+    monkeypatch.setattr(resume_router, "generate_resume", fake_generate)
+    return resume_router, seen
+
+
+async def test_run_job_uses_the_jobs_unit_template(db, monkeypatch):
+    owner, blake, _, run, job_a, _ = await _setup()
+    job = await _tailor_row(job_a, run, owner, str(blake.id), False)  # DevOps job -> the DevOps unit
+    resume_router, seen = await _capture_generation(monkeypatch)
+
+    await resume_router.run_job_doc(await ResumeApplication.get(job.id))
+
+    assert job.templateName == "devops.html"
+    assert "{{devops}}" in seen["template_html"] and seen["page_format"] == "A4"
+
+
+async def test_job_without_unit_uses_profile_template(db, monkeypatch):
+    owner, blake, _, run, job_a, _ = await _setup()
+    job = await _tailor_row(job_a, run, owner, str(blake.id), False)
+    await ResumeApplication.get_motor_collection().update_one({"_id": job.id}, {"$set": {"promptId": None}})
+    resume_router, seen = await _capture_generation(monkeypatch)
+
+    await resume_router.run_job_doc(await ResumeApplication.get(job.id))
+
+    assert seen["template_html"] is None and seen["page_format"] is None  # generate_resume uses the profile's
+
+
+async def test_tailoring_a_unit_without_template_is_refused(db):
+    units = [{"id": "default", "name": "Default", "roles": [], "body": "d"},
+             {"id": "new-1", "name": "DevOps", "roles": ["devops"], "body": "v", "templateHtml": "", "templateName": ""}]
+    owner, blake, _, run, job_a, _ = await _setup(units)
+
+    with pytest.raises(HTTPException) as err:
+        await _tailor_row(job_a, run, owner, str(blake.id), False)
+    assert err.value.status_code == 400 and err.value.detail == "This resume unit has no HTML template."
+
+    out = await tailor_all(str(run.id), TailorAllBody(accountIds=[str(blake.id)], rowIds=[str(job_a.id)]), owner)
+    assert out["queued"] == 0 and out["skipped"] == 1
+
+
+def test_tailored_out_has_template_name():
+    out = _tailored_out({"_id": "6a0000000000000000000000", "accountId": "a", "status": "completed",
+                         "promptName": "DevOps", "templateName": "devops.html"})
+    assert out["templateName"] == "devops.html"
