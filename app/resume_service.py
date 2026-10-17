@@ -571,12 +571,14 @@ async def generate_resume_html(
     prompt_body: Optional[str] = None,
     owner: Optional[UserExtra] = None,
     model_id: Optional[str] = None,
+    template_html: Optional[str] = None,
 ) -> tuple[str, LlmResult]:
     """The LLM half of the pipeline, without rendering: the model rewrites the
     style-stripped body text (or a content-hash cache hit reuses a prior output),
     and the body is spliced back into the template shell with the original CSS.
+    `template_html` is a resume unit's template; None = the profile's (default unit's).
     Returns the finished HTML document and the LLM result (model, usage, cached)."""
-    template = (account.styleTemplate or "").strip()
+    template = (template_html if template_html is not None else account.styleTemplate or "").strip()
     if not template:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -603,6 +605,8 @@ async def generate_resume(
     owner: Optional[UserExtra] = None,
     job_id: Optional[str] = None,
     model_id: Optional[str] = None,
+    template_html: Optional[str] = None,
+    page_format: Optional[str] = None,
 ) -> GeneratedResume:
     """Run the full pipeline: `generate_resume_html` (LLM rewrite or cache hit,
     CSS restored), then Playwright renders the HTML to PDF, optional S3 upload."""
@@ -612,14 +616,14 @@ async def generate_resume(
     )
 
     out_html, llm_result = await generate_resume_html(
-        account, job_description, prompt_body=prompt_body, owner=owner, model_id=model_id,
+        account, job_description, prompt_body=prompt_body, owner=owner, model_id=model_id, template_html=template_html,
     )
     usage = llm_result.usage
 
     async with _render_slots():
         pdf_bytes = await _html_to_pdf(
             out_html,
-            page_format=account.pageFormat or "A4",
+            page_format=page_format or account.pageFormat or "A4",
             margin_pt=_resolve_margin_pt(account),
         )
     s3_key, _region = await asyncio.to_thread(_maybe_upload_to_s3, pdf_bytes, account.name, company, job_id)

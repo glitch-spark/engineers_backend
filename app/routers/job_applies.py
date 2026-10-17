@@ -24,9 +24,12 @@ from app.job_apply.screening import (
 )
 from app.job_apply.resume_parse import health
 from app.job_apply.scoring import band as score_band
+from app.job_apply.prompt_suggest import job_roles, suggest_unit
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
 from app.models import Account, ResumeApplication, UserExtra
-from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, WorkAuth, WorkMode
+from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, Term, WorkAuth, WorkMode
+from app.models.account import Resume, ResumePrompt
+from app.resume_prompts import prompts_view
 from app.models.job_apply import (
     AppliedMark,
     file_key,
@@ -88,6 +91,84 @@ async def _suggested_count(run: JobApplyRun) -> int:
     return await JobApplyRow.find(await _rows_query(run, view="suggested")).count()
 
 
+def _prompt_info(account: Optional[Account]) -> dict:
+    if account is None:
+        return {"prompts": [], "defaultPromptId": None}
+    prompts, default_id = prompts_view(account)
+    return {
+        # Run payloads load units without their HTML (see _RunAccountView): a saved unit has a template name iff it
+        # has a template.
+        "prompts": [{"id": p.id, "name": p.name, "roles": list(p.roles), "hasTemplate": bool(p.templateHtml or p.templateName),
+                     "templateName": p.templateName or None} for p in prompts],
+        "defaultPromptId": default_id,
+    }
+
+
+# accountId -> (that profile's resume prompts, its default prompt id)
+PromptCtx = dict[str, tuple[list[ResumePrompt], str]]
+
+
+class _RunAccountView(BaseModel):
+    """A run's profiles as the run page needs them: names, the default template and every unit's name / roles /
+    template name, but not the units' HTML or prompt texts (runs poll every few seconds while tailoring)."""
+    id: PydanticObjectId = Field(alias="_id")
+    name: str = ""
+    country: Optional[str] = None
+    region: Optional[str] = None
+    styleTemplate: Optional[str] = None
+    styleTemplateName: Optional[str] = None
+    pageFormat: str = "A4"
+    resumePromptBody: Optional[str] = None
+    resumePrompts: list[ResumePrompt] = Field(default_factory=list)
+    defaultPromptId: Optional[str] = None
+    resumes: list[Resume] = Field(default_factory=list)  # for the resumes' readability badges
+
+    class Settings:
+        projection = {"_id": 1, "name": 1, "country": 1, "region": 1, "styleTemplate": 1, "styleTemplateName": 1,
+                      "resumes": 1,
+                      "pageFormat": 1, "defaultPromptId": 1, "resumePrompts.id": 1, "resumePrompts.name": 1,
+                      "resumePrompts.role": 1, "resumePrompts.roles": 1, "resumePrompts.templateName": 1,
+                      "resumePrompts.pageFormat": 1, "resumePrompts.updatedAt": 1}
+
+
+class _AccountPromptsView(BaseModel):
+    """Just what suggestions need from a profile (no resumes, template or prompt texts): runs poll every few seconds."""
+    id: PydanticObjectId = Field(alias="_id")
+    resumePrompts: list[ResumePrompt] = Field(default_factory=list)
+    defaultPromptId: Optional[str] = None
+    resumePromptBody: Optional[str] = None
+    styleTemplate: Optional[str] = None  # not loaded: units only need their roles here
+    styleTemplateName: Optional[str] = None
+    pageFormat: str = "A4"
+
+    class Settings:
+        projection = {"_id": 1, "resumePrompts.id": 1, "resumePrompts.name": 1, "resumePrompts.role": 1,
+                      "resumePrompts.roles": 1, "resumePrompts.templateName": 1, "styleTemplateName": 1, "pageFormat": 1,
+                      "resumePrompts.updatedAt": 1, "defaultPromptId": 1}
+
+
+async def _prompt_ctx(run: JobApplyRun) -> PromptCtx:
+    accounts = await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).project(_AccountPromptsView).to_list()
+    return {str(a.id): prompts_view(a) for a in accounts}
+
+
+def _job_role(row):
+    ex = row.extraction
+    return job_roles(row.title or (ex.title if ex else ""), list(ex.terms) if ex else [])
+
+
+def _chosen_id(row, account_id: str, prompts: list[ResumePrompt]) -> Optional[str]:
+    """The prompt a person chose for this job and profile, if it still exists."""
+    chosen = (getattr(row, "promptChoice", None) or {}).get(account_id)
+    return chosen if chosen and any(p.id == chosen for p in prompts) else None
+
+
+def _effective_prompt(row, account_id: str, prompts: list[ResumePrompt], default_id: str) -> ResumePrompt:
+    """The prompt tailoring uses for this job and profile: the person's choice, else the suggestion, else the default."""
+    pid = _chosen_id(row, account_id, prompts) or suggest_unit(prompts, default_id, _job_role(row).roles)
+    return next((p for p in prompts if p.id == pid), None) or next(p for p in prompts if p.id == default_id)
+
+
 def _template_info(account: Optional[Account]) -> dict:
     has = bool(account and (account.styleTemplate or "").strip())
     return {"hasTemplate": has, "templateName": (account.styleTemplateName or "HTML template") if has else None}
@@ -100,7 +181,7 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
     out["retryable"] = await JobApplyRow.find(_retryable_query(run.id)).count()
     if with_profiles:
         ids = [s.accountId for s in run.selection]
-        accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).to_list()}
+        accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).project(_RunAccountView).to_list()}
         out["profiles"] = [
             {
                 "accountId": str(i),
@@ -109,6 +190,8 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
                 "region": accounts[i].region if i in accounts else None,
                 # The HTML template tailored resumes are written into; without one the profile can't be tailored.
                 **_template_info(accounts.get(i)),
+                # Its resume prompts (no text) and default, for the Prompt column.
+                **_prompt_info(accounts.get(i)),
             }
             for i in ids
         ]
@@ -138,6 +221,8 @@ class _SuggestionView(BaseModel):
 
 
 class _ExtractionView(BaseModel):
+    title: str = ""
+    terms: list[Term] = Field(default_factory=list)
     workMode: str = "unknown"
     allowedLocations: list[Location] = Field(default_factory=list)
     timezoneNote: Optional[str] = None
@@ -177,11 +262,13 @@ class _RowListView(BaseModel):
     groupKey: Optional[str] = None
     forceInclude: bool = False
     markedInvalid: bool = False
+    promptChoice: dict[str, str] = Field(default_factory=dict)
 
     class Settings:
         projection = {
             "_id": 1, "rowIndex": 1, "url": 1, "title": 1, "company": 1, "status": 1, "statusReason": 1,
-            "screen": 1, "groupKey": 1, "forceInclude": 1, "markedInvalid": 1,
+            "screen": 1, "groupKey": 1, "forceInclude": 1, "markedInvalid": 1, "promptChoice": 1,
+            "extraction.title": 1, "extraction.terms": 1,
             "jdSource": 1, "jdStructured": 1, "postedDate": 1, "extractionSource": 1, "gates": 1, "profileGates": 1, "topScore": 1,
             "applied": 1, "appliedResumes": 1, "tailored": 1, "exported": 1, "tailorOnly": 1,
             "scores.accountId": 1, "scores.resumeId": 1, "scores.filename": 1, "scores.total": 1,
@@ -222,6 +309,9 @@ def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
         "error": doc.get("errorMessage"),
         # {total, band, knockouts, missing}: the tailored resume scored against this job; null = not scored.
         "match": doc.get("matchScore"),
+        # The profile's resume prompt it was tailored with (None for older ones).
+        "promptName": doc.get("promptName"),
+        "templateName": doc.get("templateName"),
     }
 
 
@@ -247,8 +337,10 @@ def _row_summary(
     account_id: str = "",
     previous: Optional[list] = None,
     tailored_docs: Optional[dict[str, dict]] = None,
+    prompt_ctx: Optional[PromptCtx] = None,
 ) -> dict:
     ex = row.extraction
+    match = _job_role(row)
     # Every profile's best uploaded resume, even below the minimum score: the app shows it next to Tailor.
     suggestions = [_suggestion(s) for s in row.bestByProfile if not account_id or s.accountId == account_id]
     marks = _applied_marks(row, [s for s in suggestions if s["total"] >= threshold])
@@ -300,7 +392,20 @@ def _row_summary(
         "openProfiles": _open_profiles(row),
         # Profiles whose row for this job is already in the Google Sheet.
         "exportedProfiles": list(row.exported),
+        # The job's role and main-stack keywords (from its title and skills), and why.
+        "jobRole": {"roles": match.roles, "reason": match.reason},
+        **({"prompt": _prompt_state(row, prompt_ctx, match.roles)} if prompt_ctx is not None else {}),
     }
+
+
+def _prompt_state(row, prompt_ctx: PromptCtx, roles: list[str]) -> dict:
+    """Per profile: the prompt suggested for this job and the person's choice (None = none, or deleted since)."""
+    out = {}
+    for acc in _open_profiles(row):
+        if acc in prompt_ctx:
+            prompts, default_id = prompt_ctx[acc]
+            out[acc] = {"suggestedId": suggest_unit(prompts, default_id, roles), "chosenId": _chosen_id(row, acc, prompts)}
+    return out
 
 
 # ---------- applications (job × profile) ----------
@@ -936,8 +1041,9 @@ async def list_rows(
                 "accountId": entry.get("accountId"),
             })
     out = []
+    prompt_ctx = await _prompt_ctx(run)
     for r in rows:
-        summary = _row_summary(r, run.threshold, accountId, previous.get(r.url), ctx.tailored)
+        summary = _row_summary(r, run.threshold, accountId, previous.get(r.url), ctx.tailored, prompt_ctx)
         apps = _applications(r, run.threshold, ctx, accountId)
         # [{accountId, state}] per profile this job is for; the job is done when all are applied.
         summary["applications"] = [{"accountId": a["accountId"], "state": a["state"]} for a in apps]
@@ -953,7 +1059,8 @@ async def _row_detail(row: JobApplyRow) -> dict:
     run = await JobApplyRun.get(row.runId)
     tailored = await _tailored_docs(_tailored_ids(row))
     await tailored_score.backfill(tailored)
-    out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored)
+    prompt_ctx = await _prompt_ctx(run) if run else None
+    out = _row_summary(row, run.threshold if run else 75, tailored_docs=tailored, prompt_ctx=prompt_ctx)
     out["scores"] = [s.model_dump(mode="json") for s in sorted(row.scores, key=lambda s: s.total, reverse=True)]
     out["extraction"] = row.extraction.model_dump(mode="json") if row.extraction else None
     out["jdText"] = row.jdText
@@ -1031,6 +1138,34 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
 
 class InvalidBody(BaseModel):
     invalid: bool
+
+
+class PromptChoiceBody(BaseModel):
+    accountId: str
+    promptId: str
+
+
+@router.put("/rows/{row_id}/prompt")
+async def choose_prompt(row_id: str, body: PromptChoiceBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Choose the resume prompt a profile tailors this job with. Choosing the suggested prompt clears the choice, so
+    the job follows the suggestion again."""
+    row = await _owned_row(row_id, user)
+    run = await JobApplyRun.get(row.runId)
+    prompt_ctx = await _prompt_ctx(run) if run else {}
+    if body.accountId not in prompt_ctx or not any(p.id == body.promptId for p in prompt_ctx[body.accountId][0]):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That prompt is not one of this profile's prompts.")
+    prompts, default_id = prompt_ctx[body.accountId]
+    suggested = suggest_unit(prompts, default_id, _job_role(row).roles)
+    # One profile's entry only, so a choice saved for another profile at the same time isn't overwritten.
+    key = f"promptChoice.{body.accountId}"  # accountId is one of the run's profiles (checked above)
+    if body.promptId == suggested:
+        update = {"$unset": {key: ""}, "$set": {"updatedAt": datetime.utcnow()}}
+    else:
+        update = {"$set": {key: body.promptId, "updatedAt": datetime.utcnow()}}
+    await JobApplyRow.get_motor_collection().update_one({"_id": row.id}, update)
+    fresh = await JobApplyRow.get(row.id)
+    row.promptChoice = fresh.promptChoice if fresh else {}
+    return _row_summary(row, run.threshold if run else 75, prompt_ctx=prompt_ctx)
 
 
 @router.put("/rows/{row_id}/invalid")
@@ -1379,18 +1514,30 @@ async def _tailor_row(
     cover_letter: bool,
     resume_model: Optional[str] = None,
     cover_letter_model: Optional[str] = None,
+    accounts: Optional[dict] = None,
 ) -> ResumeApplication:
+    """`accounts`: profiles already loaded (accountId → Account), shared across the jobs of one tailor-all."""
     account_id = account_id or _best_profile(row, run)
     if account_id not in {str(s.accountId) for s in run.selection}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick one of this run's profiles.")
-    account = await Account.get(PydanticObjectId(account_id))
+    account = accounts.get(account_id) if accounts is not None else None
+    if account is None:
+        account = await Account.get(PydanticObjectId(account_id))
+        if accounts is not None and account is not None:
+            accounts[account_id] = account
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
+    # The prompt selected in the Prompt column: the person's choice, else the one suggested from the job.
+    prompt = _effective_prompt(row, account_id, *prompts_view(account))
+    if not prompt.templateHtml:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This resume unit has no HTML template.")
+    with_prompt = {"prompt_body": prompt.body or None, "prompt_id": prompt.id, "prompt_name": prompt.name,
+                   "template_html": prompt.templateHtml, "template_name": prompt.templateName or "HTML template"}
     previous = row.tailored.get(account_id)
     if previous:  # a failed one is re-run in place, not replaced by another job
         retried = await resume_queue.requeue_failed(
             previous, account=account, jd=row.jdText or "", company=_company_label(row), job_url=row.url,
-            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model,
+            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model, **with_prompt,
         )
         if retried is not None:
             return retried
@@ -1405,6 +1552,7 @@ async def _tailor_row(
         job_apply_row_id=row.id,
         resume_model=resume_model,
         cover_letter_model=cover_letter_model,
+        **with_prompt,
     )
     jobs = ResumeApplication.get_motor_collection()
     # Compare-and-set: only link the new job if the row still points where we read it. A concurrent tailor
@@ -1484,6 +1632,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     ctx = await _app_context(run, rows)
     existing = ctx.tailored
     remaining = await resume_queue.remaining_today(owner)
+    accounts: dict = {}  # each profile loaded once for all of this tailor-all's jobs
     queued = skipped = other = 0
     for row in rows:
         done = _marked_profiles(row, run.threshold) | {acc for url, acc in ctx.logged if url == row.url}
@@ -1503,7 +1652,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
             try:
                 await _tailor_row(
                     row, run, owner, acc, body.coverLetter,
-                    resume_model=resume_model, cover_letter_model=cover_letter_model,
+                    resume_model=resume_model, cover_letter_model=cover_letter_model, accounts=accounts,
                 )
             except HTTPException as exc:
                 if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:

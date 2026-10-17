@@ -8,6 +8,22 @@ from app.models.base import TimestampedDocument
 
 
 PageFormat = Literal["A3", "A4", "A5", "Letter"]
+# Job roles a resume prompt can be written for (Job Applies suggests the prompt whose role fits the job).
+PromptRole = Literal["fullstack", "frontend", "backend", "devops", "data", "ml", "mobile", "qa"]
+
+
+class ResumePrompt(BaseModel):
+    """A resume unit: an HTML template, the prompt written for it, and the job roles it is meant for. Ids are ObjectId
+    hex, except "default" for the unit an older profile's template + prompt became (app/resume_prompts.py)."""
+    id: str
+    name: str
+    roles: List[PromptRole] = []
+    role: Optional[PromptRole] = None  # before units had several roles; read as [role]
+    body: str = ""
+    templateHtml: Optional[str] = None  # None = saved before units had templates (inherits the profile template)
+    templateName: Optional[str] = None
+    pageFormat: PageFormat = "A4"
+    updatedAt: datetime = Field(default_factory=datetime.utcnow)
 
 
 class Resume(BaseModel):
@@ -45,6 +61,10 @@ class Account(TimestampedDocument):
     # Account-level custom resume content-contract prompt. Empty → fall back
     # to the user-level prompt, then the built-in default.
     resumePromptBody: Optional[str] = None
+    # Several resume prompts, one per role (app/resume_prompts.py). Empty = an older profile: read as one "Default"
+    # prompt holding resumePromptBody, which is always kept equal to the default prompt's body.
+    resumePrompts: List[ResumePrompt] = []
+    defaultPromptId: Optional[str] = None
 
     # HTML template uploaded by the user. The resume LLM edits this in
     # place per generation — structure/CSS preserved, sample text replaced.

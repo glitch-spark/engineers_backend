@@ -51,3 +51,20 @@ def test_plain_text_from_html_collapses_blank_lines():
     text = resume_service.plain_text_from_html("<body><h1>A</h1>\n\n\n\n<p>B</p><p>C</p></body>")
     assert "\n\n\n" not in text
     assert text.startswith("A") and "B" in text and text.endswith("C")
+
+
+async def test_generation_uses_the_given_template(monkeypatch):
+    seen = {}
+
+    async def fake_output(prompt, user, template, model_id=None):
+        seen.update(prompt=prompt, template=template)
+        return LlmResult(text="<body><p>NEW</p></body>", provider="openai", model="gpt-4o-mini", usage={},
+                         fallback_used=False, model_id="openai:gpt-4o-mini", cost_usd=0.0, cached=False)
+
+    monkeypatch.setattr(resume_service, "_resume_llm_output", fake_output)
+    unit_template = "<html><head><style>.u{}</style></head><body><p>UNIT</p></body></html>"
+
+    html, _ = await resume_service.generate_resume_html(account(), "JD", template_html=unit_template)
+
+    assert seen["template"] == unit_template and "UNIT" in seen["prompt"] and "OLD" not in seen["prompt"]
+    assert "<style>.u{}</style>" in html and "NEW" in html

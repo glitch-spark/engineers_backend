@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from app import resume_files
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.models.account import Resume
+from app.models.account import PromptRole, Resume
+from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -65,6 +66,15 @@ def _validate_and_normalize_resumes(items: List[ResumeIn], existing: Optional[Li
     return out
 
 
+def _slim_units(payload: dict) -> None:
+    """Units in list responses: no prompt text or template HTML (up to 10 x 30 KB + 2 MB each per profile)."""
+    units = payload.get("resumePrompts")
+    if isinstance(units, list):
+        payload["resumePrompts"] = [
+            {k: v for k, v in u.items() if k not in ("body", "templateHtml")} if isinstance(u, dict) else u for u in units
+        ]
+
+
 def _strip_markdown_from_account(payload: dict) -> dict:
     """Replace each resume's `markdown` with `sizeBytes` for list responses.
     Keeps id/filename/uploadedAt so the SPA can show counts and filenames; the
@@ -82,6 +92,7 @@ def _strip_markdown_from_account(payload: dict) -> dict:
                     "hasFile": bool(r.get("s3Key")),
                 })
         payload["resumes"] = slim
+    _slim_units(payload)
     return payload
 
 
@@ -99,12 +110,43 @@ class AccountCreate(BaseModel):
     coverLetterPrompt: Optional[str] = None
 
 
+class ResumePromptIn(BaseModel):
+    """A resume unit as the app sends it."""
+    id: Optional[str] = None  # missing or "new-…" = a new unit; the server gives it an id
+    name: str
+    roles: List[PromptRole] = []
+    role: Optional[PromptRole] = None  # older screens: one role
+    body: str = ""
+    templateHtml: Optional[str] = None  # None = not sent (keep the unit's template)
+    templateName: Optional[str] = None
+    pageFormat: Optional[str] = None
+
+
+def _sanitized(html: Optional[str]) -> Optional[str]:
+    from app.html_sanitize import sanitize_template_html
+    return sanitize_template_html(html) if html else html
+
+
+def _account_out(acc: Account) -> dict:
+    """The account as the app reads it, with its resume prompts (an older profile's single prompt as "Default")."""
+    prompts, default_id = prompts_view(acc)
+    return {
+        **doc_to_dict(acc),
+        "resumePrompts": [p.model_dump(mode="json") for p in prompts],
+        "defaultPromptId": default_id,
+        "resumePromptBody": next((p.body for p in prompts if p.id == default_id), "") or None,
+    }
+
+
 class AccountUpdate(BaseModel):
     name: Optional[str] = None
     country: Optional[str] = None
     region: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
     resumePromptBody: Optional[str] = None
+    # The whole list of resume prompts and the default; when sent, resumePromptBody follows the default prompt.
+    resumePrompts: Optional[List[ResumePromptIn]] = None
+    defaultPromptId: Optional[str] = None
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
     pageFormat: Optional[str] = None
@@ -268,7 +310,7 @@ async def get_account(
     is_admin = user.role == "admin"
     if acc is None or (not is_admin and str(acc.createdBy) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    return doc_to_dict(acc)
+    return _account_out(acc)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -284,7 +326,7 @@ async def create_account(
         createdBy=user.id,
         resumes=resumes,
         resumePromptBody=body.resumePromptBody,
-        styleTemplate=body.styleTemplate,
+        styleTemplate=_sanitized(body.styleTemplate),
         styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
         screeningPrompt=body.screeningPrompt,
@@ -326,13 +368,18 @@ async def update_account(
         acc.resumes = _validate_and_normalize_resumes(body.resumes, before)
         kept_ids = {str(r.id) for r in acc.resumes}
         removed_files = [r.s3Key for r in before if r.s3Key and str(r.id) not in kept_ids]
-    if body.resumePromptBody is not None:
-        acc.resumePromptBody = body.resumePromptBody
-    if body.styleTemplate is not None:
-        from app.html_sanitize import sanitize_template_html
-        acc.styleTemplate = sanitize_template_html(body.styleTemplate)
-    if body.styleTemplateName is not None:
-        acc.styleTemplateName = body.styleTemplateName
+    if body.resumePrompts is not None:
+        try:
+            apply_prompts(acc, [p.model_dump() for p in body.resumePrompts], body.defaultPromptId)
+        except PromptError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    else:  # older screens write one field: it changes just the default unit
+        if body.resumePromptBody is not None:
+            sync_default_body(acc, body.resumePromptBody)
+        if body.styleTemplate is not None or body.styleTemplateName is not None:
+            from app.html_sanitize import sanitize_template_html
+            html = sanitize_template_html(body.styleTemplate) if body.styleTemplate is not None else None
+            sync_default_template(acc, html, body.styleTemplateName)
     if body.pageFormat is not None:
         acc.pageFormat = body.pageFormat  # type: ignore[assignment]
     if body.previewHtml is not None:
@@ -349,7 +396,7 @@ async def update_account(
 
     await acc.save()
     await resume_files.delete_resume_files(removed_files)
-    return doc_to_dict(acc)
+    return _account_out(acc)
 
 
 @router.post("/{account_id}/resumes")
