@@ -98,6 +98,8 @@ async def enqueue_generation(
     job_url: Optional[str] = None,
     questions: Optional[list[str]] = None,
     prompt_body: Optional[str] = None,
+    prompt_id: Optional[str] = None,
+    prompt_name: Optional[str] = None,
     cover_letter: bool = False,
     source: Literal["generator", "job_applies"] = "generator",
     job_apply_row_id: Optional[PydanticObjectId] = None,
@@ -132,6 +134,8 @@ async def enqueue_generation(
         source=source,
         countsAsBid=False if source == "job_applies" else None,
         promptOverride=(prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None,
+        promptId=prompt_id,
+        promptName=prompt_name,
         jobApplyRowId=job_apply_row_id,
         resumeModelId=(resume_model or "").strip() or None,
         coverLetterModelId=(cover_letter_model or "").strip() or None,
@@ -153,8 +157,11 @@ async def requeue_failed(
     cover_letter: bool = False,
     resume_model: Optional[str] = None,
     cover_letter_model: Optional[str] = None,
+    prompt_body: Optional[str] = None,
+    prompt_id: Optional[str] = None,
+    prompt_name: Optional[str] = None,
 ) -> Optional[ResumeApplication]:
-    """Re-run a failed Job Applies generation in place with fresh inputs, so a retry keeps one entry in Generated
+    """Re-run a failed Job Applies generation in place with fresh inputs (including the prompt now selected), so a retry keeps one entry in Generated
     Resumes (and adds nothing to the daily count). None when that profile's job is gone or isn't failed."""
     from app.routers.resume import _reset_failed_job_fields  # router imports this module; resolve lazily
 
@@ -173,6 +180,8 @@ async def requeue_failed(
     job.generateCoverLetter = bool(cover_letter)
     job.resumeModelId = (resume_model or "").strip() or None
     job.coverLetterModelId = (cover_letter_model or "").strip() or None
+    job.promptOverride = (prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None
+    job.promptId, job.promptName = prompt_id, prompt_name
     job.attempts = 0
     job.leaseAt = None
     job.updatedAt = datetime.utcnow()
@@ -191,8 +200,8 @@ _running: set[asyncio.Task] = set()
 
 # Fields the queue (claim, heartbeat, applied marks) owns; the runner never writes them back.
 _QUEUE_OWNED = frozenset({"_id", "id", "createdAt", "leaseAt", "attempts", "countsAsBid", "source", "jobApplyRowId",
-                          "promptOverride", "resumeModelId", "coverLetterModelId", "screeningModelId",
-                          "coverLetterHook"})
+                          "promptOverride", "promptId", "promptName", "resumeModelId", "coverLetterModelId",
+                          "screeningModelId", "coverLetterHook"})
 
 
 class Superseded(Exception):

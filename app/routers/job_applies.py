@@ -264,6 +264,8 @@ def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
         "error": doc.get("errorMessage"),
         # {total, band, knockouts, missing}: the tailored resume scored against this job; null = not scored.
         "match": doc.get("matchScore"),
+        # The profile's resume prompt it was tailored with (None for older ones).
+        "promptName": doc.get("promptName"),
     }
 
 
@@ -1473,11 +1475,14 @@ async def _tailor_row(
     account = await Account.get(PydanticObjectId(account_id))
     if account is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That profile no longer exists.")
+    # The prompt selected in the Prompt column: the person's choice, else the one suggested from the job.
+    prompt = _effective_prompt(row, account_id, *prompts_view(account))
+    with_prompt = {"prompt_body": prompt.body or None, "prompt_id": prompt.id, "prompt_name": prompt.name}
     previous = row.tailored.get(account_id)
     if previous:  # a failed one is re-run in place, not replaced by another job
         retried = await resume_queue.requeue_failed(
             previous, account=account, jd=row.jdText or "", company=_company_label(row), job_url=row.url,
-            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model,
+            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model, **with_prompt,
         )
         if retried is not None:
             return retried
@@ -1492,6 +1497,7 @@ async def _tailor_row(
         job_apply_row_id=row.id,
         resume_model=resume_model,
         cover_letter_model=cover_letter_model,
+        **with_prompt,
     )
     jobs = ResumeApplication.get_motor_collection()
     # Compare-and-set: only link the new job if the row still points where we read it. A concurrent tailor

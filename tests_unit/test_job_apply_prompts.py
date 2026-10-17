@@ -18,11 +18,15 @@ from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, Pr
 from app.resume_prompts import apply_prompts, prompts_view
 from app.routers.job_applies import (
     PromptChoiceBody,
+    TailorAllBody,
     _effective_prompt,
+    _tailor_row,
+    _tailored_out,
     _prompt_ctx,
     _row_summary,
     _run_out,
     choose_prompt,
+    tailor_all,
 )
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals
@@ -140,3 +144,69 @@ async def test_choose_prompt_rejects_unknown_profile_or_prompt(db):
         with pytest.raises(HTTPException) as err:
             await choose_prompt(str(job_a.id), body, owner)
         assert err.value.status_code == 404
+
+
+# ---------- tailoring with the selected prompt ----------
+
+
+async def test_tailor_uses_the_suggested_prompt(db):
+    owner, blake, _, run, job_a, _ = await _setup()
+
+    job = await _tailor_row(job_a, run, owner, str(blake.id), False)
+
+    assert (job.promptOverride, job.promptName, job.promptId) == ("devops text", "DevOps", _id(blake, "DevOps"))
+
+
+async def test_tailor_uses_the_chosen_prompt(db):
+    owner, blake, _, run, job_a, _ = await _setup()
+    await choose_prompt(str(job_a.id), PromptChoiceBody(accountId=str(blake.id), promptId="default"), owner)
+
+    job = await _tailor_row(await JobApplyRow.get(job_a.id), run, owner, str(blake.id), False)
+
+    assert (job.promptOverride, job.promptName) == ("default text", "Default")
+
+
+async def test_retry_picks_up_a_new_choice(db):
+    owner, blake, _, run, job_a, _ = await _setup()
+    first = await _tailor_row(job_a, run, owner, str(blake.id), False)
+    await ResumeApplication.get_motor_collection().update_one({"_id": first.id}, {"$set": {"status": "failed"}})
+    await choose_prompt(str(job_a.id), PromptChoiceBody(accountId=str(blake.id), promptId="default"), owner)
+
+    again = await _tailor_row(await JobApplyRow.get(job_a.id), run, owner, str(blake.id), False)
+
+    assert again.id == first.id
+    saved = await ResumeApplication.get(first.id)
+    assert (saved.promptOverride, saved.promptName, saved.promptId) == ("default text", "Default", "default")
+
+
+async def test_tailor_all_uses_each_rows_prompt(db):
+    owner, blake, _, run, job_a, _ = await _setup()
+    frontend = JobExtraction(title="Frontend Developer", terms=[Term(term="React", tier="required")])
+    job_c = await JobApplyRow(runId=run.id, userId=owner.id, rowIndex=2, url="https://jobs.example.com/c",
+                              title="Frontend Developer", company="Globex", status="scored", screen="valid",
+                              jdText="We need a React developer.", extraction=frontend,
+                              profileGates=job_a.profileGates, tailorOnly=[str(blake.id)]).insert()
+
+    await tailor_all(str(run.id), TailorAllBody(accountIds=[str(blake.id)], rowIds=[str(job_a.id), str(job_c.id)]), owner)
+
+    bodies = {}
+    for row_id in (job_a.id, job_c.id):
+        row = await JobApplyRow.get(row_id)
+        bodies[row.title] = (await ResumeApplication.get(row.tailored[str(blake.id)])).promptOverride
+    # Blake has no frontend prompt: the frontend job uses his default
+    assert bodies == {"Senior DevOps Engineer": "devops text", "Frontend Developer": "default text"}
+
+
+async def test_empty_prompt_body_falls_back(db):
+    owner, _, sam, run, job_a, _ = await _setup()
+    sam.resumePromptBody = None
+    await sam.save()
+
+    job = await _tailor_row(job_a, run, owner, str(sam.id), False)
+
+    assert job.promptOverride is None and job.promptName == "Default"
+
+
+def test_tailored_out_has_prompt_name():
+    out = _tailored_out({"_id": "6a0000000000000000000000", "accountId": "a", "status": "completed", "promptName": "DevOps"})
+    assert out["promptName"] == "DevOps"
