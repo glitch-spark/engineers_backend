@@ -1,144 +1,177 @@
 # Role-based resume prompts per profile — design
 
-Date: 2026-10-17 · Repos: engineers_backend, engineers_app · Branch: `feat/profile-prompts` (on top of `feat/job-apply`)
+Date: 2026-10-17 · Repos: engineers_app (frontend), engineers_backend · Branch: `feat/profile-prompts` (on top of
+`feat/job-apply`)
 
 ## Goal
 
-A profile can hold several resume prompts, one per role (DevOps, FullStack, …), instead of one. In Job Applies, each
-profile row gets a **Prompt** dropdown next to HTML template, pre-set to the prompt that best fits the job; the user can
-change it, and tailoring uses it.
+A profile can hold several resume prompts, one per job role (DevOps, Full stack, …), instead of one. In Job Applies,
+each profile row gets a **Prompt** dropdown next to HTML template, pre-set to the prompt that best fits the job; the
+user can change it, and tailoring uses it.
 
 ## Non-goals (this round)
 
-- **Eval on save.** Saving a prompt only saves. The prompt section shows **Run eval / Re-evaluate** buttons, disabled
-  ("Coming soon"). Wiring them to Prompt Eval, and the save-time confirmation, come later.
-- **DevOps sample JDs / DevOps Eval role.** The prompt role list includes DevOps; the Eval role list is unchanged.
-- **AI- or Eval-score-based suggestion.** The suggestion is keyword based (below); it can be replaced later behind the
-  same interface.
+- **Prompt Eval.** Nothing here uses or changes Prompt Eval. The prompt section reserves the right 30% for a future
+  diagram and shows **Run eval / Re-evaluate** disabled ("Coming soon").
+- AI-based suggestion (the suggestion is keyword based and can be swapped later).
 - Screening and cover-letter prompts stay single.
 
-## 1. Storage (backend)
+## Roles
+
+A fixed list of job roles, used only to label prompts and match jobs:
+`fullstack` Full stack · `frontend` Frontend · `backend` Backend · `devops` DevOps · `data` Data · `ml` ML / AI ·
+`mobile` Mobile · `qa` QA / Test. A prompt's role is optional ("No role").
+
+## Defaults
+
+- A profile's **default prompt** = its current prompt (today's single "Profile resume content prompt", shown as
+  **"Default"**); a profile without one gets an empty "Default". New profiles start the same way.
+- Every job (including jobs already read before this ships) starts with the **suggested** prompt; with no role match the
+  suggestion is the profile's default.
+
+---
+
+## 1. Frontend design
+
+### 1a. Profile page — "Resume generating prompt" (`AccountEdit.tsx` › `PromptsBlock`)
+
+```
+Resume generating prompt
+Drives which fields the resume LLM rewrites (and how). One prompt per role; Job Applies suggests the right one per job.
+
+ ┌───────────┬──────────┬─────────────┬────────────────┐
+ │ Default ★ │ DevOps • │ Full stack  │ + Add prompt   │        (• = unsaved changes)
+ └───────────┴──────────┴─────────────┴────────────────┘
+ Name [ DevOps                ]   Role [ DevOps        ▾]   [☆ Set as default]   [🗑 Delete]
+
+ ┌──────────────────────────── 70% ────────────────────────────┐ ┌────────── 30% ──────────┐
+ │ Prompt                              19120/30000  Load global │ │ Eval                    │
+ │ ┌──────────────────────────────────────────────────────────┐ │ │                         │
+ │ │ # Resume Tailoring — Master Prompt …                     │ │ │   ◇  No eval yet        │
+ │ │                                                          │ │ │                         │
+ │ │                                                          │ │ │ [▶ Run eval] (disabled) │
+ │ └──────────────────────────────────────────────────────────┘ │ │ Coming soon             │
+ │ Empty = inherit global.                                      │ │                         │
+ └──────────────────────────────────────────────────────────────┘ └─────────────────────────┘
+```
+
+- **Tabs**: one per prompt, in saved order; ★ = default; • = unsaved changes. Clicking a tab switches the editor.
+  **+ Add prompt** (hidden at 10 prompts) adds "New prompt" with no role and selects it, name field focused.
+- **Name** (1–60 chars, unique per profile) · **Role** select (the roles above + "No role") · **Set as default** (hidden
+  on the default) · **Delete** (disabled on the default with the hint "Make another prompt the default first"; asks
+  for confirmation).
+- **Text area** = the existing `ResumePromptField` (counter, Load global), **70%** width; the **Eval** panel **30%**
+  with the "No eval yet" placeholder and a disabled **Run eval** button ("Coming soon"). Side by side from `lg`;
+  stacked (Eval panel below) on narrower screens.
+- **Save prompts** (bottom, existing button) saves all resume prompts with the screening / cover-letter prompts.
+  Validation errors (duplicate name, empty name, too long) show under the field and on the tab; nothing is saved
+  until they're fixed.
+- Summary line in the collapsed header: "3 resume prompts · default: Default" (replaces "Customized: Resume").
+
+### 1b. Job Applies — Prompt column (`Suggestions.tsx` › `ProfileCells`, `JobApplyRun.tsx`)
+
+Column order: … Profile · Sample resumes (.pdf) · HTML template · **Prompt** · Tailored.
+
+```
+│ HTML template        │ Prompt                                            │ Tailored        │
+│ ⧉ Blake modern.html  │ [ DevOps            ▾]  Suggested                  │ [✨ Tailor]      │
+│                      │ Kubernetes · Terraform · AWS · Helm · CI/CD · Go  │                 │
+│ ⧉ Two-column.html    │ Default                                           │ ✨ Tailored 88   │
+│                      │                                                   │                 │
+```
+
+- **Select** of the profile's prompts (name; role in grey after it), value = the user's choice for this job × profile,
+  else the suggestion. Changing it saves immediately (spinner in the cell; toast on error, value restored).
+- **"Suggested"** tag when the value is the suggestion. Choosing the suggested prompt again clears the user's choice.
+- **Keyword marks**: up to **7** small chips of the main-stack skills that matched (required/core first), wrapping to a
+  second line if needed. Hover on the tag/chips: "DevOps job — title says DevOps; skills Kubernetes, Terraform, …".
+  No role match → no chips, the default is selected, tag reads "Default".
+- **One prompt** on the profile → its name as plain text (no select), no tag.
+- The **Tailored** chip's tooltip adds "Tailored with <prompt name>".
+- The bulk **Tailor resumes** dialog gets one line: "Each job uses the prompt selected in its Prompt column."
+
+### 1c. Build order
+
+Frontend first, against the API shapes below, checked in a headless browser with a mocked backend; then the backend
+(tests first); then the two together.
+
+---
+
+## 2. Storage (backend)
 
 `Account` gains:
 
 ```python
 class ResumePrompt(BaseModel):
-    id: str                      # stable id (ObjectId hex), assigned by the server when missing
-    name: str                    # 1–60 chars, unique per profile (case-insensitive)
-    role: Optional[PromptRole]   # None = no role (only the migrated "Default" starts like this)
-    body: str                    # ≤ 30000 chars, may be empty
+    id: str                       # ObjectId hex, assigned by the server when missing
+    name: str                     # 1–60 chars, unique per profile (case-insensitive)
+    role: Optional[PromptRole]    # None = no role
+    body: str = ""                # ≤ 30000 chars
     updatedAt: datetime
 
 resumePrompts: List[ResumePrompt] = []   # ≤ 10
 defaultPromptId: Optional[str] = None
 ```
 
-`PromptRole` = the Eval roles (`fullstack, frontend, backend, ai, ml, llm, data, test, senior_swe, staff_swe`) **plus
-`devops`**. It is its own Literal (in `app/models/account.py`), so adding DevOps here does not touch Prompt Eval.
+- **Lazy migration**: a profile with no `resumePrompts` is read as one prompt `{name: "Default", role: None, body:
+  resumePromptBody or ""}` that is the default; the list is written on the next prompt save. Default when
+  `defaultPromptId` is missing/stale = the first prompt.
+- **Compatibility**: `resumePromptBody` is kept equal to the default prompt's body on every save, so everything that
+  reads it today (generation's fallback chain, the profile lookup badge, other pages) works unchanged. A write to
+  `resumePromptBody` alone (older screens) also updates the default prompt's body.
+- **Validation** (400 with a message): ≤ 10 prompts, ≥ 1 when sent; names 1–60 and unique; body ≤ 30000; ids unique;
+  `defaultPromptId` must be in the list.
 
-**Migration (lazy, no script).** A profile with no `resumePrompts` is read as one prompt `{name: "Default", role: None,
-body: resumePromptBody or ""}` that is the default. The list is written on the profile's next prompt save.
+## 3. API
 
-**Compatibility.** `resumePromptBody` is kept equal to the default prompt's body on every save. Everything that reads
-it today keeps working unchanged: `_run_job`'s fallback chain (`resume.py`), Prompt Eval's `resolve_prompt`, the
-`hasPrompt` lookup badge, `NewEvalPanel` prefill / "Save to profile" (which writes `resumePromptBody`; the server then
-also updates the default prompt's body so the two never drift).
-
-**Validation** (server, 400 with a clear message): ≤ 10 prompts; names 1–60 chars and unique; body ≤ 30000;
-`defaultPromptId` must name a prompt in the list; at least one prompt when the list is sent; ids unique.
-
-## 2. API
-
-- `GET /accounts/{id}` returns `resumePrompts` (migrated view when empty) and `defaultPromptId`.
-- `PUT /accounts/{id}` accepts `resumePrompts` + `defaultPromptId` (the whole list, like the current "Save prompts"
-  that saves all fields at once). New prompts may omit `id`; the server assigns one and returns the saved list.
-- Job Applies `_run_out(..., with_profiles=True)` adds to each profile: `prompts: [{id, name, role}]` (no bodies) and
+- `GET /accounts/{id}` → adds `resumePrompts` (migrated view when empty) and `defaultPromptId`.
+- `PUT /accounts/{id}` ← accepts `resumePrompts` + `defaultPromptId` (whole list); returns the saved list with ids.
+- Job Applies run (`_run_out(with_profiles=True)`) → each profile adds `prompts: [{id, name, role}]` and
   `defaultPromptId`.
+- Job Applies row summary → `prompt: {accountId: {suggestedId, chosenId, role, marks: [str]}}`.
+- `PUT /job-applies/rows/{id}/prompt` ← `{accountId, promptId}`; choosing the suggestion clears the choice. Returns the
+  row summary.
 
-## 3. Profile page — "Resume generating prompt" (engineers_app `AccountEdit.tsx` › `PromptsBlock`)
+## 4. Suggestion (backend, `app/job_apply/prompt_suggest.py`, pure functions)
 
-```
-[ Default ★ ] [ DevOps ] [ FullStack ] [ + Add prompt ]
-Name [DevOps          ]  Role [DevOps ▾]   ☆ Set as default   🗑 Delete
-┌──────────────────────── 70% ──────────────────────┐┌──── 30% ─────┐
-│ prompt text (19120/30000 · Load global)           ││ radar, or    │
-│                                                   ││ "No eval yet"│
-└───────────────────────────────────────────────────┘│ [Re-evaluate]│ (disabled)
-                                       [Save prompts] └──────────────┘
-```
+- Keyword table per role (whole-word, case-insensitive), e.g. devops: `devops, sre, site reliability, platform
+  engineer, kubernetes, k8s, terraform, ansible, helm, ci/cd, jenkins, infrastructure as code`; frontend: `frontend,
+  front-end, react, vue, angular, next.js, css, ui engineer`; fullstack: `full stack, fullstack, full-stack, mern`;
+  backend: `backend, back-end, microservices, rest api, django, spring, node.js`; data: `data engineer, etl, spark,
+  airflow, dbt, snowflake`; ml: `machine learning, ml engineer, ai engineer, llm, pytorch, tensorflow, rag`; mobile:
+  `ios, android, mobile, swift, kotlin, react native, flutter`; qa: `qa, sdet, test automation, quality assurance,
+  selenium, cypress`.
+- Score per role = title hits × 3 + skill hits from `extraction.terms` (required/core × 2, other tiers × 1), each
+  keyword once. The job's role is the top score if ≥ 2 (a title hit alone qualifies); a tie goes to the role named in
+  the title, else no role.
+- **Marks**: up to 7 matched skill keywords for that role (role words that only appear in the title are left out),
+  required/core first, in the job's own spelling.
+- **Pick**: the profile's prompts with that role → the default if among them, else the most recently updated; no role
+  or no match → the default.
+- Computed per request from `row.title` and `row.extraction` (list projection adds `extraction.title`,
+  `extraction.terms.term/tier`); nothing stored, so jobs read before this ship get suggestions too.
 
-- One tab per prompt; ★ marks the default. **+ Add prompt** adds "New prompt" (role unset) and selects it.
-- Editor: name, role select, "Set as default", Delete (disabled on the default: make another the default first).
-- Text area is the existing `ResumePromptField` (counter, Load global) at 70% width; ≥ lg screens side by side, stacked
-  below that.
-- Right 30%: the radar (`RoleRadar`, match metric) of the latest **done** Prompt Eval run for this profile whose
-  `promptBody` equals this prompt's saved text; otherwise "No eval yet". **Run eval / Re-evaluate** shown disabled with
-  "Coming soon".
-- **Save prompts** saves all resume prompts plus the screening / cover-letter prompts, as today. Unsaved changes are
-  flagged on the tab (•).
+## 5. Choice storage and tailoring
 
-## 4. Prompt suggestion (backend, `app/job_apply/prompt_suggest.py`)
+- `JobApplyRow.promptChoice: Dict[accountId, promptId]`. A choice naming a deleted prompt is ignored.
+- Effective prompt = choice → suggestion → default. `_tailor_row` passes its body to
+  `enqueue_generation(prompt_body=…)` (stored as `ResumeApplication.promptOverride`, which already wins at generation
+  time and survives restarts); empty body → None (profile/global fallback as today).
+- `ResumeApplication` gains `promptId`, `promptName`; `_tailored_out` returns `promptName`.
+- `requeue_failed` refreshes `promptOverride` / `promptId` / `promptName`, so a retry uses the current selection.
+- Applies to Tailor, Tailor all, Tailor resumes (N), Retry and re-tailor.
 
-Pure functions, no I/O:
+## 6. Testing
 
-```python
-def job_role(title: str, terms: list[Term]) -> tuple[Optional[PromptRole], list[str]]
-def suggest_prompt(prompts, default_id, role) -> Optional[str]
-```
-
-- A keyword table per role, e.g. devops: `devops, sre, site reliability, platform engineer, kubernetes, terraform,
-  ansible, ci/cd, infrastructure`; frontend: `frontend, front-end, react, vue, angular, ui engineer`; fullstack:
-  `full stack, fullstack, full-stack`; backend: `backend, back-end, api, microservices`; data: `data engineer, etl,
-  spark, airflow, dbt`; ml: `machine learning, ml engineer, pytorch, tensorflow`; llm: `llm, rag, langchain, prompt
-  engineering`; ai: `ai engineer, artificial intelligence`; test: `qa, sdet, test automation, quality`; senior_swe /
-  staff_swe: `senior` / `staff`, `principal` in the title only, used when no stack role scores.
-- Score per role: title hits × 3 + extracted-skill hits (`extraction.terms`, required/core × 2, other tiers × 1),
-  each keyword counted once; whole-word, case-insensitive match. The job's role is the top score if ≥ 2 (a title hit
-  alone qualifies); ties → the role whose keyword appears in the title, else no role.
-- Marks: up to 3 matched **skill** keywords (title-matched role words are left out — the title is already shown),
-  required/core first, displayed with their extracted spelling (`Kubernetes`, `Terraform`).
-- `suggest_prompt`: the profile's prompts whose role equals the job's role; if several, the default when it is among
-  them, else the most recently updated; if none (or no job role), the default prompt.
-- Computed per request in `_row_summary` from `row.title` / `row.extraction` (the list projection gains
-  `extraction.title` and `extraction.terms.term/tier`). Nothing stored; jobs read before this ship get suggestions too.
-
-## 5. Job Applies — Prompt column (engineers_app `Suggestions.tsx` › `ProfileCells`)
-
-Column order: … Profile · Sample resumes (.pdf) · HTML template · **Prompt** · Tailored.
-
-- Per profile row: a compact `<select>` of the profile's prompts (name, role in grey). One prompt → plain text, no
-  select. Under it, the marks: `Kubernetes · Terraform`, and "Suggested" when the value is the suggestion; hover
-  explains ("DevOps job: title mentions DevOps; skills Kubernetes, Terraform").
-- Value = the user's choice for this job × profile if any, else the suggestion.
-- **Choice storage:** `JobApplyRow.promptChoice: Dict[accountId, promptId]`; `PUT /job-applies/rows/{id}/prompt
-  {accountId, promptId}` saves it (choosing the suggestion clears the entry). A choice naming a deleted prompt is
-  ignored (falls back to the suggestion).
-- Row summary adds `prompt: {accountId: {suggestedId, chosenId, role, marks}}`.
-
-## 6. Tailoring with the chosen prompt
-
-- `_tailor_row` resolves the effective prompt (choice → suggestion → default) and passes its body to
-  `enqueue_generation(prompt_body=…)`, so it is stored as `ResumeApplication.promptOverride` (already wins in
-  `_run_job`, survives restarts). An empty body → `None` (falls back to profile/global as today).
-- `ResumeApplication` gains `promptId`, `promptName` (for display). `_tailored_out` returns `promptName`; the Tailored
-  chip tooltip says "Tailored with DevOps".
-- `requeue_failed` also refreshes `promptOverride` / `promptId` / `promptName` so a retry uses the current choice.
-- Applies to Tailor, Tailor all, Tailor resumes (N) (`tailor-all`), Retry and re-tailor.
-
-## 7. Testing
-
-Backend (written first, mongomock like the other Job Applies tests):
-- prompts: save / validate (limits, unique names, default must exist) / lazy migration / `resumePromptBody` sync both
-  ways / ids assigned.
-- suggestion: role from title, from skills, tie-breaks, no role → default, marks (order, max 3, no title words).
-- Job Applies: `prompt` in the row summary, choice save / clear / deleted-prompt fallback, `run.profiles[].prompts`.
-- tailoring: chosen prompt body lands in `promptOverride` + `promptId/Name`; retry picks up a new choice;
-  `tailor-all` uses each row's effective prompt.
-
-Frontend: `tsc -b --noEmit`; headless-browser checks with a mocked backend for the profile prompt tabs (add, rename,
-role, default, delete, 70/30 layout) and the Prompt column (suggested value, marks, change → saved, tailor sends it).
+- Frontend: `tsc -b --noEmit`; headless-browser checks with a mocked backend — profile prompt tabs (add, rename, role,
+  default, delete rules, validation, unsaved •, 70/30 and stacked layouts) and the Prompt column (suggested value,
+  marks ≤ 7, change → saved, one-prompt plain text, tailor uses it).
+- Backend (written first, mongomock): prompt save / validation / lazy migration / `resumePromptBody` sync both ways;
+  suggestion (title, skills, ties, no role → default, marks order and limit); row `prompt` summary; choice save /
+  clear / deleted-prompt fallback; `run.profiles[].prompts`; tailoring puts the chosen body in `promptOverride` with
+  `promptId/Name`, retry picks up a new choice, `tailor-all` uses each row's prompt.
 
 ## Rollout
 
-Backend first (new fields are optional; old frontends ignore them). The frontend reads `prompts` / `prompt` only when
-present.
+Backend first (all new fields optional; older frontends ignore them); the frontend reads `resumePrompts`, `prompts`
+and `prompt` only when present.
