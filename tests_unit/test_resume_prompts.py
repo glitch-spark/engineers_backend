@@ -14,7 +14,8 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.models import Account, UserExtra
 from app.resume_prompts import PromptError, apply_prompts, find_prompt, prompts_view, sync_default_body
-from app.routers.accounts import AccountUpdate, get_account, update_account
+from app.models.account import ResumePrompt
+from app.routers.accounts import AccountUpdate, get_account, list_accounts, update_account
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -158,3 +159,100 @@ async def test_heading_names_are_trimmed_and_fall_back_to_default(db):
 
     assert len(named[0]) <= 60 and named[0].startswith("Very long heading") and not named[0].endswith(" ")
     assert named[1] == "Default"
+
+
+# ---------- resume units: each unit has its own HTML template and several roles ----------
+
+OLD_TEMPLATE = "<html><body><h1>OLD</h1></body></html>"
+
+
+def _unit(i, name, roles=(), html="<html><body>T</body></html>", fmt=None, body="b"):
+    out = {"id": f"new-{i}", "name": name, "roles": list(roles), "body": body, "templateHtml": html,
+           "templateName": f"{name}.html"}
+    return {**out, **({"pageFormat": fmt} if fmt else {})}
+
+
+async def test_legacy_profile_is_one_default_unit_with_its_template(db):
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id, resumePromptBody="# Master (general)\nbody",
+                  styleTemplate=OLD_TEMPLATE, styleTemplateName="master.html", pageFormat="Letter")
+
+    units, default_id = prompts_view(acc)
+
+    (unit,) = units
+    assert (unit.id, unit.name, unit.roles, default_id) == ("default", "Master", [], "default")
+    assert (unit.templateHtml, unit.templateName, unit.pageFormat) == (OLD_TEMPLATE, "master.html", "Letter")
+
+
+async def test_units_saved_before_templates_get_the_old_template_and_master_is_default(db):
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id, styleTemplate=OLD_TEMPLATE, styleTemplateName="master.html",
+                  resumePrompts=[ResumePrompt(id="default", name="Master", body="m"),
+                                 ResumePrompt(id="ops", name="DevOps", role="devops", body="o")],
+                  defaultPromptId="ops")
+
+    units, default_id = prompts_view(acc)
+
+    assert default_id == "default"  # the previous template + master prompt are the default
+    assert [(u.id, u.roles, u.templateHtml, u.templateName) for u in units] == [
+        ("default", [], OLD_TEMPLATE, "master.html"), ("ops", ["devops"], OLD_TEMPLATE, "master.html")]
+
+
+async def test_apply_units_sanitizes_and_mirrors_legacy_fields(db):
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id)
+
+    apply_prompts(acc, [
+        _unit(1, "Master", html="<html><body><h1>M</h1><script>alert(1)</script></body></html>", fmt="Letter", body="m"),
+        _unit(2, "Full stack + DevOps", roles=["fullstack", "devops"]),
+    ], "new-1")
+
+    master, fsd = acc.resumePrompts
+    assert "<script" not in master.templateHtml and "<h1>M</h1>" in master.templateHtml
+    assert fsd.roles == ["fullstack", "devops"] and fsd.pageFormat == "A4"
+    assert (acc.styleTemplate, acc.styleTemplateName, acc.pageFormat, acc.resumePromptBody) == (
+        master.templateHtml, "Master.html", "Letter", "m")
+
+
+@pytest.mark.parametrize("bad", [
+    _unit(1, "A", roles=["devops", "devops"]),          # duplicate role
+    _unit(1, "A", fmt="B5"),                             # unknown page format
+    _unit(1, "A", html="x" * (2 * 1024 * 1024 + 1)),     # template over 2 MB
+])
+async def test_apply_units_rejects_bad_roles_format_and_big_template(db, bad):
+    owner = await _owner()
+
+    with pytest.raises(PromptError):
+        apply_prompts(Account(name="Blake", createdBy=owner.id), [bad], "new-1")
+
+
+def test_unknown_role_is_rejected_by_the_route_model():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        AccountUpdate(resumePrompts=[{"name": "A", "roles": ["chef"]}], defaultPromptId="x")
+
+
+async def test_template_only_write_updates_the_default_unit(db):
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id)
+    apply_prompts(acc, [_unit(1, "Master"), _unit(2, "DevOps", roles=["devops"], html="<html><body>D</body></html>")], "new-1")
+    await acc.insert()
+
+    await update_account(str(acc.id), AccountUpdate(styleTemplate="<html><body>NEW</body></html>", styleTemplateName="n.html"), owner)
+
+    saved = await Account.get(acc.id)
+    by_name = {u.name: (u.templateHtml, u.templateName) for u in saved.resumePrompts}
+    assert "NEW" in by_name["Master"][0] and by_name["Master"][1] == "n.html"
+    assert by_name["DevOps"] == ("<html><body>D</body></html>", "DevOps.html")
+
+
+async def test_account_list_strips_unit_bodies_and_templates(db):
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id)
+    apply_prompts(acc, [_unit(1, "Master")], "new-1")
+    await acc.insert()
+
+    out = await list_accounts(owner, page=1, limit=10, search="", userId="", status_="active")
+
+    (unit,) = out["accounts"][0]["resumePrompts"] if "accounts" in out else out["data"][0]["resumePrompts"]
+    assert "templateHtml" not in unit and "body" not in unit and unit["templateName"] == "Master.html"

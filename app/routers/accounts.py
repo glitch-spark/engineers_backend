@@ -11,7 +11,7 @@ from app import resume_files
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.models.account import PromptRole, Resume
-from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body
+from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -66,6 +66,15 @@ def _validate_and_normalize_resumes(items: List[ResumeIn], existing: Optional[Li
     return out
 
 
+def _slim_units(payload: dict) -> None:
+    """Units in list responses: no prompt text or template HTML (up to 10 x 30 KB + 2 MB each per profile)."""
+    units = payload.get("resumePrompts")
+    if isinstance(units, list):
+        payload["resumePrompts"] = [
+            {k: v for k, v in u.items() if k not in ("body", "templateHtml")} if isinstance(u, dict) else u for u in units
+        ]
+
+
 def _strip_markdown_from_account(payload: dict) -> dict:
     """Replace each resume's `markdown` with `sizeBytes` for list responses.
     Keeps id/filename/uploadedAt so the SPA can show counts and filenames; the
@@ -83,6 +92,7 @@ def _strip_markdown_from_account(payload: dict) -> dict:
                     "hasFile": bool(r.get("s3Key")),
                 })
         payload["resumes"] = slim
+    _slim_units(payload)
     return payload
 
 
@@ -101,10 +111,20 @@ class AccountCreate(BaseModel):
 
 
 class ResumePromptIn(BaseModel):
-    id: Optional[str] = None  # missing or "new-…" = a new prompt; the server gives it an id
+    """A resume unit as the app sends it."""
+    id: Optional[str] = None  # missing or "new-…" = a new unit; the server gives it an id
     name: str
-    role: Optional[PromptRole] = None
+    roles: List[PromptRole] = []
+    role: Optional[PromptRole] = None  # older screens: one role
     body: str = ""
+    templateHtml: Optional[str] = None  # None = not sent (keep the unit's template)
+    templateName: Optional[str] = None
+    pageFormat: Optional[str] = None
+
+
+def _sanitized(html: Optional[str]) -> Optional[str]:
+    from app.html_sanitize import sanitize_template_html
+    return sanitize_template_html(html) if html else html
 
 
 def _account_out(acc: Account) -> dict:
@@ -305,7 +325,7 @@ async def create_account(
         createdBy=user.id,
         resumes=resumes,
         resumePromptBody=body.resumePromptBody,
-        styleTemplate=body.styleTemplate,
+        styleTemplate=_sanitized(body.styleTemplate),
         styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
         screeningPrompt=body.screeningPrompt,
@@ -352,13 +372,13 @@ async def update_account(
             apply_prompts(acc, [p.model_dump() for p in body.resumePrompts], body.defaultPromptId)
         except PromptError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    elif body.resumePromptBody is not None:
-        sync_default_body(acc, body.resumePromptBody)  # older screens: updates just the default prompt
-    if body.styleTemplate is not None:
-        from app.html_sanitize import sanitize_template_html
-        acc.styleTemplate = sanitize_template_html(body.styleTemplate)
-    if body.styleTemplateName is not None:
-        acc.styleTemplateName = body.styleTemplateName
+    else:  # older screens write one field: it changes just the default unit
+        if body.resumePromptBody is not None:
+            sync_default_body(acc, body.resumePromptBody)
+        if body.styleTemplate is not None or body.styleTemplateName is not None:
+            from app.html_sanitize import sanitize_template_html
+            html = sanitize_template_html(body.styleTemplate) if body.styleTemplate is not None else None
+            sync_default_template(acc, html, body.styleTemplateName)
     if body.pageFormat is not None:
         acc.pageFormat = body.pageFormat  # type: ignore[assignment]
     if body.previewHtml is not None:

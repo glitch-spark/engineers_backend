@@ -13,12 +13,16 @@ PromptRole = Literal["fullstack", "frontend", "backend", "devops", "data", "ml",
 
 
 class ResumePrompt(BaseModel):
-    """One of a profile's resume prompts. Ids are ObjectId hex, except "default" for the prompt an older profile's
-    single resumePromptBody became."""
+    """A resume unit: an HTML template, the prompt written for it, and the job roles it is meant for. Ids are ObjectId
+    hex, except "default" for the unit an older profile's template + prompt became (app/resume_prompts.py)."""
     id: str
     name: str
-    role: Optional[PromptRole] = None
+    roles: List[PromptRole] = []
+    role: Optional[PromptRole] = None  # before units had several roles; read as [role]
     body: str = ""
+    templateHtml: Optional[str] = None  # None = saved before units had templates (inherits the profile template)
+    templateName: Optional[str] = None
+    pageFormat: PageFormat = "A4"
     updatedAt: datetime = Field(default_factory=datetime.utcnow)
 
 
