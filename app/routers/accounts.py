@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from app import resume_files
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.models.account import Resume
+from app.models.account import PromptRole, Resume
+from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -99,12 +100,32 @@ class AccountCreate(BaseModel):
     coverLetterPrompt: Optional[str] = None
 
 
+class ResumePromptIn(BaseModel):
+    id: Optional[str] = None  # missing or "new-…" = a new prompt; the server gives it an id
+    name: str
+    role: Optional[PromptRole] = None
+    body: str = ""
+
+
+def _account_out(acc: Account) -> dict:
+    """The account as the app reads it, with its resume prompts (an older profile's single prompt as "Default")."""
+    prompts, default_id = prompts_view(acc)
+    return {
+        **doc_to_dict(acc),
+        "resumePrompts": [p.model_dump(mode="json") for p in prompts],
+        "defaultPromptId": default_id,
+    }
+
+
 class AccountUpdate(BaseModel):
     name: Optional[str] = None
     country: Optional[str] = None
     region: Optional[str] = None
     resumes: Optional[List[ResumeIn]] = None
     resumePromptBody: Optional[str] = None
+    # The whole list of resume prompts and the default; when sent, resumePromptBody follows the default prompt.
+    resumePrompts: Optional[List[ResumePromptIn]] = None
+    defaultPromptId: Optional[str] = None
     styleTemplate: Optional[str] = None
     styleTemplateName: Optional[str] = None
     pageFormat: Optional[str] = None
@@ -268,7 +289,7 @@ async def get_account(
     is_admin = user.role == "admin"
     if acc is None or (not is_admin and str(acc.createdBy) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    return doc_to_dict(acc)
+    return _account_out(acc)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -326,8 +347,13 @@ async def update_account(
         acc.resumes = _validate_and_normalize_resumes(body.resumes, before)
         kept_ids = {str(r.id) for r in acc.resumes}
         removed_files = [r.s3Key for r in before if r.s3Key and str(r.id) not in kept_ids]
-    if body.resumePromptBody is not None:
-        acc.resumePromptBody = body.resumePromptBody
+    if body.resumePrompts is not None:
+        try:
+            apply_prompts(acc, [p.model_dump() for p in body.resumePrompts], body.defaultPromptId)
+        except PromptError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    elif body.resumePromptBody is not None:
+        sync_default_body(acc, body.resumePromptBody)  # older screens: updates just the default prompt
     if body.styleTemplate is not None:
         from app.html_sanitize import sanitize_template_html
         acc.styleTemplate = sanitize_template_html(body.styleTemplate)
@@ -349,7 +375,7 @@ async def update_account(
 
     await acc.save()
     await resume_files.delete_resume_files(removed_files)
-    return doc_to_dict(acc)
+    return _account_out(acc)
 
 
 @router.post("/{account_id}/resumes")
