@@ -34,20 +34,29 @@ One HTML template + its prompt per unit. Job Applies suggests the unit whose rol
  [ Resume Tailoring — Master Prompt ★ ] [ DevOps • ] [ + Add unit ]          (★ default, • unsaved)
  Name [ DevOps                  ]   Roles [DevOps ✕] [Backend ✕] [+ role ▾]   [☆ Set as default] [🗑 Delete]
 
- HTML template   ⧉ devops-modern.html · 48 KB   [Upload] [Preview] [Remove]
-                 (no template: "No HTML template — Job Applies can't tailor with this unit")
-
- ┌──────────────────────── 70% ───────────────────────┐ ┌──────── 30% ────────┐
- │ Prompt                        19120/30000 Load global│ │ Eval — No eval yet  │
- │ [ text … ]                                          │ │ [▶ Run eval] (off)  │
- └─────────────────────────────────────────────────────┘ └─────────────────────┘
-                                                              [Save resume units]
+ ┌──────────── 40% ────────────┐ ┌─────────── 30% ───────────┐ ┌────── 30% ──────┐
+ │ HTML template               │ │ Prompt    19120/30000      │ │ Eval            │
+ │ ⧉ devops-modern.html · 48 KB│ │           Load global      │ │                 │
+ │ [Upload] [Preview] [Remove] │ │ [ text …                 ] │ │  No eval yet    │
+ │ ┌─────────────────────────┐ │ │                            │ │                 │
+ │ │ inline preview (scaled, │ │ │                            │ │ [▶ Run eval]    │
+ │ │ sandboxed iframe)       │ │ │                            │ │ (off)           │
+ │ └─────────────────────────┘ │ │                            │ │ Coming soon     │
+ └─────────────────────────────┘ └────────────────────────────┘ └─────────────────┘
+                                                                 [Save resume units]
 ```
+
+- **Layout**: three columns from `lg` — HTML template **40%**, Prompt **30%**, Eval **30%**
+  (`lg:grid-cols-[4fr_3fr_3fr]`); stacked (template, prompt, Eval) below `lg`.
+- **HTML template column**: file name and size, Upload / Preview (full page in a new tab) / Remove, and an inline
+  preview of the template — a scaled, sandboxed `srcdoc` iframe (scripts off, same sanitizing as today's preview),
+  same height as the prompt box. No template: "No HTML template — Job Applies can't tailor with this unit" with
+  the upload drop zone in place of the preview.
 
 - Tabs, name, default and delete behave as today's prompt tabs (★, •, rules, validation, ≤ 10).
 - **Roles**: chips with ✕; "+ role" menu lists roles not yet added. No chips = "All roles (general)".
-- **HTML template**: upload (`.html`, same picker and checks as today's template pane), preview in a new tab, remove.
-  New units start with no template.
+- **HTML template** upload uses the same picker and checks as today's template pane (`.html` only). New units start
+  with no template.
 - One **Save resume units** button saves all units (and, as today, the screening / cover-letter prompts in the same
   block keep their own fields).
 - The page no longer shows the separate "HTML template" section; the default unit's template is the profile template.
