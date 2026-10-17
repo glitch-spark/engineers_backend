@@ -88,6 +88,11 @@ async def _suggested_count(run: JobApplyRun) -> int:
     return await JobApplyRow.find(await _rows_query(run, view="suggested")).count()
 
 
+def _template_info(account: Optional[Account]) -> dict:
+    has = bool(account and (account.styleTemplate or "").strip())
+    return {"hasTemplate": has, "templateName": (account.styleTemplateName or "HTML template") if has else None}
+
+
 async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
     out = doc_to_dict(run)
     out["suggested"] = await _suggested_count(run)
@@ -102,6 +107,8 @@ async def _run_out(run: JobApplyRun, *, with_profiles: bool = False) -> dict:
                 "name": accounts[i].name if i in accounts else "(deleted profile)",
                 "country": accounts[i].country if i in accounts else None,
                 "region": accounts[i].region if i in accounts else None,
+                # The HTML template tailored resumes are written into; without one the profile can't be tailored.
+                **_template_info(accounts.get(i)),
             }
             for i in ids
         ]

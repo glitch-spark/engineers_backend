@@ -21,6 +21,7 @@ from app.routers.job_applies import (
     _applications,
     _row_summary,
     _rows_query,
+    _run_out,
     _suggested_count,
     tailor_all,
 )
@@ -155,3 +156,17 @@ async def test_tailor_resumes_for_ticked_jobs_follows_the_same_rule(db):
     await tailor_all(str(run.id), TailorAllBody(rowIds=[str(job_a.id)]), owner)
 
     assert set((await JobApplyRow.get(job_a.id)).tailored) == {str(sam.id), str(jordan.id)}
+
+
+async def test_run_profiles_say_which_html_template_each_uses(db):
+    _, (alex, sam, jordan), run, _, _ = await _setup()
+    alex.styleTemplateName = "Modern two-column.html"
+    await alex.save()
+    sam.styleTemplate = None
+    await sam.save()
+
+    out = await _run_out(run, with_profiles=True)
+
+    by_name = {p["name"]: (p["hasTemplate"], p["templateName"]) for p in out["profiles"]}
+    # Jordan has a template saved without a file name: it still counts
+    assert by_name == {"Alex": (True, "Modern two-column.html"), "Sam": (False, None), "Jordan": (True, "HTML template")}
