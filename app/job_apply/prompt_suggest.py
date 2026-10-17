@@ -1,7 +1,7 @@
-"""Which job role a posting is, from its title and extracted skills, and which of a profile's resume prompts fits it.
+"""Which job roles a posting is (from its title and extracted skills) and which of a profile's resume units fits it.
 
-Keyword based (no LLM call): the title counts most, then required / core skills. The result also carries the
-main-stack keywords shown on the job ("marks") and a one-line reason for the suggestion.
+Keyword based (no LLM call): the title counts most, then required / core skills. A job can have several roles
+(e.g. Full stack + DevOps); the suggested unit is the one whose role marks overlap them most.
 """
 import re
 from dataclasses import dataclass, field
@@ -24,15 +24,14 @@ ROLE_LABEL = {
     "fullstack": "Full stack", "frontend": "Frontend", "backend": "Backend", "devops": "DevOps", "data": "Data",
     "ml": "ML / AI", "mobile": "Mobile", "qa": "QA / Test",
 }
-MAX_MARKS = 7
+MAX_ROLES = 3
 _TITLE_WEIGHT = 3
 _STRONG = ("required", "core")
 
 
 @dataclass(frozen=True)
 class RoleMatch:
-    role: Optional[str]
-    marks: list[str] = field(default_factory=list)
+    roles: list[str] = field(default_factory=list)  # strongest first
     reason: str = ""
 
 
@@ -44,11 +43,6 @@ _PATTERN = re.compile(
 )
 
 
-def _find(text: str, keyword: str) -> Optional[re.Match]:
-    """`keyword` (any word or phrase) as a whole word in `text`."""
-    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text)
-
-
 def _keywords_in(text: str) -> list[tuple[int, str]]:
     """(position, keyword) of each role keyword in lowercase `text`, in one pass."""
     return [(m.start(), m.group()) for m in _PATTERN.finditer(text)]
@@ -58,15 +52,15 @@ def _weight(term: Term) -> int:
     return 2 if term.tier in _STRONG else 1
 
 
-def job_role(title: str, terms: Sequence[Term]) -> RoleMatch:
-    """The job's role (None without enough signal), up to 7 main-stack marks, and why."""
+def job_roles(title: str, terms: Sequence[Term]) -> RoleMatch:
+    """The job's roles: each with a score of at least 2 and at least half the top score, at most MAX_ROLES, strongest
+    first (ties: first named in the title). Title hits count 3, required / core skills 2, other skills 1."""
     low_title = (title or "").lower()
-    skills = [s for s in terms if not s.soft]
     in_title: dict[str, int] = {}  # keyword -> first position in the title
     for pos, kw in _keywords_in(low_title):
         in_title.setdefault(kw, pos)
     by_skill: dict[str, Term] = {}  # keyword -> the heaviest skill naming it (keywords in the title are left out)
-    for skill in sorted(skills, key=_weight, reverse=True):
+    for skill in sorted((s for s in terms if not s.soft), key=_weight, reverse=True):
         for name in (skill.term, *skill.aliases):
             for _, kw in _keywords_in(name.lower()):
                 if kw not in in_title:
@@ -80,44 +74,33 @@ def job_role(title: str, terms: Sequence[Term]) -> RoleMatch:
                 skill_hits.append(skill)
         score = _TITLE_WEIGHT * len(title_hits) + sum(_weight(s) for s in skill_hits)
         first = title_hits[0][0] if title_hits else len(low_title) + 1
-        scored.append((score, -first, role, title_hits, skill_hits))
-    best = max(s[0] for s in scored)
-    top = [s for s in scored if s[0] == best]
-    if best < 2:
-        return RoleMatch(None, _top_skills(skills, [], low_title), "")
-    if len(top) > 1:
-        top = sorted((s for s in top if s[3]), key=lambda s: s[1], reverse=True)[:1]  # named first in the title
-        if not top:
-            return RoleMatch(None, _top_skills(skills, [], low_title), "")
-    _, _, role, title_hits, skill_hits = top[0]
-    role_marks = [s.term for s in sorted(skill_hits, key=_weight, reverse=True)]
-    marks = _top_skills(skills, role_marks, low_title)
-    parts = []
-    if title_hits:
-        pos, word = title_hits[0]
-        parts.append(f"title says {title[pos:pos + len(word)]}")
-    if role_marks:
-        parts.append(f"skills {', '.join(role_marks[:2])}")
-    return RoleMatch(role, marks, f"{ROLE_LABEL[role]} job — " + "; ".join(parts))
+        scored.append((score, first, role, title_hits, skill_hits))
+    top = max(s[0] for s in scored)
+    if top < 2:
+        return RoleMatch()
+    picked = sorted((s for s in scored if s[0] >= 2 and 2 * s[0] >= top), key=lambda s: (-s[0], s[1]))[:MAX_ROLES]
+    reasons = []
+    for _, _, role, title_hits, skill_hits in picked:
+        parts = []
+        if title_hits:
+            pos, word = title_hits[0]
+            parts.append(f"title says {title[pos:pos + len(word)]}")
+        if skill_hits:
+            parts.append("skills " + ", ".join(s.term for s in sorted(skill_hits, key=_weight, reverse=True)[:2]))
+        reasons.append(f"{ROLE_LABEL[role]} — " + "; ".join(parts))
+    return RoleMatch([s[2] for s in picked], " · ".join(reasons))
 
 
-def _top_skills(skills: Sequence[Term], first: list[str], low_title: str) -> list[str]:
-    """`first`, then the job's other required / core skills, each once, at most MAX_MARKS; skills the title already
-    names are left out (the job row shows the title)."""
-    out: list[str] = []
-    for name in [*first, *(s.term for s in skills if s.tier in _STRONG)]:
-        if name and _find(low_title, name.lower()):
-            continue
-        if name and name.lower() not in {o.lower() for o in out}:
-            out.append(name)
-    return out[:MAX_MARKS]
-
-
-def suggest_prompt(prompts: Sequence, default_id: str, role: Optional[str]) -> str:
-    """The prompt for the job's role: the default if it's one of them, else the latest updated; else the default."""
-    matching = [p for p in prompts if role and p.role == role]
-    if not matching:
+def suggest_unit(units: Sequence, default_id: str, roles: Sequence[str]) -> str:
+    """The unit whose role marks overlap the job's roles most; ties → one with the job's main (first) role, then the
+    default, then the most recently updated. No overlap (or no job roles) → the default."""
+    if not roles:
         return default_id
-    if any(p.id == default_id for p in matching):
-        return default_id
-    return max(matching, key=lambda p: p.updatedAt).id
+    wanted = set(roles)
+
+    def rank(unit):
+        marks = set(unit.roles or [])
+        return len(marks & wanted), roles[0] in marks, unit.id == default_id, unit.updatedAt
+
+    best = max(units, key=rank, default=None)
+    return best.id if best is not None and rank(best)[0] > 0 else default_id

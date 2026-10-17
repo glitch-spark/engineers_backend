@@ -1,11 +1,12 @@
-"""Unit tests for the job role / keyword marks behind Job Applies' suggested resume prompt (pure, no DB)."""
+"""Unit tests for the job roles and resume-unit suggestion behind Job Applies' Prompt column (pure, no DB)."""
 import os
+import time
 from datetime import datetime
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from app.job_apply.prompt_suggest import MAX_MARKS, RoleMatch, job_role, suggest_prompt  # noqa: E402
+from app.job_apply.prompt_suggest import MAX_ROLES, RoleMatch, job_roles, suggest_unit  # noqa: E402
 from app.job_apply.schema import Term  # noqa: E402
 from app.models.account import ResumePrompt  # noqa: E402
 
@@ -15,83 +16,85 @@ def t(term, tier="mentioned", soft=False):
 
 
 def test_title_decides_the_role():
-    m = job_role("Senior DevOps Engineer", [])
-    assert m.role == "devops" and m.reason == "DevOps job — title says DevOps"
+    assert job_roles("Senior DevOps Engineer", []) == RoleMatch(["devops"], "DevOps — title says DevOps")
 
 
 def test_skills_decide_when_the_title_is_generic():
-    m = job_role("Software Engineer", [t("Kubernetes", "required"), t("Terraform", "core"), t("Python")])
-    assert m.role == "devops"
-    assert m.marks[:2] == ["Kubernetes", "Terraform"]
-    assert m.reason == "DevOps job — skills Kubernetes, Terraform"
+    m = job_roles("Software Engineer", [t("Kubernetes", "required"), t("Terraform", "core"), t("Python")])
+    assert m == RoleMatch(["devops"], "DevOps — skills Kubernetes, Terraform")
 
 
-def test_marks_are_capped_at_seven_and_skip_title_words():
-    terms = [t("DevOps", "required"), t("Kubernetes", "required"), t("Terraform", "required"), t("Helm", "core"),
-             t("Jenkins", "core"), t("Ansible", "mentioned"), t("AWS", "required"), t("Go", "core"), t("Python", "required"),
-             t("Linux", "core"), t("Communication", "required", soft=True)]
-    m = job_role("DevOps Engineer", terms)
-    assert len(m.marks) == MAX_MARKS == 7
-    assert "DevOps" not in m.marks and "Communication" not in m.marks
-    assert m.marks[:4] == ["Kubernetes", "Terraform", "Helm", "Jenkins"]  # role keywords, required/core first
-    assert "AWS" in m.marks  # then the job's other required / core skills
+def test_full_stack_and_devops_job_has_both_roles():
+    m = job_roles("Full Stack Engineer", [t("Kubernetes", "required"), t("Terraform", "required")])
+    assert set(m.roles) == {"fullstack", "devops"}
+    assert "Full stack — title says Full Stack" in m.reason and "DevOps — skills Kubernetes, Terraform" in m.reason
+
+
+def test_weak_second_role_is_left_out():
+    m = job_roles("DevOps Engineer", [t("Kubernetes", "required"), t("Terraform", "required"), t("React", "required")])
+    assert m.roles == ["devops"]  # frontend (2) is under half of devops (7)
+
+
+def test_at_most_three_roles_in_order():
+    m = job_roles("Full Stack / DevOps / iOS / QA Engineer", [])
+    assert MAX_ROLES == 3 and m.roles == ["fullstack", "devops", "mobile"]  # all tied: by position in the title
 
 
 def test_no_role_without_enough_signal():
-    m = job_role("Engineer", [t("Jira")])
-    assert m == RoleMatch(None, [], "")
-
-
-def test_no_role_still_shows_top_required_skills():
-    m = job_role("Engineer", [t("Salesforce", "required"), t("Apex", "core"), t("Jira")])
-    assert m.role is None and m.marks == ["Salesforce", "Apex"] and m.reason == ""
+    assert job_roles("Engineer", [t("Jira"), t("Salesforce", "required", soft=True)]) == RoleMatch([], "")
 
 
 def test_whole_word_matching():
     for title, terms in [("Good communicator", []), ("Build tools developer", [t("Build tools", "required")]),
                          ("Aqua Security analyst", []), ("Reactive systems engineer", [])]:
-        assert job_role(title, terms).role is None, title
-    assert job_role("Engineer", [t("CI/CD pipelines", "required")]).role == "devops"
-    assert job_role("Next.js developer", []).role == "frontend"
-    assert job_role("Engineer", [t("Node.js", "required")]).role == "backend"
-
-
-def test_tie_goes_to_the_role_named_first_in_the_title():
-    assert job_role("Full Stack React Developer", []).role == "fullstack"
-    assert job_role("React Full Stack Developer", []).role == "frontend"
-
-
-def test_job_without_extraction():
-    assert job_role("", []) == RoleMatch(None, [], "")
-
-
-def _prompt(pid, role, updated):
-    return ResumePrompt(id=pid, name=pid, role=role, body="", updatedAt=datetime(2026, 10, updated))
-
-
-def test_suggest_prompt():
-    prompts = [_prompt("default", None, 1), _prompt("ops-old", "devops", 2), _prompt("ops-new", "devops", 9),
-               _prompt("fe", "frontend", 3)]
-    assert suggest_prompt(prompts, "default", "frontend") == "fe"
-    assert suggest_prompt(prompts, "default", "devops") == "ops-new"     # two of that role: the latest
-    assert suggest_prompt(prompts, "ops-old", "devops") == "ops-old"     # ... unless the default is one of them
-    assert suggest_prompt(prompts, "default", "data") == "default"       # no prompt for the role
-    assert suggest_prompt(prompts, "default", None) == "default"         # no role
+        assert job_roles(title, terms).roles == [], title
+    assert job_roles("Engineer", [t("CI/CD pipelines", "required")]).roles == ["devops"]
+    assert job_roles("Next.js developer", []).roles == ["frontend"]
+    assert job_roles("Engineer", [t("Node.js", "required")]).roles == ["backend"]
 
 
 def test_react_native_is_mobile_not_frontend():
-    assert job_role("React Native Developer", []).role == "mobile"
-    m = job_role("Senior React Native Engineer", [t("React Native", "required"), t("TypeScript", "core")])
-    assert m.role == "mobile" and m.reason.startswith("Mobile job")
+    assert job_roles("React Native Developer", []).roles == ["mobile"]
+    m = job_roles("Senior React Native Engineer", [t("React Native", "required"), t("TypeScript", "core")])
+    assert m.roles == ["mobile"] and m.reason.startswith("Mobile — title says React Native")
+
+
+def test_two_roles_in_the_title_follow_title_order():
+    assert job_roles("Full Stack React Developer", []).roles == ["fullstack", "frontend"]
+    assert job_roles("React Full Stack Developer", []).roles == ["frontend", "fullstack"]
+
+
+def test_job_without_extraction():
+    assert job_roles("", []) == RoleMatch([], "")
 
 
 def test_role_detection_is_fast_enough_for_a_200_row_page():
-    import time
     terms = [t(f"Skill{i}", "required") for i in range(20)] + [t("Kubernetes", "required"), t("React", "core"),
                                                               t("CI/CD", "core"), t("Python", "required"), t("AWS", "core")]
     for term in terms:
         term.aliases = [term.term + " dev"]
     start = time.perf_counter()
     for _ in range(200):
-        job_role("Senior Platform Engineer, Cloud Infrastructure", terms)
+        job_roles("Senior Platform Engineer, Cloud Infrastructure", terms)
     assert time.perf_counter() - start < 0.5
+
+
+def _unit(uid, roles, updated):
+    return ResumePrompt(id=uid, name=uid, roles=roles, updatedAt=datetime(2026, 10, updated))
+
+
+def test_suggest_unit():
+    units = [_unit("default", [], 1), _unit("fsd", ["fullstack", "devops"], 2), _unit("fs", ["fullstack"], 3),
+             _unit("ops", ["devops"], 4), _unit("fe", ["frontend"], 5)]
+    assert suggest_unit(units, "default", ["fullstack", "devops"]) == "fsd"      # both marks
+    no_pair = [u for u in units if u.id != "fsd"]
+    assert suggest_unit(no_pair, "default", ["fullstack", "devops"]) == "fs"     # the job's main role
+    assert suggest_unit(no_pair, "default", ["devops", "fullstack"]) == "ops"
+    assert suggest_unit(units, "default", ["data"]) == "default"                 # no overlap
+    assert suggest_unit(units, "default", []) == "default"                       # no job roles
+
+
+def test_suggest_unit_ties_go_to_the_default_then_the_latest():
+    units = [_unit("a", ["devops"], 1), _unit("b", ["devops"], 2), _unit("c", ["devops"], 9)]
+    assert suggest_unit(units, "a", ["devops"]) == "a"
+    assert suggest_unit(units, "x", ["devops"]) == "c"
