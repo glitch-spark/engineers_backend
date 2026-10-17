@@ -138,3 +138,23 @@ async def test_get_account_shows_the_default_view_for_an_older_profile(db):
 
     assert out["resumePrompts"][0]["id"] == "default" and out["resumePrompts"][0]["body"] == "legacy"
     assert out["defaultPromptId"] == "default"
+
+
+async def test_an_older_prompt_is_named_from_its_heading(db):
+    owner = await _owner()
+    body = "# Resume Tailoring — Master Prompt (general: any team member, any JD)\n\n**Scope:** …"
+
+    prompts, _ = prompts_view(Account(name="Blake", createdBy=owner.id, resumePromptBody=body))
+
+    assert prompts[0].name == "Resume Tailoring — Master Prompt" and prompts[0].id == "default"
+
+
+async def test_heading_names_are_trimmed_and_fall_back_to_default(db):
+    owner = await _owner()
+    long = "## " + "Very long heading words " * 5
+    no_heading = "Write the resume for the job.\n# Not first"
+
+    named = [prompts_view(Account(name="B", createdBy=owner.id, resumePromptBody=b))[0][0].name for b in (long, no_heading)]
+
+    assert len(named[0]) <= 60 and named[0].startswith("Very long heading") and not named[0].endswith(" ")
+    assert named[1] == "Default"

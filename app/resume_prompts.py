@@ -4,6 +4,7 @@ Older profiles have only `resumePromptBody`; they read as one prompt named "Defa
 prompts are saved. `resumePromptBody` is kept equal to the default prompt's body, so everything that reads it (the
 generation fallback chain, Prompt Eval, the lookup badge) keeps working.
 """
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -22,12 +23,25 @@ class PromptError(ValueError):
     """The prompt list can't be saved; the message is shown to the user."""
 
 
+def legacy_name(body: Optional[str]) -> str:
+    """A name for an older profile's single prompt: its first line when that's a markdown heading ("# Resume Tailoring —
+    Master Prompt (general: …)" → "Resume Tailoring — Master Prompt"), else "Default"."""
+    first = next((line.strip() for line in (body or "").splitlines() if line.strip()), "")
+    if not first.startswith("#"):
+        return DEFAULT_NAME
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", first.lstrip("#").strip()).replace("**", "").strip()
+    if len(name) > MAX_NAME:
+        name = name[:MAX_NAME].rsplit(" ", 1)[0]
+    return name.rstrip(" -—:·") or DEFAULT_NAME
+
+
 def prompts_view(account: Any) -> tuple[list[ResumePrompt], str]:
-    """(prompts, default prompt id). An older profile reads as one "Default" prompt; a missing or stale default id
-    falls back to the first prompt."""
+    """(prompts, default prompt id). An older profile reads as one prompt (named from its heading, else "Default");
+    a missing or stale default id falls back to the first prompt."""
     prompts = list(account.resumePrompts or [])
     if not prompts:
-        prompts = [ResumePrompt(id=LEGACY_ID, name=DEFAULT_NAME, body=account.resumePromptBody or "")]
+        body = account.resumePromptBody or ""
+        prompts = [ResumePrompt(id=LEGACY_ID, name=legacy_name(body), body=body)]
     ids = {p.id for p in prompts}
     default_id = account.defaultPromptId if account.defaultPromptId in ids else prompts[0].id
     return prompts, default_id
