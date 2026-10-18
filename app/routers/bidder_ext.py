@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from beanie.exceptions import RevisionIdWasChanged
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import AwareDatetime, BaseModel, Field, StringConstraints
+from pydantic import AwareDatetime, BaseModel, Field, StringConstraints, ValidationInfo, field_validator
 from pymongo.errors import DuplicateKeyError
 
 from app.bids import rate_limit
@@ -23,6 +23,7 @@ from app.bids.upload_keys import IMAGE_FORMATS, build_upload_key
 from app.config import get_settings
 from app.deps import BidderAuth, get_current_bidder
 from app.models import Account
+from app.models.bid import Attachment
 from app.models.bidder import Bidder
 from app.security import bidder_token_needs_renewal, create_bidder_token, hash_password, verify_password
 
@@ -186,6 +187,32 @@ async def change_password(
     return await _session(bidder)
 
 
+_ATTACHMENTS_MAX = 20
+_ATTACHMENT_TEXT_MAX = {"field": 200, "name": 255, "type": 100, "path": 1000, "pathError": 200}
+
+
+class AttachmentIn(BaseModel):
+    """A file the bidder attached on the page (see app.models.bid.Attachment). Over-long text is cut rather than
+    refused: an upload must never fail because of a file on the page."""
+
+    field: Optional[str] = None
+    name: str = ""
+    size: Optional[int] = Field(default=None, ge=0)
+    type: Optional[str] = None
+    lastModified: Optional[AwareDatetime] = None
+    path: Optional[str] = None
+    pathError: Optional[str] = None
+    inField: bool = True
+
+    @field_validator(*_ATTACHMENT_TEXT_MAX, mode="before")
+    @classmethod
+    def _cut(cls, v: object, info: ValidationInfo) -> object:
+        if not isinstance(v, str):
+            return v
+        v = v.strip()[: _ATTACHMENT_TEXT_MAX[info.field_name]]
+        return v if info.field_name == "name" else v or None
+
+
 class UploadUrlIn(BaseModel):
     job: str = Field(min_length=1, max_length=200)
     step: int = Field(ge=1, le=500)
@@ -197,6 +224,13 @@ class UploadUrlIn(BaseModel):
     jobTitle: Optional[Annotated[str, StringConstraints(strip_whitespace=True)]] = None
     # Extensions before 3.2.0 send no format and upload PNG.
     format: Literal["png", "webp", "jpeg"] = "png"
+    # Sent from 3.3.0, only for a bidder who allowed it; extra entries beyond the cap are dropped.
+    attachments: list[AttachmentIn] = []
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def _cap(cls, v: object) -> object:
+        return v[:_ATTACHMENTS_MAX] if isinstance(v, list) else v
 
 
 _JOB_URL_MAX = 2000
@@ -234,6 +268,7 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
     bid = await record_screenshot(
         bidder, key, body.step, body.trigger, body.capturedAt, job_url,
         (body.jobTitle or "")[:_JOB_TITLE_MAX] or None,
+        [Attachment(**a.model_dump()) for a in body.attachments],
     )
     try:
         content_type = IMAGE_FORMATS[body.format][1]
