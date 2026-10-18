@@ -10,6 +10,16 @@ from pymongo import IndexModel
 from app.models.base import TimestampedDocument
 
 
+class Attachment(BaseModel):
+    """A file the bidder had attached on the job page when the screenshot was taken, sent only when the bidder allowed
+    it in the extension. path is its full location on their computer; when it couldn't be looked up, path is None and
+    name and pathError say which file and why."""
+
+    path: Optional[str] = None
+    name: str = ""
+    pathError: Optional[str] = None
+
+
 class Screenshot(BaseModel):
     """uploadedAt stays None until the extension confirms the PUT succeeded."""
 
@@ -18,6 +28,7 @@ class Screenshot(BaseModel):
     trigger: str
     capturedAt: datetime
     uploadedAt: Optional[datetime] = None
+    attachments: list[Attachment] = []
 
 
 class Bid(TimestampedDocument):

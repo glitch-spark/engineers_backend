@@ -481,6 +481,37 @@ async def test_upload_url_records_the_bid(ext, storage):
     ]
 
 
+_RESUME = {"path": "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf", "name": "Ana_Lima.pdf", "pathError": None}
+
+
+async def test_upload_url_records_the_attached_files(ext, storage):
+    _, _, body = await register(ext)
+    unread = {"path": None, "name": "cover.pdf", "pathError": "Not allowed"}
+    r = await ext.post("/ext/upload-url", json=_shot(attachments=[_RESUME, unread])[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    stored = (await Bid.find_one()).screenshots[0].attachments
+    assert [a.model_dump() for a in stored] == [_RESUME, unread]
+
+
+async def test_upload_url_cuts_attachment_text_instead_of_refusing(ext, storage):
+    _, _, body = await register(ext)
+    many = [{"path": "C:\\" + "p" * 1200, "name": f"{i}.pdf", "pathError": "  "} for i in range(25)]
+    r = await ext.post("/ext/upload-url", json=_shot(attachments=many)[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    stored = (await Bid.find_one()).screenshots[0].attachments
+    assert len(stored) == 20 and [a.name for a in stored[:2]] == ["0.pdf", "1.pdf"]
+    assert len(stored[0].path) == 1000 and stored[0].pathError is None
+
+
+async def test_upload_url_without_attachments_stores_none(ext, storage):
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    assert (await Bid.find_one()).screenshots[0].attachments == []
+    raw = await Bid.get_motor_collection().find_one()
+    assert "attachments" not in raw["screenshots"][0]
+
+
 async def test_upload_url_truncates_the_job_title(ext, storage):
     _, _, body = await register(ext)
     r = await ext.post("/ext/upload-url", json=_shot(jobTitle="t" * 400)[0], headers=auth(body["token"]))

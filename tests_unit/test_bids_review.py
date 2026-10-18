@@ -344,7 +344,7 @@ async def test_screenshots_only_sign_uploaded_ones(make_client, owner, storage):
     assert shots[0] == {
         "key": "ana/2026-10-05/backend/one/step0_step_0.png", "step": 1, "trigger": "step",
         "capturedAt": iso(start + timedelta(hours=1)), "url": None,  # never confirmed
-        "isSubmit": False,
+        "isSubmit": False, "attachments": [],
     }
     assert shots[1]["url"] == "https://signed/bid-screenshots/ana/2026-10-05/backend/one/step1_step_1.png"
     assert storage.signed == [("bid-screenshots", "ana/2026-10-05/backend/one/step1_step_1.png")]
@@ -359,6 +359,17 @@ async def test_screenshots_mark_submit(make_client, owner):
     async with make_client(owner) as c:
         shots = (await c.get(f"/bids/{bid.id}/screenshots")).json()
     assert [(s["step"], s["trigger"], s["isSubmit"]) for s in shots] == [(1, "step", False), (2, "step", False), (3, "submit", True)]
+
+
+async def test_screenshots_carry_their_attachments(make_client, owner):
+    start, _ = day_window()
+    bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
+    resume = {"path": "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf", "name": "Ana_Lima.pdf", "pathError": None}
+    await Bid.get_motor_collection().update_one({"_id": bid.id}, {"$set": {"screenshots.1.attachments": [resume]}})  # step 1
+    async with make_client(owner) as c:
+        shots = (await c.get(f"/bids/{bid.id}/screenshots")).json()
+    assert shots[0]["attachments"] == [resume]
+    assert shots[1]["attachments"] == []
 
 
 async def test_list_includes_evidence_and_timezone(make_client, owner):

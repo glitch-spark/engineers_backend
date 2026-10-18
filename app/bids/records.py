@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime, time, timezone
 from typing import Optional
 
@@ -11,7 +12,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app.bids.windows import BidSchedule
 from app.config import Settings, get_settings
-from app.models.bid import Bid
+from app.models.bid import Attachment, Bid
 from app.models.bid_report import BidReport
 from app.models.bid_report_post import BidReportPost
 from app.models.bidder import Bidder
@@ -31,7 +32,7 @@ def _naive_utc(at: datetime) -> datetime:
 
 async def record_screenshot(
     bidder: Bidder, key: str, step: int, trigger: str, captured_at: datetime,
-    job_url: Optional[str], job_title: Optional[str],
+    job_url: Optional[str], job_title: Optional[str], attachments: Sequence[Attachment] = (),
 ) -> Bid:
     """Upsert the bid of this bidder and job folder and attach the screenshot (a retried key is not added twice)."""
     coll = Bid.get_motor_collection()
@@ -55,6 +56,8 @@ async def record_screenshot(
     bid_id = doc["_id"]
 
     shot = {"key": key, "step": step, "trigger": trigger, "capturedAt": at, "uploadedAt": None}
+    if attachments:
+        shot["attachments"] = [a.model_dump() for a in attachments]
     pushed = await coll.update_one(
         {"_id": bid_id, "screenshots.key": {"$ne": key}}, {"$push": {"screenshots": shot}}
     )
