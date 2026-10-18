@@ -481,35 +481,26 @@ async def test_upload_url_records_the_bid(ext, storage):
     ]
 
 
-def _resume(**over):
-    return {
-        "field": "Resume/CV", "name": "Ana_Lima.pdf", "size": 48213, "type": "application/pdf",
-        "lastModified": "2026-10-01T09:30:00.000Z", "path": "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf",
-        "inField": True, **over,
-    }
+_RESUME = {"path": "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf", "name": "Ana_Lima.pdf", "pathError": None}
 
 
 async def test_upload_url_records_the_attached_files(ext, storage):
     _, _, body = await register(ext)
-    unread = _resume(field=None, name="cover.pdf", path=None, pathError="Not allowed", inField=False)
-    r = await ext.post("/ext/upload-url", json=_shot(attachments=[_resume(), unread])[0], headers=auth(body["token"]))
+    unread = {"path": None, "name": "cover.pdf", "pathError": "Not allowed"}
+    r = await ext.post("/ext/upload-url", json=_shot(attachments=[_RESUME, unread])[0], headers=auth(body["token"]))
     assert r.status_code == 200, r.text
-    [first, second] = (await Bid.find_one()).screenshots[0].attachments
-    assert (first.field, first.name, first.size, first.type, first.path, first.pathError, first.inField) == (
-        "Resume/CV", "Ana_Lima.pdf", 48213, "application/pdf", "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf", None, True,
-    )
-    assert first.lastModified == datetime(2026, 10, 1, 9, 30)  # naive UTC like the other stored times
-    assert (second.name, second.path, second.pathError, second.inField) == ("cover.pdf", None, "Not allowed", False)
+    stored = (await Bid.find_one()).screenshots[0].attachments
+    assert [a.model_dump() for a in stored] == [_RESUME, unread]
 
 
 async def test_upload_url_cuts_attachment_text_instead_of_refusing(ext, storage):
     _, _, body = await register(ext)
-    many = [_resume(name=f"{i}.pdf", path="C:\\" + "p" * 1200, field=" " * 3) for i in range(25)]
+    many = [{"path": "C:\\" + "p" * 1200, "name": f"{i}.pdf", "pathError": "  "} for i in range(25)]
     r = await ext.post("/ext/upload-url", json=_shot(attachments=many)[0], headers=auth(body["token"]))
     assert r.status_code == 200, r.text
     stored = (await Bid.find_one()).screenshots[0].attachments
     assert len(stored) == 20 and [a.name for a in stored[:2]] == ["0.pdf", "1.pdf"]
-    assert len(stored[0].path) == 1000 and stored[0].field is None
+    assert len(stored[0].path) == 1000 and stored[0].pathError is None
 
 
 async def test_upload_url_without_attachments_stores_none(ext, storage):

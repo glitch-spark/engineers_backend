@@ -364,15 +364,11 @@ async def test_screenshots_mark_submit(make_client, owner):
 async def test_screenshots_carry_their_attachments(make_client, owner):
     start, _ = day_window()
     bid = await add_bid(await make_bidder(owner), "one", start + timedelta(hours=1))
-    resume = {
-        "field": "Resume/CV", "name": "Ana_Lima.pdf", "size": 48213, "type": "application/pdf",
-        "lastModified": datetime(2026, 10, 1, 9, 30), "path": "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf",
-        "pathError": None, "inField": False,
-    }
+    resume = {"path": "C:\\Users\\ana\\Resumes\\Ana_Lima.pdf", "name": "Ana_Lima.pdf", "pathError": None}
     await Bid.get_motor_collection().update_one({"_id": bid.id}, {"$set": {"screenshots.1.attachments": [resume]}})  # step 1
     async with make_client(owner) as c:
         shots = (await c.get(f"/bids/{bid.id}/screenshots")).json()
-    assert shots[0]["attachments"] == [{**resume, "lastModified": iso(datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc))}]
+    assert shots[0]["attachments"] == [resume]
     assert shots[1]["attachments"] == []
 
 

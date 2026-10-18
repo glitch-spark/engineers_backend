@@ -11,18 +11,13 @@ from app.models.base import TimestampedDocument
 
 
 class Attachment(BaseModel):
-    """A file the bidder attached on the job page, as the extension saw it when the screenshot was taken. Sent only
-    when the bidder allowed it in the extension. path is the file's full location on their computer; None (with
-    pathError) when it couldn't be looked up. inField is False for a file the site has since taken out of its field."""
+    """A file the bidder had attached on the job page when the screenshot was taken, sent only when the bidder allowed
+    it in the extension. path is its full location on their computer; when it couldn't be looked up, path is None and
+    name and pathError say which file and why."""
 
-    field: Optional[str] = None
-    name: str
-    size: Optional[int] = None
-    type: Optional[str] = None
-    lastModified: Optional[datetime] = None
     path: Optional[str] = None
+    name: str = ""
     pathError: Optional[str] = None
-    inField: bool = True
 
 
 class Screenshot(BaseModel):

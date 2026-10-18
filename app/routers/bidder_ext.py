@@ -188,21 +188,16 @@ async def change_password(
 
 
 _ATTACHMENTS_MAX = 20
-_ATTACHMENT_TEXT_MAX = {"field": 200, "name": 255, "type": 100, "path": 1000, "pathError": 200}
+_ATTACHMENT_TEXT_MAX = {"path": 1000, "name": 255, "pathError": 200}
 
 
 class AttachmentIn(BaseModel):
     """A file the bidder attached on the page (see app.models.bid.Attachment). Over-long text is cut rather than
     refused: an upload must never fail because of a file on the page."""
 
-    field: Optional[str] = None
-    name: str = ""
-    size: Optional[int] = Field(default=None, ge=0)
-    type: Optional[str] = None
-    lastModified: Optional[AwareDatetime] = None
     path: Optional[str] = None
+    name: str = ""
     pathError: Optional[str] = None
-    inField: bool = True
 
     @field_validator(*_ATTACHMENT_TEXT_MAX, mode="before")
     @classmethod

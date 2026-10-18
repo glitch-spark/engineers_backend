@@ -57,9 +57,7 @@ async def record_screenshot(
 
     shot = {"key": key, "step": step, "trigger": trigger, "capturedAt": at, "uploadedAt": None}
     if attachments:
-        shot["attachments"] = [
-            {**a.model_dump(), "lastModified": a.lastModified and _naive_utc(a.lastModified)} for a in attachments
-        ]
+        shot["attachments"] = [a.model_dump() for a in attachments]
     pushed = await coll.update_one(
         {"_id": bid_id, "screenshots.key": {"$ne": key}}, {"$push": {"screenshots": shot}}
     )

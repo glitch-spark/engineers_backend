@@ -288,7 +288,7 @@ async def bid_screenshots(bid_id: str, user: Annotated[UserExtra, Depends(get_cu
         {
             "key": s.key, "step": s.step, "trigger": s.trigger, "isSubmit": s.trigger == "submit",
             "capturedAt": _iso_utc(s.capturedAt), "url": urls.get(s.key),
-            "attachments": [{**a.model_dump(), "lastModified": _iso_utc(a.lastModified)} for a in s.attachments],
+            "attachments": [a.model_dump() for a in s.attachments],
         }
         for s in shots
     ]
