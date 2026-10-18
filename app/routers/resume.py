@@ -82,6 +82,8 @@ class GenerateBody(BaseModel):
     screeningModel: Optional[str] = None
     # Optional one-line angle for the cover letter.
     coverLetterHook: Optional[str] = Field(default=None, max_length=500)
+    # The profile's resume unit (template + prompt) to generate with; omitted = the default unit, as before.
+    promptId: Optional[str] = None
 
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -98,6 +100,17 @@ async def generate(
     cover_letter_model = require_model("cover_letter", body.coverLetterModel, user)
     screening_model = require_model("screening", body.screeningModel, user)
     account = await _load_owned_account(body.accountId, user)
+    with_unit: dict = {"prompt_body": body.promptBody}
+    if body.promptId:
+        # As Job Applies tailoring: the unit's prompt (a one-off promptBody still wins) and its template.
+        unit = find_prompt(account, body.promptId)
+        if unit is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That resume unit is no longer on this profile.")
+        if not unit.templateHtml:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This resume unit has no HTML template.")
+        with_unit = {"prompt_body": (body.promptBody or "").strip() or unit.body or None, "prompt_id": unit.id,
+                     "prompt_name": unit.name, "template_html": unit.templateHtml,
+                     "template_name": unit.templateName or "HTML template"}
     job = await resume_queue.enqueue_generation(
         user=user,
         account=account,
@@ -105,7 +118,7 @@ async def generate(
         company=body.company,
         job_url=body.jobUrl,
         questions=body.questions,
-        prompt_body=body.promptBody,
+        **with_unit,
         cover_letter=body.generateCoverLetter,
         resume_model=resume_model,
         cover_letter_model=cover_letter_model,
