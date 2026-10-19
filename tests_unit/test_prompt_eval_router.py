@@ -80,6 +80,25 @@ async def test_create_run_requires_a_template(monkeypatch):
     assert r.status_code == 400 and "template" in r.json()["detail"].lower()
 
 
+async def test_rules_judge_skips_judge_model_checks(monkeypatch):
+    async def owned(account_id, user):
+        return account(styleTemplate="")
+
+    monkeypatch.setattr(pe, "load_owned_account", owned)
+    async with client() as c:
+        r = await c.post(
+            "/resume/eval/runs",
+            json={"accountId": "a1", "judgeMode": "rules", "judgeModel": "anthropic:claude-haiku-4-5"},
+        )
+    assert r.status_code == 400 and "template" in r.json()["detail"].lower()
+
+
+async def test_unknown_judge_mode_is_rejected(no_db):
+    async with client() as c:
+        r = await c.post("/resume/eval/runs", json={"accountId": "a1", "judgeMode": "vibes"})
+    assert r.status_code == 422
+
+
 async def test_create_run_404_when_profile_is_not_owned(monkeypatch):
     from fastapi import HTTPException
 

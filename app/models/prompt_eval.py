@@ -11,6 +11,7 @@ from beanie import PydanticObjectId
 from pydantic import BaseModel, Field
 from pymongo import ASCENDING, DESCENDING, IndexModel
 
+from app.job_apply.schema import JobExtraction
 from app.models.base import TimestampedDocument
 
 EvalRole = Literal["fullstack", "frontend", "backend", "ai", "ml", "llm", "data", "test", "senior_swe", "staff_swe"]
@@ -35,6 +36,10 @@ class EvalJobDescription(TimestampedDocument):
     createdBy: Optional[PydanticObjectId] = None
     archived: bool = False
     archivedAt: Optional[datetime] = None
+    # The rules judge's reading of `text`, reused by later runs while `extractionKey` still matches
+    # (jd_hash(text):PROMPT_VERSION).
+    extraction: Optional[JobExtraction] = None
+    extractionKey: Optional[str] = None
 
     class Settings:
         name = "eval_job_descriptions"
@@ -47,6 +52,18 @@ class EvalJobDescription(TimestampedDocument):
 EvalRowStatus = Literal["pending", "generating", "judging", "done", "failed"]
 EvalRunStatus = Literal["running", "done", "failed"]
 PromptSource = Literal["custom", "profile", "global", "none"]
+# "llm": a judge model reads each resume. "rules": Job Applies scoring plus text checks, no model per row.
+JudgeMode = Literal["llm", "rules"]
+
+
+class ScorePart(BaseModel):
+    """One weighted piece of a rules-judge score, shown as the reason for it."""
+
+    key: str
+    label: str
+    score: float
+    weight: int
+    detail: str = ""
 
 
 class JudgeVerdict(BaseModel):
@@ -58,6 +75,9 @@ class JudgeVerdict(BaseModel):
     redFlags: List[str] = []
     strengths: List[str] = []
     summary: str = ""
+    # Rules judge only: how each score was built.
+    matchParts: List[ScorePart] = []
+    believabilityParts: List[ScorePart] = []
 
 
 class EvalRow(BaseModel):
@@ -113,6 +133,7 @@ class ResumePromptEval(TimestampedDocument):
     promptSource: PromptSource = "custom"
     resumeModelId: Optional[str] = None  # requested ids; None = server default
     judgeModelId: Optional[str] = None
+    judgeMode: JudgeMode = "llm"
     status: EvalRunStatus = "running"
     error: Optional[str] = None
     startedAt: datetime = Field(default_factory=datetime.utcnow)

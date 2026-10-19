@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from beanie import PydanticObjectId
@@ -20,7 +21,10 @@ from beanie.odm.utils.encoder import Encoder
 from app import ai_usage
 from app.config import get_settings
 from app.models import Account, EvalJobDescription, ResumePromptEval, UserExtra
+from app.job_apply.scoring import Idf
+from app.job_apply.schema import JobExtraction
 from app.models.prompt_eval import EVAL_ROLES, EvalRow, RoleScore
+from app.prompt_eval import rules_judge
 from app.prompt_eval.judge import judge_resume
 from app.resume_service import generate_resume_html, plain_text_from_html
 
@@ -126,6 +130,33 @@ async def mark_stale_runs(runs: list[ResumePromptEval]) -> None:
 # ---------- the work ----------
 
 
+@dataclass
+class RulesContext:
+    """What the rules judge shares across a run's rows: each job description's reading, its cost per row,
+    whether it was reused, and the run's term rarity."""
+
+    idf: Idf
+    run_date: date
+    readings: dict[str, JobExtraction] = field(default_factory=dict)
+    cost_per_row: dict[str, Optional[float]] = field(default_factory=dict)
+    reused: dict[str, bool] = field(default_factory=dict)
+
+
+async def _rules_context(run: ResumePromptEval, jds: list, owner: Optional[UserExtra]) -> RulesContext:
+    run_date = (run.startedAt or datetime.utcnow()).date()
+    ctx = RulesContext(idf=rules_judge.build_run_idf([j.text for j in jds]), run_date=run_date)
+    uses: dict[str, int] = {}
+    for r in run.rows:
+        uses[str(r.jdId)] = uses.get(str(r.jdId), 0) + 1
+    for jd in jds:
+        key = str(jd.id)
+        ex, cost, reused = await rules_judge.jd_reading(jd, owner, run_date=run_date)
+        ctx.readings[key] = ex
+        ctx.reused[key] = reused
+        ctx.cost_per_row[key] = None if cost is None else cost / max(1, uses.get(key, 1))
+    return ctx
+
+
 async def _run_row(
     run: ResumePromptEval,
     index: int,
@@ -133,6 +164,7 @@ async def _run_row(
     account: Account,
     owner: Optional[UserExtra],
     jd_text: Optional[str],
+    rules: Optional[RulesContext] = None,
 ) -> EvalRow:
     started = time.monotonic()
     try:
@@ -157,6 +189,23 @@ async def _run_row(
         row.resumeText = plain_text_from_html(html)
         row.status = "judging"
         await _persist_row(run.id, index, row)
+
+        if rules is not None:
+            key = str(row.jdId)
+            extraction = rules.readings.get(key)
+            if extraction is None:
+                raise ValueError("job description could not be read for the rules judge")
+            row.verdict = await asyncio.to_thread(
+                rules_judge.judge_rules, resume_text=row.resumeText, jd_text=jd_text, extraction=extraction,
+                idf=rules.idf, run_date=rules.run_date,
+            )
+            row.judgeModel = "rules"
+            row.judgeCached = rules.reused.get(key, False)
+            row.judgeCostUsd = rules.cost_per_row.get(key)
+            row.status = "done"
+            row.durationMs = int((time.monotonic() - started) * 1000)
+            await _persist_row(run.id, index, row)
+            return row
 
         with ai_usage.usage_scope(user_id=run.userId, feature="eval_judge", ref_id=run.id):
             verdict, jr = await judge_resume(
@@ -196,10 +245,11 @@ async def run_eval(run_id: PydanticObjectId) -> None:
         owner = await UserExtra.get(run.userId)
         jds = await EvalJobDescription.find({"_id": {"$in": [r.jdId for r in rows]}}).to_list()
         text_by_id = {str(j.id): j.text for j in jds}
+        rules = await _rules_context(run, jds, owner) if run.judgeMode == "rules" else None
 
         async def one(index: int, row: EvalRow) -> EvalRow:
             async with _slots():
-                return await _run_row(run, index, row, account, owner, text_by_id.get(str(row.jdId)))
+                return await _run_row(run, index, row, account, owner, text_by_id.get(str(row.jdId)), rules)
 
         results = await asyncio.gather(*(one(i, r) for i, r in enumerate(rows)), return_exceptions=True)
         for index, result in enumerate(results):

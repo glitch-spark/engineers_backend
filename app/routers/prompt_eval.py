@@ -19,6 +19,7 @@ from app.models.prompt_eval import (
     EvalCounts,
     EvalRole,
     EvalRow,
+    JudgeMode,
     PromptSource,
 )
 from app.prompt_eval import runner
@@ -59,6 +60,14 @@ async def _load_jd(jd_id: str) -> EvalJobDescription:
     return jd
 
 
+def _jd_out(jd: EvalJobDescription) -> dict:
+    """The rules judge's stored reading stays server-side."""
+    out = doc_to_dict(jd)
+    out.pop("extraction", None)
+    out.pop("extractionKey", None)
+    return out
+
+
 @router.get("/jds")
 async def list_jds(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -73,7 +82,7 @@ async def list_jds(
         query["archived"] = False
     jds = await EvalJobDescription.find(query).to_list()
     jds.sort(key=_jd_sort_key)
-    return {"roles": list(EVAL_ROLES), "jds": [doc_to_dict(j) for j in jds]}
+    return {"roles": list(EVAL_ROLES), "jds": [_jd_out(j) for j in jds]}
 
 
 @router.post("/jds", status_code=status.HTTP_201_CREATED)
@@ -83,7 +92,7 @@ async def create_jd(body: JdIn, user: Annotated[UserExtra, Depends(get_current_u
         createdBy=user.id,
     )
     await jd.insert()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 @router.put("/jds/{jd_id}")
@@ -95,7 +104,7 @@ async def update_jd(jd_id: str, body: JdPatch, user: Annotated[UserExtra, Depend
     for key, value in changes.items():
         setattr(jd, key, value.strip() if isinstance(value, str) else value)
     await jd.save()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 @router.post("/jds/{jd_id}/archive")
@@ -105,7 +114,7 @@ async def archive_jd(jd_id: str, user: Annotated[UserExtra, Depends(get_current_
         jd.archived = True
         jd.archivedAt = datetime.utcnow()
         await jd.save()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 @router.post("/jds/{jd_id}/unarchive")
@@ -115,7 +124,7 @@ async def unarchive_jd(jd_id: str, user: Annotated[UserExtra, Depends(get_curren
         jd.archived = False
         jd.archivedAt = None
         await jd.save()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 # ---------- runs ----------
@@ -126,7 +135,8 @@ class RunIn(BaseModel):
     # None = use the saved prompt (profile, then your global prompt). A string, even empty, is used as is.
     promptBody: Optional[str] = Field(None, max_length=30_000)
     resumeModel: Optional[str] = None
-    judgeModel: Optional[str] = None
+    judgeModel: Optional[str] = None  # ignored when judgeMode is "rules"
+    judgeMode: JudgeMode = "llm"
     roles: List[EvalRole] = []
     jdIds: List[str] = []
     label: Optional[str] = Field(None, max_length=120)
@@ -191,7 +201,7 @@ def slim(run_dict: dict) -> dict:
 async def create_run(body: RunIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Validate everything, insert the run with one pending row per JD, start it in the background."""
     resume_model = require_model("resume", body.resumeModel, user)
-    judge_model = require_model("judge", body.judgeModel, user)
+    judge_model = None if body.judgeMode == "rules" else require_model("judge", body.judgeModel, user)
     if body.jdIds:
         _check_jd_count(len(body.jdIds))
     account = await load_owned_account(body.accountId, user)
@@ -212,6 +222,7 @@ async def create_run(body: RunIn, user: Annotated[UserExtra, Depends(get_current
         promptSource=source,
         resumeModelId=resume_model,
         judgeModelId=judge_model,
+        judgeMode=body.judgeMode,
         status="running",
         startedAt=datetime.utcnow(),
         rows=[EvalRow(jdId=j.id, role=j.role, jdTitle=j.title, jdCompany=j.company) for j in jds],
@@ -219,7 +230,10 @@ async def create_run(body: RunIn, user: Annotated[UserExtra, Depends(get_current
     )
     await run.insert()
     runner.start_run(run.id)
-    log.info("prompt eval %s started: profile=%s jds=%d resume=%s judge=%s", run.id, account.name, len(jds), resume_model, judge_model)
+    log.info(
+        "prompt eval %s started: profile=%s jds=%d resume=%s judge=%s", run.id, account.name, len(jds), resume_model,
+        judge_model if body.judgeMode == "llm" else "rules",
+    )
     return {"runId": str(run.id), "status": run.status, "jdCount": len(jds)}
 
 

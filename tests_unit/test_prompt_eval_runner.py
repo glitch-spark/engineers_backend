@@ -6,12 +6,13 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from beanie import PydanticObjectId
 
+from app.job_apply.schema import JobExtraction
 from app.llm_router import LlmResult
 from app.models.prompt_eval import EvalRow, JudgeVerdict, ResumePromptEval
 from app.prompt_eval import runner
@@ -183,6 +184,7 @@ def world(monkeypatch, persisted):
     run = SimpleNamespace(
         id=PydanticObjectId(), status="running", userId=PydanticObjectId(), accountId=PydanticObjectId(),
         accountName="P", promptBody="x", resumeModelId=None, judgeModelId=None, rows=rows,
+        judgeMode="llm", startedAt=datetime(2026, 10, 1, 9, 0),
     )
     account = SimpleNamespace(id=run.accountId, styleTemplate="<html/>")
     finished = []
@@ -205,7 +207,7 @@ def world(monkeypatch, persisted):
     monkeypatch.setattr(runner.EvalJobDescription, "find", staticmethod(lambda q: FakeQuery(jds)))
     monkeypatch.setattr(runner, "_finish", fake_finish)
     monkeypatch.setattr(runner, "_sem", None)
-    return SimpleNamespace(run=run, jds=jds, finished=finished, account=account)
+    return SimpleNamespace(run=run, jds=jds, finished=finished, account=account, persisted=persisted)
 
 
 async def test_run_eval_finishes_done_even_when_some_rows_fail(monkeypatch, world):
@@ -254,6 +256,48 @@ async def test_run_eval_fails_the_run_when_the_profile_is_gone(monkeypatch, worl
     monkeypatch.setattr(runner.Account, "get", staticmethod(no_account))
     await runner.run_eval(world.run.id)
     assert world.finished[0][2] == "profile no longer exists"
+
+
+async def test_run_eval_rules_mode_reads_each_jd_once_and_never_calls_the_judge_model(monkeypatch, world):
+    world.run.judgeMode = "rules"
+    world.run.rows.append(EvalRow(jdId=world.jds[0].id, role="backend", jdTitle="again", jdCompany="Co"))
+    reads = []
+
+    async def fake_reading(jd, owner, *, run_date):
+        reads.append((jd.id, run_date))
+        return JobExtraction(title="Engineer"), (0.004 if jd is world.jds[0] else 0.0), jd is not world.jds[0]
+
+    async def fake_generate(account, jd, **k):
+        return HTML, llm()
+
+    async def no_judge(**k):
+        raise AssertionError("the model judge must not run in rules mode")
+
+    monkeypatch.setattr(runner.rules_judge, "jd_reading", fake_reading)
+    monkeypatch.setattr(runner.rules_judge, "judge_rules", lambda **k: verdict(61, 90))
+    monkeypatch.setattr(runner, "generate_resume_html", fake_generate)
+    monkeypatch.setattr(runner, "judge_resume", no_judge)
+    monkeypatch.setattr(runner, "get_settings", lambda: SimpleNamespace(PROMPT_EVAL_CONCURRENCY=4))
+    await runner.run_eval(world.run.id)
+
+    assert sorted(i for i, _ in reads) == sorted(j.id for j in world.jds)
+    assert {d for _, d in reads} == {date(2026, 10, 1)}
+    assert world.finished[0][1] == ["done"] * 4
+    done = {i: r for i, _, r in world.persisted if r.status == "done"}
+    assert done[0].judgeModel == "rules" and done[0].judgeModelId is None
+    assert done[0].judgeCostUsd == pytest.approx(0.002) and done[3].judgeCostUsd == pytest.approx(0.002)
+    assert done[0].judgeCached is False and done[1].judgeCached is True
+    assert done[1].verdict.matchScore == 61
+
+
+async def test_run_row_rules_mode_fails_when_the_jd_has_no_reading(monkeypatch, persisted):
+    async def fake_generate(*a, **k):
+        return HTML, llm()
+
+    monkeypatch.setattr(runner, "generate_resume_html", fake_generate)
+    ctx = runner.RulesContext(idf=runner.rules_judge.build_run_idf(["JD"]), run_date=date(2026, 10, 1))
+    out = await runner._run_row(a_run(), 0, row(), SimpleNamespace(), None, "JD", ctx)
+    assert out.status == "failed" and "could not be read" in out.error and out.resumeText == "Hi"
 
 
 async def test_run_eval_ignores_unknown_or_finished_runs(monkeypatch, world):
