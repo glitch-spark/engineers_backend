@@ -16,9 +16,9 @@ from pydantic import BaseModel, Field
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, gsheet, jd_store, sheet_checks, tailored_score, worker
+from app.job_apply.extract import tailor_text
 from app.job_apply.sheet_links import exported_to
 from app.job_apply.sheet_checks import sheet_text
-from app.job_apply.extract import tailor_text
 from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import (
     APPROVABLE, MARKETS, NO_LOCATION, WORTH, bucket, build_report, markets_for, rescreen, scoring_key,
@@ -294,7 +294,9 @@ def _applied_marks(row, suggestions: list[dict]) -> list[dict]:
     return marks
 
 
-_TAILORED_PROJECTION = {"pdfData": 0, "jobDescription": 0, "tailorJobDescription": 0, "plainText": 0, "coverLetterText": 0, "screeningPairs": 0}
+_TAILORED_PROJECTION = {
+    "pdfData": 0, "jobDescription": 0, "tailorJobDescription": 0, "plainText": 0, "coverLetterText": 0, "screeningPairs": 0,
+}
 
 
 def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
@@ -1263,7 +1265,7 @@ async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the job description first.")
     fields = sent - {"jdText"}
     ex = info.extraction if info else row.extraction
-    reread = ex is None or (new_jd and new_jd != current_jd and not fields)
+    reread = ex is None or bool(new_jd and new_jd != current_jd and not fields)
     if reread:
         # No reading yet, or a new description with nothing else corrected: read it (one LLM call).
         try:
@@ -1272,9 +1274,10 @@ async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra
             log.warning("job info extraction failed: %s", exc)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read that description.") from exc
     ex = ex.model_copy(deep=True)
-    ex.isJobPosting = True
     if not reread and new_jd and new_jd != current_jd:
-        ex.tailorJd = tailor_text(jd)  # the reading kept is of the old description
+        # Description changed alongside other corrections, so it was not re-read. Refresh the short text from rules.
+        ex.tailorJd = tailor_text(jd) or None
+    ex.isJobPosting = True
     if "title" in fields:
         ex.title = (body.title or "").strip()
     elif not ex.title:
@@ -1522,11 +1525,13 @@ def _best_profile(row: JobApplyRow, run: JobApplyRun) -> str:
     return str(run.selection[0].accountId)
 
 
-def _tailor_jd(row: JobApplyRow) -> Optional[str]:
-    """The short posting the resume model reads: the reading's pick, else the rules filter (readings from before
-    tailorJd). None sends the full posting."""
-    picked = row.extraction.tailorJd if row.extraction else None
-    return picked or tailor_text(row.jdText or "")
+def _short_jd(row: JobApplyRow) -> str:
+    """The posting the resume rewrite sees. Old rows have no tailorJd, so the rules text is built with no model call."""
+    short = ((row.extraction.tailorJd if row.extraction else None) or "").strip()
+    if short:
+        return short
+    rules = tailor_text(row.jdText or "").strip()
+    return rules or (row.jdText or "")
 
 
 async def _tailor_row(
@@ -1556,12 +1561,12 @@ async def _tailor_row(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This resume unit has no HTML template.")
     with_prompt = {"prompt_body": prompt.body or None, "prompt_id": prompt.id, "prompt_name": prompt.name,
                    "template_html": prompt.templateHtml, "template_name": prompt.templateName or "HTML template"}
-    tailor_jd = _tailor_jd(row)
     previous = row.tailored.get(account_id)
     if previous:  # a failed one is re-run in place, not replaced by another job
         retried = await resume_queue.requeue_failed(
-            previous, account=account, jd=row.jdText or "", tailor_jd=tailor_jd, company=_company_label(row), job_url=row.url,
-            cover_letter=cover_letter, resume_model=resume_model, cover_letter_model=cover_letter_model, **with_prompt,
+            previous, account=account, jd=row.jdText or "", tailor_jd=_short_jd(row), company=_company_label(row),
+            job_url=row.url, cover_letter=cover_letter, resume_model=resume_model,
+            cover_letter_model=cover_letter_model, **with_prompt,
         )
         if retried is not None:
             return retried
@@ -1569,7 +1574,7 @@ async def _tailor_row(
         user=owner,
         account=account,
         jd=row.jdText or "",
-        tailor_jd=tailor_jd,
+        tailor_jd=_short_jd(row),
         company=_company_label(row),
         job_url=row.url,
         cover_letter=cover_letter,

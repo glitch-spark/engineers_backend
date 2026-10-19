@@ -35,6 +35,7 @@ DAILY_WINDOW_MINUTES = 5
 def _stale_filter(cutoff: datetime) -> dict:
     has_text = [
         {"jobDescription": {"$nin": [None, ""]}},
+        {"tailorJobDescription": {"$nin": [None, ""]}},
         {"plainText": {"$nin": [None, ""]}},
         {"coverLetterText": {"$nin": [None, ""]}},
         {"screeningPairs.0": {"$exists": True}},

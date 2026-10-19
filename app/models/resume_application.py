@@ -55,8 +55,7 @@ class ResumeApplication(TimestampedDocument):
     companyName: str
     companyNameLower: str
     jobDescription: str
-    # Job Applies: the posting's title and technical / product lines. The resume model reads this; the cover letter
-    # and screening answers read the full jobDescription.
+    # Short posting used only for the resume rewrite. Absent on Generator-page jobs and on rows from before tailorJd.
     tailorJobDescription: Optional[str] = None
     jobUrl: Optional[str] = None
 

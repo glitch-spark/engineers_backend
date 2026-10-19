@@ -77,10 +77,16 @@ async def remaining_today(user: UserExtra) -> int:
     return max(0, _daily_cap() - await daily_count(user))
 
 
-def _check_inputs(jd: str, account: Account, template_html: Optional[str] = None) -> None:
+def _check_inputs(
+    jd: str, account: Account, template_html: Optional[str] = None, tailor_jd: Optional[str] = None
+) -> None:
     """`template_html`: the resume unit's template being used; None = the profile's (default unit's)."""
     if len((jd or "").encode("utf-8")) > MAX_JD_BYTES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"jobDescription exceeds {MAX_JD_BYTES} bytes")
+    if tailor_jd and len(tailor_jd.encode("utf-8")) > MAX_JD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"tailorJobDescription exceeds {MAX_JD_BYTES} bytes"
+        )
     if not (jd or "").strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This job has no description to tailor to.")
     if not (template_html if template_html is not None else account.styleTemplate or "").strip():
@@ -97,7 +103,6 @@ async def enqueue_generation(
     jd: str,
     company: str,
     job_url: Optional[str] = None,
-    tailor_jd: Optional[str] = None,
     questions: Optional[list[str]] = None,
     prompt_body: Optional[str] = None,
     prompt_id: Optional[str] = None,
@@ -111,11 +116,12 @@ async def enqueue_generation(
     cover_letter_model: Optional[str] = None,
     screening_model: Optional[str] = None,
     cover_letter_hook: Optional[str] = None,
+    tailor_jd: Optional[str] = None,
 ) -> ResumeApplication:
     """Validate and queue one generation. The caller has already checked the user may use `account`.
     `template_html` (checked, not stored: the runner looks the unit up by `prompt_id`) / `template_name`: the resume
-    unit's template. `tailor_jd`: the shorter posting the resume model reads (the full `jd` when None)."""
-    _check_inputs(jd, account, template_html)
+    unit's template. `tailor_jd`: the short posting for the resume rewrite; the cover letter and screening keep `jd`."""
+    _check_inputs(jd, account, template_html, tailor_jd)
     cap = _daily_cap()
     if await daily_count(user) >= cap:
         raise HTTPException(
@@ -162,7 +168,6 @@ async def requeue_failed(
     jd: str,
     company: str,
     job_url: Optional[str] = None,
-    tailor_jd: Optional[str] = None,
     cover_letter: bool = False,
     resume_model: Optional[str] = None,
     cover_letter_model: Optional[str] = None,
@@ -171,6 +176,7 @@ async def requeue_failed(
     prompt_name: Optional[str] = None,
     template_html: Optional[str] = None,
     template_name: Optional[str] = None,
+    tailor_jd: Optional[str] = None,
 ) -> Optional[ResumeApplication]:
     """Re-run a failed Job Applies generation in place with fresh inputs (including the prompt now selected), so a retry keeps one entry in Generated
     Resumes (and adds nothing to the daily count). None when that profile's job is gone or isn't failed."""
@@ -179,7 +185,7 @@ async def requeue_failed(
     job = await ResumeApplication.find_one({"_id": job_id, "accountId": account.id, "status": "failed"})
     if job is None:
         return None
-    _check_inputs(jd, account, template_html)
+    _check_inputs(jd, account, template_html, tailor_jd)
     _reset_failed_job_fields(job)
     company = (company or "").strip() or "Company"
     job.profileName = account.name or "profile"
