@@ -583,7 +583,8 @@ async def _rows_query(
     if view == "suggested":
         # Every job a profile can take, whatever its scores: below the minimum score it is tailored, not hidden.
         q["$or"] = [{"topScore": {"$ne": None}}, {"tailorOnly.0": {"$exists": True}}]
-        q["screen"] = {"$ne": "invalid_role"}  # a person moved it out of Worth applying after it was scored
+        # Still Worth applying: not moved to Invalid role, nor an approval undone, after it was scored.
+        q["screen"] = {"$in": list(WORTH)}
     elif view == "excluded":
         # Failed a job check, or no profile can take it (every scored profile blocked by location/work
         # authorization, and no tailor-only profile open to it).
@@ -1092,11 +1093,15 @@ class IncludeBody(BaseModel):
 async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Approve a job (or undo it): a person has checked it, so it moves to Worth applying whatever the checks said.
     Needs a readable description: for a job that could not be fetched or read it has to be pasted in Job info first
-    (saving it reads the job again, and it lands in the bucket its checks give)."""
+    (saving it reads the job again, and it lands in the bucket its checks give). Any time no step is running, since
+    several people check the same links: once the run is scored, an approved job is scored right away; an undone one
+    leaves the Suggested list (its score stays for a later approval)."""
     row = await _owned_row(row_id, user)
     run = await JobApplyRun.get(row.runId)
-    if run is None or run.status != "screened":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Jobs can only be approved before scoring starts.")
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    if run.status in ACTIVE:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Wait for the run to finish its current step.")
     is_job = row.extraction.isJobPosting if row.extraction is not None else True
     base = bucket(
         status=row.status, status_reason=row.statusReason, gates=row.gates, group_key=row.groupKey, force_include=False,
@@ -1133,6 +1138,9 @@ async def include_row(row_id: str, body: IncludeBody, user: Annotated[UserExtra,
             )
         else:
             await JobApproval.find(JobApproval.url == row.url).delete()
+    if body.include and run.phase == "score" and not row.scoredAt:
+        await worker.score_rows(run, {row.id})
+        row = await JobApplyRow.get(row.id) or row
     return _row_summary(row, run.threshold)
 
 
@@ -1277,6 +1285,10 @@ async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra
         ex.allowedLocations = body.allowedLocations
     if "postedDate" in fields:
         ex.postedDate = body.postedDate
+    elif not ex.postedDate:
+        # Left as it was: keep the date the job shows (often from the job site, not the reading). Dropping it would
+        # make freshness unknown and move a Worth applying job to Needs a check.
+        ex.postedDate = row.postedDate
     if "clearance" in fields:
         ex.clearance = Clearance(level=body.clearance, note=ex.clearance.note)
     if "workAuthorization" in fields:

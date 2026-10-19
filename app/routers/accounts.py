@@ -1,5 +1,6 @@
 import os
 import re
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 from app import resume_files
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.models.account import PromptRole, Resume
+from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
@@ -224,9 +225,58 @@ _LOOKUP_PIPELINE = [
             "archived": 1,
             "hasTemplate": _non_blank("styleTemplate"),
             "hasPrompt": _non_blank("resumePromptBody"),
+            # Resume units, small fields only. tpl: null = saved before units had templates, else has HTML.
+            "units": {
+                "$map": {
+                    "input": {"$ifNull": ["$resumePrompts", []]},
+                    "as": "u",
+                    "in": {
+                        "id": "$$u.id",
+                        "name": "$$u.name",
+                        "roles": "$$u.roles",
+                        "role": "$$u.role",
+                        "templateName": "$$u.templateName",
+                        "tpl": {"$cond": [
+                            {"$eq": [{"$ifNull": ["$$u.templateHtml", None]}, None]},
+                            None,
+                            {"$gt": [{"$strLenCP": "$$u.templateHtml"}, 0]},
+                        ]},
+                    },
+                }
+            },
+            "defaultPromptId": 1,
+            "styleTemplateName": 1,
+            # An older profile's single unit is named from its prompt's heading.
+            "promptHead": {"$substrCP": [{"$ifNull": ["$resumePromptBody", ""]}, 0, 400]},
         }
     }
 ]
+
+
+def _lookup_units(a: dict) -> dict:
+    """The profile's units as Job Applies lists them, read with the same rules (prompts_view) from the slim lookup
+    fields: placeholders stand in for template HTML and prompt texts, which never leave the database."""
+    def stand_in(tpl):
+        return None if tpl is None else ("x" if tpl else "")
+
+    stored = [
+        ResumePrompt.model_construct(
+            id=u.get("id"), name=u.get("name") or "", roles=list(u.get("roles") or []), role=u.get("role"), body="",
+            templateHtml=stand_in(u.get("tpl")), templateName=u.get("templateName"), pageFormat="A4",
+        )
+        for u in a.get("units") or [] if u.get("id")
+    ]
+    view = SimpleNamespace(
+        resumePrompts=stored, defaultPromptId=a.get("defaultPromptId"),
+        styleTemplate="x" if a.get("hasTemplate") else "", styleTemplateName=a.get("styleTemplateName"),
+        pageFormat="A4", resumePromptBody=a.get("promptHead") or "",
+    )
+    units, default_id = prompts_view(view)
+    return {
+        "units": [{"id": u.id, "name": u.name, "roles": list(u.roles), "hasTemplate": bool(u.templateHtml),
+                   "templateName": u.templateName or None} for u in units],
+        "defaultPromptId": default_id,
+    }
 
 
 @router.get("/lookup")
@@ -251,6 +301,7 @@ async def lookup_accounts(
                 # Profiles saved before these fields existed are active and shown.
                 "showInGenerate": a.get("showInGenerate", True),
                 "archived": a.get("archived", False),
+                **_lookup_units(a),
             }
             for a in rows
         ]

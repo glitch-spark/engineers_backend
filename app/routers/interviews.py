@@ -520,16 +520,17 @@ def _iso_utc(value: Any) -> Optional[str]:
 def flatten_rounds(
     interviews: list[dict],
     *,
-    from_dt: datetime,
-    to_dt: datetime,
+    from_dt: Optional[datetime],
+    to_dt: Optional[datetime],
     stage: str = "",
     status: str = "",
     caller_only: bool = False,
     caller_id: str = "",
 ) -> list[dict]:
-    """Calendar rows: one per round dated in [from_dt, to_dt), filtered on the round itself.
+    """Calendar rows: one per round dated in [from_dt, to_dt) (None = open-ended), filtered on the round itself.
     caller_only keeps caller rounds; caller_id keeps one caller's ("unassigned": no caller yet)."""
-    lo, hi = _utc_naive(from_dt), _utc_naive(to_dt)
+    lo = _utc_naive(from_dt) if from_dt is not None else None
+    hi = _utc_naive(to_dt) if to_dt is not None else None
     want_stage = _normalize_stage(stage) if stage else None
     rows = []
     for iv in interviews:
@@ -538,7 +539,7 @@ def flatten_rounds(
         owner_id = str(owner.get("_id")) if isinstance(owner, dict) else str(owner or "")
         for e in iv.get("stageHistory") or []:
             start = _as_naive_utc(e.get("scheduledAt"))
-            if start is None or not (lo <= start < hi):
+            if start is None or (lo is not None and start < lo) or (hi is not None and start >= hi):
                 continue
             if want_stage and _normalize_stage(e.get("stage")) != want_stage:
                 continue
@@ -672,6 +673,54 @@ async def list_interview_rounds(
     # (GET /{id} is limited to owner/admin/interview manager; this feed is not).
     shown = {r["interviewId"] for r in rounds}
     return {"rounds": rounds, "interviews": {str(i["_id"]): i for i in out if str(i["_id"]) in shown}}
+
+
+@router.get("/caller-rounds")
+async def list_caller_rounds(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+    stage: str = Query(""),
+    status_: str = Query("", alias="status"),
+    callerId: str = Query(""),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=200),
+    dir: str = Query("desc"),
+) -> dict:
+    """Callers list: every user's caller rounds, one row per round, by start time (desc by default), paginated.
+    `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
+    if status_ and status_ not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    f_dt = parse_date(from_) if from_ else None
+    t_dt = parse_date(to) if to else None
+    if (from_ and f_dt is None) or (to and t_dt is None):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid from/to")
+    hi = _utc_naive(t_dt) + timedelta(microseconds=1) if t_dt is not None else None  # inclusive end
+    in_range: dict[str, Any] = {"caller.enabled": True}
+    if f_dt is not None or hi is not None:
+        rng: dict[str, Any] = {}
+        if f_dt is not None:
+            rng["$gte"] = f_dt
+        if hi is not None:
+            rng["$lt"] = hi
+        in_range["scheduledAt"] = rng
+    rows = await Interview.find({"stageHistory": {"$elemMatch": in_range}}).to_list()
+    out = await _populate_account(await populate_owner(rows, field="createdBy"))
+    rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
+    if dir != "asc":
+        rounds.reverse()  # flatten_rounds sorts oldest first
+    total = len(rounds)
+    shown = rounds[(page - 1) * limit: page * limit]
+    ids = {r["interviewId"] for r in shown}
+    total_pages = (total + limit - 1) // limit
+    return {
+        "rounds": shown,
+        "interviews": {str(i["_id"]): i for i in out if str(i["_id"]) in ids},
+        "pagination": {
+            "page": page, "limit": limit, "total": total, "totalPages": total_pages,
+            "hasNext": page < total_pages, "hasPrev": page > 1,
+        },
+    }
 
 
 @router.get("/{iv_id}")

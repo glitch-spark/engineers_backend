@@ -77,6 +77,9 @@ async def test_lookup_keeps_the_same_response_shape(collection):
                 "_id": str(ACCOUNT_ID), "name": "Backend", "country": "US", "region": "US",
                 "hasTemplate": True, "hasPrompt": False, "createdBy": str(OWNER_ID),
                 "showInGenerate": False, "archived": True,
+                # No stored units: the profile's template + prompt read as its one default unit.
+                "units": [{"id": "default", "name": "Default", "roles": [], "hasTemplate": True, "templateName": None}],
+                "defaultPromptId": "default",
             }
         ]
     }
@@ -96,7 +99,11 @@ async def test_lookup_projects_flags_in_the_database_and_never_returns_the_html(
     projected = stage["$project"]
     assert set(projected) == {
         "name", "country", "region", "createdBy", "showInGenerate", "archived", "hasTemplate", "hasPrompt",
+        "units", "defaultPromptId", "styleTemplateName", "promptHead",
     }
     for heavy in ("styleTemplate", "previewHtml", "resumes", "resumePromptBody", "screeningPrompt", "coverLetterPrompt"):
         assert heavy not in projected  # only read inside the flag expressions, never returned
     assert "$styleTemplate" in str(projected["hasTemplate"]) and "$resumePromptBody" in str(projected["hasPrompt"])
+    # Units: names, roles and a has-template flag; the HTML is only measured, never returned.
+    assert "$$u.templateHtml" in str(projected["units"]["$map"]["in"]["tpl"])
+    assert "templateHtml" not in projected["units"]["$map"]["in"] and "body" not in projected["units"]["$map"]["in"]
