@@ -61,6 +61,8 @@ class JobExtraction(BaseModel):
     postedDate: Optional[date] = None
     # False for error pages, cookie notices, job lists and careers landing pages read in place of a posting.
     isJobPosting: bool = True
+    # Verbatim lines kept for resume tailoring. Cover letters, screening, and match scores keep the full posting.
+    tailorJd: Optional[str] = None
 
 
 class GateResult(BaseModel):

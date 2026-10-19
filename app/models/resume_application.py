@@ -55,6 +55,8 @@ class ResumeApplication(TimestampedDocument):
     companyName: str
     companyNameLower: str
     jobDescription: str
+    # Short posting used only for the resume rewrite. Absent on Generator-page jobs and on rows from before tailorJd.
+    tailorJobDescription: Optional[str] = None
     jobUrl: Optional[str] = None
 
     status: JobStatus = "queued"

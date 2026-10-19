@@ -66,6 +66,12 @@ def test_rules_extract():
     assert ex.clearance.level == "required" and ex.workMode == "hybrid"
     assert ex.postedDate == date(2026, 9, 21) and ex.seniority == "senior"
     assert ex.title == "Senior Backend Engineer"
+    assert ex.tailorJd == (
+        "Senior Backend Engineer\n"
+        "- 5+ years of experience with Python and PostgreSQL\n"
+        "- Bachelor's degree or equivalent experience\n"
+        "- Kubernetes"
+    )
 
 
 def test_rules_remote_and_auto_terms():
@@ -143,7 +149,8 @@ def test_build_prompt_has_location_and_posting_examples():
 
 def test_build_prompt_contains_rules():
     p = build_prompt("JD TEXT HERE", RUN)
-    assert "JD TEXT HERE" in p and "2026-10-01" in p and '"workMode"' in p and "able to obtain" in p
+    assert "[1] JD TEXT HERE" in p and "2026-10-01" in p and '"workMode"' in p and "able to obtain" in p
+    assert '"tailorLines"' in p
 
 
 def test_jd_hash_normalises():
@@ -236,7 +243,7 @@ async def test_extract_job_keeps_remote_and_unknown():
 def test_prompt_version_is_current():
     from app.job_apply.extract import PROMPT_VERSION
 
-    assert PROMPT_VERSION == "job-extract-v6"  # v4: work mode only when stated; v5: remoteAreas; v6: more regions
+    assert PROMPT_VERSION == "job-extract-v7"  # v6: more regions; v7: tailorLines
 
 
 def test_parse_remote_areas():
@@ -248,3 +255,33 @@ def test_parse_remote_areas():
 def test_build_prompt_asks_for_remote_areas():
     p = build_prompt("JD", RUN)
     assert '"remoteAreas"' in p and "metro areas" in p
+
+
+_EXAMPLE_JD = (
+    "Senior Backend Engineer\nRequirements:\n- 5+ years of experience with Python and PostgreSQL\n"
+    "- Bachelor's degree or equivalent experience\n- Active Secret clearance required\n"
+    "Nice to have:\n- Kubernetes\nThis is a hybrid role, 3 days in office.\nPosted 10 days ago"
+)
+
+
+def test_parse_tailor_lines_copies_verbatim_and_ignores_bad_numbers():
+    raw = json.dumps({
+        "title": "Senior Backend Engineer",
+        "terms": [{"term": "Python", "tier": "required"}],
+        "tailorLines": [1, 5, 3, 99, 0, "nope"],
+    })
+    ex = parse_extraction(raw, _EXAMPLE_JD)
+    assert ex.tailorJd == (
+        "Senior Backend Engineer\n"
+        "- Active Secret clearance required\n"
+        "- 5+ years of experience with Python and PostgreSQL"
+    )
+
+
+def test_parse_missing_tailor_lines_uses_rules_text():
+    raw = json.dumps({"title": "Senior Backend Engineer", "terms": [{"term": "Python", "tier": "required"}]})
+    ex = parse_extraction(raw, _EXAMPLE_JD)
+    assert ex.tailorJd == rules_extract(_EXAMPLE_JD, RUN).tailorJd
+    assert "clearance" not in ex.tailorJd.lower()
+    assert "hybrid" not in ex.tailorJd.lower()
+    assert "Posted" not in ex.tailorJd

@@ -22,10 +22,12 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v6"
+PROMPT_VERSION = "job-extract-v7"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
+# A line-number selection this small is treated as a miss: the rules text is used instead.
+TAILOR_MIN_FRACTION = 0.2
 
 _TIERS = ("required", "core", "mentioned", "preferred", "context")
 _TIER_RANK = {t: i for i, t in enumerate(_TIERS)}  # lower = stronger
@@ -50,7 +52,8 @@ JSON shape (use null when the posting doesn't say):
   "timezoneNote": "4h overlap with EST",
   "clearance": {{"level": "required|preferred|none", "note": "Active Secret"}},
   "postedDate": "YYYY-MM-DD",
-  "isJobPosting": true
+  "isJobPosting": true,
+  "tailorLines": [1, 2, 4]
 }}
 
 Rules:
@@ -93,6 +96,10 @@ Rules:
 - postedDate: when the job was posted or published; resolve relative phrases ("Posted 2 weeks ago") against today's
   date. Never an archived, closing, expiry, deadline or updated date, nor a date from company news (founding,
   funding, launches), and never today's date unless the posting says it was posted today. null if not stated.
+- tailorLines: the numbers of lines to keep for resume tailoring, from the numbered posting below, in order.
+  Keep the job title, requirements, responsibilities, skills, tools, domain, and preferred technical items.
+  Drop company story, benefits, salary, legal text, location, work mode, time zone, clearance, work authorization,
+  and posted or closing dates. Return only those line numbers. Do not rewrite the lines.
 
 Job posting:
 <<<
@@ -100,9 +107,18 @@ Job posting:
 >>>"""
 
 
+def posting_lines(jd: str) -> list[str]:
+    """Non-empty lines of the posting, in the same truncation the extraction prompt shows the model."""
+    return [ln.strip() for ln in ((jd or "")[:MAX_JD_CHARS]).splitlines() if ln.strip()]
+
+
+def numbered_posting(jd: str) -> str:
+    return "\n".join(f"[{i}] {line}" for i, line in enumerate(posting_lines(jd), 1))
+
+
 def build_prompt(jd: str, run_date: date) -> str:
     return _PROMPT.format(
-        run_date=run_date.isoformat(), max_required=MAX_REQUIRED, max_terms=MAX_TERMS, jd=(jd or "")[:MAX_JD_CHARS]
+        run_date=run_date.isoformat(), max_required=MAX_REQUIRED, max_terms=MAX_TERMS, jd=numbered_posting(jd)
     )
 
 
@@ -161,7 +177,40 @@ def _terms(items: Any) -> list[Term]:
     return (required[:MAX_REQUIRED] + others)[:MAX_TERMS]
 
 
-def parse_extraction(raw: str) -> JobExtraction:
+def _line_number(v: Any) -> Optional[int]:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return None
+
+
+def _tailor_from_lines(jd: str, numbers: Any) -> Optional[str]:
+    """Copy the numbered lines the model kept. None when the selection is missing, empty, or too small."""
+    lines = posting_lines(jd)
+    if not isinstance(numbers, list) or not numbers:
+        return None
+    kept: list[str] = []
+    seen: set[int] = set()
+    for n in numbers:
+        i = _line_number(n)
+        if i is None or i < 1 or i > len(lines) or i in seen:
+            continue
+        seen.add(i)
+        kept.append(lines[i - 1])
+    if not kept:
+        return None
+    text = "\n".join(kept)
+    if len(text) < TAILOR_MIN_FRACTION * len(jd or ""):
+        return None
+    return text
+
+
+def parse_extraction(raw: str, jd: Optional[str] = None) -> JobExtraction:
     from app.llm_router import _try_parse_jsonish
 
     obj = _try_parse_jsonish(raw or "")
@@ -232,6 +281,7 @@ def parse_extraction(raw: str) -> JobExtraction:
         clearance=clearance,
         postedDate=_iso_date(obj.get("postedDate")),
         isJobPosting=obj.get("isJobPosting") is not False,
+        tailorJd=_resolved_tailor_jd(obj, jd),
     )
 
 
@@ -371,6 +421,57 @@ def _auto_terms(line: str) -> list[str]:
     return out
 
 
+_TAILOR_KINDS = frozenset({"required", "core", "mentioned", "preferred"})
+_LOCATION_LINE = re.compile(r"^\s*location\s*:", re.I)
+_TAILOR_DROP = (_CLEARANCE, _WORK_AUTH, _TIMEZONE, _HYBRID, _ONSITE, _REMOTE, _NOT_REMOTE)
+
+
+def _posted_line(line: str) -> bool:
+    return bool(
+        _REL_POSTED.search(line)
+        or _POSTED_TODAY.search(line)
+        or _POSTED_YESTERDAY.search(line)
+        or _POSTED_ISO.search(line)
+        or _POSTED_TEXT.search(line)
+    )
+
+
+def _location_line(line: str) -> bool:
+    if _LOCATION_LINE.search(line):
+        return True
+    return any(rx.search(line) for rx, _loc in _LOCATION_RULES)
+
+
+def _drop_tailor_line(line: str) -> bool:
+    return any(rx.search(line) for rx in _TAILOR_DROP) or _location_line(line) or _posted_line(line)
+
+
+def tailor_text(jd: str) -> str:
+    """Rules version of the short posting: kept sections, with clearance, location, work mode, and dates removed."""
+    jd = jd or ""
+    kept: list[str] = []
+    first = next((ln.strip() for ln in jd.splitlines() if ln.strip()), "")
+    if first:
+        kept.append(first)
+    for section in split_sections(jd):
+        if section.kind not in _TAILOR_KINDS:
+            continue
+        for line in section.lines:
+            if line == first or _drop_tailor_line(line):
+                continue
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def _resolved_tailor_jd(obj: dict, jd: Optional[str]) -> Optional[str]:
+    if jd is None:
+        return None
+    picked = _tailor_from_lines(jd, obj.get("tailorLines"))
+    if picked:
+        return picked
+    return tailor_text(jd) or None
+
+
 def rules_extract(jd: str, run_date: date) -> JobExtraction:
     jd = jd or ""
     sections = split_sections(jd)
@@ -442,6 +543,7 @@ def rules_extract(jd: str, run_date: date) -> JobExtraction:
         timezoneNote=tz.group(0).strip() if tz else None,
         clearance=clearance,
         postedDate=_posted_date(jd, run_date),
+        tailorJd=tailor_text(jd) or None,
     )
 
 
@@ -460,7 +562,7 @@ async def extract_job(
         from app.llm_router import complete_with_fallback as llm
     try:
         res = await llm(build_prompt(jd, run_date), user, validate=_validate, purpose="job_extract")
-        ex = parse_extraction(res.text)
+        ex = parse_extraction(res.text, jd)
         posted = ex.postedDate
         if posted and (posted > run_date or (posted == run_date and _posted_date(jd, run_date) != run_date)):
             ex.postedDate = None  # models answer "today" (from the prompt) when the posting gives no date

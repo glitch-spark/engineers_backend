@@ -8,14 +8,17 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 os.environ["RESUME_QUEUE_DISABLED"] = "1"
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from beanie import init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
 from app import resume_queue
+from app.job_apply.schema import JobExtraction
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, ProfileGates, RunSelection
+from app.routers import resume as resume_router
 from app.routers.job_applies import TailorAllBody, TailorBody, _tailor_row, tailor_all, tailor_row
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals
@@ -114,3 +117,73 @@ async def test_job_applies_always_tailors_with_gpt_4o_mini(db):
     for row in rows:
         job = await ResumeApplication.get((await JobApplyRow.get(row.id)).tailored[str(account.id)])
         assert job.resumeModelId == "openai:gpt-4o-mini"
+
+
+_FULL_JD = (
+    "Senior Backend Engineer\nRequirements:\n- 5+ years of experience with Python and PostgreSQL\n"
+    "- Bachelor's degree or equivalent experience\n- Active Secret clearance required\n"
+    "Nice to have:\n- Kubernetes\nThis is a hybrid role, 3 days in office.\nPosted 10 days ago"
+)
+_SHORT_JD = "Senior Backend Engineer\n- 5+ years of experience with Python and PostgreSQL\n- Kubernetes"
+
+
+async def test_tailor_stores_short_and_full_description(db):
+    owner, account, run, _row, _done = await _setup("completed")
+    row = await JobApplyRow(
+        runId=run.id, userId=owner.id, rowIndex=3, url="https://jobs.example.com/9", company="Acme",
+        jdText=_FULL_JD, extraction=JobExtraction(title="Senior Backend Engineer", tailorJd=_SHORT_JD),
+        profileGates=[ProfileGates(accountId=str(account.id))],
+    ).insert()
+
+    job = await _tailor_row(row, run, owner, str(account.id), True)
+
+    assert job.jobDescription == _FULL_JD
+    assert job.tailorJobDescription == _SHORT_JD
+
+
+async def test_resume_prompt_gets_short_text_and_cover_letter_gets_full(db, monkeypatch):
+    owner = await UserExtra(name="Athen", email="athen@x.io").insert()
+    account = await Account(name="Ian Meron", createdBy=owner.id, styleTemplate="<html>{{resume}}</html>").insert()
+    job = await ResumeApplication(
+        userId=owner.id, accountId=account.id, profileName="Ian Meron", companyName="Acme", companyNameLower="acme",
+        jobDescription=_FULL_JD, tailorJobDescription=_SHORT_JD, generateCoverLetter=True,
+        screeningQuestions=["Why you?"], status="in_progress", step="generating_resume", source="job_applies",
+    ).insert()
+    seen = {}
+
+    async def fake_generate(account, jd, company, **kwargs):
+        seen["resume"] = jd
+        return SimpleNamespace(
+            cost_usd=None, input_tokens=1, output_tokens=1, reasoning_tokens=0, plain_text="resume text",
+            llm_provider="openai", llm_model="x", llm_fallback_used=False, llm_fallback_reason=None,
+            s3_key=None, pdf_bytes=b"%PDF",
+        )
+
+    async def fake_letter(**kwargs):
+        seen["letter"] = kwargs["job_description"]
+        return SimpleNamespace(
+            text="Dear Acme", provider="openai", model="x", fallback_used=False, fallback_reason=None, cost_usd=None,
+        )
+
+    async def fake_screen(**kwargs):
+        seen["screen"] = kwargs["jd"]
+        return SimpleNamespace(
+            pairs=[], cost_usd=None, llm_provider="openai", llm_model="x",
+            llm_fallback_used=False, llm_fallback_reason=None,
+        )
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(resume_router, "generate_resume", fake_generate)
+    monkeypatch.setattr(resume_router, "write_cover_letter", fake_letter)
+    monkeypatch.setattr(resume_router, "_run_screening", fake_screen)
+    monkeypatch.setattr(resume_queue, "persist_job", noop)
+    monkeypatch.setattr("app.job_apply.tailored_score.score_job", noop)
+    monkeypatch.setattr("app.job_apply.sheet_links.fill_link", noop)
+
+    await resume_router.run_job_doc(job)
+
+    assert seen["resume"] == _SHORT_JD
+    assert seen["letter"] == _FULL_JD
+    assert seen["screen"] == _FULL_JD
