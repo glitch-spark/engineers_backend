@@ -456,6 +456,11 @@ async def reread_with_info(run: JobApplyRun, targets: list[JobApplyRow]) -> list
     return [r for r in await _rows(run.id) if r.id in ids]
 
 
+async def score_rows(run: JobApplyRun, ids: set[PydanticObjectId]) -> None:
+    """Score just these rows of a run no worker is processing (a job approved after the run was scored)."""
+    await _score_stage(run, await _rows(run.id), _Checker(run.id), only=ids)
+
+
 async def reapply_info(run: JobApplyRun, row: JobApplyRow) -> None:
     """After a correction: read this one row again and move the run's counters. Other runs pick the correction up
     through `sync_corrections` (or when they next read the URL)."""
