@@ -8,7 +8,9 @@ import pytest
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from app.job_apply.extract import build_prompt, extract_job, jd_hash, parse_extraction, rules_extract  # noqa: E402
+from app.job_apply.extract import (  # noqa: E402
+    build_prompt, extract_job, jd_hash, parse_extraction, rules_extract, tailor_text,
+)
 from app.job_apply.schema import MinYears  # noqa: E402
 
 RUN = date(2026, 10, 1)
@@ -66,6 +68,67 @@ def test_rules_extract():
     assert ex.clearance.level == "required" and ex.workMode == "hybrid"
     assert ex.postedDate == date(2026, 9, 21) and ex.seniority == "senior"
     assert ex.title == "Senior Backend Engineer"
+    assert ex.tailorJd == TAILOR_EXAMPLE
+
+
+EXAMPLE_JD = (
+    "Senior Backend Engineer\nRequirements:\n- 5+ years of experience with Python and PostgreSQL\n"
+    "- Bachelor's degree or equivalent experience\n- Active Secret clearance required\n"
+    "Nice to have:\n- Kubernetes\nThis is a hybrid role, 3 days in office.\nPosted 10 days ago"
+)
+TAILOR_EXAMPLE = (
+    "Senior Backend Engineer\nRequirements:\n- 5+ years of experience with Python and PostgreSQL\n"
+    "- Bachelor's degree or equivalent experience\nNice to have:\n- Kubernetes"
+)
+
+
+def test_tailor_text_keeps_title_and_technical_lines():
+    assert tailor_text(EXAMPLE_JD) == TAILOR_EXAMPLE
+
+
+def test_tailor_text_drops_company_benefits_and_logistics():
+    jd = (
+        "Platform Engineer (Remote, US)\nLocation: Austin, TX\nAbout Acme\nWe make rockets.\n"
+        "What you'll do:\n- Build hybrid cloud infrastructure on AWS\n- Work with distributed teams\n"
+        "- Must be authorized to work in the United States without sponsorship\n- Overlap with EST hours\n"
+        "Benefits:\n- 401k match\n- Unlimited PTO"
+    )
+    assert tailor_text(jd) == (
+        "Platform Engineer (Remote, US)\nWhat you'll do:\n- Build hybrid cloud infrastructure on AWS\n"
+        "- Work with distributed teams"
+    )
+
+
+def test_tailor_text_empty():
+    assert tailor_text("") is None and tailor_text(None) is None
+
+
+def test_build_prompt_numbers_lines():
+    p = build_prompt("Backend Engineer\n\n  - Python  \n", RUN)
+    assert "[1] Backend Engineer\n[2] - Python" in p and '"tailorLines"' in p
+
+
+def test_parse_tailor_lines_copies_posting_lines_verbatim():
+    raw = json.dumps({"title": "T", "terms": [{"term": "Python"}], "tailorLines": [6, 1, 2, "3", 99, 0, True, 1, "x"]})
+    ex = parse_extraction(raw, jd=EXAMPLE_JD)
+    assert ex.tailorJd == (
+        "Senior Backend Engineer\nRequirements:\n- 5+ years of experience with Python and PostgreSQL\nNice to have:"
+    )
+    assert parse_extraction(raw).tailorJd is None  # no posting to number
+
+
+async def test_extract_job_uses_the_models_pick():
+    picks = [1, 2, 3, 4, 6, 7]
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "tailorLines": picks}))
+    ex, _ = await extract_job(EXAMPLE_JD, user=None, run_date=RUN, llm=llm)
+    assert ex.tailorJd == TAILOR_EXAMPLE
+
+
+@pytest.mark.parametrize("picks", [None, [], [99], [1]])
+async def test_extract_job_falls_back_to_rules_for_missing_or_tiny_pick(picks):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "tailorLines": picks}))
+    ex, _ = await extract_job(EXAMPLE_JD, user=None, run_date=RUN, llm=llm)
+    assert ex.tailorJd == TAILOR_EXAMPLE
 
 
 def test_rules_remote_and_auto_terms():
@@ -236,7 +299,8 @@ async def test_extract_job_keeps_remote_and_unknown():
 def test_prompt_version_is_current():
     from app.job_apply.extract import PROMPT_VERSION
 
-    assert PROMPT_VERSION == "job-extract-v6"  # v4: work mode only when stated; v5: remoteAreas; v6: more regions
+    # v4: work mode only when stated; v5: remoteAreas; v6: more regions; v7: tailorLines
+    assert PROMPT_VERSION == "job-extract-v7"
 
 
 def test_parse_remote_areas():

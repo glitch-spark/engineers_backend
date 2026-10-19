@@ -97,6 +97,7 @@ async def enqueue_generation(
     jd: str,
     company: str,
     job_url: Optional[str] = None,
+    tailor_jd: Optional[str] = None,
     questions: Optional[list[str]] = None,
     prompt_body: Optional[str] = None,
     prompt_id: Optional[str] = None,
@@ -113,7 +114,7 @@ async def enqueue_generation(
 ) -> ResumeApplication:
     """Validate and queue one generation. The caller has already checked the user may use `account`.
     `template_html` (checked, not stored: the runner looks the unit up by `prompt_id`) / `template_name`: the resume
-    unit's template."""
+    unit's template. `tailor_jd`: the shorter posting the resume model reads (the full `jd` when None)."""
     _check_inputs(jd, account, template_html)
     cap = _daily_cap()
     if await daily_count(user) >= cap:
@@ -130,6 +131,7 @@ async def enqueue_generation(
         companyName=company,
         companyNameLower=company.lower(),
         jobDescription=jd,
+        tailorJobDescription=(tailor_jd or "").strip() or None,
         jobUrl=(job_url or "").strip() or None,
         screeningQuestions=[q.strip() for q in questions or [] if q and q.strip()],
         status="queued",
@@ -160,6 +162,7 @@ async def requeue_failed(
     jd: str,
     company: str,
     job_url: Optional[str] = None,
+    tailor_jd: Optional[str] = None,
     cover_letter: bool = False,
     resume_model: Optional[str] = None,
     cover_letter_model: Optional[str] = None,
@@ -183,6 +186,7 @@ async def requeue_failed(
     job.companyName = company
     job.companyNameLower = company.lower()
     job.jobDescription = jd
+    job.tailorJobDescription = (tailor_jd or "").strip() or None
     job.jobUrl = (job_url or "").strip() or None
     job.pdfFilename = build_filename(job.profileName, company)
     job.generateCoverLetter = bool(cover_letter)

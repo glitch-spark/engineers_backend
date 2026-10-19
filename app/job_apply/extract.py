@@ -16,13 +16,15 @@ from app.job_apply.schema import (
     WorkAuth,
 )
 from app.job_apply.gates import normalize_country, region_key
-from app.job_apply.sections import line_kind, split_sections
+from app.job_apply.sections import _heading_kind, line_kind, split_sections
 from app.job_apply.skills_dict import SKILLS, SOFT_SKILLS, canonical, find_skills, is_soft
 from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v6"
+PROMPT_VERSION = "job-extract-v7"
+# A model pick shorter than this share of the rules filter's text has dropped requirements; use the rules instead.
+TAILOR_MIN_SHARE = 0.2
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -50,10 +52,16 @@ JSON shape (use null when the posting doesn't say):
   "timezoneNote": "4h overlap with EST",
   "clearance": {{"level": "required|preferred|none", "note": "Active Secret"}},
   "postedDate": "YYYY-MM-DD",
-  "isJobPosting": true
+  "isJobPosting": true,
+  "tailorLines": [1, 2, 3]
 }}
 
 Rules:
+- tailorLines: the [n] numbers of the posting lines a resume writer needs: the job title, section headings above
+  kept lines, requirements, responsibilities, skills, tools, technologies, domain and product work, and preferred
+  technical items. Leave out company story and mission, benefits, salary, perks, legal / EEO text, how to apply,
+  location, work mode (remote / hybrid / on-site, days in office), time zone, travel, security clearance, citizenship,
+  visa or work authorization, and posted / closing dates. Lines are copied as written, so pick whole lines.
 - terms: skills, tools, technologies, methods or domains a resume screen would look for. Not generic words.
   At most {max_required} "required" terms and {max_terms} terms in total. Give common aliases/abbreviations.
 - tier comes from the section: Requirements/Qualifications/About you = required; Responsibilities/What you'll do = core;
@@ -100,10 +108,14 @@ Job posting:
 >>>"""
 
 
+def jd_lines(jd: str) -> list[str]:
+    """The posting's non-empty lines, as numbered in the prompt ([1] is the first)."""
+    return [line.strip() for line in (jd or "")[:MAX_JD_CHARS].splitlines() if line.strip()]
+
+
 def build_prompt(jd: str, run_date: date) -> str:
-    return _PROMPT.format(
-        run_date=run_date.isoformat(), max_required=MAX_REQUIRED, max_terms=MAX_TERMS, jd=(jd or "")[:MAX_JD_CHARS]
-    )
+    numbered = "\n".join(f"[{i}] {line}" for i, line in enumerate(jd_lines(jd), 1))
+    return _PROMPT.format(run_date=run_date.isoformat(), max_required=MAX_REQUIRED, max_terms=MAX_TERMS, jd=numbered)
 
 
 def jd_hash(jd: str) -> str:
@@ -161,7 +173,19 @@ def _terms(items: Any) -> list[Term]:
     return (required[:MAX_REQUIRED] + others)[:MAX_TERMS]
 
 
-def parse_extraction(raw: str) -> JobExtraction:
+def _picked_lines(picks: Any, jd: str) -> Optional[str]:
+    """The posting lines the model numbered in `tailorLines`, verbatim and in posting order."""
+    lines = jd_lines(jd)
+    wanted = set()
+    for p in picks if isinstance(picks, list) else []:
+        n = p if isinstance(p, int) and not isinstance(p, bool) else int(p) if isinstance(p, str) and p.strip().isdigit() else 0
+        if 1 <= n <= len(lines):
+            wanted.add(n)
+    return "\n".join(lines[n - 1] for n in sorted(wanted)) or None
+
+
+def parse_extraction(raw: str, jd: Optional[str] = None) -> JobExtraction:
+    """`jd`: the posting the prompt numbered, to turn `tailorLines` back into text."""
     from app.llm_router import _try_parse_jsonish
 
     obj = _try_parse_jsonish(raw or "")
@@ -232,6 +256,7 @@ def parse_extraction(raw: str) -> JobExtraction:
         clearance=clearance,
         postedDate=_iso_date(obj.get("postedDate")),
         isJobPosting=obj.get("isJobPosting") is not False,
+        tailorJd=_picked_lines(obj.get("tailorLines"), jd) if jd else None,
     )
 
 
@@ -371,6 +396,38 @@ def _auto_terms(line: str) -> list[str]:
     return out
 
 
+# Lines about where, when and who may work, not what the work is. Narrower than the work-mode rules above so
+# "hybrid cloud", "remote sensing" or "distributed teams" stay in.
+_TAILOR_DROP = (
+    _CLEARANCE, _WORK_AUTH, _TIMEZONE, _NOT_REMOTE, _ONSITE, _OFFICE,
+    re.compile(r"\bhybrid\b(?!\s+(?:cloud|apps?|mobile|search|models?|architectures?|infrastructure|environments?|workloads?))", re.I),
+    re.compile(r"\d+\s*(?:days?|x)\s*(?:a|per|/)?\s*(?:week\s*)?(?:in|at)\s*(?:the\s*|our\s*)?office|commut(?:e|ing|able) distance", re.I),
+    re.compile(r"\bremote\b(?!\s+(?:sensing|control|monitoring|access|debugging|procedure))|work from (?:home|anywhere)|\bWFH\b", re.I),
+    re.compile(r"\b(?:posted|published|date posted|closing date|apply by)\b|\b\d+\+?\s*(?:day|week|month)s?\s+ago\b", re.I),
+    re.compile(r"^(?:location|company|workplace(?: type)?|work location|job location|salary|compensation|pay range)\s*:", re.I),
+    *(rx for rx, _ in _LOCATION_RULES),
+)
+_TAILOR_KINDS = frozenset({"required", "core", "mentioned", "preferred"})
+
+
+def tailor_text(jd: str) -> Optional[str]:
+    """The posting's title and technical / product lines, verbatim, with their headings: what a resume writer needs.
+    Drops company story, benefits, legal text and logistics (location, work mode, time zone, clearance, work
+    authorization, posted dates). None when nothing is left."""
+    jd = (jd or "")[:MAX_JD_CHARS]
+    out: list[str] = []
+    for section in split_sections(jd):
+        if section.kind not in _TAILOR_KINDS:
+            continue
+        kept = [line for line in section.lines if not any(rx.search(line) for rx in _TAILOR_DROP)]
+        if kept:
+            out.extend([section.heading, *kept] if section.heading else kept)
+    title = next((line.strip() for line in jd.splitlines() if line.strip()), "")
+    if title and title not in out[:1] and _heading_kind(title) is None:
+        out.insert(0, title)
+    return "\n".join(out) or None
+
+
 def rules_extract(jd: str, run_date: date) -> JobExtraction:
     jd = jd or ""
     sections = split_sections(jd)
@@ -442,6 +499,7 @@ def rules_extract(jd: str, run_date: date) -> JobExtraction:
         timezoneNote=tz.group(0).strip() if tz else None,
         clearance=clearance,
         postedDate=_posted_date(jd, run_date),
+        tailorJd=tailor_text(jd),
     )
 
 
@@ -460,7 +518,10 @@ async def extract_job(
         from app.llm_router import complete_with_fallback as llm
     try:
         res = await llm(build_prompt(jd, run_date), user, validate=_validate, purpose="job_extract")
-        ex = parse_extraction(res.text)
+        ex = parse_extraction(res.text, jd=jd)
+        rules_jd = tailor_text(jd)
+        if not ex.tailorJd or (rules_jd and len(ex.tailorJd) < TAILOR_MIN_SHARE * len(rules_jd)):
+            ex.tailorJd = rules_jd  # missing or implausibly short pick: the rules keep every technical line
         posted = ex.postedDate
         if posted and (posted > run_date or (posted == run_date and _posted_date(jd, run_date) != run_date)):
             ex.postedDate = None  # models answer "today" (from the prompt) when the posting gives no date

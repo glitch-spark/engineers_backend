@@ -55,6 +55,9 @@ class ResumeApplication(TimestampedDocument):
     companyName: str
     companyNameLower: str
     jobDescription: str
+    # Job Applies: the posting's title and technical / product lines. The resume model reads this; the cover letter
+    # and screening answers read the full jobDescription.
+    tailorJobDescription: Optional[str] = None
     jobUrl: Optional[str] = None
 
     status: JobStatus = "queued"

@@ -137,9 +137,11 @@ async def _run_job(
     questions: List[str],
     prompt_body_override: Optional[str] = None,
     generate_cover_letter: bool = False,
+    tailor_jd: Optional[str] = None,
 ) -> None:
     """Background orchestrator: resume → optional screening + cover letter,
-    persisting state at each step."""
+    persisting state at each step. `tailor_jd`: the shorter posting the resume model reads; screening and the
+    cover letter read the full `jd`."""
     started = time.monotonic()
     job = await ResumeApplication.get(job_id)
     if job is None:
@@ -175,7 +177,7 @@ async def _run_job(
         await resume_queue.persist_job(job)
 
         result = await generate_resume(
-            account, jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id),
+            account, tailor_jd or jd, company, prompt_body=resolved_prompt_body or None, owner=owner, job_id=str(job.id),
             model_id=job.resumeModelId, template_html=template_html, page_format=page_format,
         )
         _add_cost(job, result.cost_usd)
@@ -297,6 +299,7 @@ async def run_job_doc(job: ResumeApplication) -> None:
             questions=list(job.screeningQuestions or []),
             prompt_body_override=job.promptOverride,
             generate_cover_letter=bool(job.generateCoverLetter),
+            tailor_jd=job.tailorJobDescription,
         )
 
 

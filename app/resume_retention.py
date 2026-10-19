@@ -22,7 +22,9 @@ from app.resume_service import _s3_client, s3_enabled
 log = logging.getLogger(__name__)
 
 # jobDescription is a required str on the model, so it's blanked instead of unset.
-HEAVY_FIELDS = ("jobDescription", "plainText", "coverLetterText", "screeningPairs", "resumeLlmFallbackReason")
+HEAVY_FIELDS = (
+    "jobDescription", "tailorJobDescription", "plainText", "coverLetterText", "screeningPairs", "resumeLlmFallbackReason",
+)
 ARCHIVE_PREFIX = "archive/resume-text"
 BATCH_SIZE = 500
 # The cron ticks every 5 minutes; only the tick in this UTC window runs the daily pass.
