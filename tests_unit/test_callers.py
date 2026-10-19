@@ -226,3 +226,38 @@ def test_feed_rows_carry_the_caller_and_filter_on_it():
     assert ids(caller_only=True) == ["legacy", "pietro", "tbd"]
     assert ids(caller_id="p1") == ["pietro"]
     assert ids(caller_id="unassigned") == ["tbd"]
+
+
+# ---- list feed (/interviews/caller-rounds) ----
+
+async def test_caller_rounds_list_pages_newest_first_and_filters(client):
+    pietro = await make_caller("Pietro")
+    owner, other = await make_user(), await make_user("Kim")
+    days = [7, 8, 9]
+    for d in days:  # three caller rounds on different days, two owners
+        when = START.replace(day=d)
+        entry = InterviewStageEvent(
+            stage="intro", at=when, scheduledAt=when, status="scheduled",
+            caller=InterviewCaller(enabled=True, startsAt=when, callerName="Pietro" if d == 8 else "TBD",
+                                   callerId=str(pietro.id) if d == 8 else None),
+        )
+        await Interview(accountId=PydanticObjectId(), createdBy=(owner if d != 9 else other).id, scheduledAt=when,
+                        companyName=f"Co{d}", stageHistory=[entry.model_dump()]).insert()
+    await make_interview(owner, caller=False)  # not a caller round: left out
+    async with client(owner) as c:
+        res = (await c.get("/interviews/caller-rounds", params={"limit": 2})).json()
+        assert [r["companyName"] for r in res["rounds"]] == ["Co9", "Co8"]  # every owner, newest first
+        assert res["pagination"]["total"] == 3 and res["pagination"]["hasNext"] is True
+        assert set(res["interviews"]) == {r["interviewId"] for r in res["rounds"]}
+        page2 = (await c.get("/interviews/caller-rounds", params={"limit": 2, "page": 2})).json()
+        assert [r["companyName"] for r in page2["rounds"]] == ["Co7"]
+        asc = (await c.get("/interviews/caller-rounds", params={"dir": "asc"})).json()
+        assert [r["companyName"] for r in asc["rounds"]] == ["Co7", "Co8", "Co9"]
+        only = (await c.get("/interviews/caller-rounds", params={"callerId": str(pietro.id)})).json()
+        assert [r["callerName"] for r in only["rounds"]] == ["Pietro"]
+        none = (await c.get("/interviews/caller-rounds", params={"callerId": "unassigned"})).json()
+        assert [r["companyName"] for r in none["rounds"]] == ["Co9", "Co7"]
+        span = {"from": "2026-10-08T00:00:00Z", "to": "2026-10-08T23:59:59.999Z"}
+        ranged = (await c.get("/interviews/caller-rounds", params=span)).json()
+        assert [r["companyName"] for r in ranged["rounds"]] == ["Co8"]
+        assert (await c.get("/interviews/caller-rounds", params={"status": "nope"})).status_code == 400
