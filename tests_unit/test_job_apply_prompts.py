@@ -302,6 +302,23 @@ async def test_tailoring_a_unit_without_template_is_refused(db):
     assert out["queued"] == 0 and out["skipped"] == 1
 
 
+async def test_a_failure_without_a_message_records_the_error_type(db, monkeypatch):
+    # Playwright on a SelectorEventLoop raises NotImplementedError(), whose str() is "".
+    owner, blake, _, run, job_a, _ = await _setup()
+    job = await _tailor_row(job_a, run, owner, str(blake.id), False)
+    from app.routers import resume as resume_router
+
+    async def no_subprocess(*a, **kw):
+        raise NotImplementedError()
+
+    monkeypatch.setattr(resume_router, "generate_resume", no_subprocess)
+
+    await resume_router.run_job_doc(await ResumeApplication.get(job.id))
+
+    failed = await ResumeApplication.get(job.id)
+    assert failed.status == "failed" and failed.errorMessage == "NotImplementedError"
+
+
 def test_tailored_out_has_template_name():
     out = _tailored_out({"_id": "6a0000000000000000000000", "accountId": "a", "status": "completed",
                          "promptName": "DevOps", "templateName": "devops.html"})
