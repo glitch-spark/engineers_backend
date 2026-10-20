@@ -24,7 +24,6 @@ from app.routers import (
     callers,
     dashboard,
     global_prompt,
-    interview_prep,
     interviews,
     job_applies,
     metrics,
@@ -115,7 +114,6 @@ def create_app() -> FastAPI:
     app.include_router(callers.router)
     app.include_router(skills.router)
     app.include_router(global_prompt.router)
-    app.include_router(interview_prep.router)
     app.include_router(ai_review.router)
     app.include_router(ai_usage.router)
     app.include_router(metrics.router)
