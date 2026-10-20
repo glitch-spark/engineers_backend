@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -19,10 +19,15 @@ from app.models.prompt_eval import (
     EvalCounts,
     EvalRole,
     EvalRow,
+    EvalUnit,
+    JudgeMode,
+    PromptMode,
     PromptSource,
 )
+from app.models.account import ResumePrompt
 from app.prompt_eval import runner
-from app.resume_prompts import default_prompt_body
+from app.prompt_eval.routing import route_jds
+from app.resume_prompts import MAX_BODY, default_prompt_body, prompts_view
 from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume/eval", tags=["prompt-eval"])
@@ -59,6 +64,14 @@ async def _load_jd(jd_id: str) -> EvalJobDescription:
     return jd
 
 
+def _jd_out(jd: EvalJobDescription) -> dict:
+    """The rules judge's stored reading stays server-side."""
+    out = doc_to_dict(jd)
+    out.pop("extraction", None)
+    out.pop("extractionKey", None)
+    return out
+
+
 @router.get("/jds")
 async def list_jds(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -73,7 +86,7 @@ async def list_jds(
         query["archived"] = False
     jds = await EvalJobDescription.find(query).to_list()
     jds.sort(key=_jd_sort_key)
-    return {"roles": list(EVAL_ROLES), "jds": [doc_to_dict(j) for j in jds]}
+    return {"roles": list(EVAL_ROLES), "jds": [_jd_out(j) for j in jds]}
 
 
 @router.post("/jds", status_code=status.HTTP_201_CREATED)
@@ -83,7 +96,7 @@ async def create_jd(body: JdIn, user: Annotated[UserExtra, Depends(get_current_u
         createdBy=user.id,
     )
     await jd.insert()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 @router.put("/jds/{jd_id}")
@@ -95,7 +108,7 @@ async def update_jd(jd_id: str, body: JdPatch, user: Annotated[UserExtra, Depend
     for key, value in changes.items():
         setattr(jd, key, value.strip() if isinstance(value, str) else value)
     await jd.save()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 @router.post("/jds/{jd_id}/archive")
@@ -105,7 +118,7 @@ async def archive_jd(jd_id: str, user: Annotated[UserExtra, Depends(get_current_
         jd.archived = True
         jd.archivedAt = datetime.utcnow()
         await jd.save()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 @router.post("/jds/{jd_id}/unarchive")
@@ -115,7 +128,7 @@ async def unarchive_jd(jd_id: str, user: Annotated[UserExtra, Depends(get_curren
         jd.archived = False
         jd.archivedAt = None
         await jd.save()
-    return doc_to_dict(jd)
+    return _jd_out(jd)
 
 
 # ---------- runs ----------
@@ -126,17 +139,28 @@ class RunIn(BaseModel):
     # None = use the saved prompt (profile, then your global prompt). A string, even empty, is used as is.
     promptBody: Optional[str] = Field(None, max_length=30_000)
     resumeModel: Optional[str] = None
-    judgeModel: Optional[str] = None
+    judgeModel: Optional[str] = None  # ignored when judgeMode is "rules"
+    judgeMode: JudgeMode = "llm"
+    promptMode: PromptMode = "single"
+    # Single mode: the unit to test (None = the default unit); `promptBody` is its prompt for this run.
+    unitId: Optional[str] = None
+    # Profile mode: prompt text per unit id for this run (missing = the unit's saved prompt), and hand-picked units
+    # per JD id.
+    unitPrompts: Dict[str, str] = {}
+    unitOverrides: Dict[str, str] = {}
     roles: List[EvalRole] = []
     jdIds: List[str] = []
     label: Optional[str] = Field(None, max_length=120)
 
 
-def resolve_prompt(body_prompt: Optional[str], account: Account, user: UserExtra) -> tuple[PromptSource, str]:
-    """Which prompt a run uses: the text in the request, else the profile's, else the user's global one."""
+def resolve_prompt(
+    body_prompt: Optional[str], account: Account, user: UserExtra, unit: Optional[ResumePrompt] = None,
+) -> tuple[PromptSource, str]:
+    """Which prompt a run uses: the text in the request, else the unit's (default unit's) saved one, else the user's
+    global one."""
     if body_prompt is not None:
         return "custom", body_prompt.strip()
-    profile = default_prompt_body(account).strip()
+    profile = (unit.body if unit is not None else default_prompt_body(account)).strip()
     if profile:
         return "profile", profile
     global_prompt = (getattr(user, "resumePromptBody", None) or "").strip()
@@ -182,26 +206,114 @@ async def _select_jds(body: RunIn) -> list[EvalJobDescription]:
 
 
 def slim(run_dict: dict) -> dict:
-    """List view: rows without the generated resume (text + HTML), which can be large."""
+    """List view: rows without the generated resume (text + HTML) and units without their prompts, which can be
+    large."""
     rows = [{k: v for k, v in row.items() if k not in ("resumeText", "resumeHtml")} for row in run_dict.get("rows", [])]
-    return {**run_dict, "rows": rows}
+    units = [{k: v for k, v in unit.items() if k != "body"} for unit in run_dict.get("units", [])]
+    return {**run_dict, "rows": rows, "units": units}
+
+
+def _bad_request(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+def _check_templates(units: list[ResumePrompt], account: Account) -> None:
+    """Every unit the run generates with needs a template (its own, else the profile's)."""
+    fallback = (getattr(account, "styleTemplate", None) or "").strip()
+    missing = [u.name for u in units if not ((u.templateHtml or "").strip() or fallback)]
+    if missing:
+        raise _bad_request(
+            f"No HTML template for {', '.join(missing[:3])}. Upload one in the profile's resume units first."
+        )
+
+
+def _snapshot(unit: ResumePrompt, body: str) -> EvalUnit:
+    return EvalUnit(
+        id=unit.id, name=unit.name, roles=list(unit.roles or []), body=body,
+        templateName=unit.templateName or "", edited=body.strip() != (unit.body or "").strip(),
+    )
+
+
+class RouteIn(BaseModel):
+    accountId: str
+    jdIds: List[str] = []
+    overrides: Dict[str, str] = {}
+
+
+@router.post("/route")
+async def route_preview(body: RouteIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Which resume unit each JD would get in a whole-profile run, and why. Keyword based: no model call."""
+    if len(body.jdIds) > MAX_JDS_PER_RUN:
+        raise _bad_request(f"Pick at most {MAX_JDS_PER_RUN} job descriptions per run.")
+    account = await load_owned_account(body.accountId, user)
+    jds: list[EvalJobDescription] = []
+    if body.jdIds:
+        found = await EvalJobDescription.find({"_id": {"$in": [to_object_id(i) for i in body.jdIds]}}).to_list()
+        by_id = {str(j.id): j for j in found}
+        jds = [by_id[i] for i in body.jdIds if i in by_id]
+    routes, units, default_id = route_jds(account, jds, body.overrides, datetime.utcnow().date())
+    fallback = bool((getattr(account, "styleTemplate", None) or "").strip())
+    return {
+        "defaultUnitId": default_id,
+        "units": [
+            {
+                "id": u.id, "name": u.name, "roles": list(u.roles or []), "body": u.body or "",
+                "templateName": u.templateName or "", "hasTemplate": bool((u.templateHtml or "").strip()) or fallback,
+            }
+            for u in units
+        ],
+        "routes": [
+            {"jdId": r.jdId, "unitId": r.unitId, "unitName": r.unitName, "pick": r.pick, "reason": r.reason}
+            for r in routes
+        ],
+    }
 
 
 @router.post("/runs", status_code=status.HTTP_202_ACCEPTED)
 async def create_run(body: RunIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """Validate everything, insert the run with one pending row per JD, start it in the background."""
     resume_model = require_model("resume", body.resumeModel, user)
-    judge_model = require_model("judge", body.judgeModel, user)
+    judge_model = None if body.judgeMode == "rules" else require_model("judge", body.judgeModel, user)
     if body.jdIds:
         _check_jd_count(len(body.jdIds))
+    if any(len(text) > MAX_BODY for text in body.unitPrompts.values()):
+        raise _bad_request(f"A prompt can be up to {MAX_BODY} characters.")
     account = await load_owned_account(body.accountId, user)
-    if not (account.styleTemplate or "").strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No HTML template on this profile. Upload one on the Resume Styles tab first.",
-        )
-    source, prompt_text = resolve_prompt(body.promptBody, account, user)
-    jds = await _select_jds(body)
+    units, default_id = prompts_view(account)
+    by_id = {u.id: u for u in units}
+    started = datetime.utcnow()
+
+    if body.promptMode == "single":
+        unit = by_id.get(body.unitId or default_id)
+        if unit is None:
+            raise _bad_request("Unknown resume unit.")
+        _check_templates([unit], account)
+        source, prompt_text = resolve_prompt(body.promptBody, account, user, unit)
+        jds = await _select_jds(body)
+        snapshot = [_snapshot(unit, prompt_text)]
+        rows = [
+            EvalRow(jdId=j.id, role=j.role, jdTitle=j.title, jdCompany=j.company,
+                    unitId=unit.id, unitName=unit.name, unitPick="single")
+            for j in jds
+        ]
+        overrides: dict[str, str] = {}
+    else:
+        unknown = [k for k in body.unitPrompts if k not in by_id] + [
+            v for v in body.unitOverrides.values() if v not in by_id
+        ]
+        if unknown:
+            raise _bad_request("Unknown resume unit.")
+        jds = await _select_jds(body)
+        routes, _, _ = route_jds(account, jds, body.unitOverrides, started.date())
+        _check_templates([by_id[uid] for uid in dict.fromkeys(r.unitId for r in routes)], account)
+        snapshot = [_snapshot(u, body.unitPrompts.get(u.id, u.body or "").strip()) for u in units]
+        source, prompt_text = ("custom" if any(s.edited for s in snapshot) else "profile"), ""
+        rows = [
+            EvalRow(jdId=j.id, role=j.role, jdTitle=j.title, jdCompany=j.company,
+                    unitId=r.unitId, unitName=r.unitName, unitPick=r.pick, unitReason=r.reason)
+            for j, r in zip(jds, routes)
+        ]
+        overrides = {r.jdId: r.unitId for r in routes if r.pick == "manual"}
 
     run = ResumePromptEval(
         userId=user.id,
@@ -212,14 +324,21 @@ async def create_run(body: RunIn, user: Annotated[UserExtra, Depends(get_current
         promptSource=source,
         resumeModelId=resume_model,
         judgeModelId=judge_model,
+        judgeMode=body.judgeMode,
+        promptMode=body.promptMode,
+        units=snapshot,
+        unitOverrides=overrides,
         status="running",
-        startedAt=datetime.utcnow(),
-        rows=[EvalRow(jdId=j.id, role=j.role, jdTitle=j.title, jdCompany=j.company) for j in jds],
+        startedAt=started,
+        rows=rows,
         counts=EvalCounts(total=len(jds)),
     )
     await run.insert()
     runner.start_run(run.id)
-    log.info("prompt eval %s started: profile=%s jds=%d resume=%s judge=%s", run.id, account.name, len(jds), resume_model, judge_model)
+    log.info(
+        "prompt eval %s started: profile=%s mode=%s jds=%d resume=%s judge=%s", run.id, account.name,
+        body.promptMode, len(jds), resume_model, judge_model if body.judgeMode == "llm" else "rules",
+    )
     return {"runId": str(run.id), "status": run.status, "jdCount": len(jds)}
 
 

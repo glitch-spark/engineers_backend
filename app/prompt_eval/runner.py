@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from beanie import PydanticObjectId
@@ -20,8 +21,12 @@ from beanie.odm.utils.encoder import Encoder
 from app import ai_usage
 from app.config import get_settings
 from app.models import Account, EvalJobDescription, ResumePromptEval, UserExtra
+from app.job_apply.scoring import Idf
+from app.job_apply.schema import JobExtraction
 from app.models.prompt_eval import EVAL_ROLES, EvalRow, RoleScore
+from app.prompt_eval import rules_judge
 from app.prompt_eval.judge import judge_resume
+from app.resume_prompts import find_prompt, unit_template
 from app.resume_service import generate_resume_html, plain_text_from_html
 
 log = logging.getLogger(__name__)
@@ -46,23 +51,31 @@ def _mean(values: list[float]) -> Optional[float]:
     return round(sum(values) / len(values), 1) if values else None
 
 
+def _scores(rows: list[EvalRow]) -> RoleScore:
+    return RoleScore(
+        match=_mean([float(r.verdict.matchScore) for r in rows]),
+        believability=_mean([float(r.verdict.believabilityScore) for r in rows]),
+        n=len(rows),
+    )
+
+
 def aggregate(rows: list[EvalRow]) -> dict:
-    """Run-level numbers from the rows: averages over scored rows, per-role averages, cost, cache hits."""
+    """Run-level numbers from the rows: averages over scored rows, per-role and per-unit averages, cost, cache hits."""
     scored = [r for r in rows if r.status == "done" and r.verdict is not None]
     role_scores: dict[str, RoleScore] = {}
     for role in EVAL_ROLES:
         in_role = [r for r in scored if r.role == role]
         if in_role:
-            role_scores[role] = RoleScore(
-                match=_mean([float(r.verdict.matchScore) for r in in_role]),
-                believability=_mean([float(r.verdict.believabilityScore) for r in in_role]),
-                n=len(in_role),
-            )
+            role_scores[role] = _scores(in_role)
+    unit_scores: dict[str, RoleScore] = {}
+    for unit_id in dict.fromkeys(r.unitId for r in scored if r.unitId):
+        unit_scores[unit_id] = _scores([r for r in scored if r.unitId == unit_id])
     cost = sum((r.genCostUsd or 0.0) + (r.judgeCostUsd or 0.0) for r in rows)
     return {
         "avgMatch": _mean([float(r.verdict.matchScore) for r in scored]),
         "avgBelievability": _mean([float(r.verdict.believabilityScore) for r in scored]),
         "roleScores": role_scores,
+        "unitScores": unit_scores,
         "totalCostUsd": round(cost, 6),
         "cachedRows": sum(1 for r in rows if r.genCached),
         "cachedJudgeRows": sum(1 for r in rows if r.judgeCached),
@@ -98,6 +111,7 @@ async def _finish(run_id: PydanticObjectId, rows: list[EvalRow], started: float,
     fields = {
         **summary,
         "roleScores": {k: v.model_dump() for k, v in summary["roleScores"].items()},
+        "unitScores": {k: v.model_dump() for k, v in summary["unitScores"].items()},
         "status": "failed" if error else "done",
         "error": error,
         "finishedAt": now,
@@ -126,6 +140,45 @@ async def mark_stale_runs(runs: list[ResumePromptEval]) -> None:
 # ---------- the work ----------
 
 
+@dataclass
+class RulesContext:
+    """What the rules judge shares across a run's rows: each job description's reading, its cost per row,
+    whether it was reused, and the run's term rarity."""
+
+    idf: Idf
+    run_date: date
+    readings: dict[str, JobExtraction] = field(default_factory=dict)
+    cost_per_row: dict[str, Optional[float]] = field(default_factory=dict)
+    reused: dict[str, bool] = field(default_factory=dict)
+
+
+async def _rules_context(run: ResumePromptEval, jds: list, owner: Optional[UserExtra]) -> RulesContext:
+    run_date = (run.startedAt or datetime.utcnow()).date()
+    ctx = RulesContext(idf=rules_judge.build_run_idf([j.text for j in jds]), run_date=run_date)
+    uses: dict[str, int] = {}
+    for r in run.rows:
+        uses[str(r.jdId)] = uses.get(str(r.jdId), 0) + 1
+    for jd in jds:
+        key = str(jd.id)
+        ex, cost, reused = await rules_judge.jd_reading(jd, owner, run_date=run_date)
+        ctx.readings[key] = ex
+        ctx.reused[key] = reused
+        ctx.cost_per_row[key] = None if cost is None else cost / max(1, uses.get(key, 1))
+    return ctx
+
+
+def _unit_inputs(run: ResumePromptEval, row: EvalRow, account: Account) -> tuple[Optional[str], Optional[str]]:
+    """(template HTML, prompt) a row generates with: its unit's live template and the prompt the run froze for it.
+    Rows from before units use the profile template and the run's single prompt."""
+    if not row.unitId:
+        return None, run.promptBody or None
+    snapshot = next((u for u in getattr(run, "units", None) or [] if u.id == row.unitId), None)
+    live = find_prompt(account, row.unitId)
+    if snapshot is None or live is None:
+        raise ValueError("resume unit was removed from the profile")
+    return unit_template(live)[0], snapshot.body or None
+
+
 async def _run_row(
     run: ResumePromptEval,
     index: int,
@@ -133,17 +186,20 @@ async def _run_row(
     account: Account,
     owner: Optional[UserExtra],
     jd_text: Optional[str],
+    rules: Optional[RulesContext] = None,
 ) -> EvalRow:
     started = time.monotonic()
     try:
         if not (jd_text or "").strip():
             raise ValueError("job description was deleted")
+        template_html, prompt_body = _unit_inputs(run, row, account)
         row.status = "generating"
         await _persist_row(run.id, index, row)
 
         with ai_usage.usage_scope(user_id=run.userId, feature="eval_resume", ref_id=run.id):
             html, gen = await generate_resume_html(
-                account, jd_text, prompt_body=run.promptBody or None, owner=owner, model_id=run.resumeModelId,
+                account, jd_text, prompt_body=prompt_body, owner=owner, model_id=run.resumeModelId,
+                template_html=template_html,
             )
         row.genModelId = gen.model_id or None
         row.genProvider = gen.provider
@@ -157,6 +213,23 @@ async def _run_row(
         row.resumeText = plain_text_from_html(html)
         row.status = "judging"
         await _persist_row(run.id, index, row)
+
+        if rules is not None:
+            key = str(row.jdId)
+            extraction = rules.readings.get(key)
+            if extraction is None:
+                raise ValueError("job description could not be read for the rules judge")
+            row.verdict = await asyncio.to_thread(
+                rules_judge.judge_rules, resume_text=row.resumeText, jd_text=jd_text, extraction=extraction,
+                idf=rules.idf, run_date=rules.run_date,
+            )
+            row.judgeModel = "rules"
+            row.judgeCached = rules.reused.get(key, False)
+            row.judgeCostUsd = rules.cost_per_row.get(key)
+            row.status = "done"
+            row.durationMs = int((time.monotonic() - started) * 1000)
+            await _persist_row(run.id, index, row)
+            return row
 
         with ai_usage.usage_scope(user_id=run.userId, feature="eval_judge", ref_id=run.id):
             verdict, jr = await judge_resume(
@@ -196,10 +269,11 @@ async def run_eval(run_id: PydanticObjectId) -> None:
         owner = await UserExtra.get(run.userId)
         jds = await EvalJobDescription.find({"_id": {"$in": [r.jdId for r in rows]}}).to_list()
         text_by_id = {str(j.id): j.text for j in jds}
+        rules = await _rules_context(run, jds, owner) if run.judgeMode == "rules" else None
 
         async def one(index: int, row: EvalRow) -> EvalRow:
             async with _slots():
-                return await _run_row(run, index, row, account, owner, text_by_id.get(str(row.jdId)))
+                return await _run_row(run, index, row, account, owner, text_by_id.get(str(row.jdId)), rules)
 
         results = await asyncio.gather(*(one(i, r) for i, r in enumerate(rows)), return_exceptions=True)
         for index, result in enumerate(results):

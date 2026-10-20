@@ -6,14 +6,16 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from beanie import PydanticObjectId
 
+from app.job_apply.schema import JobExtraction
 from app.llm_router import LlmResult
-from app.models.prompt_eval import EvalRow, JudgeVerdict, ResumePromptEval
+from app.models.account import ResumePrompt
+from app.models.prompt_eval import EvalRow, EvalUnit, JudgeVerdict, ResumePromptEval
 from app.prompt_eval import runner
 
 HTML = "<html><body><p>Hi</p></body></html>"
@@ -65,6 +67,16 @@ def test_aggregate_ignores_failed_rows_and_sums_cost_over_all_rows():
     assert agg["counts"] == {"total": 4, "done": 3, "failed": 1}
 
 
+def test_aggregate_groups_scores_by_unit():
+    a1, a2, b = row("backend", "done", verdict(90, 80)), row("ai", "done", verdict(70, 60)), row("data", "done", verdict(50, 40))
+    a1.unitId = a2.unitId = "u-a"
+    b.unitId = "u-b"
+    agg = runner.aggregate([a1, a2, b, row("ml", "done", verdict(10, 10))])
+    assert set(agg["unitScores"]) == {"u-a", "u-b"}
+    assert agg["unitScores"]["u-a"].match == 80.0 and agg["unitScores"]["u-a"].n == 2
+    assert agg["unitScores"]["u-b"].believability == 40.0
+
+
 def test_aggregate_with_nothing_scored_gives_none_averages():
     agg = runner.aggregate([row("ai", "failed")])
     assert agg["avgMatch"] is None and agg["avgBelievability"] is None and agg["roleScores"] == {}
@@ -97,8 +109,9 @@ def a_run(**over):
 async def test_run_row_happy_path_persists_each_step_and_records_cache_flags(monkeypatch, persisted):
     seen = {}
 
-    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None):
+    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None, template_html=None):
         seen.update(jd=jd, prompt_body=prompt_body, model_id=model_id)
+        assert template_html is None  # a row from before units uses the profile template
         return HTML, llm(cached=True, cost=0.0)
 
     async def fake_judge(*, resume_text, job_description, role, user, model_id):
@@ -150,7 +163,7 @@ async def test_run_row_generation_failure_and_missing_jd(monkeypatch, persisted)
 async def test_run_row_empty_prompt_is_sent_as_none(monkeypatch, persisted):
     seen = {}
 
-    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None):
+    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None, template_html=None):
         seen["prompt_body"] = prompt_body
         return HTML, llm()
 
@@ -161,6 +174,50 @@ async def test_run_row_empty_prompt_is_sent_as_none(monkeypatch, persisted):
     monkeypatch.setattr(runner, "judge_resume", fake_judge)
     await runner._run_row(a_run(promptBody=""), 0, row(), SimpleNamespace(), None, "JD")
     assert seen["prompt_body"] is None
+
+
+def profile_account():
+    return SimpleNamespace(
+        styleTemplate="<html>default</html>", styleTemplateName="d", pageFormat="A4", defaultPromptId="u-a",
+        resumePromptBody="saved a",
+        resumePrompts=[
+            ResumePrompt(id="u-a", name="General", body="saved a", templateHtml="<html>A</html>", templateName="a"),
+            ResumePrompt(id="u-b", name="Backend", roles=["backend"], body="saved b", templateHtml="<html>B</html>",
+                         templateName="b"),
+        ],
+    )
+
+
+async def test_run_row_uses_its_unit_template_and_frozen_prompt(monkeypatch, persisted):
+    seen = {}
+
+    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None, template_html=None):
+        seen.update(prompt_body=prompt_body, template_html=template_html)
+        return HTML, llm()
+
+    async def fake_judge(**k):
+        return verdict(), llm()
+
+    monkeypatch.setattr(runner, "generate_resume_html", fake_generate)
+    monkeypatch.setattr(runner, "judge_resume", fake_judge)
+    run = a_run(units=[EvalUnit(id="u-b", name="Backend", body="edited b", edited=True)])
+    r = row()
+    r.unitId = "u-b"
+    out = await runner._run_row(run, 0, r, profile_account(), None, "JD")
+    assert out.status == "done"
+    assert seen == {"prompt_body": "edited b", "template_html": "<html>B</html>"}
+
+
+async def test_run_row_fails_when_its_unit_was_removed(monkeypatch, persisted):
+    async def never(*a, **k):
+        raise AssertionError("must not generate")
+
+    monkeypatch.setattr(runner, "generate_resume_html", never)
+    run = a_run(units=[EvalUnit(id="u-gone", name="Gone", body="x")])
+    r = row()
+    r.unitId = "u-gone"
+    out = await runner._run_row(run, 0, r, profile_account(), None, "JD")
+    assert out.status == "failed" and out.error == "resume unit was removed from the profile"
 
 
 # ---------- run_eval ----------
@@ -183,6 +240,7 @@ def world(monkeypatch, persisted):
     run = SimpleNamespace(
         id=PydanticObjectId(), status="running", userId=PydanticObjectId(), accountId=PydanticObjectId(),
         accountName="P", promptBody="x", resumeModelId=None, judgeModelId=None, rows=rows,
+        judgeMode="llm", startedAt=datetime(2026, 10, 1, 9, 0),
     )
     account = SimpleNamespace(id=run.accountId, styleTemplate="<html/>")
     finished = []
@@ -205,7 +263,7 @@ def world(monkeypatch, persisted):
     monkeypatch.setattr(runner.EvalJobDescription, "find", staticmethod(lambda q: FakeQuery(jds)))
     monkeypatch.setattr(runner, "_finish", fake_finish)
     monkeypatch.setattr(runner, "_sem", None)
-    return SimpleNamespace(run=run, jds=jds, finished=finished, account=account)
+    return SimpleNamespace(run=run, jds=jds, finished=finished, account=account, persisted=persisted)
 
 
 async def test_run_eval_finishes_done_even_when_some_rows_fail(monkeypatch, world):
@@ -254,6 +312,48 @@ async def test_run_eval_fails_the_run_when_the_profile_is_gone(monkeypatch, worl
     monkeypatch.setattr(runner.Account, "get", staticmethod(no_account))
     await runner.run_eval(world.run.id)
     assert world.finished[0][2] == "profile no longer exists"
+
+
+async def test_run_eval_rules_mode_reads_each_jd_once_and_never_calls_the_judge_model(monkeypatch, world):
+    world.run.judgeMode = "rules"
+    world.run.rows.append(EvalRow(jdId=world.jds[0].id, role="backend", jdTitle="again", jdCompany="Co"))
+    reads = []
+
+    async def fake_reading(jd, owner, *, run_date):
+        reads.append((jd.id, run_date))
+        return JobExtraction(title="Engineer"), (0.004 if jd is world.jds[0] else 0.0), jd is not world.jds[0]
+
+    async def fake_generate(account, jd, **k):
+        return HTML, llm()
+
+    async def no_judge(**k):
+        raise AssertionError("the model judge must not run in rules mode")
+
+    monkeypatch.setattr(runner.rules_judge, "jd_reading", fake_reading)
+    monkeypatch.setattr(runner.rules_judge, "judge_rules", lambda **k: verdict(61, 90))
+    monkeypatch.setattr(runner, "generate_resume_html", fake_generate)
+    monkeypatch.setattr(runner, "judge_resume", no_judge)
+    monkeypatch.setattr(runner, "get_settings", lambda: SimpleNamespace(PROMPT_EVAL_CONCURRENCY=4))
+    await runner.run_eval(world.run.id)
+
+    assert sorted(i for i, _ in reads) == sorted(j.id for j in world.jds)
+    assert {d for _, d in reads} == {date(2026, 10, 1)}
+    assert world.finished[0][1] == ["done"] * 4
+    done = {i: r for i, _, r in world.persisted if r.status == "done"}
+    assert done[0].judgeModel == "rules" and done[0].judgeModelId is None
+    assert done[0].judgeCostUsd == pytest.approx(0.002) and done[3].judgeCostUsd == pytest.approx(0.002)
+    assert done[0].judgeCached is False and done[1].judgeCached is True
+    assert done[1].verdict.matchScore == 61
+
+
+async def test_run_row_rules_mode_fails_when_the_jd_has_no_reading(monkeypatch, persisted):
+    async def fake_generate(*a, **k):
+        return HTML, llm()
+
+    monkeypatch.setattr(runner, "generate_resume_html", fake_generate)
+    ctx = runner.RulesContext(idf=runner.rules_judge.build_run_idf(["JD"]), run_date=date(2026, 10, 1))
+    out = await runner._run_row(a_run(), 0, row(), SimpleNamespace(), None, "JD", ctx)
+    assert out.status == "failed" and "could not be read" in out.error and out.resumeText == "Hi"
 
 
 async def test_run_eval_ignores_unknown_or_finished_runs(monkeypatch, world):
