@@ -46,6 +46,7 @@ uvicorn app.main:app --reload
 | `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for prompt-eval judge verdicts, keyed by content hash + model lane. Generated resumes are never stored in Redis; they use only the 7-day Mongo cache. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |
 | `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
 | `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |
+| `RESUME_QUEUE_ENABLED`, `JOB_APPLY_WORKER_ENABLED` | deploy only | `1` runs the resume generation queue / Job Applies worker in this process. Set them **only on the deployed backend**: a local backend shares the production database, so with these on it would take real users' jobs. Unset, queued work waits for the deployed worker. `RESUME_QUEUE_DISABLED=1` / `JOB_APPLY_WORKER_DISABLED=1` turn them off even when enabled |
 
 ## Layout
 
@@ -89,4 +90,4 @@ The repo ships a `Dockerfile` based on `mcr.microsoft.com/playwright/python` so 
 
 1. Connect the repo; Railway auto-detects the Dockerfile.
 2. Bump the service to **1 GB RAM minimum** — Chromium peaks around 400 MB per request.
-3. Set the envs above (`OPENAI_API_KEY`, optional `AWS_REGION`/`AWS_S3_BUCKET`/AWS credentials).
+3. Set the envs above (`OPENAI_API_KEY`, optional `AWS_REGION`/`AWS_S3_BUCKET`/AWS credentials), plus `RESUME_QUEUE_ENABLED=1` and `JOB_APPLY_WORKER_ENABLED=1` — without them no resume or Job Applies run is ever processed.
