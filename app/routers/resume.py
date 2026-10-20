@@ -277,7 +277,7 @@ async def _run_job(
         log.info("resume job %s was re-queued elsewhere; this run stops", job_id)
     except Exception as exc:  # noqa: BLE001 — capture *any* failure on the job
         log.exception("resume job %s failed", job_id)
-        await _mark_failed(job, str(exc), started)
+        await _mark_failed(job, str(exc) or exc.__class__.__name__, started)
 
 
 def _add_cost(job: ResumeApplication, cost: Optional[float]) -> None:
