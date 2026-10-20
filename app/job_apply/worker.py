@@ -585,7 +585,7 @@ async def resume_stale_runs() -> int:
 
 
 async def sweep_forever() -> None:
-    """Started from the app lifespan unless JOB_APPLY_WORKER_DISABLED=1."""
+    """Started from the app lifespan when worker_enabled()."""
     while True:
         try:
             await resume_stale_runs()
@@ -595,4 +595,7 @@ async def sweep_forever() -> None:
 
 
 def worker_enabled() -> bool:
-    return os.environ.get("JOB_APPLY_WORKER_DISABLED") != "1"
+    """Opt-in: only the deployed backend sets JOB_APPLY_WORKER_ENABLED=1 (see resume_queue.queue_enabled). With it
+    off, a run started here stays queued until the deployed worker's sweep picks it up.
+    JOB_APPLY_WORKER_DISABLED=1 still wins."""
+    return os.environ.get("JOB_APPLY_WORKER_ENABLED") == "1" and os.environ.get("JOB_APPLY_WORKER_DISABLED") != "1"

@@ -341,4 +341,6 @@ async def queue_forever() -> None:
 
 
 def queue_enabled() -> bool:
-    return os.environ.get("RESUME_QUEUE_DISABLED") != "1"
+    """Opt-in: only the deployed backend sets RESUME_QUEUE_ENABLED=1. Local backends share the production
+    database, so a queue that ran by default would take real users' jobs. RESUME_QUEUE_DISABLED=1 still wins."""
+    return os.environ.get("RESUME_QUEUE_ENABLED") == "1" and os.environ.get("RESUME_QUEUE_DISABLED") != "1"
