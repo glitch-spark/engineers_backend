@@ -54,6 +54,20 @@ EvalRunStatus = Literal["running", "done", "failed"]
 PromptSource = Literal["custom", "profile", "global", "none"]
 # "llm": a judge model reads each resume. "rules": Job Applies scoring plus text checks, no model per row.
 JudgeMode = Literal["llm", "rules"]
+# "single": one resume unit on every JD. "profile": each JD gets the unit Job Applies would pick (or an override).
+PromptMode = Literal["single", "profile"]
+UnitPick = Literal["auto", "manual", "single"]
+
+
+class EvalUnit(BaseModel):
+    """A resume unit as a run used it: the prompt text is frozen; the template is read from the profile."""
+
+    id: str
+    name: str
+    roles: List[str] = []
+    body: str = ""
+    templateName: str = ""
+    edited: bool = False  # the run's prompt differs from the unit's saved one
 
 
 class ScorePart(BaseModel):
@@ -85,6 +99,11 @@ class EvalRow(BaseModel):
     role: str
     jdTitle: str
     jdCompany: str
+    # The resume unit that generated this row (None on runs from before units).
+    unitId: Optional[str] = None
+    unitName: Optional[str] = None
+    unitPick: Optional[UnitPick] = None
+    unitReason: Optional[str] = None
     status: EvalRowStatus = "pending"
     error: Optional[str] = None
     # Resume generation
@@ -134,6 +153,9 @@ class ResumePromptEval(TimestampedDocument):
     resumeModelId: Optional[str] = None  # requested ids; None = server default
     judgeModelId: Optional[str] = None
     judgeMode: JudgeMode = "llm"
+    promptMode: PromptMode = "single"
+    units: List[EvalUnit] = []
+    unitOverrides: Dict[str, str] = {}  # jdId -> unitId picked by hand, so a re-run can restore them
     status: EvalRunStatus = "running"
     error: Optional[str] = None
     startedAt: datetime = Field(default_factory=datetime.utcnow)
@@ -144,6 +166,7 @@ class ResumePromptEval(TimestampedDocument):
     avgMatch: Optional[float] = None
     avgBelievability: Optional[float] = None
     roleScores: Dict[str, RoleScore] = {}
+    unitScores: Dict[str, RoleScore] = {}  # by unit id
     totalCostUsd: float = 0.0
     cachedRows: int = 0  # rows whose resume came from a cache
     cachedJudgeRows: int = 0  # rows whose verdict came from a cache

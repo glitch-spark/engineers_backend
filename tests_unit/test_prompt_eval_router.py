@@ -8,11 +8,13 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from types import SimpleNamespace
 
 import pytest
+from beanie import PydanticObjectId
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app import model_catalog as mc
 from app.deps import get_current_user
+from app.models.account import ResumePrompt
 from app.models.prompt_eval import MAX_JDS_PER_RUN
 from app.routers import prompt_eval as pe
 
@@ -159,3 +161,122 @@ def test_slim_strips_resume_text_and_html_but_keeps_the_prompt():
     assert out["promptBody"] == "P"
     assert out["rows"] == [{"jdTitle": "t", "verdict": {"matchScore": 1}}]
     assert run["rows"][0]["resumeText"] == "long", "input must not be mutated"
+
+
+def test_slim_drops_unit_prompts():
+    out = pe.slim({"rows": [], "units": [{"id": "u", "name": "Backend", "body": "long prompt"}]})
+    assert out["units"] == [{"id": "u", "name": "Backend"}]
+
+
+# ---------- resume units ----------
+
+
+def unit_account():
+    return account(
+        styleTemplate="<html>g</html>", defaultPromptId="gen", resumePromptBody="saved g",
+        resumePrompts=[
+            ResumePrompt(id="gen", name="General", body="saved g", templateHtml="<html>g</html>", templateName="g"),
+            ResumePrompt(id="be", name="Backend", roles=["backend"], body="saved b", templateHtml="<html>b</html>",
+                         templateName="b"),
+        ],
+    )
+
+
+def eval_jd(title, role="backend"):
+    return SimpleNamespace(
+        id=PydanticObjectId(), role=role, title=title, company="Co", text="We build things.", archived=False,
+        extraction=None, extractionKey=None,
+    )
+
+
+@pytest.fixture
+def created(monkeypatch):
+    """create_run with the profile, JDs, insert and start faked; returns what the run was built with."""
+    jds = [eval_jd("Senior Backend Engineer"), eval_jd("Software Engineer", role="fullstack")]
+    built = {}
+
+    async def owned(account_id, user):
+        return unit_account()
+
+    async def select(body):
+        return jds
+
+    class FakeRun:
+        def __init__(self, **kw):
+            built.update(kw)
+            self.id, self.status = PydanticObjectId(), kw["status"]
+
+        async def insert(self):
+            return self
+
+    monkeypatch.setattr(pe, "load_owned_account", owned)
+    monkeypatch.setattr(pe, "_select_jds", select)
+    monkeypatch.setattr(pe, "ResumePromptEval", FakeRun)
+    monkeypatch.setattr(pe.runner, "start_run", lambda run_id: None)
+    return SimpleNamespace(jds=jds, built=built)
+
+
+async def test_profile_mode_routes_each_jd_and_freezes_edited_prompts(created):
+    be, gen = created.jds
+    async with client() as c:
+        r = await c.post("/resume/eval/runs", json={
+            "accountId": "a1", "judgeMode": "rules", "promptMode": "profile",
+            "unitPrompts": {"be": "edited b"}, "unitOverrides": {str(gen.id): "be"},
+        })
+    assert r.status_code == 202, r.text
+    b = created.built
+    assert b["promptMode"] == "profile" and b["promptBody"] == "" and b["promptSource"] == "custom"
+    units = {u.id: u for u in b["units"]}
+    assert units["be"].body == "edited b" and units["be"].edited is True
+    assert units["gen"].body == "saved g" and units["gen"].edited is False
+    first, second = b["rows"]
+    assert (first.unitId, first.unitPick) == ("be", "auto") and "Backend" in first.unitReason
+    assert (second.unitId, second.unitPick, second.unitName) == ("be", "manual", "Backend")
+    assert b["unitOverrides"] == {str(gen.id): "be"}
+
+
+async def test_profile_mode_rejects_unknown_units(created):
+    async with client() as c:
+        r = await c.post("/resume/eval/runs", json={
+            "accountId": "a1", "judgeMode": "rules", "promptMode": "profile", "unitPrompts": {"nope": "x"},
+        })
+    assert r.status_code == 400 and "unit" in r.json()["detail"].lower()
+
+
+async def test_single_mode_uses_the_chosen_unit_prompt(created):
+    async with client() as c:
+        r = await c.post("/resume/eval/runs", json={"accountId": "a1", "judgeMode": "rules", "unitId": "be"})
+    assert r.status_code == 202, r.text
+    b = created.built
+    assert (b["promptSource"], b["promptBody"]) == ("profile", "saved b")
+    assert [u.id for u in b["units"]] == ["be"] and b["units"][0].edited is False
+    assert {(row.unitId, row.unitPick) for row in b["rows"]} == {("be", "single")}
+
+
+async def test_single_mode_unknown_unit_is_400(created):
+    async with client() as c:
+        r = await c.post("/resume/eval/runs", json={"accountId": "a1", "judgeMode": "rules", "unitId": "nope"})
+    assert r.status_code == 400
+
+
+async def test_route_preview_routes_without_any_model(monkeypatch):
+    jds = [eval_jd("Senior Backend Engineer"), eval_jd("Software Engineer")]
+
+    async def owned(account_id, user):
+        return unit_account()
+
+    class Found:
+        async def to_list(self):
+            return jds
+
+    monkeypatch.setattr(pe, "load_owned_account", owned)
+    monkeypatch.setattr(pe.EvalJobDescription, "find", staticmethod(lambda q: Found()))
+    async with client() as c:
+        r = await c.post("/resume/eval/route", json={
+            "accountId": "a1", "jdIds": [str(j.id) for j in jds], "overrides": {str(jds[1].id): "be"},
+        })
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["defaultUnitId"] == "gen" and [u["id"] for u in out["units"]] == ["gen", "be"]
+    assert all(u["hasTemplate"] for u in out["units"])
+    assert [(x["unitId"], x["pick"]) for x in out["routes"]] == [("be", "auto"), ("be", "manual")]

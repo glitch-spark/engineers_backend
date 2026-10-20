@@ -14,7 +14,8 @@ from beanie import PydanticObjectId
 
 from app.job_apply.schema import JobExtraction
 from app.llm_router import LlmResult
-from app.models.prompt_eval import EvalRow, JudgeVerdict, ResumePromptEval
+from app.models.account import ResumePrompt
+from app.models.prompt_eval import EvalRow, EvalUnit, JudgeVerdict, ResumePromptEval
 from app.prompt_eval import runner
 
 HTML = "<html><body><p>Hi</p></body></html>"
@@ -66,6 +67,16 @@ def test_aggregate_ignores_failed_rows_and_sums_cost_over_all_rows():
     assert agg["counts"] == {"total": 4, "done": 3, "failed": 1}
 
 
+def test_aggregate_groups_scores_by_unit():
+    a1, a2, b = row("backend", "done", verdict(90, 80)), row("ai", "done", verdict(70, 60)), row("data", "done", verdict(50, 40))
+    a1.unitId = a2.unitId = "u-a"
+    b.unitId = "u-b"
+    agg = runner.aggregate([a1, a2, b, row("ml", "done", verdict(10, 10))])
+    assert set(agg["unitScores"]) == {"u-a", "u-b"}
+    assert agg["unitScores"]["u-a"].match == 80.0 and agg["unitScores"]["u-a"].n == 2
+    assert agg["unitScores"]["u-b"].believability == 40.0
+
+
 def test_aggregate_with_nothing_scored_gives_none_averages():
     agg = runner.aggregate([row("ai", "failed")])
     assert agg["avgMatch"] is None and agg["avgBelievability"] is None and agg["roleScores"] == {}
@@ -98,8 +109,9 @@ def a_run(**over):
 async def test_run_row_happy_path_persists_each_step_and_records_cache_flags(monkeypatch, persisted):
     seen = {}
 
-    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None):
+    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None, template_html=None):
         seen.update(jd=jd, prompt_body=prompt_body, model_id=model_id)
+        assert template_html is None  # a row from before units uses the profile template
         return HTML, llm(cached=True, cost=0.0)
 
     async def fake_judge(*, resume_text, job_description, role, user, model_id):
@@ -151,7 +163,7 @@ async def test_run_row_generation_failure_and_missing_jd(monkeypatch, persisted)
 async def test_run_row_empty_prompt_is_sent_as_none(monkeypatch, persisted):
     seen = {}
 
-    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None):
+    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None, template_html=None):
         seen["prompt_body"] = prompt_body
         return HTML, llm()
 
@@ -162,6 +174,50 @@ async def test_run_row_empty_prompt_is_sent_as_none(monkeypatch, persisted):
     monkeypatch.setattr(runner, "judge_resume", fake_judge)
     await runner._run_row(a_run(promptBody=""), 0, row(), SimpleNamespace(), None, "JD")
     assert seen["prompt_body"] is None
+
+
+def profile_account():
+    return SimpleNamespace(
+        styleTemplate="<html>default</html>", styleTemplateName="d", pageFormat="A4", defaultPromptId="u-a",
+        resumePromptBody="saved a",
+        resumePrompts=[
+            ResumePrompt(id="u-a", name="General", body="saved a", templateHtml="<html>A</html>", templateName="a"),
+            ResumePrompt(id="u-b", name="Backend", roles=["backend"], body="saved b", templateHtml="<html>B</html>",
+                         templateName="b"),
+        ],
+    )
+
+
+async def test_run_row_uses_its_unit_template_and_frozen_prompt(monkeypatch, persisted):
+    seen = {}
+
+    async def fake_generate(account, jd, prompt_body=None, owner=None, model_id=None, template_html=None):
+        seen.update(prompt_body=prompt_body, template_html=template_html)
+        return HTML, llm()
+
+    async def fake_judge(**k):
+        return verdict(), llm()
+
+    monkeypatch.setattr(runner, "generate_resume_html", fake_generate)
+    monkeypatch.setattr(runner, "judge_resume", fake_judge)
+    run = a_run(units=[EvalUnit(id="u-b", name="Backend", body="edited b", edited=True)])
+    r = row()
+    r.unitId = "u-b"
+    out = await runner._run_row(run, 0, r, profile_account(), None, "JD")
+    assert out.status == "done"
+    assert seen == {"prompt_body": "edited b", "template_html": "<html>B</html>"}
+
+
+async def test_run_row_fails_when_its_unit_was_removed(monkeypatch, persisted):
+    async def never(*a, **k):
+        raise AssertionError("must not generate")
+
+    monkeypatch.setattr(runner, "generate_resume_html", never)
+    run = a_run(units=[EvalUnit(id="u-gone", name="Gone", body="x")])
+    r = row()
+    r.unitId = "u-gone"
+    out = await runner._run_row(run, 0, r, profile_account(), None, "JD")
+    assert out.status == "failed" and out.error == "resume unit was removed from the profile"
 
 
 # ---------- run_eval ----------
