@@ -1,13 +1,14 @@
 """A Job Applies tailored resume scored against its job, with the run's scoring (same terms, weights and IDF).
 
 Scored when the generation finishes (app/routers/resume.py); tailored resumes from before that are scored when
-their row is next listed (`backfill`).
+their row is next listed (`backfill`). Resume Generator resumes are scored the same way against their pasted JD
+(`score_manual`), when they finish only.
 """
 import asyncio
 import logging
 import time
 from types import SimpleNamespace
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from beanie import PydanticObjectId
@@ -72,12 +73,52 @@ async def score_text(row_id: Optional[PydanticObjectId], text: Optional[str]) ->
     return await asyncio.to_thread(tailored_match, row.extraction, row.jdText, text, idf, run_date=run_date)
 
 
-async def score_job(job) -> Optional[TailoredMatch]:
-    """The finished generation `job` scored, if it's a Job Applies one. Never raises: a score isn't worth a failed job."""
-    if getattr(job, "source", None) != "job_applies":
+async def _extraction(jd: str, user) -> JobExtraction:
+    """The job read the way Job Applies reads one; cached by JD text, so a JD seen before costs no LLM call."""
+    from app.job_apply import extract
+    from app.models.job_apply import JobExtractionCache
+
+    key = f"{extract.jd_hash(jd)}:{extract.PROMPT_VERSION}"
+    cached = await JobExtractionCache.find_one(JobExtractionCache.key == key)
+    if cached:
+        return cached.extraction
+    ex, source = await extract.extract_job(jd, user=user, run_date=date.today())
+    if source == "llm":  # as the Job Applies worker caches it (rules output is cheap to recompute)
+        await JobExtractionCache.get_motor_collection().update_one(
+            {"key": key},
+            {"$set": {"key": key, "extraction": ex.model_dump(mode="json"), "updatedAt": datetime.utcnow()},
+             "$setOnInsert": {"createdAt": datetime.utcnow()}},
+            upsert=True,
+        )
+    return ex
+
+
+async def _user_idf(user_id) -> Idf:
+    """No run to weigh terms with: the user's latest Job Applies run's IDF; even weights when they have none."""
+    from app.models.job_apply import JobApplyRun
+
+    run = await JobApplyRun.find(JobApplyRun.userId == user_id).sort("-createdAt").first_or_none() if user_id else None
+    return await _run_idf(run.id) if run else build_idf([])
+
+
+async def score_manual(jd: Optional[str], text: Optional[str], user) -> Optional[TailoredMatch]:
+    """`text` (a resume from the Resume Generator) scored against the JD pasted with it; None when it can't be."""
+    if not (jd or "").strip() or not (text or "").strip():
         return None
+    ex = await _extraction(jd, user)
+    if not ex.isJobPosting or not ex.terms:
+        return None
+    idf = await _user_idf(getattr(user, "id", None))
+    return await asyncio.to_thread(tailored_match, ex, jd, text, idf, run_date=date.today())
+
+
+async def score_job(job, user=None) -> Optional[TailoredMatch]:
+    """The finished generation `job` scored against its job: the Job Applies row's, or the JD pasted on the Resume
+    Generator (read for `user`). Never raises: a score isn't worth a failed job."""
     try:
-        return await score_text(job.jobApplyRowId, job.plainText)
+        if getattr(job, "source", None) == "job_applies":
+            return await score_text(job.jobApplyRowId, job.plainText)
+        return await score_manual(job.jobDescription, job.plainText, user)
     except Exception as exc:  # noqa: BLE001
         log.warning("scoring tailored resume %s failed: %s", getattr(job, "id", "?"), exc)
         return None
