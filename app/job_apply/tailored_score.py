@@ -15,7 +15,7 @@ from beanie import PydanticObjectId
 
 from app.job_apply import jd_store
 from app.job_apply.resume_parse import parse_resume
-from app.job_apply.schema import JobExtraction, TailoredMatch
+from app.job_apply.schema import JobExtraction, ResumeScore, TailoredMatch
 from app.job_apply.scoring import Idf, build_idf, score_resume
 from app.job_apply.sections import substantive_text
 
@@ -27,13 +27,17 @@ IDF_TTL_SECONDS = 600
 _idf_cache: dict[str, tuple[float, Idf]] = {}
 
 
-def tailored_match(ex: JobExtraction, jd: str, text: str, idf: Idf, *, run_date: date) -> TailoredMatch:
-    s = score_resume(
-        ex, jd, parse_resume(text, run_date), idf,
-        run_date=run_date, account_id="", resume_id="", filename="", uploaded_at=None,
-    )
+def match_from_score(s: ResumeScore) -> TailoredMatch:
+    """A resume's score with a job, in the shape shown beside tailored resumes (also an uploaded resume's)."""
     missing = [h.term for h in sorted(s.terms, key=lambda h: -h.weight) if h.credit == 0]
     return TailoredMatch(total=s.total, band=s.band, knockouts=s.knockouts, missing=missing[:MISSING_MAX])
+
+
+def tailored_match(ex: JobExtraction, jd: str, text: str, idf: Idf, *, run_date: date) -> TailoredMatch:
+    return match_from_score(score_resume(
+        ex, jd, parse_resume(text, run_date), idf,
+        run_date=run_date, account_id="", resume_id="", filename="", uploaded_at=None,
+    ))
 
 
 async def _run_idf(run_id: PydanticObjectId) -> Idf:

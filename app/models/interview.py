@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, PrivateAttr, field_serializer, field_vali
 from pymongo import IndexModel
 
 from app.interview_normalize import normalize_status, resolve_interview
+from app.job_apply.schema import TailoredMatch
 from app.models.base import TimestampedDocument
 
 
@@ -117,6 +118,38 @@ class InterviewStageEvent(BaseModel):
         return data
 
 
+# fixed_resume: no search result, but the user picked which of the profile's uploaded resumes was sent (the link is
+# then kind "uploaded" with this reason).
+NoMatchReason = Literal["fixed_resume", "outside_app", "recruiter", "referral", "name_differs", "other"]
+
+
+class InterviewResumeLink(BaseModel):
+    """The resume and job an interview came from, frozen when linked (for interview statistics). See
+    app/interview_resume_link.py and docs/superpowers/specs/2026-10-23-interview-resume-link-design.md."""
+
+    kind: Literal["tailored", "uploaded", "none"]  # none = no company found (reason says why)
+    linkedBy: Literal["user", "auto"] = "user"  # auto = scripts/backfill_interview_resume_links.py
+    linkedAt: datetime = Field(default_factory=datetime.utcnow)
+    resumeJobId: Optional[PydanticObjectId] = None  # tailored: the generated resume (resumeapplications)
+    appliedLogId: Optional[PydanticObjectId] = None  # uploaded: the Job Applies applied-log entry
+    resumeId: Optional[str] = None  # uploaded: the profile's resume file
+    matchedCompany: Optional[str] = None
+    source: Optional[Literal["generator", "job_applies"]] = None
+    filename: Optional[str] = None
+    promptName: Optional[str] = None
+    resumeModel: Optional[str] = None
+    appliedAt: Optional[datetime] = None  # when the resume was generated / applied with
+    jobDescription: Optional[str] = None
+    jobUrl: Optional[str] = None
+    score: Optional[TailoredMatch] = None  # None = never scored
+    reason: Optional[NoMatchReason] = None
+    reasonNote: Optional[str] = None
+
+    @field_serializer("linkedAt", "appliedAt", when_used="json")
+    def _times_utc(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_json(v)
+
+
 class SlackThread(BaseModel):
     """An interview's #caller thread: its main post."""
 
@@ -144,6 +177,8 @@ class Interview(TimestampedDocument):
     confirmed: bool = False  # mirrors the latest round
     # The one #caller thread for all rounds (set by the first caller post).
     slackThread: Optional[SlackThread] = None
+    # Which resume and job this interview came from (None = not linked yet: older interviews).
+    resumeLink: Optional[InterviewResumeLink] = None
 
     @field_serializer("scheduledAt", "endsAt", when_used="json")
     def _times_utc(self, v: Optional[datetime]) -> Optional[str]:

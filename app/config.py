@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # Generated resumes older than this keep metadata + PDF but lose their heavy text (JD, resume text,
     # cover letter, screening answers), archived to S3 first (app/resume_retention.py). 0 = keep forever.
     RESUME_TEXT_RETENTION_DAYS: int = 30
+    # New interviews must link a resume or say why there's none (app/interview_resume_link.py). Off until the form
+    # that sends the link is deployed, so open tabs on the older form can still create interviews.
+    INTERVIEW_RESUME_LINK_REQUIRED: bool = False
     # Reasoning effort for non-resume gpt-5* calls (interview rollup,
     # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for

@@ -15,6 +15,7 @@ from app import ai_usage
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
+from app.interview_resume_link import ResumeLinkIn, build_link, fixed_resume_link, resolve_link, search_matches
 from app.models import (
     Account,
     AnalyzeChatLog,
@@ -149,6 +150,8 @@ class InterviewCreate(BaseModel):
     transcript: Optional[str] = ""
     note: Optional[str] = ""
     caller: Optional[CallerIn] = None
+    # The resume / job it came from, or why none was found (app/interview_resume_link.py).
+    resumeLink: Optional[ResumeLinkIn] = None
 
 
 class StageCreate(RoundIn):
@@ -184,6 +187,8 @@ class InterviewUpdate(BaseModel):
     endsAt: Optional[str] = None
     # Whole-history rewrites are no longer accepted (they silently deleted rounds).
     stageHistory: Optional[Any] = None
+    # Re-link (absent = keep the link; changing the profile drops a link to the old profile's resume).
+    resumeLink: Optional[ResumeLinkIn] = None
 
 
 def _round_caller(
@@ -435,6 +440,14 @@ async def _interview_out(iv: Interview) -> dict:
     return out[0]
 
 
+def _list_view(items: list) -> list:
+    """List and calendar feeds leave out the linked job description (one interview's GET has it)."""
+    for item in items:
+        if item.get("resumeLink"):
+            item["resumeLink"].pop("jobDescription", None)
+    return items
+
+
 async def _populate_account(items: Iterable[dict], *, field: str = "accountId") -> list:
     items = list(items)
     account_ids = []
@@ -619,7 +632,7 @@ async def list_interviews(
         [(field, direction), ("_id", direction)]
     ).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
-    rows_out = await _populate_account(rows_with_owner)
+    rows_out = _list_view(await _populate_account(rows_with_owner))
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -665,7 +678,7 @@ async def list_interview_rounds(
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
     rows = await Interview.find(query).to_list()
-    out = await _populate_account(await populate_owner(rows, field="createdBy"))
+    out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(
         out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_, caller_only=callerOnly, caller_id=callerId,
     )
@@ -705,7 +718,7 @@ async def list_caller_rounds(
             rng["$lt"] = hi
         in_range["scheduledAt"] = rng
     rows = await Interview.find({"stageHistory": {"$elemMatch": in_range}}).to_list()
-    out = await _populate_account(await populate_owner(rows, field="createdBy"))
+    out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
     if dir != "asc":
         rounds.reverse()  # flatten_rounds sorts oldest first
@@ -721,6 +734,41 @@ async def list_caller_rounds(
             "hasNext": page < total_pages, "hasPrev": page > 1,
         },
     }
+
+
+@router.get("/resume-matches")
+async def resume_matches(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    accountId: str = Query(...),
+    q: str = Query(""),
+) -> dict:
+    """The interview form's company search: this profile's generated resumes and uploaded-resume applications."""
+    account_oid = await _account_for_write(accountId, user)
+    return {"matches": await search_matches(account_oid, q)}
+
+
+@router.get("/fixed-resume")
+async def fixed_resume_preview(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    accountId: str = Query(...),
+    resumeId: str = Query(...),
+    jobUrl: str = Query(""),
+) -> dict:
+    """The form's preview of "Used a fixed resume": that uploaded resume, scored against the Job URL's job when the
+    app has read it."""
+    account_oid = await _account_for_write(accountId, user)
+    return (await fixed_resume_link(account_oid, resumeId, jobUrl, user)).model_dump(mode="json")
+
+
+@router.get("/resume-matches/{match_id}")
+async def resume_match(
+    match_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    accountId: str = Query(...),
+) -> dict:
+    """One search result's full snapshot (with the job description), for the form's preview."""
+    account_oid = await _account_for_write(accountId, user)
+    return (await build_link(match_id, account_oid, user)).model_dump(mode="json")
 
 
 @router.get("/{iv_id}")
@@ -815,6 +863,11 @@ async def create_interview(
     if not company:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="companyName is required")
     account_oid = await _account_for_write(body.accountId, user)
+    link = await resolve_link(body.resumeLink, account_oid, user, job_url=body.jobUrl) if body.resumeLink else None
+    if link is None and get_settings().INTERVIEW_RESUME_LINK_REQUIRED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Pick the resume for this company, or tick No company found.",
+        )
     first = body.round or _legacy_round(body)
     first.caller = await _resolve_caller(first.caller)
     entry = _build_round(first, user=user, source="create")
@@ -831,6 +884,7 @@ async def create_interview(
         jobUrl=_job_url(body.jobUrl),
         mainTechStack=(body.mainTechStack or "").strip() or None,
         stageHistory=[],
+        resumeLink=link,
     )
     iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
@@ -873,6 +927,7 @@ async def update_interview(
         body.scheduledAt = None
         body.endsAt = None
 
+    previous_account = iv.accountId
     if body.accountId is not None:
         iv.accountId = await _account_for_write(body.accountId, user)
     if body.companyName is not None:
@@ -886,6 +941,10 @@ async def update_interview(
         iv.jobUrl = _job_url(body.jobUrl)
     if body.mainTechStack is not None:
         iv.mainTechStack = body.mainTechStack.strip() or None
+    if body.resumeLink is not None:
+        iv.resumeLink = await resolve_link(body.resumeLink, iv.accountId, user, job_url=iv.jobUrl)
+    elif iv.accountId != previous_account and iv.resumeLink and iv.resumeLink.kind != "none":
+        iv.resumeLink = None  # it was the old profile's resume
 
     # Legacy stage move (board drag from a stale tab): append / re-date a round.
     new_sched = iv.scheduledAt

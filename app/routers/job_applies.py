@@ -1351,6 +1351,17 @@ async def reset_row_info(row_id: str, user: Annotated[UserExtra, Depends(get_cur
 # ---------- applied marks ----------
 
 
+async def _uploaded_snapshot(row: JobApplyRow, account_id: str, resume_id: str) -> dict:
+    """An uploaded resume's application keeps the JD and its score with it: the run and the JD cache expire, and an
+    interview linked to it later (app/interview_resume_link.py) needs both."""
+    await jd_store.hydrate([row])
+    s = next((s for s in row.scores if s.accountId == account_id and s.resumeId == resume_id), None)
+    return {
+        "jdText": row.jdText or None,
+        "score": tailored_score.match_from_score(s).model_dump() if s else None,
+    }
+
+
 async def _set_applied(
     row: JobApplyRow,
     account_id: str,
@@ -1381,7 +1392,8 @@ async def _set_applied(
             key,
             {"$set": {**key, "company": row.company, "title": row.title, "accountId": account_id,
                       "profileName": acc.name if acc else "", "resumeId": resume_id, "tailoredJobId": tailored_job_id,
-                      "filename": filename, "runId": row.runId, "rowId": row.id, "updatedAt": now},
+                      "filename": filename, "runId": row.runId, "rowId": row.id, "updatedAt": now,
+                      **(await _uploaded_snapshot(row, account_id, resume_id) if resume_id else {})},
              "$setOnInsert": {"appliedAt": now, "createdAt": now}},
             upsert=True,
         )
