@@ -90,6 +90,39 @@ async def strip_old_resume_text(
     return {"stripped": stripped, "batches": batches, "cutoffDays": days}
 
 
+_ARCHIVE_CACHE_MAX = 8  # archive files kept in memory: a backfill reads many resumes from the same few
+_archive_cache: dict[str, dict[str, dict]] = {}
+
+
+async def _read_archive(key: str) -> dict[str, dict]:
+    hit = _archive_cache.get(key)
+    if hit is not None:
+        return hit
+    bucket = get_settings().AWS_S3_BUCKET
+
+    def fetch() -> bytes:
+        return _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+
+    lines = gzip.decompress(await asyncio.to_thread(fetch)).decode().splitlines()
+    docs = {str(d["_id"]): d for d in (json_util.loads(line) for line in lines if line.strip())}
+    if len(_archive_cache) >= _ARCHIVE_CACHE_MAX:
+        _archive_cache.pop(next(iter(_archive_cache)))
+    _archive_cache[key] = docs
+    return docs
+
+
+async def archived_text(key: Optional[str], job_id: object) -> Optional[dict]:
+    """The heavy text retention archived for one generated resume ({jobDescription, plainText, ...}), or None when it
+    has no archive or it can't be read."""
+    if not key or not s3_enabled():
+        return None
+    try:
+        return (await _read_archive(key)).get(str(job_id))
+    except Exception as exc:  # noqa: BLE001 — a missing archive just means no text
+        log.warning("reading resume archive %s failed: %s", key, exc)
+        return None
+
+
 def daily_due(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     return now.hour == DAILY_HOUR_UTC and now.minute < DAILY_WINDOW_MINUTES

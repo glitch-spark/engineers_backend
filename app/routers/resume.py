@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
 from app.deps import get_current_user
+from app.job_apply.schema import TailoredMatch
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import (
     COVER_LETTER_HISTORY_MAX,
@@ -252,10 +253,10 @@ async def _run_job(
             except Exception as exc:  # noqa: BLE001 — non-fatal
                 log.warning("cover-letter generation failed for job %s: %s", job_id, exc)
 
-        # ---- match score (Job Applies): the tailored resume against its job, shown beside it ----
+        # ---- match score: the tailored resume against its job (Job Applies row, or the pasted JD) ----
         from app.job_apply import tailored_score
 
-        job.matchScore = await tailored_score.score_job(job)
+        job.matchScore = await tailored_score.score_job(job, owner)
 
         # ---- done ----
         job.status = "completed"
@@ -698,11 +699,32 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "screeningLlmFallbackUsed": job.screeningLlmFallbackUsed,
         "screeningLlmFallbackReason": job.screeningLlmFallbackReason,
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
+        # Job Applies: {total, band, knockouts, missing}, the score shown beside it there; null = not scored.
+        "matchScore": job.matchScore.model_dump() if job.matchScore else None,
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,
         "completedAt": job.completedAt.isoformat() if job.completedAt else None,
     }
     return d
+
+
+async def _backfill_match_scores(jobs: list[ResumeApplication]) -> None:
+    """Score this page's finished Job Applies resumes that predate scoring, as the Job Applies table does."""
+    from app.job_apply import tailored_score
+
+    ids = [j.id for j in jobs if j.source == "job_applies" and j.status == "completed" and j.matchScore is None]
+    if not ids:
+        return
+    # Only those with no matchScore at all: null means "tried, couldn't be scored".
+    cursor = ResumeApplication.get_motor_collection().find(
+        {"_id": {"$in": ids}, "matchScore": {"$exists": False}}, {"status": 1}
+    )
+    docs = {str(d["_id"]): d async for d in cursor}
+    await tailored_score.backfill(docs)
+    for j in jobs:
+        value = docs.get(str(j.id), {}).get("matchScore")
+        if value:
+            j.matchScore = TailoredMatch(**value)
 
 
 async def _job_apply_links(jobs: list[ResumeApplication]) -> dict[str, dict]:
@@ -793,6 +815,7 @@ async def list_jobs(
         return out
 
     jobs_out = []
+    await _backfill_match_scores(rows)
     links = await _job_apply_links(rows)
     for r in rows:
         d = {**_job_to_dict(r), **_NO_LINK, **links.get(str(r.id), {})}

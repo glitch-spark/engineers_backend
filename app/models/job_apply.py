@@ -10,7 +10,7 @@ from beanie import PydanticObjectId
 from pydantic import BaseModel, Field
 from pymongo import ASCENDING, DESCENDING, IndexModel
 
-from app.job_apply.schema import GateResult, JobExtraction, ResumeScore
+from app.job_apply.schema import GateResult, JobExtraction, ResumeScore, TailoredMatch
 from app.models.base import TimestampedDocument
 
 RunStatus = Literal["queued", "running", "screened", "done", "failed", "cancelled"]
@@ -259,6 +259,10 @@ class JobApplicationLog(TimestampedDocument):
     runId: Optional[PydanticObjectId] = None
     rowId: Optional[PydanticObjectId] = None
     appliedAt: datetime = Field(default_factory=datetime.utcnow)
+    # Uploaded resumes: the job description and the resume's score with it, kept past the run (and the JD cache) so
+    # an interview can be linked to this application later (app/interview_resume_link.py). None on older entries.
+    jdText: Optional[str] = None
+    score: Optional[TailoredMatch] = None
 
     class Settings:
         name = "job_application_log"
