@@ -685,6 +685,47 @@ async def leaderboard_consolidated(
     }
 
 
+@router.get("/interview-rates")
+async def interview_rates(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month"] = Query("week"),
+    date: str = Query("", description="YYYY-MM-DD, any day in the week or month (default: today, UTC)"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+) -> dict:
+    """Statistics → Interview rate: every user's bids, interviews and rate in one period and region, ranked, with
+    the viewer's and the team's rate over the last periods (app/interview_rates.py)."""
+    from datetime import date as date_cls
+
+    from app import interview_rates as ir
+
+    try:
+        day = date_cls.fromisoformat(date) if date else datetime.now(timezone.utc).date()
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date must be YYYY-MM-DD")
+    return await ir.interview_rates(user, period, day, region)
+
+
+@router.get("/resume-compare")
+async def resume_compare(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD, any day in the week or month (default: today, UTC)"),
+    q: str = Query("", description="company name filter"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+) -> dict:
+    """Statistics → Resume compare: the jobs with an interview in the period, and every user's resume and score for
+    each (app/resume_compare.py)."""
+    from datetime import date as date_cls
+
+    from app import resume_compare as rc
+
+    try:
+        day = date_cls.fromisoformat(date) if date else datetime.now(timezone.utc).date()
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date must be YYYY-MM-DD")
+    return await rc.resume_compare(user, period, day, q, region)
+
+
 @router.get("/dashboard-feed")
 async def dashboard_feed(
     user: Annotated[UserExtra, Depends(get_current_user)],

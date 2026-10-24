@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
-from beanie import PydanticObjectId
-from pydantic import BaseModel
+from beanie import Insert, PydanticObjectId, before_event
+from pydantic import BaseModel, field_validator
 from pymongo import IndexModel
 
 from app.job_apply.schema import TailoredMatch
@@ -23,6 +23,30 @@ JobStep = Literal[
 # Bid counting: tailored resumes from Job Applies count only once the job is marked applied with them.
 # Absent/None (old records, Generator page) counts.
 BID_FILTER: dict = {"countsAsBid": {"$ne": False}}
+
+
+def as_match(value: Any) -> Any:
+    """A stored matchScore as {total, band, knockouts, missing}. 151 resumes from an early scoring test (2026-09-28)
+    hold a bare 0-100 number: it becomes the total, with its band."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        from app.job_apply.scoring import band
+
+        total = int(round(value))
+        return {"total": total, "band": band(total), "knockouts": [], "missing": []}
+    return value
+
+
+def job_url_key(url: Optional[str]) -> Optional[str]:
+    """A job link's key for "same job" matching: normalised as Job Applies matches links (tracking params, trailing
+    slash and platform variants dropped), then without the scheme and a leading www. ("jobs.acme.com/123")."""
+    import re
+
+    from app.job_apply.urls import normalize_url
+
+    raw = (url or "").strip()
+    if not raw.lower().startswith(("http://", "https://", "www.")):
+        return None
+    return re.sub(r"^https?://(www\.)?", "", normalize_url(raw), flags=re.IGNORECASE) or None
 
 
 class ScreeningPair(BaseModel):
@@ -58,6 +82,9 @@ class ResumeApplication(TimestampedDocument):
     # Short posting used only for the resume rewrite. Absent on Generator-page jobs and on rows from before tailorJd.
     tailorJobDescription: Optional[str] = None
     jobUrl: Optional[str] = None
+    # jobUrl normalised (app/job_apply/urls.normalize_url), set on insert: resumes for the same job across profiles
+    # (Statistics → Resume compare). scripts/backfill_job_url_keys.py fills it for resumes made before it existed.
+    jobUrlKey: Optional[str] = None
 
     status: JobStatus = "queued"
     step: JobStep = "queued"
@@ -138,9 +165,19 @@ class ResumeApplication(TimestampedDocument):
     # Job Applies: this resume scored against that row's job (app/job_apply/tailored_score.py); absent = not scored yet.
     matchScore: Optional[TailoredMatch] = None
 
+    @field_validator("matchScore", mode="before")
+    @classmethod
+    def _numeric_score(cls, v: Any) -> Any:
+        return as_match(v)
+
+    @before_event(Insert)
+    def _job_url_key(self) -> None:
+        self.jobUrlKey = job_url_key(self.jobUrl)
+
     class Settings:
         name = "resumeapplications"
         indexes = [
+            IndexModel([("jobUrlKey", 1)], name="job_url_key", sparse=True),
             IndexModel([("userId", 1), ("createdAt", -1)], name="user_recent"),
             IndexModel([("accountId", 1), ("createdAt", -1)], name="account_recent"),
             IndexModel([("status", 1), ("createdAt", 1)], name="queue"),
