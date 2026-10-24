@@ -17,6 +17,7 @@ from beanie.odm.utils.encoder import Encoder
 
 from app import ai_usage
 from app.job_apply import extract as extract_mod
+from app.job_apply import fixed_forks
 from app.job_apply import fetch as fetch_mod
 from app.job_apply import jd_store
 from app.job_apply.gates import blocked, failing_reasons, job_gates
@@ -380,6 +381,7 @@ async def _score_stage(
     jds = [r.jdText for r in rows if r.extraction and r.jdText]
     idf = await asyncio.to_thread(lambda: build_idf([substantive_text(jd) or jd for jd in jds]))
     run_date = run.runDate.date()
+    accounts: dict = {}  # profiles loaded once for the run's fixed-resume forks
     for row in todo:
         await check.tick()
         allowed = assigned_profiles(run.assignments, scoring_key(row.groupKey, row.forceInclude))
@@ -403,6 +405,10 @@ async def _score_stage(
         row.status = "scored"  # also a job a person approved after it failed a check
         await _save_fields(row, _SCORE_FIELDS)
         await _inc(run.id, scored=1)
+        try:  # the picked uploaded resume becomes this job's own copy, like a tailored one
+            await fixed_forks.sync_row(row, run.threshold, accounts)
+        except Exception:  # noqa: BLE001 — a missing fork leaves the shared file, as before forks
+            log.exception("fixed forks for row %s failed", row.id)
 
 
 _REREAD_FIELDS = tuple(dict.fromkeys(_FETCH_FIELDS + _EXTRACT_FIELDS + _SCORE_FIELDS))

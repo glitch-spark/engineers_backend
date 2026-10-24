@@ -69,7 +69,8 @@ async def daily_count(user: UserExtra) -> int:
 
     start, end = local_day_bounds_utc(local_now(resolve_user_tz(user)))
     return await ResumeApplication.find(
-        {"userId": user.id, "createdAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)}}
+        {"userId": user.id, "createdAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)},
+         "fixedFrom": None},  # fixed-resume forks aren't generations
     ).count()
 
 
