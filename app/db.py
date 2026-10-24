@@ -27,6 +27,8 @@ STALE_INDEXES: dict[str, list[str]] = {
     "job_posting_cache": ["ttl"],
     # Unique key moved from resumeId to fileKey (uploaded or tailored file).
     "job_application_log": ["user_url_resume"],
+    # Sparse unique index on seedKey allowed only one user-added eval JD (explicit null); replaced by "seed_key_str".
+    "eval_job_descriptions": ["seed_key"],
 }
 
 from app.models import (

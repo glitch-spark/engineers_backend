@@ -75,6 +75,20 @@ async def test_jd_crud_and_archive(client, staff_user, auth_header):
     assert r.json()["archived"] is False and r.json()["archivedAt"] is None
 
 
+async def test_many_user_added_jds_can_coexist_with_seeds(client, staff_user, auth_header):
+    """Regression: a sparse unique seedKey index treated every user-added `seedKey: null` as a duplicate (500)."""
+    await seed_eval_jds()
+    h = auth_header(staff_user)
+    for i in range(3):
+        r = await client.post(
+            "/resume/eval/jds",
+            json={"role": "ai", "title": f"AI Eng {i}", "company": "Co", "text": "Do AI things."},
+            headers=h,
+        )
+        assert r.status_code == 201, r.text
+    assert await seed_eval_jds() == 0  # seeds stay unique and idempotent
+
+
 async def test_create_run_persists_rows_and_starts_the_runner(client, staff_user, auth_header, started):
     await seed_eval_jds()
     acc = await make_account(staff_user, resumePromptBody="Profile prompt")
