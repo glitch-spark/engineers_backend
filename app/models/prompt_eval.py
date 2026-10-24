@@ -44,7 +44,14 @@ class EvalJobDescription(TimestampedDocument):
     class Settings:
         name = "eval_job_descriptions"
         indexes = [
-            IndexModel([("seedKey", ASCENDING)], unique=True, sparse=True, name="seed_key"),
+            # Partial, not sparse: user-added JDs are saved with an explicit `seedKey: null`, which a sparse
+            # index still counts, so only one could ever exist. Only string keys (the built-ins) are unique.
+            IndexModel(
+                [("seedKey", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"seedKey": {"$type": "string"}},
+                name="seed_key_str",
+            ),
             IndexModel([("role", ASCENDING), ("archived", ASCENDING)], name="role_archived"),
         ]
 
