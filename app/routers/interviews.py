@@ -15,7 +15,7 @@ from app import ai_usage
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
-from app.interview_resume_link import ResumeLinkIn, build_link, fixed_resume_link, resolve_link, search_matches
+from app.interview_resume_link import ResumeLinkIn, build_link, resolve_link, search_matches
 from app.models import (
     Account,
     AnalyzeChatLog,
@@ -747,19 +747,6 @@ async def resume_matches(
     return {"matches": await search_matches(account_oid, q)}
 
 
-@router.get("/fixed-resume")
-async def fixed_resume_preview(
-    user: Annotated[UserExtra, Depends(get_current_user)],
-    accountId: str = Query(...),
-    resumeId: str = Query(...),
-    jobUrl: str = Query(""),
-) -> dict:
-    """The form's preview of "Used a fixed resume": that uploaded resume, scored against the Job URL's job when the
-    app has read it."""
-    account_oid = await _account_for_write(accountId, user)
-    return (await fixed_resume_link(account_oid, resumeId, jobUrl, user)).model_dump(mode="json")
-
-
 @router.get("/resume-matches/{match_id}")
 async def resume_match(
     match_id: str,
@@ -863,7 +850,7 @@ async def create_interview(
     if not company:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="companyName is required")
     account_oid = await _account_for_write(body.accountId, user)
-    link = await resolve_link(body.resumeLink, account_oid, user, job_url=body.jobUrl) if body.resumeLink else None
+    link = await resolve_link(body.resumeLink, account_oid, user) if body.resumeLink else None
     if link is None and get_settings().INTERVIEW_RESUME_LINK_REQUIRED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Pick the resume for this company, or tick No company found.",
@@ -942,7 +929,7 @@ async def update_interview(
     if body.mainTechStack is not None:
         iv.mainTechStack = body.mainTechStack.strip() or None
     if body.resumeLink is not None:
-        iv.resumeLink = await resolve_link(body.resumeLink, iv.accountId, user, job_url=iv.jobUrl)
+        iv.resumeLink = await resolve_link(body.resumeLink, iv.accountId, user)
     elif iv.accountId != previous_account and iv.resumeLink and iv.resumeLink.kind != "none":
         iv.resumeLink = None  # it was the old profile's resume
 
