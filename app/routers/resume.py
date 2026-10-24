@@ -701,6 +701,8 @@ def _job_to_dict(job: ResumeApplication) -> dict:
         "hasPdf": bool(job.s3Key) or bool(job.pdfData),
         # Job Applies: {total, band, knockouts, missing}, the score shown beside it there; null = not scored.
         "matchScore": job.matchScore.model_dump() if job.matchScore else None,
+        # Job Applies fixed-resume fork (app/job_apply/fixed_forks.py): the uploaded resume it copies.
+        "fixedFrom": job.fixedFrom,
         "createdAt": job.createdAt.isoformat() if job.createdAt else None,
         "startedAt": job.startedAt.isoformat() if job.startedAt else None,
         "completedAt": job.completedAt.isoformat() if job.completedAt else None,

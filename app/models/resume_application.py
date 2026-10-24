@@ -132,6 +132,9 @@ class ResumeApplication(TimestampedDocument):
     promptName: Optional[str] = None
     templateName: Optional[str] = None  # the unit's HTML template, for display
     jobApplyRowId: Optional[PydanticObjectId] = None
+    # Job Applies: a fixed-resume fork, not a generation. The profile's uploaded resume (this id) that scoring picked
+    # for the job, copied for it (app/job_apply/fixed_forks.py). Not counted toward the daily generation cap.
+    fixedFrom: Optional[str] = None
     # Job Applies: this resume scored against that row's job (app/job_apply/tailored_score.py); absent = not scored yet.
     matchScore: Optional[TailoredMatch] = None
 

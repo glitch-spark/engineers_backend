@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
-from app.job_apply import file_links, gsheet, jd_store, sheet_checks, tailored_score, worker
+from app.job_apply import file_links, fixed_forks, gsheet, jd_store, sheet_checks, tailored_score, worker
 from app.job_apply.extract import tailor_text
 from app.job_apply.sheet_links import exported_to
 from app.job_apply.sheet_checks import sheet_text
@@ -314,6 +314,8 @@ def _tailored_out(doc: Optional[dict]) -> Optional[dict]:
         "match": doc.get("matchScore"),
         # The profile's resume prompt it was tailored with (None for older ones).
         "promptName": doc.get("promptName"),
+        # A fixed-resume fork (app/job_apply/fixed_forks.py): the uploaded resume it copies, else None.
+        "fixedFrom": doc.get("fixedFrom"),
         "templateName": doc.get("templateName"),
     }
 
@@ -780,7 +782,7 @@ async def get_run(
     tailored_ids = await _run_tailored_ids(run)
     jobs = ResumeApplication.get_motor_collection()
     by_status = {
-        s: await jobs.count_documents({"_id": {"$in": tailored_ids}, "status": s})
+        s: await jobs.count_documents({"_id": {"$in": tailored_ids}, "status": s, "fixedFrom": None})
         for s in ("queued", "in_progress", "completed", "failed")
     } if tailored_ids else dict.fromkeys(("queued", "in_progress", "completed", "failed"), 0)
     out["tailoring"] = {
@@ -854,6 +856,8 @@ async def update_run(run_id: str, body: RunPatch, user: Annotated[UserExtra, Dep
         setattr(run, k, v)
     if body.maxAgeDays is not None:
         await _rescreen_rows(run)
+    if body.threshold is not None:  # another minimum picks other uploaded resumes: their forks follow
+        await fixed_forks.sync_rows(run, await JobApplyRow.find({"runId": run.id, "scoredAt": {"$ne": None}}).to_list())
     return await _run_out(run, with_profiles=True)
 
 

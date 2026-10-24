@@ -7,7 +7,6 @@ and statistics must not move with them.
 
 Spec: docs/superpowers/specs/2026-10-23-interview-resume-link-design.md
 """
-import logging
 import re
 from datetime import datetime
 from types import SimpleNamespace
@@ -19,8 +18,6 @@ from pydantic import BaseModel
 
 from app.models.interview import InterviewResumeLink, NoMatchReason
 
-log = logging.getLogger(__name__)
-
 MAX_MATCHES = 20
 SCAN_PER_SOURCE = 200  # candidates read from each source before the normalised-name filter
 # Dropped when comparing company names: legal forms and a leading "the".
@@ -30,6 +27,7 @@ _NAME_NOISE = {
 }
 _TAILORED_FIELDS = {
     "companyName": 1, "createdAt": 1, "pdfFilename": 1, "source": 1, "promptName": 1, "jobUrl": 1, "matchScore": 1,
+    "fixedFrom": 1,
 }
 
 
@@ -49,7 +47,8 @@ def _basename(path: Optional[str]) -> Optional[str]:
 
 def _tailored_out(d: dict) -> dict:
     return {
-        "matchId": f"t:{d['_id']}", "kind": "tailored", "company": d.get("companyName") or "",
+        "matchId": f"t:{d['_id']}", "kind": "fixed" if d.get("fixedFrom") else "tailored",
+        "company": d.get("companyName") or "",
         "appliedAt": d.get("createdAt"), "filename": _basename(d.get("pdfFilename")),
         "source": d.get("source") or "generator", "promptName": d.get("promptName"), "jobUrl": d.get("jobUrl"),
         "score": d.get("matchScore"),
@@ -150,7 +149,8 @@ async def _tailored_link(oid, account_oid, user, linked_by: str, score_missing: 
             score = match.model_dump()
             await coll.update_one({"_id": oid}, {"$set": {"matchScore": score}})
     return InterviewResumeLink(
-        kind="tailored", linkedBy=linked_by, resumeJobId=oid, matchedCompany=d.get("companyName"),
+        kind="fixed" if d.get("fixedFrom") else "tailored", linkedBy=linked_by, resumeJobId=oid,
+        matchedCompany=d.get("companyName"),
         source=d.get("source") or "generator", filename=_basename(d.get("pdfFilename")),
         promptName=d.get("promptName"), resumeModel=d.get("resumeLlmModel"), appliedAt=d.get("createdAt"),
         jobDescription=jd or None, jobUrl=d.get("jobUrl"), score=score,
@@ -190,56 +190,24 @@ async def build_link(
     return await _uploaded_link(oid, account_oid, linked_by)
 
 
-async def fixed_resume_link(
-    account_oid: PydanticObjectId, resume_id: Optional[str], job_url: Optional[str], user, *, note: Optional[str] = None,
-) -> InterviewResumeLink:
-    """One of the profile's uploaded resumes, picked by hand (no search result): scored against the job at `job_url`
-    when the app has read that job (Job Applies' JD cache or a person's correction)."""
-    from app.job_apply import tailored_score
-    from app.job_apply.urls import normalize_url
-    from app.models import Account
-
-    acc = await Account.get(account_oid)
-    resume = next((r for r in (acc.resumes if acc else []) if str(r.id) == (resume_id or "")), None)
-    if resume is None:
-        raise _bad("Pick one of this profile's uploaded resumes.")
-    url = (job_url or "").strip()
-    jd = await _cached_jd(normalize_url(url)) if url else None
-    score = None
-    if jd:
-        try:
-            score = await tailored_score.score_manual(jd, resume.markdown, user)
-        except Exception as exc:  # noqa: BLE001 — a score isn't worth a failed save
-            log.warning("scoring fixed resume %s failed: %s", resume.id, exc)
-    return InterviewResumeLink(
-        kind="uploaded", resumeId=str(resume.id), filename=resume.filename, appliedAt=resume.uploadedAt,
-        jobDescription=jd, jobUrl=url or None, score=score, reason="fixed_resume", reasonNote=note or None,
-    )
-
-
 class ResumeLinkIn(BaseModel):
-    """What the interview form sends: a picked search result, or that none was found and why (with the uploaded
-    resume that was sent, for reason fixed_resume)."""
+    """What the interview form sends: a picked search result, or that none was found and why."""
 
     matchId: Optional[str] = None
     none: bool = False
     reason: Optional[NoMatchReason] = None
     note: Optional[str] = None
-    resumeId: Optional[str] = None
 
 
-async def resolve_link(
-    body: ResumeLinkIn, account_oid: PydanticObjectId, user, *, job_url: Optional[str] = None,
-) -> InterviewResumeLink:
-    """`job_url`: the interview's, to score a fixed resume against."""
+async def resolve_link(body: ResumeLinkIn, account_oid: PydanticObjectId, user) -> InterviewResumeLink:
     if body.none:
         note = (body.note or "").strip()
         if body.reason is None:
             raise _bad("Pick why no company was found.")
+        if body.reason == "fixed_resume":  # forks replaced it: the company search finds the fixed resume
+            raise _bad("Search the company: a fixed resume used in Job Applies is found there.")
         if body.reason == "other" and not note:
             raise _bad("Add a note for the reason Other.")
-        if body.reason == "fixed_resume":
-            return await fixed_resume_link(account_oid, body.resumeId, job_url, user, note=note)
         return InterviewResumeLink(kind="none", reason=body.reason, reasonNote=note or None)
     if not body.matchId:
         raise _bad("Pick a resume, or tick No company found.")

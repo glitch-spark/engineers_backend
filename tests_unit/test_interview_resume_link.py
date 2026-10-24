@@ -276,46 +276,36 @@ async def test_backfill_links_the_latest_exact_match_before_the_first_round(db):
     again = await backfill(apply=True)
     assert again["counts"] == {"seen": 1, "unmatched": 1}  # the linked one is skipped
 
+# ---------- fixed-resume forks ----------
 
-# ---------- "Used a fixed resume" ----------
 
+async def test_a_fixed_resume_fork_is_found_and_linked_as_fixed(db):
+    owner, jordan, _ = await _owner_and_profiles()
+    fork = await _generated(owner, jordan, "Initech", datetime(2026, 10, 1), source="job_applies",
+                            fixedFrom="res1", pdfFilename="jordan_backend.pdf", matchScore=SCORE)
 
-async def test_fixed_resume_is_linked_and_scored_against_the_job_url(db, monkeypatch):
-    from app.models.account import Resume
-
-    owner = await UserExtra(name="Athen", email="athen@x.io").insert()
-    cv = Resume(filename="jordan_backend.pdf", markdown="Python FastAPI engineer")
-    jordan = await Account(name="Jordan", createdBy=owner.id, resumes=[cv]).insert()
-    await JobPostingCache(url="https://jobs.example.com/initech", text="Initech wants Python", source="fetch").insert()
-    seen: list = []
-
-    async def fake_manual(jd, text, user):
-        seen.append((jd, text))
-        return SCORE
-
-    monkeypatch.setattr(tailored_score, "score_manual", fake_manual)
+    found = await irl.search_matches(jordan.id, "initech")
+    assert [(m["kind"], m["filename"]) for m in found] == [("fixed", "jordan_backend.pdf")]
 
     out = await create_interview(InterviewCreate(
-        accountId=str(jordan.id), companyName="Initech", round=_round(),
-        jobUrl="https://jobs.example.com/initech?utm_source=x",
-        resumeLink={"none": True, "reason": "fixed_resume", "resumeId": str(cv.id)},
+        accountId=str(jordan.id), companyName="Initech", round=_round(), resumeLink={"matchId": f"t:{fork.id}"},
     ), owner)
-
     link = (await Interview.get(out["_id"])).resumeLink
-    assert (link.kind, link.reason, link.resumeId, link.filename) == ("uploaded", "fixed_resume", str(cv.id), cv.filename)
-    assert link.jobDescription == "Initech wants Python" and link.score == SCORE
-    assert seen == [("Initech wants Python", "Python FastAPI engineer")]
-
-    preview = await interviews.fixed_resume_preview(owner, accountId=str(jordan.id), resumeId=str(cv.id), jobUrl="")
-    assert preview["filename"] == cv.filename and preview["score"] is None  # no job to score against
+    assert (link.kind, link.resumeJobId, link.score) == ("fixed", fork.id, SCORE)
 
 
-async def test_fixed_resume_must_be_the_profiles(db):
+async def test_the_used_a_fixed_resume_reason_is_no_longer_accepted(db):
     owner, jordan, _ = await _owner_and_profiles()
-    for resume_id in (None, "not-one-of-theirs"):
-        with pytest.raises(HTTPException) as err:
-            await create_interview(InterviewCreate(
-                accountId=str(jordan.id), companyName="Initech", round=_round(),
-                resumeLink={"none": True, "reason": "fixed_resume", "resumeId": resume_id},
-            ), owner)
-        assert err.value.status_code == 400
+    with pytest.raises(HTTPException) as err:
+        await create_interview(InterviewCreate(
+            accountId=str(jordan.id), companyName="Initech", round=_round(),
+            resumeLink={"none": True, "reason": "fixed_resume"},
+        ), owner)
+    assert err.value.status_code == 400
+
+    # Links saved with it before still load.
+    iv = await Interview.get((await create_interview(InterviewCreate(
+        accountId=str(jordan.id), companyName="Initech", round=_round()), owner))["_id"])
+    await Interview.get_motor_collection().update_one({"_id": iv.id}, {"$set": {"resumeLink": {
+        "kind": "uploaded", "linkedBy": "user", "resumeId": "res1", "filename": "a.pdf", "reason": "fixed_resume"}}})
+    assert (await Interview.get(iv.id)).resumeLink.reason == "fixed_resume"

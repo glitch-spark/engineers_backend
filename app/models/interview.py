@@ -118,8 +118,8 @@ class InterviewStageEvent(BaseModel):
         return data
 
 
-# fixed_resume: no search result, but the user picked which of the profile's uploaded resumes was sent (the link is
-# then kind "uploaded" with this reason).
+# fixed_resume: an uploaded resume picked by hand on the form (kind "uploaded" with this reason). No longer offered:
+# fixed-resume forks are found by the company search (kind "fixed"); kept so the links saved with it still load.
 NoMatchReason = Literal["fixed_resume", "outside_app", "recruiter", "referral", "name_differs", "other"]
 
 
@@ -127,10 +127,11 @@ class InterviewResumeLink(BaseModel):
     """The resume and job an interview came from, frozen when linked (for interview statistics). See
     app/interview_resume_link.py and docs/superpowers/specs/2026-10-23-interview-resume-link-design.md."""
 
-    kind: Literal["tailored", "uploaded", "none"]  # none = no company found (reason says why)
+    # fixed = a Job Applies fixed-resume fork (app/job_apply/fixed_forks.py); none = no company found (reason says why)
+    kind: Literal["tailored", "fixed", "uploaded", "none"]
     linkedBy: Literal["user", "auto"] = "user"  # auto = scripts/backfill_interview_resume_links.py
     linkedAt: datetime = Field(default_factory=datetime.utcnow)
-    resumeJobId: Optional[PydanticObjectId] = None  # tailored: the generated resume (resumeapplications)
+    resumeJobId: Optional[PydanticObjectId] = None  # tailored / fixed: the resume's record (resumeapplications)
     appliedLogId: Optional[PydanticObjectId] = None  # uploaded: the Job Applies applied-log entry
     resumeId: Optional[str] = None  # uploaded: the profile's resume file
     matchedCompany: Optional[str] = None
