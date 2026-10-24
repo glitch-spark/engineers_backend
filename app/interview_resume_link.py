@@ -17,6 +17,7 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 
 from app.models.interview import InterviewResumeLink, NoMatchReason
+from app.models.resume_application import as_match
 
 MAX_MATCHES = 20
 SCAN_PER_SOURCE = 200  # candidates read from each source before the normalised-name filter
@@ -51,7 +52,7 @@ def _tailored_out(d: dict) -> dict:
         "company": d.get("companyName") or "",
         "appliedAt": d.get("createdAt"), "filename": _basename(d.get("pdfFilename")),
         "source": d.get("source") or "generator", "promptName": d.get("promptName"), "jobUrl": d.get("jobUrl"),
-        "score": d.get("matchScore"),
+        "score": as_match(d.get("matchScore")),
     }
 
 
@@ -139,7 +140,7 @@ async def _tailored_link(oid, account_oid, user, linked_by: str, score_missing: 
     if (not jd or not text) and d.get("textArchiveKey"):
         archived = await resume_retention.archived_text(d["textArchiveKey"], oid) or {}
         jd, text = jd or archived.get("jobDescription") or "", text or archived.get("plainText") or ""
-    score = d.get("matchScore")
+    score = as_match(d.get("matchScore"))
     if score is None and score_missing and text:
         job = SimpleNamespace(
             id=oid, source=d.get("source"), jobApplyRowId=d.get("jobApplyRowId"), jobDescription=jd, plainText=text,
