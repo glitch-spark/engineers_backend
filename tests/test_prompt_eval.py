@@ -163,3 +163,51 @@ async def test_delete_run(client, staff_user, auth_header, started):
     r = await client.delete(f"/resume/eval/runs/{run_id}", headers=auth_header(staff_user))
     assert r.status_code == 200 and r.json() == {"ok": True}
     assert await ResumePromptEval.get(run_id) is None
+
+
+async def _start_run(client, user, auth_header, roles=("ai", "test")):
+    await seed_eval_jds()
+    acc = await make_account(user)
+    r = await client.post("/resume/eval/runs", json={"accountId": str(acc.id), "roles": list(roles)}, headers=auth_header(user))
+    return await ResumePromptEval.get(r.json()["runId"])
+
+
+async def test_stop_run_closes_it_and_keeps_finished_rows(client, staff_user, auth_header, started):
+    run = await _start_run(client, staff_user, auth_header)
+    assert len(run.rows) >= 2
+    run.rows[0].status = "done"
+    run.rows[1].status = "generating"
+    await run.save()
+    r = await client.post(f"/resume/eval/runs/{run.id}/stop", headers=auth_header(staff_user))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "stopped" and body["error"] == runner.STOPPED_ERROR and body["finishedAt"]
+    assert body["rows"][0]["status"] == "done"
+    assert all(x["status"] == "failed" and x["error"] == runner.STOPPED_ERROR for x in body["rows"][1:])
+    assert body["counts"]["done"] == 1
+    assert (await ResumePromptEval.get(run.id)).status == "stopped"
+
+
+async def test_stop_run_cancels_the_live_task(client, staff_user, auth_header, started):
+    import asyncio
+
+    run = await _start_run(client, staff_user, auth_header)
+    task = asyncio.create_task(asyncio.sleep(60))
+    runner._tasks[str(run.id)] = task
+    try:
+        r = await client.post(f"/resume/eval/runs/{run.id}/stop", headers=auth_header(staff_user))
+        assert r.status_code == 200 and r.json()["status"] == "stopped"
+        assert task.cancelled()
+    finally:
+        runner._tasks.pop(str(run.id), None)
+        task.cancel()
+
+
+async def test_stop_run_is_a_noop_when_not_running_and_stays_private(client, staff_user, staff_user_2, auth_header, started):
+    run = await _start_run(client, staff_user, auth_header, roles=("test",))
+    assert (await client.post(f"/resume/eval/runs/{run.id}/stop", headers=auth_header(staff_user_2))).status_code == 404
+    assert (await ResumePromptEval.get(run.id)).status == "running"
+    run.status = "done"
+    await run.save()
+    r = await client.post(f"/resume/eval/runs/{run.id}/stop", headers=auth_header(staff_user))
+    assert r.status_code == 200 and r.json()["status"] == "done" and r.json()["error"] is None

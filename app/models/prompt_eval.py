@@ -57,7 +57,7 @@ class EvalJobDescription(TimestampedDocument):
 
 
 EvalRowStatus = Literal["pending", "generating", "judging", "done", "failed"]
-EvalRunStatus = Literal["running", "done", "failed"]
+EvalRunStatus = Literal["running", "done", "failed", "stopped"]
 PromptSource = Literal["custom", "profile", "global", "none"]
 # "llm": a judge model reads each resume. "rules": Job Applies scoring plus text checks, no model per row.
 JudgeMode = Literal["llm", "rules"]

@@ -33,8 +33,9 @@ log = logging.getLogger(__name__)
 
 STALE_AFTER = timedelta(minutes=20)
 STALE_ERROR = "Run timed out (the server may have restarted while it was running)"
+STOPPED_ERROR = "Stopped by user"
 
-_tasks: set[asyncio.Task] = set()
+_tasks: dict[str, asyncio.Task] = {}  # run id -> its task, so a stop can cancel it
 _sem: Optional[asyncio.Semaphore] = None
 
 
@@ -105,20 +106,27 @@ async def _persist_row(run_id: PydanticObjectId, index: int, row: EvalRow) -> No
     )
 
 
-async def _finish(run_id: PydanticObjectId, rows: list[EvalRow], started: float, *, error: Optional[str] = None) -> None:
+async def _finish(
+    run_id: PydanticObjectId, rows: list[EvalRow], started: float, *, error: Optional[str] = None, stopped: bool = False
+) -> None:
     summary = aggregate(rows)
     now = datetime.utcnow()
     fields = {
         **summary,
         "roleScores": {k: v.model_dump() for k, v in summary["roleScores"].items()},
         "unitScores": {k: v.model_dump() for k, v in summary["unitScores"].items()},
-        "status": "failed" if error else "done",
-        "error": error,
+        "status": "stopped" if stopped else "failed" if error else "done",
+        "error": STOPPED_ERROR if stopped else error,
         "finishedAt": now,
         "durationMs": int((time.monotonic() - started) * 1000),
         "updatedAt": now,
     }
-    await ResumePromptEval.get_motor_collection().update_one({"_id": run_id}, {"$set": fields})
+    query: dict = {"_id": run_id}
+    if stopped:
+        # Rows the stop cut short are saved with the run, and a run that already finished is left alone.
+        fields["rows"] = [Encoder(to_db=True).encode(row.model_dump()) for row in rows]
+        query["status"] = "running"
+    await ResumePromptEval.get_motor_collection().update_one(query, {"$set": fields})
 
 
 async def mark_stale_runs(runs: list[ResumePromptEval]) -> None:
@@ -290,6 +298,27 @@ async def run_eval(run_id: PydanticObjectId) -> None:
 
 
 def start_run(run_id: PydanticObjectId) -> None:
+    key = str(run_id)
     task = asyncio.create_task(run_eval(run_id))
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    _tasks[key] = task
+    task.add_done_callback(lambda t: _tasks.pop(key, None) if _tasks.get(key) is t else None)
+
+
+async def stop_run(run_id: PydanticObjectId) -> bool:
+    """Stop a running eval: cancel its task here (no more model calls are started), then close the run as
+    `stopped` with whatever rows finished. Also frees a run orphaned by a restart. False if it was not running."""
+    task = _tasks.get(str(run_id))
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)  # wait, so no row write lands after the stop
+    run = await ResumePromptEval.get(run_id)
+    if run is None or run.status != "running":
+        return False
+    rows = list(run.rows)
+    for row in rows:
+        if row.status not in ("done", "failed"):
+            row.status = "failed"
+            row.error = STOPPED_ERROR
+    elapsed = (datetime.utcnow() - run.startedAt).total_seconds()
+    await _finish(run_id, rows, time.monotonic() - elapsed, stopped=True)
+    return True

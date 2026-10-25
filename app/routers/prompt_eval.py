@@ -391,6 +391,17 @@ async def get_run(run_id: str, user: Annotated[UserExtra, Depends(get_current_us
     return doc_to_dict(run)
 
 
+@router.post("/runs/{run_id}/stop")
+async def stop_run(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Stop a running eval. Rows that finished keep their scores; the rest are marked stopped. A run that is
+    not running is returned unchanged, so a double click is harmless."""
+    run = await _load_run(run_id, user)
+    if run.status == "running":
+        await runner.stop_run(run.id)
+        run = await _load_run(run_id, user)
+    return doc_to_dict(run)
+
+
 @router.delete("/runs/{run_id}")
 async def delete_run(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     run = await _load_run(run_id, user)
