@@ -45,7 +45,7 @@ from app.models.job_apply import (
     RunSelection,
 )
 from app.routers._util import doc_to_dict, require_model, to_object_id
-from app.routers.resume import _build_zip, _safe_folder
+from app.routers.resume import _build_zip, _folder_header, _safe_folder
 
 log = logging.getLogger(__name__)
 
@@ -1881,7 +1881,7 @@ async def row_resume_file(
         media_type=resume_files.ALLOWED_TYPES[ext],
         headers={
             "Content-Disposition": f'attachment; filename="Resume{ext}"',
-            "X-Folder": f"{_safe_folder(account.name)}/{_safe_folder(_company(row))}",
+            "X-Folder": _folder_header(f"{_safe_folder(account.name)}/{_safe_folder(_company(row))}"),
         },
     )
 

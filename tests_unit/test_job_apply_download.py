@@ -5,6 +5,7 @@ tailored resume when ready, else the highest template resume at or above the min
 import io
 import os
 import zipfile
+from urllib.parse import unquote
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
@@ -153,6 +154,17 @@ async def test_template_file_comes_with_its_folder(db):
 
     assert res.body == b"template:k/a1.pdf"
     assert res.headers["X-Folder"] == "Alex/Acme" and res.media_type == "application/pdf"
+
+
+async def test_template_file_folder_with_non_latin1_company(db):
+    """Headers are Latin-1: "Macy’s" (curly apostrophe) used to 500. The folder arrives percent-encoded."""
+    owner, (alex, _, _), (alex_cv, _, _), _, job_a, _, _ = await _setup()
+    job_a.company = "Macy’s 株式会社"
+    await job_a.save()
+
+    res = await row_resume_file(str(job_a.id), str(alex.id), str(alex_cv.id), owner)
+
+    assert unquote(res.headers["X-Folder"]) == "Alex/Macy’s 株式会社"
 
 
 async def test_zip_has_the_same_folders(db):
