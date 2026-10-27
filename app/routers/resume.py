@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
+from urllib.parse import quote
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -15,6 +16,7 @@ from app.config import get_settings
 from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
 from app.deps import get_current_user
+from app.job_apply.file_links import content_disposition
 from app.job_apply.schema import TailoredMatch
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.resume_application import (
@@ -863,6 +865,16 @@ def _safe_folder(name: str) -> str:
     return s[:120]
 
 
+# ASCII the folder may keep after _safe_folder, sent as-is so plain names read the same; `%` itself is encoded.
+_FOLDER_HEADER_SAFE = "/ !#$&'()+,;=@[]^`{}~"
+
+
+def _folder_header(folder: str) -> str:
+    """`X-Folder` value. Headers are Latin-1, so a company like "Macy’s" or "株式会社" would 500 the download;
+    percent-encode anything non-ASCII and the app decodes it."""
+    return quote(folder, safe=_FOLDER_HEADER_SAFE)
+
+
 async def _fetch_pdf_bytes(job: ResumeApplication) -> bytes:
     """PDF bytes for a job — pulled from S3 when configured, else inline
     pdfData. Used by both single + bulk zip downloads."""
@@ -932,14 +944,14 @@ async def download_job(
         return Response(
             content=pdf,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="Resume.pdf"', "X-Folder": folder},
+            headers={"Content-Disposition": f'attachment; filename="Resume.pdf"', "X-Folder": _folder_header(folder)},
         )
     zip_bytes = _build_zip([(f"{folder}/Resume.pdf", pdf)])
     zip_name = f"{_safe_folder(job.companyName or 'company')}.zip"
     return Response(
         content=zip_bytes,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        headers={"Content-Disposition": content_disposition(zip_name)},
     )
 
 
