@@ -245,6 +245,7 @@ async def _run_job(
                     user=owner,
                     model_id=job.coverLetterModelId,
                     hook=job.coverLetterHook,
+                    screening_pairs=job.screeningPairs,
                 )
                 job.coverLetterText = cl.text
                 job.coverLetterLlmProvider = cl.provider
@@ -591,6 +592,7 @@ async def regenerate_cover_letter(
                 user=owner,
                 model_id=model_id,
                 hook=hook or None,
+                screening_pairs=job.screeningPairs,
             )
     except Exception as exc:  # noqa: BLE001 — surface any provider failure; the job stays as it was
         log.warning("cover-letter regeneration failed for job %s: %s", job_id, exc)
