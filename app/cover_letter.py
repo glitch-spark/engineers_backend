@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 from app.llm_router import LlmResult, complete
 from app.models import UserExtra
@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 
 MIN_WORDS = 150
 MAX_WORDS = 450
+# Per-answer cap on the screening Q&A fed to the draft, to bound its token cost.
+SCREENING_ANSWER_MAX_CHARS = 600
 
 _DRAFT_SYSTEM = (
     "You write a personalized cover letter for a job application. The "
@@ -127,8 +129,31 @@ def _context_blocks(resume_text: str, job_description: str, company: str) -> lis
     return blocks
 
 
+def _screening_block(screening_pairs: Optional[Sequence[Any]]) -> Optional[str]:
+    """The job's screening Q&A as tone/angle guidance only; None when there is none."""
+    lines: list[str] = []
+    for p in screening_pairs or []:
+        q = (p.get("question") if isinstance(p, dict) else getattr(p, "question", "")) or ""
+        a = (p.get("answer") if isinstance(p, dict) else getattr(p, "answer", "")) or ""
+        if q.strip() and a.strip():
+            lines.append(f"Q: {q.strip()}\nA: {a.strip()[:SCREENING_ANSWER_MAX_CHARS]}")
+    if not lines:
+        return None
+    return (
+        "SCREENING Q&A (the candidate's own answers for this application — use ONLY to inform the "
+        "letter's tone, motivation and angle; do NOT cite any fact from it that the resume does "
+        "not support):\n" + "\n\n".join(lines)
+    )
+
+
 def build_draft_prompt(
-    *, resume_text: str, job_description: str, company: str, prompt_body: str, hook: Optional[str]
+    *,
+    resume_text: str,
+    job_description: str,
+    company: str,
+    prompt_body: str,
+    hook: Optional[str],
+    screening_pairs: Optional[Sequence[Any]] = None,
 ) -> str:
     if not (resume_text or "").strip():
         log.warning("cover letter prompt missing resume text — output will be generic")
@@ -145,6 +170,9 @@ def build_draft_prompt(
         parts.append(
             "ANGLE FROM THE CANDIDATE (work this in naturally, truthfully):\n" + hook.strip()
         )
+    screening = _screening_block(screening_pairs)
+    if screening:
+        parts.append(screening)
     parts.extend(_context_blocks(resume_text, job_description, company))
     return "\n\n".join(parts)
 
@@ -191,14 +219,16 @@ async def generate_cover_letter(
     user: Optional[UserExtra],
     model_id: Optional[str],
     hook: Optional[str] = None,
+    screening_pairs: Optional[Sequence[Any]] = None,
 ) -> CoverLetterResult:
     ctx = dict(resume_text=resume_text, job_description=job_description, company=company)
     results: list[LlmResult] = []
     step_errors: list[str] = []
 
+    # Screening Q&A goes to the draft only: it steers tone, so the review steps don't need (or pay for) it.
     draft = await complete(
         "cover_letter",
-        build_draft_prompt(prompt_body=prompt_body, hook=hook, **ctx),
+        build_draft_prompt(prompt_body=prompt_body, hook=hook, screening_pairs=screening_pairs, **ctx),
         user,
         model_id=model_id,
     )

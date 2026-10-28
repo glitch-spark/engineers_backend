@@ -175,6 +175,28 @@ async def test_hook_appears_in_draft_prompt(monkeypatch):
     assert "I mentored three interns on your stack" in calls[0]["prompt"]
 
 
+async def test_screening_qa_goes_to_draft_only_as_tone_guidance(monkeypatch):
+    calls = script(monkeypatch, [letter(), "- fix", letter(extra="v2")])
+    pairs = [
+        {"question": "Why Acme?", "answer": "I love developer tooling."},
+        {"question": "Unanswered?", "answer": "  "},
+    ]
+    await generate(screening_pairs=pairs)
+    draft, critique, revise = (c["prompt"] for c in calls)
+    assert "Q: Why Acme?\nA: I love developer tooling." in draft and "tone" in draft
+    assert "Unanswered?" not in draft
+    assert "I love developer tooling" not in critique and "I love developer tooling" not in revise
+
+
+async def test_screening_answers_are_capped_and_absent_without_pairs(monkeypatch):
+    calls = script(monkeypatch, [letter(), "OK", letter(), "OK"])
+    await generate(screening_pairs=[{"question": "Q", "answer": "x" * 5000}])
+    assert "x" * cl.SCREENING_ANSWER_MAX_CHARS in calls[0]["prompt"]
+    assert "x" * (cl.SCREENING_ANSWER_MAX_CHARS + 1) not in calls[0]["prompt"]
+    await generate()
+    assert "SCREENING Q&A" not in calls[2]["prompt"]
+
+
 async def test_long_dashes_normalized_and_fences_stripped(monkeypatch):
     script(monkeypatch, ["```\n" + letter(extra="Fast — reliable") + "\n```", "OK"])
     res = await generate()

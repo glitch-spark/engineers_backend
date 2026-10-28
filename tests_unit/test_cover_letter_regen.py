@@ -49,7 +49,7 @@ def make_job(**over):
         userId="u1", accountId="acc1", companyName="Acme", jobDescription="JD", plainText="resume text",
         coverLetterText="old letter", coverLetterLlmProvider="anthropic", coverLetterLlmModel="claude-opus-5-5",
         coverLetterLlmFallbackUsed=False, coverLetterLlmFallbackReason=None, coverLetterHistory=[],
-        coverLetterHook=None, coverLetterModelId=None, estimatedCostUsd=0.5, saved=0,
+        coverLetterHook=None, coverLetterModelId=None, estimatedCostUsd=0.5, saved=0, screeningPairs=[],
     )
     base.update(over)
     job = SimpleNamespace(**base)
@@ -130,6 +130,15 @@ async def test_regen_falls_back_to_user_prompt_and_stored_hook(writer):
     assert r.status_code == 200
     assert writer[0]["prompt_body"] == "user prompt" and writer[0]["hook"] == "stored hook"
     assert r.json()["coverLetterHistory"] == []  # nothing to archive
+
+
+async def test_regen_passes_screening_pairs_and_leaves_them_untouched(writer):
+    pairs = [SimpleNamespace(question="Why us?", answer="Your mission.")]
+    job = make_job(screeningPairs=pairs)
+    FakeJobs.store[JOB_ID] = job
+    r = await regen({})
+    assert r.status_code == 200
+    assert writer[0]["screening_pairs"] is pairs and job.screeningPairs is pairs
 
 
 async def test_regen_history_capped_at_five_newest_first(writer):
