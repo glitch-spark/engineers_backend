@@ -243,7 +243,45 @@ async def test_extract_job_keeps_remote_and_unknown():
 def test_prompt_version_is_current():
     from app.job_apply.extract import PROMPT_VERSION
 
-    assert PROMPT_VERSION == "job-extract-v7"  # v6: more regions; v7: tailorLines
+    assert PROMPT_VERSION == "job-extract-v8"  # v6: more regions; v7: tailorLines; v8: work auth only when stated
+
+
+# ---------- work authorization: only when the posting says so (Honeydew / Veralto / Superlinked, 2026-10-27) ----------
+
+HONEYDEW = "Sr Fullstack Engineer - Growth\nLocation: Remote\nBuild product in TypeScript.\nA fully remote role."
+_COPIED_EXAMPLE = {"restricted": True, "countries": ["US"], "note": "US citizens only"}
+
+
+def test_build_prompt_does_not_show_a_restriction_as_the_example():
+    p = build_prompt("JD", RUN)
+    assert "US citizens only" not in p
+    assert "alone is not a restriction" in p
+
+
+@pytest.mark.parametrize("extra", [
+    "",
+    "We hire regardless of race, national origin, citizenship, or veteran status.",
+    "We are an equal opportunity employer and do not discriminate on the basis of citizenship.",
+])
+async def test_extract_job_drops_a_work_auth_restriction_the_posting_never_states(extra):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workAuthorization": _COPIED_EXAMPLE}))
+    ex, _ = await extract_job(f"{HONEYDEW}\n{extra}", user=None, run_date=RUN, llm=llm)
+    assert ex.workAuthorization is None
+
+
+@pytest.mark.parametrize("wording", [
+    "Applicants must be US citizens.",
+    "We are unable to offer visa sponsorship.",
+    "You must be authorized to work in the United States.",
+    "Candidates must have the right to work in the UK.",
+    "This role requires a valid work permit.",
+    "Must be a U.S. person under ITAR.",
+    "Work Auth Status: USC or GC",
+])
+async def test_extract_job_keeps_a_work_auth_restriction_the_posting_states(wording):
+    llm = _llm_says(json.dumps({"title": "T", "terms": [{"term": "Python"}], "workAuthorization": _COPIED_EXAMPLE}))
+    ex, _ = await extract_job(f"{HONEYDEW}\n{wording}", user=None, run_date=RUN, llm=llm)
+    assert ex.workAuthorization is not None and ex.workAuthorization.restricted
 
 
 def test_parse_remote_areas():
