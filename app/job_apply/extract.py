@@ -22,7 +22,7 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v7"
+PROMPT_VERSION = "job-extract-v8"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
 MAX_TERMS = 40
@@ -48,7 +48,7 @@ JSON shape (use null when the posting doesn't say):
   "workMode": "remote|hybrid|onsite|unknown",
   "allowedLocations": [{{"kind": "country|region", "value": "US"}}],
   "remoteAreas": ["Austin Metro", "North Carolina"],
-  "workAuthorization": {{"restricted": true, "countries": ["US"], "note": "US citizens only"}},
+  "workAuthorization": {{"restricted": false, "countries": [], "note": null}},
   "timezoneNote": "4h overlap with EST",
   "clearance": {{"level": "required|preferred|none", "note": "Active Secret"}},
   "postedDate": "YYYY-MM-DD",
@@ -90,8 +90,11 @@ Rules:
   Regions: Worldwide, Americas, North America, South America, Latam, EMEA, Europe, European Union, EU, Africa, APAC,
   Asia. Keep "South America" and "European Union" as written (not Latam / Europe); "America" or "the Americas" is
   Americas. Countries as ISO-3166 alpha-2 codes. Empty list only when the posting gives no location at all.
-- workAuthorization.restricted: true for "citizens only", "must be authorized to work in X without sponsorship",
-  "no visa sponsorship"; countries are ISO-2 codes.
+- workAuthorization.restricted: true only when the posting itself states a citizenship, visa, sponsorship or
+  right-to-work rule: "citizens only", "must be authorized to work in X without sponsorship", "no visa sponsorship".
+  countries are ISO-2 codes; note quotes the posting's own words. Where hires may live is allowedLocations, not
+  this: "Location: United States" or "Remote - UK" alone is not a restriction. When the posting says nothing on
+  work authorization, restricted is false (or workAuthorization is null).
 - clearance.level "required" covers "must hold" AND "must be able to obtain" a security clearance.
 - postedDate: when the job was posted or published; resolve relative phrases ("Posted 2 weeks ago") against today's
   date. Never an archived, closing, expiry, deadline or updated date, nor a date from company news (founding,
@@ -339,6 +342,25 @@ _WORK_AUTH = re.compile(
     re.I,
 )
 _US_MENTION = re.compile(r"\b(?:US|U\.S\.|United States)\b")
+# Wording a real work-authorization rule uses. A model restriction with none of it in the posting is a guess (models
+# copied the prompt's example, "US citizens only", onto 400+ postings that never mention it; 2026-10-27).
+_AUTH_WORDING = re.compile(
+    r"citizen|sponsor|\bvisas?\b|authori[sz](?:ed|ation) to work|\bwork(?:ing)? auth|right to work"
+    r"|work permit|eligib(?:le|ility) to work|legally (?:able|allowed|authori[sz]ed|entitled|permitted) to work"
+    r"|permanent resident|green card|\bUSC\b|\bGC holders?\b|\bITAR\b|export control|\bU\.?S\.? persons?\b",
+    re.I,
+)
+# Equal-opportunity text ("regardless of ... citizenship") names citizenship without restricting anyone.
+_EEO_SENTENCE = re.compile(
+    r"[^.\n]*(?:regardless of|without regard to|equal (?:employment )?opportunit|discriminat)[^.\n]*", re.I
+)
+
+
+def stated_work_auth(wa: Optional[WorkAuth], text: str) -> Optional[WorkAuth]:
+    """Keep a work-authorization restriction only when the posting has wording for one."""
+    if wa is None or not wa.restricted or _AUTH_WORDING.search(_EEO_SENTENCE.sub(" ", text or "")):
+        return wa
+    return None
 _TIMEZONE = re.compile(r"[^.\n]{0,60}\b(?:EST|EDT|PST|PDT|CET|CEST|UTC|GMT|ET|PT|CT|MT)\b[^.\n]{0,40}")
 _CAP_WORD = re.compile(r"(?<![\w.])([A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)*(?:\.[a-z]+)?)(?![\w])")
 _AUTO_SKIP = frozenset(
@@ -569,6 +591,7 @@ async def extract_job(
         if ex.postedDate is None:
             ex.postedDate = _posted_date(jd, run_date)
         ex.workMode = _stated_mode(ex.workMode, jd)
+        ex.workAuthorization = stated_work_auth(ex.workAuthorization, jd)
         return ex, "llm"
     except Exception as exc:  # noqa: BLE001 — any LLM failure falls back to rules
         log.warning("job extraction via LLM failed, using rules: %s", exc)
