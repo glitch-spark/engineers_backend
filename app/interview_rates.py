@@ -65,9 +65,12 @@ async def _profile_regions() -> tuple[dict, int]:
     return regions, sum(1 for r in regions.values() if not r)
 
 
-async def counts(user_ids: list, start: date, end: date, region: Region, regions: dict) -> dict:
+async def counts(
+    user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None,
+) -> dict:
     """userId → [bids, interviews, bidder bids] over the local days [start, end], in the selected region unless
-    `all`. Bids include the bidder ones (All and US only: see BIDDER_REGIONS)."""
+    `all`. Bids include the bidder ones (All and US only: see BIDDER_REGIONS). With `days`, also fills
+    (day, userId) → [self bids, bidder bids] for the bids chart."""
     from app.dashboard_stats import app_tz, local_day_start_utc
     from app.interview_rounds import count_interview_rounds, load_interviews_for_window
     from app.models import DailyPlan
@@ -81,14 +84,59 @@ async def counts(user_ids: list, start: date, end: date, region: Region, regions
     }).to_list()
     for p in plans:
         bidder = p.done.bidsBidder if region in BIDDER_REGIONS else 0
-        out[p.userId][0] += (getattr(p.done, field) if field else p.done.bidsSelf) + bidder
+        own = getattr(p.done, field) if field else p.done.bidsSelf
+        out[p.userId][0] += own + bidder
         out[p.userId][2] += bidder
+        if days is not None:
+            d = days.setdefault((p.date.date(), p.userId), [0, 0])
+            d[0] += own
+            d[1] += bidder
     tz = app_tz()
     first, last = local_day_start_utc(start, tz), local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     for iv in await load_interviews_for_window(user_ids, first, last):
         if region == "all" or regions.get(iv.accountId) == region:
             out[iv.createdBy][1] += count_interview_rounds(iv, first, last)[0]
     return out
+
+
+def buckets(period: Period, start: date, end: date) -> list[tuple[date, date, str]]:
+    """The bids chart's bars: each day of a week; each Monday–Sunday week of a month, clipped to the month."""
+    if period == "week":
+        return [(d, d, f"{d:%a} {d.day}") for d in (start + timedelta(days=i) for i in range((end - start).days + 1))]
+    out, s = [], start
+    while s <= end:
+        e = min(s + timedelta(days=6 - s.weekday()), end)
+        out.append((s, e, f"{s:%b} {s.day}" if s == e else f"{s:%b} {s.day}–{e.day}"))
+        s = e + timedelta(days=1)
+    return out
+
+
+def bids_chart(period: Period, start: date, end: date, users: list, days: dict, viewer_id) -> dict:
+    """Self and bidder applies per user per day (week) or week (month). `users` are every ranked user, oldest
+    account first: a user's color slot is their place there, so it doesn't change with the period or region. Users
+    with no bids in the period are left out."""
+    from app.routers.metrics import _display_name
+
+    totals: dict = defaultdict(int)
+    for (_, uid), (own, bidder) in days.items():
+        totals[uid] += own + bidder
+    shown = [(slot, u) for slot, u in enumerate(users) if totals.get(u.id)]
+    out = []
+    for s, e, lbl in buckets(period, start, end):
+        bids = {}
+        for _, u in shown:
+            own = bidder = 0
+            for (d, uid), (o, b) in days.items():
+                if uid == u.id and s <= d <= e:
+                    own, bidder = own + o, bidder + b
+            bids[str(u.id)] = {"self": own, "bidder": bidder}
+        out.append({"label": lbl, "start": s.isoformat(), "end": e.isoformat(), "bids": bids})
+    return {
+        "unit": "day" if period == "week" else "week",
+        "users": [{"userId": str(u.id), "name": _display_name(u), "slot": slot, "isMe": u.id == viewer_id}
+                  for slot, u in shown],
+        "buckets": out,
+    }
 
 
 def ranked(rows: list[dict]) -> list[dict]:
@@ -112,7 +160,8 @@ async def interview_rates(viewer, period: Period, day: date, region: Region) -> 
     regions, unassigned = await _profile_regions()
 
     start, end = window(period, day)
-    now = await counts(user_ids, start, end, region, regions)
+    days: dict = {}
+    now = await counts(user_ids, start, end, region, regions, days)
     rows = []
     for uid in by_id:
         bids, interviews, bidder = now.get(uid, (0, 0, 0))
@@ -152,5 +201,6 @@ async def interview_rates(viewer, period: Period, day: date, region: Region) -> 
         # Bids shown as self (+bidder): All and US, where the bidder applies count.
         "bidderSplit": region in BIDDER_REGIONS,
         "trend": trend,
+        "bidsChart": bids_chart(period, start, end, sorted(users, key=lambda u: u.id), days, viewer.id),
         "unassignedProfiles": unassigned,
     }

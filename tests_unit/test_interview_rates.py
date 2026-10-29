@@ -131,3 +131,36 @@ async def test_trend_has_the_viewers_and_teams_rate_per_period(db):
     assert sep["teamRate"] == 0.025
     assert (oct_["bids"], oct_["teamBids"], oct_["teamRate"]) == (20, 20, 0.0)
     assert trend[0]["start"] == "2026-03-01"
+
+
+def test_bids_chart_bars_are_days_of_a_week_or_weeks_of_a_month():
+    assert [b[2] for b in ir.buckets("week", *ir.window("week", DAY))] == [
+        "Mon 19", "Tue 20", "Wed 21", "Thu 22", "Fri 23", "Sat 24", "Sun 25"]
+    assert [b[2] for b in ir.buckets("month", *ir.window("month", DAY))] == [
+        "Oct 1–4", "Oct 5–11", "Oct 12–18", "Oct 19–25", "Oct 26–31"]
+
+
+async def test_bids_chart_splits_self_and_bidder_per_user_per_day_oldest_user_first(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    bo = await UserExtra(name="Bo", email="bo@x.io").insert()
+    cy = await UserExtra(name="Cy", email="cy@x.io").insert()  # no bids: left off the chart
+    await _plan(bo, date(2026, 10, 19), bidsSelfUs=4, bidsSelfEu=6, bidsSelf=10, bidsBidder=20)
+    await _plan(ana, date(2026, 10, 19), bidsSelfUs=3, bidsSelf=3)
+    await _plan(ana, date(2026, 10, 21), bidsSelfEu=5, bidsSelf=5, bidsBidder=7)
+
+    chart = (await endpoint(bo, period="week", date="2026-10-21", region="all"))["bidsChart"]
+    assert chart["unit"] == "day"
+    assert [(u["name"], u["slot"], u["isMe"]) for u in chart["users"]] == [("Ana", 0, False), ("Bo", 1, True)]
+    by_day = {b["label"]: b["bids"] for b in chart["buckets"]}
+    assert by_day["Mon 19"] == {str(ana.id): {"self": 3, "bidder": 0}, str(bo.id): {"self": 10, "bidder": 20}}
+    assert by_day["Wed 21"] == {str(ana.id): {"self": 5, "bidder": 7}, str(bo.id): {"self": 0, "bidder": 0}}
+    assert str(cy.id) not in by_day["Mon 19"]
+
+    eu = (await endpoint(bo, period="week", date="2026-10-21", region="EU"))["bidsChart"]  # no bidder outside US
+    assert {b["label"]: b["bids"] for b in eu["buckets"]}["Mon 19"] == {
+        str(ana.id): {"self": 0, "bidder": 0}, str(bo.id): {"self": 6, "bidder": 0}}
+    assert [u["slot"] for u in eu["users"]] == [0, 1]  # colors stay with the user
+
+    month = (await endpoint(bo, period="month", date="2026-10-21", region="all"))["bidsChart"]
+    assert month["unit"] == "week"
+    assert {b["label"]: b["bids"] for b in month["buckets"]}["Oct 19–25"][str(ana.id)] == {"self": 8, "bidder": 7}
