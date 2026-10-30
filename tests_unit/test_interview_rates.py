@@ -10,6 +10,7 @@ os.environ["RESUME_QUEUE_DISABLED"] = "1"
 from datetime import date, datetime
 
 import pytest
+from fastapi import HTTPException
 from beanie import init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
@@ -113,21 +114,93 @@ async def test_everyone_is_ranked_by_rate_low_volume_last(db):
     assert out["label"] == "Oct 19–25, 2026" and out["minBids"] == ir.MIN_BIDS
 
 
-async def test_trend_has_the_viewers_and_teams_rate_per_period(db):
+def test_bids_chart_bars_are_days_of_a_week_or_weeks_of_a_month():
+    week, month = ir.window("week", DAY), ir.window("month", DAY)
+    assert ir.unit("week", *week) == "day" and ir.unit("month", *month) == "week"
+    assert [b[2] for b in ir.buckets("day", *week)] == [
+        "Mon 19", "Tue 20", "Wed 21", "Thu 22", "Fri 23", "Sat 24", "Sun 25"]
+    assert [b[2] for b in ir.buckets("week", *month)] == [
+        "Oct 1–4", "Oct 5–11", "Oct 12–18", "Oct 19–25", "Oct 26–31"]
+
+
+def test_a_custom_range_is_split_by_its_length():
+    assert ir.window("custom", date(2026, 10, 3), date(2026, 10, 9)) == (date(2026, 10, 3), date(2026, 10, 9))
+    assert ir.unit("custom", date(2026, 10, 1), date(2026, 10, 14)) == "day"
+    assert ir.unit("custom", date(2026, 10, 1), date(2026, 10, 15)) == "week"
+    assert ir.unit("custom", date(2026, 6, 1), date(2026, 9, 28)) == "week"  # 120 days
+    assert ir.unit("custom", date(2026, 6, 1), date(2026, 9, 29)) == "month"
+    assert [b[2] for b in ir.buckets("week", date(2026, 9, 24), date(2026, 10, 6))] == [
+        "Sep 24–27", "Sep 28 – Oct 4", "Oct 5–6"]
+    assert [b[2] for b in ir.buckets("month", date(2025, 11, 20), date(2026, 1, 10))] == [
+        "Nov 2025", "Dec 2025", "Jan 2026"]
+    assert ir.label("custom", date(2025, 12, 20), date(2026, 1, 5)) == "Dec 20, 2025 – Jan 5, 2026"
+    assert ir.label("custom", date(2026, 10, 3), date(2026, 10, 3)) == "Oct 3, 2026"
+
+
+async def test_a_custom_range_counts_its_days(db):
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
-    ben = await UserExtra(name="Ben", email="ben@x.io").insert()
-    b_acc = await Account(name="Ben", createdBy=ben.id, region="US").insert()
-    await _plan(ana, date(2026, 9, 10), bidsSelf=10)
-    await _plan(ben, date(2026, 9, 12), bidsSelf=10, bidsBidder=20)
-    await _interview(ben, b_acc, ("intro", datetime(2026, 9, 20, 15), "scheduled"))
-    await _plan(ana, date(2026, 10, 5), bidsSelf=20)
+    us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
+    await _plan(ana, date(2026, 10, 18), bidsSelf=50)  # the day before: outside the range
+    await _plan(ana, date(2026, 10, 19), bidsSelf=10, bidsBidder=30)
+    await _plan(ana, date(2026, 10, 21), bidsSelf=20)
+    await _interview(ana, us, ("intro", IN_WEEK, "passed"))
 
-    out = await endpoint(ana, period="month", date="2026-10-21", region="all")
+    out = await endpoint(ana, period="custom", date="2026-10-19", to="2026-10-21", region="all")
+    assert (out["label"], out["rows"][0]["bids"], out["rows"][0]["interviews"]) == ("Oct 19–21, 2026", 60, 1)
+    assert out["bidsChart"]["unit"] == "day" and "trend" not in out
+    bids = {b["label"]: b["values"][str(ana.id)] for b in out["bidsChart"]["buckets"]}
+    assert bids == {"Mon 19": {"self": 10, "bidder": 30}, "Tue 20": {"self": 0, "bidder": 0},
+                    "Wed 21": {"self": 20, "bidder": 0}}
+    ivs = {b["label"]: b["values"][str(ana.id)] for b in out["interviewsChart"]["buckets"]}
+    assert ivs["Tue 20"] == {"interviews": 1}
 
-    trend = out["trend"]
-    assert len(trend) == ir.TREND_PERIODS and [t["label"] for t in trend[-2:]] == ["Sep 2026", "Oct 2026"]
-    sep, oct_ = trend[-2], trend[-1]
-    assert (sep["bids"], sep["rate"], sep["teamBids"], sep["teamInterviews"]) == (10, 0.0, 40, 1)
-    assert sep["teamRate"] == 0.025
-    assert (oct_["bids"], oct_["teamBids"], oct_["teamRate"]) == (20, 20, 0.0)
-    assert trend[0]["start"] == "2026-03-01"
+    for bad in ({"to": ""}, {"to": "2026-10-18"}, {"to": "2027-10-20"}):
+        with pytest.raises(HTTPException) as e:
+            await endpoint(ana, period="custom", date="2026-10-19", region="all", **bad)
+        assert e.value.status_code == 400
+
+
+async def test_bids_chart_splits_self_and_bidder_per_user_per_day_oldest_user_first(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    bo = await UserExtra(name="Bo", email="bo@x.io").insert()
+    cy = await UserExtra(name="Cy", email="cy@x.io").insert()  # no bids: left off the chart
+    await _plan(bo, date(2026, 10, 19), bidsSelfUs=4, bidsSelfEu=6, bidsSelf=10, bidsBidder=20)
+    await _plan(ana, date(2026, 10, 19), bidsSelfUs=3, bidsSelf=3)
+    await _plan(ana, date(2026, 10, 21), bidsSelfEu=5, bidsSelf=5, bidsBidder=7)
+
+    chart = (await endpoint(bo, period="week", date="2026-10-21", region="all"))["bidsChart"]
+    assert chart["unit"] == "day"
+    assert [(u["name"], u["slot"], u["isMe"]) for u in chart["users"]] == [("Ana", 0, False), ("Bo", 1, True)]
+    by_day = {b["label"]: b["values"] for b in chart["buckets"]}
+    assert by_day["Mon 19"] == {str(ana.id): {"self": 3, "bidder": 0}, str(bo.id): {"self": 10, "bidder": 20}}
+    assert by_day["Wed 21"] == {str(ana.id): {"self": 5, "bidder": 7}, str(bo.id): {"self": 0, "bidder": 0}}
+    assert str(cy.id) not in by_day["Mon 19"]
+
+    eu = (await endpoint(bo, period="week", date="2026-10-21", region="EU"))["bidsChart"]  # no bidder outside US
+    assert {b["label"]: b["values"] for b in eu["buckets"]}["Mon 19"] == {
+        str(ana.id): {"self": 0, "bidder": 0}, str(bo.id): {"self": 6, "bidder": 0}}
+    assert [u["slot"] for u in eu["users"]] == [0, 1]  # colors stay with the user
+
+    month = (await endpoint(bo, period="month", date="2026-10-21", region="all"))["bidsChart"]
+    assert month["unit"] == "week"
+    assert {b["label"]: b["values"] for b in month["buckets"]}["Oct 19–25"][str(ana.id)] == {"self": 8, "bidder": 7}
+
+
+async def test_interviews_chart_counts_rounds_held_per_user_per_day(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    bo = await UserExtra(name="Bo", email="bo@x.io").insert()  # bids but no interviews: left off this chart
+    us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
+    await _plan(bo, date(2026, 10, 19), bidsSelf=10)
+    await _interview(ana, us, ("intro", IN_WEEK, "passed"), ("tech_round_1", datetime(2026, 10, 22, 15), "scheduled"))
+    await _interview(ana, us, ("intro", IN_WEEK, "canceled"))  # canceled rounds don't count
+
+    out = await endpoint(ana, period="week", date="2026-10-21", region="all")
+    chart = out["interviewsChart"]
+    assert [(u["name"], u["slot"], u["isMe"]) for u in chart["users"]] == [("Ana", 0, True)]
+    by_day = {b["label"]: b["values"] for b in chart["buckets"]}
+    assert by_day["Tue 20"] == {str(ana.id): {"interviews": 1}}
+    assert by_day["Thu 22"] == {str(ana.id): {"interviews": 1}}
+    assert by_day["Mon 19"] == {str(ana.id): {"interviews": 0}}
+    assert [u["name"] for u in out["bidsChart"]["users"]] == ["Bo"]
+    assert out["bidsChart"]["users"][0]["slot"] == 1  # colors stay with the user across charts
+    assert (await endpoint(ana, period="week", date="2026-10-21", region="EU"))["interviewsChart"]["users"] == []

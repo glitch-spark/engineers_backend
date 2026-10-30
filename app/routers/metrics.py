@@ -685,45 +685,60 @@ async def leaderboard_consolidated(
     }
 
 
+def _stats_days(period: str, date: str, to: str):
+    """The Statistics tabs' `date` (a day in the week or month; a custom range's first day) and, for a custom
+    range, its last day `to`."""
+    from datetime import date as date_cls
+
+    from app.interview_rates import MAX_CUSTOM_DAYS
+
+    try:
+        day = date_cls.fromisoformat(date) if date else datetime.now(timezone.utc).date()
+        until = date_cls.fromisoformat(to) if period == "custom" and to else None
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date and to must be YYYY-MM-DD")
+    if period == "custom":
+        if not (date and until):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="a custom range needs date and to")
+        if until < day:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="to must be on or after date")
+        if (until - day).days + 1 > MAX_CUSTOM_DAYS:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"a custom range is at most {MAX_CUSTOM_DAYS} days")
+    return day, until
+
+
 @router.get("/interview-rates")
 async def interview_rates(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    period: Literal["week", "month"] = Query("week"),
-    date: str = Query("", description="YYYY-MM-DD, any day in the week or month (default: today, UTC)"),
+    period: Literal["week", "month", "custom"] = Query("week"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month (default: today, UTC); custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
 ) -> dict:
     """Statistics → Interview rate: every user's bids, interviews and rate in one period and region, ranked, with
     the viewer's and the team's rate over the last periods (app/interview_rates.py)."""
-    from datetime import date as date_cls
-
     from app import interview_rates as ir
 
-    try:
-        day = date_cls.fromisoformat(date) if date else datetime.now(timezone.utc).date()
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date must be YYYY-MM-DD")
-    return await ir.interview_rates(user, period, day, region)
+    day, until = _stats_days(period, date, to)
+    return await ir.interview_rates(user, period, day, region, until)
 
 
 @router.get("/resume-compare")
 async def resume_compare(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    period: Literal["week", "month"] = Query("month"),
-    date: str = Query("", description="YYYY-MM-DD, any day in the week or month (default: today, UTC)"),
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month (default: today, UTC); custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     q: str = Query("", description="company name filter"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
 ) -> dict:
     """Statistics → Resume compare: the jobs with an interview in the period, and every user's resume and score for
     each (app/resume_compare.py)."""
-    from datetime import date as date_cls
-
     from app import resume_compare as rc
 
-    try:
-        day = date_cls.fromisoformat(date) if date else datetime.now(timezone.utc).date()
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date must be YYYY-MM-DD")
-    return await rc.resume_compare(user, period, day, q, region)
+    day, until = _stats_days(period, date, to)
+    return await rc.resume_compare(user, period, day, q, region, until)
 
 
 @router.get("/dashboard-feed")
