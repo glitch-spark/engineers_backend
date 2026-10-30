@@ -54,7 +54,9 @@ async def _resumes_for(keys: list[str], user_ids: list) -> list[dict]:
     return out
 
 
-async def resume_compare(viewer, period: Period, day: date, q: str = "", region: Region = "all") -> dict:
+async def resume_compare(
+    viewer, period: Period, day: date, q: str = "", region: Region = "all", until: Optional[date] = None,
+) -> dict:
     from app.dashboard_stats import app_tz, local_day_start_utc
     from app.interview_resume_link import normalize_company
     from app.interview_rounds import load_interviews_for_window
@@ -64,7 +66,7 @@ async def resume_compare(viewer, period: Period, day: date, q: str = "", region:
 
     users = await UserExtra.find({"role": {"$ne": "admin"}}).to_list()
     by_id = {u.id: u for u in users}
-    start, end = window(period, day)
+    start, end = window(period, day, until)
     tz = app_tz()
     first, last = local_day_start_utc(start, tz), local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     regions, _ = await _profile_regions()
