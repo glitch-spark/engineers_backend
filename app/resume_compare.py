@@ -132,7 +132,7 @@ async def resume_compare(
                 "promptName": d.get("promptName"),
                 "score": {"total": score["total"], "band": score["band"], "missing": score.get("missing") or []}
                 if score else None,
-                "link": file_links.file_url("tailored", str(d["_id"])),
+                "link": file_links.file_path("tailored", str(d["_id"])),
                 "interviewed": (str(uid), str(acc)) in interviewed,
             })
         # An interviewed profile with no resume for the link still shows that it got the interview.

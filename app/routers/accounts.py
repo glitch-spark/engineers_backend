@@ -501,9 +501,10 @@ async def resume_file_url(
     resume_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    """Short-lived download link for a resume's original file. Owner-or-admin, like GET /accounts/{id}."""
+    """Short-lived download link for a resume's original file. Owner, admin, or an interview manager (they open
+    everyone's interviews, so they can save the resume an interview came from)."""
     acc = await Account.get(to_object_id(account_id))
-    if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
+    if acc is None or (user.role not in ("admin", "interview_manager") and str(acc.createdBy) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     resume = next((r for r in acc.resumes if str(r.id) == resume_id), None)
     if resume is None or not resume.s3Key:

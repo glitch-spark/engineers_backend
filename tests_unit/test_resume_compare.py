@@ -70,6 +70,7 @@ async def test_one_row_per_interviewed_job_with_everyones_resume_and_score(db):
     a, = row["cells"][str(ana.id)]
     assert (a["resumeJobId"], a["kind"], a["score"]["total"], a["interviewed"]) == (str(winner.id), "tailored", 84, True)
     assert file_links.read_token(a["link"].rsplit("/", 1)[1])["id"] == str(winner.id)  # a signed link anyone can open
+    assert a["link"].startswith("/job-applies/files/")  # the app prefixes the API it talks to, not APP_BASE_URL
     b, = row["cells"][str(ben.id)]
     assert (b["resumeJobId"], b["kind"], b["score"]["total"], b["interviewed"]) == (str(newer.id), "fixed", 71, False)
     assert str(older.id) != b["resumeJobId"] and str(cy.id) not in row["cells"]

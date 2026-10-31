@@ -937,7 +937,8 @@ async def download_job(
     header — used by the File System Access API path so the SPA can write
     nested folders directly into the user-picked directory."""
     job = await ResumeApplication.get(to_object_id(job_id))
-    if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
+    # Interview managers open everyone's interviews, so they can save the resume an interview came from.
+    if job is None or (user.role not in ("admin", "interview_manager") and str(job.userId) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
 
     pdf = await _fetch_pdf_bytes(job)
