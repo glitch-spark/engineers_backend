@@ -125,6 +125,25 @@ async def test_each_callers_interviews_by_the_period_they_were_held_in(db):
     assert {r["callerId"] for r in eu_only["rounds"]} == {str(pi.id), None}
 
 
+async def test_a_typed_caller_name_counts_for_that_caller(db):
+    """Rounds saved before the caller list have only a typed name: it counts for the caller of that name (any case,
+    or a known other spelling); TBD and unknown names stay Unassigned."""
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
+    mu = await _caller("Muhammad")
+    await _interview(ana, us, _round(at(10, 5), "canceled", typed="Mohammad"), company="Zoox")
+    await _interview(ana, us, _round(at(10, 6), "rejected", typed=" muhammad "), company="Recuro")
+    await _interview(ana, us, _round(at(10, 7), "canceled", typed="TBD"), company="Open")
+    await _interview(ana, us, _round(at(10, 8), "passed", typed="David"), company="Dave")
+
+    out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
+
+    rows = {c["name"]: c for c in out["callers"]}
+    assert (rows["Muhammad"]["counts"]["canceled"], rows["Muhammad"]["counts"]["rejected"]) == (1, 1)
+    assert {r["company"] for r in out["rounds"] if r["callerId"] == str(mu.id)} == {"Zoox", "Recuro"}
+    assert {r["company"] for r in out["rounds"] if r["callerId"] is None} == {"Open", "Dave"}
+
+
 async def test_the_endpoint_is_for_caller_managers(client):
     staff = await UserExtra(name="Ana", email="ana@x.io").insert()
     boss = await UserExtra(name="Boss", email="boss@x.io", role="interview_manager").insert()

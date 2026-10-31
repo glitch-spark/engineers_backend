@@ -1,8 +1,9 @@
 """Statistics → Callers: each caller's interviews for a week, month or custom range, which callers are paid by.
 See docs/superpowers/specs/2026-10-30-caller-stats-design.md.
 
-A caller round is a round with a caller requested; its caller is caller.callerId (none = Unassigned). A round counts
-in the period it was held, with its result as it is now. Sections:
+A caller round is a round with a caller requested; its caller is caller.callerId, else the caller whose name was typed
+(rounds saved before the caller list), else Unassigned. A round counts in the period it was held, with its result as it
+is now. Sections:
 - period: rounds held within the period: passed, rejected, canceled or awaiting their result;
 - outdated: rounds held before the period, still awaiting their result;
 - scheduled: rounds still scheduled, dated on or before the period's last day (stale when the time has passed).
@@ -17,6 +18,18 @@ from typing import Optional
 from app.interview_rates import Period, Region, _profile_regions, label, rate, window
 
 RESULTS = ("passed", "rejected", "canceled", "awaiting")  # a held round's result; awaiting = held, none yet
+# Other spellings typed for a caller: typed key → the caller's nameKey.
+ALIASES = {"mohammad": "muhammad", "mohammed": "muhammad", "muhammed": "muhammad"}
+
+
+def name_key(name: str) -> str:
+    return " ".join((name or "").split()).lower()
+
+
+def typed_caller(name: str, callers: dict):
+    """The caller (`callers`: nameKey → caller) a typed caller name means, or None (TBD, unknown names)."""
+    key = name_key(name)
+    return callers.get(ALIASES.get(key, key))
 
 
 def _utc(v: datetime) -> datetime:
@@ -58,6 +71,7 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
     start, end = window(period, day, until)
     regions, _ = await _profile_regions()
     callers = sorted(await Caller.find_all().to_list(), key=lambda c: c.nameKey)
+    by_key = {c.nameKey: c for c in callers}
 
     rounds, owners = [], set()
     for iv in await Interview.find({"stageHistory.caller.enabled": True}).to_list():
@@ -72,8 +86,10 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
             if section is None:
                 continue
             ends = e.endsAt or held + timedelta(hours=1)
+            typed = None if e.caller.callerId else typed_caller(e.caller.callerName, by_key)
             rounds.append({
-                "interviewId": str(iv.id), "roundId": e.id, "callerId": e.caller.callerId or None,
+                "interviewId": str(iv.id), "roundId": e.id,
+                "callerId": e.caller.callerId or (str(typed.id) if typed else None),
                 "callerName": (e.caller.callerName or "").strip(), "section": section, "roundDate": _iso(held),
                 "company": (iv.companyName or "").strip(), "stage": getattr(e.stage, "value", e.stage),
                 "engineerId": iv.createdBy, "result": result,
