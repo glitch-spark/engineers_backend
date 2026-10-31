@@ -43,7 +43,7 @@ from app.interview_rounds import (
     load_interviews_for_window,
 )
 from app.models import DailyPlan, Transaction, UserExtra
-from app.plan_auto import interviews_by_day, weekly_plans_for
+from app.plan_auto import interviews_by_day, interviews_split, weekly_plans_for
 from app.routers._util import to_object_id
 from app.routers.metrics import _display_name
 from app.routers.transactions import _TOTALS_GROUP
@@ -182,8 +182,8 @@ async def dashboard_week(
     bids_scores = {uid: 0 for uid in population}
     for p in score_docs:
         bids_scores[p.userId] = bids_scores.get(p.userId, 0) + p.done.bidsSelf + p.done.bidsBidder
-    interviews = await interviews_by_day(members, monday, sunday)
-    iv_scores = {uid: sum(interviews.get(uid, {}).values()) for uid in population}
+    interviews = await interviews_split(members, monday, sunday)
+    iv_scores = {uid: interviews[uid]["self"] + interviews[uid]["caller"] for uid in population}
     interviews_done = iv_scores[sid]
 
     return {
@@ -198,6 +198,8 @@ async def dashboard_week(
         },
         "interviews": {
             "done": interviews_done,
+            "self": interviews[sid]["self"],
+            "caller": interviews[sid]["caller"],
             "target": interviews_target,
             "pace": pace(interviews_done, interviews_target, day),
             "percentile": percentile(interviews_done, list(iv_scores.values())),
@@ -326,20 +328,23 @@ async def _active_members() -> list[UserExtra]:
 async def team_metrics(
     members: list[UserExtra], start: date, end: date, today: date, *, with_streak: bool = False,
 ) -> dict:
-    """Every dashboard metric per member over [start, end]: bids (self/bidder), interviews, net earnings, goal
+    """Every dashboard metric per member over [start, end]: bids (self/bidder), interviews (self/caller), net earnings, goal
     attainment (weekly goals pro-rated to the period), plan logging, and — with `with_streak` — the current streak
     (a 400-day plan scan, so only the team table asks for it)."""
     ids = [m.id for m in members]
-    out = {uid: {"bids": 0, "bidsSelf": 0, "bidsBidder": 0, "interviews": 0, "earnings": 0.0} for uid in ids}
+    out = {uid: {"bids": 0, "bidsSelf": 0, "bidsBidder": 0, "interviews": 0, "interviewsSelf": 0, "interviewsCaller": 0,
+                 "earnings": 0.0} for uid in ids}
 
     for p in await _logged_plans(ids, start, end):
         row = out[p.userId]
         row["bidsSelf"] += p.done.bidsSelf
         row["bidsBidder"] += p.done.bidsBidder
         row["bids"] += p.done.bidsSelf + p.done.bidsBidder
-    by_day = await interviews_by_day(ids, start, end)
+    split = await interviews_split(ids, start, end)
     for uid in ids:
-        out[uid]["interviews"] = sum(by_day.get(uid, {}).values())
+        row = out[uid]
+        row["interviewsSelf"], row["interviewsCaller"] = split[uid]["self"], split[uid]["caller"]
+        row["interviews"] = row["interviewsSelf"] + row["interviewsCaller"]
     # Transaction.date is a naive calendar midnight (see /net-monthly): compare it as-is.
     rows = await Transaction.aggregate([
         {"$match": {"userId": {"$in": ids}, "status": "approved",
@@ -400,13 +405,15 @@ async def dashboard_compare(
     people = {m.id: m for m in members}
     stats = await team_metrics(members, start, end, day)
 
-    def ranked(key: str) -> dict:
+    def ranked(key: str, split: Optional[dict] = None) -> dict:
+        """`split`: {row field: stats key} added to each row, e.g. interviews' self and caller parts."""
         board = rank_rows([(uid, _display_name(people[uid]), row[key]) for uid, row in stats.items()])
         mine = next((r for r in board if r["id"] == sid), None)
         return {
             "rows": [
                 {"userId": str(r["id"]), "name": r["name"], "image": people[r["id"]].image or None,
-                 "value": r["value"], "rank": r["rank"]}
+                 "value": r["value"], "rank": r["rank"],
+                 **{field: stats[r["id"]][k] for field, k in (split or {}).items()}}
                 for r in board
             ],
             "subject": {"rank": mine["rank"] if mine else None, "value": mine["value"] if mine else None,
@@ -420,7 +427,7 @@ async def dashboard_compare(
         "subjectId": str(sid),
         "metrics": {
             "bids": ranked("bids"),
-            "interviews": ranked("interviews"),
+            "interviews": ranked("interviews", {"self": "interviewsSelf", "caller": "interviewsCaller"}),
             "earnings": ranked("earnings"),
         },
     }
@@ -452,8 +459,9 @@ async def dashboard_team(
     users = [
         # Admins manage these people, so real names here (the leaderboard's anonymity applies to /compare).
         {"userId": str(m.id), "name": (m.name or m.email or "").strip() or _display_name(m), "image": m.image or None,
-         **{k: stats[m.id][k] for k in ("bids", "bidsSelf", "bidsBidder", "interviews", "earnings", "goalBidsPct",
-                                        "goalInterviewsPct", "logged", "workingDays", "streak")}}
+         **{k: stats[m.id][k] for k in ("bids", "bidsSelf", "bidsBidder", "interviews", "interviewsSelf",
+                                        "interviewsCaller", "earnings", "goalBidsPct", "goalInterviewsPct", "logged",
+                                        "workingDays", "streak")}}
         for m in members
     ]
     users.sort(key=lambda u: (-u["bids"], u["name"].lower()))
@@ -467,6 +475,8 @@ async def dashboard_team(
             "bidsSelf": sum(r["bidsSelf"] for r in rows),
             "bidsBidder": sum(r["bidsBidder"] for r in rows),
             "interviews": sum(r["interviews"] for r in rows),
+            "interviewsSelf": sum(r["interviewsSelf"] for r in rows),
+            "interviewsCaller": sum(r["interviewsCaller"] for r in rows),
             "earnings": round(sum(r["earnings"] for r in rows), 2),
             "goalBidsPct": _team_goal_pct(stats, "bids", "goalBids"),
             "goalInterviewsPct": _team_goal_pct(stats, "interviews", "goalInterviews"),
