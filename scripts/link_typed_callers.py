@@ -1,11 +1,11 @@
 """Link caller rounds that only have a typed caller name to the caller list.
 
-Rounds saved before the caller list have caller.callerName but no callerId, so Statistics → Callers counts them as
-Unassigned. Run once:
+Rounds saved before the caller list have caller.callerName but no callerId. Statistics → Callers already matches the
+name when it reads them; this sets callerId so other screens (the Interviews page's caller filter) match too. Run once:
   python -m scripts.link_typed_callers          # dry run: prints each change and the names left as they are
   python -m scripts.link_typed_callers --apply
 
-A typed name matches a caller's name ignoring case and spacing, or an alias below. TBD, Anyone and unknown names are
+A typed name matches a caller's name ignoring case and spacing, or an alias (app.caller_stats.ALIASES). TBD, Anyone and unknown names are
 left as they are. Idempotent: linked rounds have a callerId and are skipped.
 """
 
@@ -20,14 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
 
+from app.caller_stats import typed_caller  # noqa: E402
 from app.config import get_settings  # noqa: E402
-
-# Other spellings typed for a caller: typed key → the caller's nameKey.
-ALIASES = {"mohammad": "muhammad", "mohammed": "muhammad", "muhammed": "muhammad"}
-
-
-def name_key(name: str) -> str:
-    return " ".join((name or "").split()).lower()
 
 
 def plan_links(doc: dict, callers: dict[str, dict]) -> list[tuple[int, dict, dict]]:
@@ -38,8 +32,7 @@ def plan_links(doc: dict, callers: dict[str, dict]) -> list[tuple[int, dict, dic
         c = e.get("caller") or {}
         if not c.get("enabled") or c.get("callerId"):
             continue
-        key = name_key(c.get("callerName") or "")
-        caller = callers.get(ALIASES.get(key, key))
+        caller = typed_caller(c.get("callerName") or "", callers)
         if caller is not None:
             out.append((i, e, caller))
     return out
