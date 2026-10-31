@@ -88,7 +88,7 @@ async def test_ranks_bids_interviews_and_earnings(db):
     await tx(pedro, 6, 500.0)
     await tx(pedro, 7, -100.0)         # net 400
     await tx(ana, 6, 900.0, status="pending")  # not approved: 0
-    r = await get(pedro, interviews={pedro.id: 2, ana.id: 3})
+    r = await get(pedro, interviews={pedro.id: 2, ana.id: (1, 2)})
     assert r.status_code == 200, r.text
     body = r.json()
     assert (body["range"], body["from"], body["to"], body["subjectId"]) == ("week", "2026-10-05", "2026-10-11", str(pedro.id))
@@ -97,6 +97,8 @@ async def test_ranks_bids_interviews_and_earnings(db):
     assert bids["subject"] == {"rank": 2, "value": 30, "outOf": 3}
     ivs = body["metrics"]["interviews"]
     assert [(x["name"], x["value"]) for x in ivs["rows"]] == [("Ana", 3), ("Pedro", 2), ("Maria", 0)]
+    assert [(x["self"], x["caller"]) for x in ivs["rows"]] == [(1, 2), (2, 0), (0, 0)]
+    assert "self" not in bids["rows"][0]
     earn = body["metrics"]["earnings"]
     assert [(x["name"], x["value"]) for x in earn["rows"]][0] == ("Pedro", 400.0)
     assert earn["subject"]["rank"] == 1

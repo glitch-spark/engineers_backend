@@ -405,13 +405,15 @@ async def dashboard_compare(
     people = {m.id: m for m in members}
     stats = await team_metrics(members, start, end, day)
 
-    def ranked(key: str) -> dict:
+    def ranked(key: str, split: Optional[dict] = None) -> dict:
+        """`split`: {row field: stats key} added to each row, e.g. interviews' self and caller parts."""
         board = rank_rows([(uid, _display_name(people[uid]), row[key]) for uid, row in stats.items()])
         mine = next((r for r in board if r["id"] == sid), None)
         return {
             "rows": [
                 {"userId": str(r["id"]), "name": r["name"], "image": people[r["id"]].image or None,
-                 "value": r["value"], "rank": r["rank"]}
+                 "value": r["value"], "rank": r["rank"],
+                 **{field: stats[r["id"]][k] for field, k in (split or {}).items()}}
                 for r in board
             ],
             "subject": {"rank": mine["rank"] if mine else None, "value": mine["value"] if mine else None,
@@ -425,7 +427,7 @@ async def dashboard_compare(
         "subjectId": str(sid),
         "metrics": {
             "bids": ranked("bids"),
-            "interviews": ranked("interviews"),
+            "interviews": ranked("interviews", {"self": "interviewsSelf", "caller": "interviewsCaller"}),
             "earnings": ranked("earnings"),
         },
     }
