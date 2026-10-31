@@ -48,6 +48,7 @@ async def tx(user, day, amount, status="approved"):
 
 
 def client_for(user, interviews=None):
+    """`interviews`: {userId: self rounds, or (self, caller)} held in any window asked for."""
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
 
@@ -57,10 +58,17 @@ def client_for(user, interviews=None):
     app = FastAPI()
     app.include_router(dashboard.router)
     app.dependency_overrides[get_current_user] = lambda: user
+    def split_of(uid):
+        n = (interviews or {}).get(uid, 0)
+        self_, caller = n if isinstance(n, tuple) else (n, 0)
+        return {"self": self_, "caller": caller}
+
     by_day = AsyncMock(side_effect=lambda ids, start, end: {
-        uid: ({start: (interviews or {}).get(uid, 0)} if (interviews or {}).get(uid) else {}) for uid in ids
+        uid: ({start: sum(split_of(uid).values())} if (interviews or {}).get(uid) else {}) for uid in ids
     })
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test"), patch.object(dashboard, "interviews_by_day", by_day)
+    split = AsyncMock(side_effect=lambda ids, start, end: {uid: split_of(uid) for uid in ids})
+    return (AsyncClient(transport=ASGITransport(app=app), base_url="http://test"),
+            patch.multiple(dashboard, interviews_by_day=by_day, interviews_split=split))
 
 
 async def get(user, interviews=None, **params):

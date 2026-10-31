@@ -539,9 +539,11 @@ def flatten_rounds(
     status: str = "",
     caller_only: bool = False,
     caller_id: str = "",
+    call_type: str = "",
 ) -> list[dict]:
     """Calendar rows: one per round dated in [from_dt, to_dt) (None = open-ended), filtered on the round itself.
-    caller_only keeps caller rounds; caller_id keeps one caller's ("unassigned": no caller yet)."""
+    caller_only keeps caller rounds; caller_id keeps one caller's ("unassigned": no caller yet); call_type keeps
+    "self" rounds (no caller) or "caller" rounds."""
     lo = _utc_naive(from_dt) if from_dt is not None else None
     hi = _utc_naive(to_dt) if to_dt is not None else None
     want_stage = _normalize_stage(stage) if stage else None
@@ -562,7 +564,9 @@ def flatten_rounds(
             on = bool(caller.get("enabled"))
             cid = caller.get("callerId") if on else None
             cname = ((caller.get("callerName") or "").strip() or "TBD") if on else None
-            if (caller_only or caller_id) and not on:
+            if (caller_only or caller_id or call_type == "caller") and not on:
+                continue
+            if call_type == "self" and on:
                 continue
             if caller_id == "unassigned" and (cid or cname != "TBD"):
                 continue
@@ -587,6 +591,13 @@ def flatten_rounds(
     return rows
 
 
+def _call_type_match(call_type: str) -> Any:
+    """Mongo match on `caller.enabled` for a Self / Caller filter: a self round has no caller (or a disabled one)."""
+    if call_type not in ("self", "caller"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="callType must be self or caller")
+    return True if call_type == "caller" else {"$ne": True}
+
+
 _SORT_FIELDS = {"latest": "scheduledAt", "company": "companyName", "stage": "stage", "status": "status"}
 
 
@@ -601,6 +612,7 @@ async def list_interviews(
     stage: str = Query(""),
     status_: str = Query("", alias="status"),
     creatorId: str = Query(""),
+    callType: str = Query("", description="self | caller: who takes the latest round"),
     sort: str = Query("latest"),
     dir: str = Query("desc"),
 ) -> dict:
@@ -619,6 +631,8 @@ async def list_interviews(
         query["status"] = status_
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
+    if callType:
+        query["caller.enabled"] = _call_type_match(callType)
 
     # Legacy clients send sort=asc|desc (by date).
     if sort in ("asc", "desc"):
@@ -659,9 +673,10 @@ async def list_interview_rounds(
     creatorId: str = Query(""),
     callerOnly: bool = Query(False),
     callerId: str = Query(""),
+    callType: str = Query("", description="self | caller: who takes the round"),
 ) -> dict:
     """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list.
-    callerOnly / callerId narrow it to caller rounds (the Callers calendar)."""
+    callerOnly / callerId narrow it to caller rounds (the Callers calendar); callType to self or caller rounds."""
     f_dt, t_dt = parse_date(from_), parse_date(to)
     if f_dt is None or t_dt is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from and to are required")
@@ -670,6 +685,8 @@ async def list_interview_rounds(
     if status_ and status_ not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     in_range: dict[str, Any] = {"scheduledAt": {"$gte": f_dt, "$lt": t_dt}}
+    if callType:
+        in_range["caller.enabled"] = _call_type_match(callType)
     if callerOnly or callerId:
         in_range["caller.enabled"] = True
     query: dict[str, Any] = {"stageHistory": {"$elemMatch": in_range}}
@@ -681,6 +698,7 @@ async def list_interview_rounds(
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(
         out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_, caller_only=callerOnly, caller_id=callerId,
+        call_type=callType,
     )
     # The interviews behind the rounds, so a click can open the side panel
     # (GET /{id} is limited to owner/admin/interview manager; this feed is not).

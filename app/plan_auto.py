@@ -57,6 +57,15 @@ async def interviews_by_day(user_ids: list, start: date, end: date) -> dict:
     }
 
 
+async def interviews_split(user_ids: list, start: date, end: date) -> dict:
+    """{userId: {"self": rounds the owner took, "caller": caller rounds}} held over [start, end]."""
+    counts = await interview_counts(user_ids, start, end)
+    return {
+        uid: {who: sum(e[who] for e in counts.get(uid, {}).values()) for who in ("self", "caller")}
+        for uid in user_ids
+    }
+
+
 def effective_daily_done(plan: Optional[Any], auto_day: dict) -> Counts:
     """A day's Done: typed bids (when there is a plan) and its interviews."""
     return Counts(
