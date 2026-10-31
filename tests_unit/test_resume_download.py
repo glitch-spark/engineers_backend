@@ -74,3 +74,31 @@ async def test_zip_download_names_the_zip_after_the_company(db):
     assert "filename*=UTF-8''" + "Macy%E2%80%99s%20_%20Inc.zip" in cd
     with zipfile.ZipFile(io.BytesIO(res.body)) as zf:
         assert zf.namelist() == ["Alex/Macy’s _ Inc/Resume.pdf"]
+
+
+async def test_admins_and_interview_managers_download_anyones_resume(db, monkeypatch):
+    """They open everyone's interviews, so they can save the resume an interview came from; other users can't."""
+    from fastapi import HTTPException
+
+    from app.models.account import Resume
+    from app.routers import accounts
+
+    monkeypatch.setattr(accounts.resume_files, "presigned_url", lambda key, name: f"https://s3.example/{key}")
+    owner, job = await _job("Alex", "Acme")
+    acc = await Account.get(job.accountId)
+    acc.resumes = [Resume(filename="cv.pdf", markdown="x", s3Key="k/cv.pdf")]
+    await acc.save()
+    rid = str(acc.resumes[0].id)
+    manager = await UserExtra(name="Puma", email="puma@x.io", role="interview_manager").insert()
+    admin = await UserExtra(name="Boss", email="boss@x.io", role="admin").insert()
+    other = await UserExtra(name="Ben", email="ben@x.io").insert()
+
+    for user in (owner, manager, admin):
+        assert (await download_job(str(job.id), user, format="pdf")).body == b"%PDF-fake"
+        assert (await accounts.resume_file_url(str(acc.id), rid, user))["url"] == "https://s3.example/k/cv.pdf"
+    with pytest.raises(HTTPException) as e:
+        await download_job(str(job.id), other, format="pdf")
+    assert e.value.status_code == 404
+    with pytest.raises(HTTPException) as e:
+        await accounts.resume_file_url(str(acc.id), rid, other)
+    assert e.value.status_code == 404

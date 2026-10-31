@@ -63,9 +63,14 @@ def read_token(token: str) -> dict:
     return {"kind": payload["k"], "id": payload["i"], "accountId": payload.get("a"), "company": payload.get("c")}
 
 
+def file_path(kind: Kind, file_id: str, account_id: Optional[str] = None, *, company: Optional[str] = None) -> str:
+    """The link without the API's address, for the app: the browser prefixes the backend it already talks to."""
+    return f"/job-applies/files/{make_token(kind, file_id, account_id, company=company)}"
+
+
 def file_url(kind: Kind, file_id: str, account_id: Optional[str] = None, *, company: Optional[str] = None) -> str:
-    base = get_settings().APP_BASE_URL.rstrip("/")
-    return f"{base}/job-applies/files/{make_token(kind, file_id, account_id, company=company)}"
+    """The full link, for places outside the app (the exported sheet): APP_BASE_URL must be the public API address."""
+    return get_settings().APP_BASE_URL.rstrip("/") + file_path(kind, file_id, account_id, company=company)
 
 
 # ---------- the download: <Company>.zip holding the resume ----------
