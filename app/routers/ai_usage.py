@@ -1,5 +1,5 @@
-"""Admin AI spend report over the ai_usage_events ledger (app/ai_usage.py writes it, the backfill script
-seeds history).
+"""AI spend report for every signed-in user, over the ai_usage_events ledger (app/ai_usage.py writes it, the
+backfill script seeds history).
 
 The SPA sends the period as UTC instants (`from` inclusive, `to` exclusive) plus the viewer's IANA time
 zone, and buckets are labelled in that zone. Mongo filters and sums per UTC 15-minute slot; the slots are
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.deps import require_admin
+from app.deps import get_current_user
 from app.models import AiUsageEvent, UserExtra
 
 router = APIRouter(prefix="/ai-usage", tags=["ai-usage"])
@@ -96,7 +96,7 @@ async def _names(keys: set[str]) -> dict[str, str]:
 
 @router.get("")
 async def ai_usage_report(
-    _admin: Annotated[UserExtra, Depends(require_admin)],
+    _user: Annotated[UserExtra, Depends(get_current_user)],
     from_: str = Query(..., alias="from"),
     to: str = Query(...),
     tz: str = Query("UTC"),

@@ -1,4 +1,4 @@
-"""GET /ai-usage: admin-only AI spend report over the ai_usage_events ledger (mongomock)."""
+"""GET /ai-usage: the AI spend report every signed-in user sees over the ai_usage_events ledger (mongomock)."""
 
 import os
 
@@ -53,9 +53,9 @@ async def get(user, params):
         return await c.get("/ai-usage", params=params)
 
 
-async def test_admin_only(db):
+async def test_every_signed_in_user_can_see_it(db):
     pedro = await make_user("Pedro")
-    assert (await get(pedro, OCT14)).status_code == 403
+    assert (await get(pedro, OCT14)).status_code == 200
 
 
 async def test_totals_rows_and_options(db):

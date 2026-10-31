@@ -144,12 +144,9 @@ async def test_a_typed_caller_name_counts_for_that_caller(db):
     assert {r["company"] for r in out["rounds"] if r["callerId"] is None} == {"Open", "Dave"}
 
 
-async def test_the_endpoint_is_for_caller_managers(client):
+async def test_every_signed_in_user_sees_the_report(client):
     staff = await UserExtra(name="Ana", email="ana@x.io").insert()
-    boss = await UserExtra(name="Boss", email="boss@x.io", role="interview_manager").insert()
     async with client(staff) as c:
-        assert (await c.get("/metrics/caller-stats")).status_code == 403
-    async with client(boss) as c:
         assert (await c.get("/metrics/caller-stats", params={"period": "month", "date": "2026-10-01"})).status_code == 200
         bad = await c.get("/metrics/caller-stats", params={"period": "custom", "date": "2026-10-09", "to": "2026-10-01"})
         assert bad.status_code == 400
