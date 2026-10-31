@@ -31,7 +31,6 @@ from app.models import Interview, ResumeApplication, Transaction, UserExtra
 from app.models.resume_application import BID_FILTER
 from app.plan_auto import week_snapshot
 from app.routers._util import parse_date
-from app.routers.callers import require_caller_manager
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
 log = logging.getLogger(__name__)
@@ -744,14 +743,14 @@ async def resume_compare(
 
 @router.get("/caller-stats")
 async def caller_stats(
-    user: Annotated[UserExtra, Depends(require_caller_manager)],
+    user: Annotated[UserExtra, Depends(get_current_user)],
     period: Literal["week", "month", "custom"] = Query("month"),
     date: str = Query("", description="YYYY-MM-DD: any day in the week or month (default: today, UTC); custom: the first day"),
     to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
 ) -> dict:
-    """Statistics → Callers: each caller's statement, pending and scheduled rounds (app/caller_stats.py). Admins
-    and interview managers only: callers are paid by it."""
+    """Statistics → Callers: each caller's statement, pending and scheduled rounds (app/caller_stats.py), for every
+    signed-in user. Marking a round rejected stays with caller managers."""
     from app import caller_stats as cs
 
     day, until = _stats_days(period, date, to)

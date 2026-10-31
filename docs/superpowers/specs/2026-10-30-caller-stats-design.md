@@ -16,8 +16,8 @@ Out of scope:
 
 ## Who sees it
 
-Admins and interview managers (`routers/callers.is_caller_manager`), as it is about paying callers. Others don't get
-the tab, and both endpoints return 403 to them.
+Every signed-in user sees the tab and the report. Only admins and interview managers
+(`routers/callers.is_caller_manager`) get Mark rejected; the reject endpoint returns 403 to others.
 
 ## Rounds and sections
 
@@ -136,7 +136,7 @@ Unit tests use mongomock, like `tests_unit/test_interview_rates.py`:
   - 409 when the round isn't awaiting, 404 for an unknown round;
   - 403 for someone who isn't a caller manager;
   - calls the Slack sync.
-- 403 on the report for someone who isn't a caller manager; 400 for a bad custom range.
+- 200 on the report for any signed-in user; 400 for a bad custom range.
 - The script matches by name and alias and leaves TBD and unknown names.
 
 Then the tab is checked in the browser against real data (week, month, custom; both sorts; all three tables).
