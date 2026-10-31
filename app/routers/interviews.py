@@ -1127,6 +1127,29 @@ async def update_interview_stage(
     return await _interview_out(iv)
 
 
+@router.post("/{iv_id}/stages/{stage_id}/reject")
+async def reject_awaiting_round(
+    iv_id: str,
+    stage_id: str,
+    user: Annotated[UserExtra, Depends(require_caller_manager)],
+) -> dict:
+    """Statistics → Callers: a held round still awaiting its result is marked rejected (the recruiter never
+    answered). Caller managers can do it on anyone's interview."""
+    iv = await Interview.get(to_object_id(iv_id))
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    before = _round_snapshots(iv)
+    entry = iv.stageHistory[_find_stage(iv, stage_id)]
+    if _status_value(entry.status) != InterviewStatus.completed.value:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only a round awaiting its result can be rejected")
+    entry.status = InterviewStatus.rejected
+    entry.confirmed = False
+    _sync_top_from_tip(iv)
+    await _save_interview(iv)
+    await _sync_caller_posts(iv, before)
+    return await _interview_out(iv)
+
+
 @router.delete("/{iv_id}/stages/{stage_id}")
 async def delete_interview_stage(
     iv_id: str,
