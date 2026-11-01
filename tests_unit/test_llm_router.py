@@ -224,6 +224,22 @@ async def test_openai_responses_sends_temperature_only_to_models_that_take_it(mo
     assert sent[0]["temperature"] == 0 and "temperature" not in sent[1]
 
 
+async def test_resume_task_asks_openai_for_low_temperature_and_other_tasks_do_not(monkeypatch):
+    import app.llm_router as router
+
+    seen = []
+
+    async def fake_responses(prompt, model=None, effort=None, *, temperature=None):
+        seen.append(temperature)
+        return "{}", {}
+
+    monkeypatch.setattr(router, "_openai_responses", fake_responses)
+    spec = SimpleNamespace(provider="openai", api_model="gpt-4o-mini", supports_effort=True)
+    await router._call_spec(spec, "p", "resume", None)
+    await router._call_spec(spec, "p", "cover_letter", None)
+    assert seen == [0.2, None]
+
+
 async def test_job_extract_uses_its_own_model_when_set(monkeypatch):
     import app.llm_router as router
 

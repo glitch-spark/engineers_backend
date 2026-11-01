@@ -45,6 +45,11 @@ class LlmResult:
 # Purposes whose output must not vary between runs of the same input (structured extraction, not writing).
 DETERMINISTIC_PURPOSES = frozenset({"job_extract"})
 
+# Sampling temperature for catalog tasks on OpenAI chat models (reasoning models ignore it, and Anthropic
+# calls never send one). Resume tailoring follows long fill-in prompts, which small models obey more
+# consistently below the API default of 1.0.
+TASK_TEMPERATURE: dict[Task, float] = {"resume": 0.2}
+
 
 def _temperature_for(purpose: str) -> Optional[float]:
     return 0.0 if purpose in DETERMINISTIC_PURPOSES else None
@@ -142,7 +147,9 @@ async def _call_spec(
     if spec.provider == "anthropic":
         effort = TASK_EFFORT[task] if spec.supports_effort else None
         return await anthropic_complete(spec.api_model, prompt, effort=effort)
-    return await _openai_responses(prompt, spec.api_model, effort=TASK_EFFORT[task])
+    return await _openai_responses(
+        prompt, spec.api_model, effort=TASK_EFFORT[task], temperature=TASK_TEMPERATURE.get(task)
+    )
 
 
 def _failure_reason(spec: ModelSpec, exc: Exception) -> str:
