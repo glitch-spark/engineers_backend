@@ -12,7 +12,9 @@ from app import resume_files
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.models.account import PromptRole, Resume, ResumePrompt
-from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
+from app.resume_prompts import (
+    PromptError, apply_prompts, max_body, prompts_view, sync_default_body, sync_default_template,
+)
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -364,6 +366,11 @@ async def get_account(
     return _account_out(acc)
 
 
+def _cut_prompt(text: Optional[str]) -> Optional[str]:
+    """A screening / cover-letter prompt cut to RESUME_PROMPT_MAX_CHARS, like resume prompts."""
+    return text[:max_body()] if text else text
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_account(
     body: AccountCreate,
@@ -380,8 +387,8 @@ async def create_account(
         styleTemplate=_sanitized(body.styleTemplate),
         styleTemplateName=body.styleTemplateName,
         previewHtml=body.previewHtml,
-        screeningPrompt=body.screeningPrompt,
-        coverLetterPrompt=body.coverLetterPrompt,
+        screeningPrompt=_cut_prompt(body.screeningPrompt),
+        coverLetterPrompt=_cut_prompt(body.coverLetterPrompt),
     )
     if body.pageFormat is not None:
         kwargs["pageFormat"] = body.pageFormat
@@ -436,9 +443,9 @@ async def update_account(
     if body.previewHtml is not None:
         acc.previewHtml = body.previewHtml
     if body.screeningPrompt is not None:
-        acc.screeningPrompt = body.screeningPrompt
+        acc.screeningPrompt = _cut_prompt(body.screeningPrompt)
     if body.coverLetterPrompt is not None:
-        acc.coverLetterPrompt = body.coverLetterPrompt
+        acc.coverLetterPrompt = _cut_prompt(body.coverLetterPrompt)
     if body.showInGenerate is not None:
         acc.showInGenerate = body.showInGenerate
     if body.archived is not None and body.archived != acc.archived:

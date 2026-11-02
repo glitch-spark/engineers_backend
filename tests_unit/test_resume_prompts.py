@@ -90,7 +90,10 @@ def _p(i, name=None, body="b"):
         ([_p(1)], "missing"),                         # default not in the list
     ],
 )
-async def test_apply_prompts_rejects_bad_lists(db, prompts, default_id):
+async def test_apply_prompts_rejects_bad_lists(db, monkeypatch, prompts, default_id):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "RESUME_PROMPT_MAX_CHARS", 30000)  # whatever the local .env says
     owner = await _owner()
     acc = Account(name="Blake", createdBy=owner.id)
 
@@ -329,3 +332,20 @@ async def test_the_user_prompt_and_eval_prompt_follow_the_setting(db, monkeypatc
     monkeypatch.setattr("app.routers.prompt_eval.require_model", lambda *a, **k: "m")
     with pytest.raises(HTTPException, match="100 characters"):
         await create_run(RunIn(accountId="a", promptBody="x" * 101), owner)
+
+
+async def test_screening_and_cover_letter_prompts_follow_the_setting(db, monkeypatch):
+    from app.config import get_settings
+    from app.routers.profile import ProfileUpdate, update_profile
+
+    owner = await _owner()
+    acc = await Account(name="Blake", createdBy=owner.id).insert()
+    monkeypatch.setattr(get_settings(), "RESUME_PROMPT_MAX_CHARS", 50000)
+
+    await update_account(str(acc.id), AccountUpdate(screeningPrompt="s" * 60000, coverLetterPrompt="c" * 40000), owner)
+    saved = await Account.get(acc.id)
+    assert (len(saved.screeningPrompt), len(saved.coverLetterPrompt)) == (50000, 40000)
+
+    await update_profile(ProfileUpdate(username="Athen", email="athen@x.io", screeningPromptBody="s" * 60000,
+                                       coverLetterPromptBody="c" * 60000), owner)
+    assert (len(owner.screeningPromptBody), len(owner.coverLetterPromptBody)) == (50000, 50000)

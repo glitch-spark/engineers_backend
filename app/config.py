@@ -64,9 +64,9 @@ class Settings(BaseSettings):
     # the top; the tail is benefits/EEO/legal boilerplate. Trimming cuts
     # input tokens with negligible quality loss. ~12000 chars ≈ 3K tokens.
     RESUME_JD_MAX_CHARS: int = 12000
-    # Longest resume prompt, in characters: a resume unit's body, the profile's / user's resume prompt, a one-off
-    # prompt. Checked on save and read by the editor (GET /resume/limits). Raise it for long prompts; each character
-    # is also input sent to the model on every generation.
+    # Longest prompt, in characters: a resume unit's body, the profile's / user's resume, screening and cover-letter
+    # prompts, a one-off prompt. Checked on save and read by the editor (GET /resume/limits). Raise it for long
+    # prompts; each character is also input sent to the model on every generation.
     RESUME_PROMPT_MAX_CHARS: int = 30000
     # Generation queue (app/resume_queue.py): resumes generating at once, PDF renders (Chromium) at once,
     # and generations a user may queue per day (both the Generator page and Job Applies).

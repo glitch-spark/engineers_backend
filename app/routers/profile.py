@@ -108,9 +108,9 @@ async def update_profile(
     if body.resumePromptBody is not None:
         user.resumePromptBody = body.resumePromptBody[:max_body()] or None
     if body.screeningPromptBody is not None:
-        user.screeningPromptBody = body.screeningPromptBody[:30000] or None
+        user.screeningPromptBody = body.screeningPromptBody[:max_body()] or None
     if body.coverLetterPromptBody is not None:
-        user.coverLetterPromptBody = body.coverLetterPromptBody[:30000] or None
+        user.coverLetterPromptBody = body.coverLetterPromptBody[:max_body()] or None
     await user.save()
 
     return {
