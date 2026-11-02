@@ -16,6 +16,7 @@ from fastapi import HTTPException, status
 from pymongo import ReturnDocument
 
 from app.config import get_settings
+from app.resume_prompts import max_body
 from app.models import Account, ResumeApplication, UserExtra
 
 log = logging.getLogger(__name__)
@@ -27,7 +28,6 @@ POLL_SECONDS = 5
 MAX_ATTEMPTS = 3
 
 MAX_JD_BYTES = 50_000
-MAX_PROMPT_CHARS = 30_000
 
 _wake = asyncio.Event()
 
@@ -147,7 +147,7 @@ async def enqueue_generation(
         generateCoverLetter=bool(cover_letter),
         source=source,
         countsAsBid=False if source == "job_applies" else None,
-        promptOverride=(prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None,
+        promptOverride=(prompt_body or "").strip()[:max_body()] or None,
         promptId=prompt_id,
         promptName=prompt_name,
         templateName=template_name,
@@ -199,7 +199,7 @@ async def requeue_failed(
     job.generateCoverLetter = bool(cover_letter)
     job.resumeModelId = (resume_model or "").strip() or None
     job.coverLetterModelId = (cover_letter_model or "").strip() or None
-    job.promptOverride = (prompt_body or "").strip()[:MAX_PROMPT_CHARS] or None
+    job.promptOverride = (prompt_body or "").strip()[:max_body()] or None
     job.promptId, job.promptName, job.templateName = prompt_id, prompt_name, template_name
     job.attempts = 0
     job.leaseAt = None

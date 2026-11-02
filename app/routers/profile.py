@@ -8,6 +8,7 @@ from app.bids.schemas import password_problem
 from app.deps import get_current_user
 from app.config import get_settings
 from app.models import UserExtra
+from app.resume_prompts import max_body
 from app.security import hash_password, verify_password
 from app.slack_bot import (
     normalize_slack_timezone,
@@ -105,7 +106,7 @@ async def update_profile(
     if body.leaderboardAnon is not None:
         user.leaderboardAnon = body.leaderboardAnon
     if body.resumePromptBody is not None:
-        user.resumePromptBody = body.resumePromptBody[:30000] or None
+        user.resumePromptBody = body.resumePromptBody[:max_body()] or None
     if body.screeningPromptBody is not None:
         user.screeningPromptBody = body.screeningPromptBody[:30000] or None
     if body.coverLetterPromptBody is not None:

@@ -27,7 +27,7 @@ from app.models.prompt_eval import (
 from app.models.account import ResumePrompt
 from app.prompt_eval import runner
 from app.prompt_eval.routing import route_jds
-from app.resume_prompts import MAX_BODY, default_prompt_body, prompts_view
+from app.resume_prompts import default_prompt_body, max_body, prompts_view
 from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume/eval", tags=["prompt-eval"])
@@ -137,7 +137,7 @@ async def unarchive_jd(jd_id: str, user: Annotated[UserExtra, Depends(get_curren
 class RunIn(BaseModel):
     accountId: str
     # None = use the saved prompt (profile, then your global prompt). A string, even empty, is used as is.
-    promptBody: Optional[str] = Field(None, max_length=30_000)
+    promptBody: Optional[str] = None  # up to RESUME_PROMPT_MAX_CHARS, checked in create_run
     resumeModel: Optional[str] = None
     judgeModel: Optional[str] = None  # ignored when judgeMode is "rules"
     judgeMode: JudgeMode = "llm"
@@ -276,8 +276,8 @@ async def create_run(body: RunIn, user: Annotated[UserExtra, Depends(get_current
     judge_model = None if body.judgeMode == "rules" else require_model("judge", body.judgeModel, user)
     if body.jdIds:
         _check_jd_count(len(body.jdIds))
-    if any(len(text) > MAX_BODY for text in body.unitPrompts.values()):
-        raise _bad_request(f"A prompt can be up to {MAX_BODY} characters.")
+    if any(len(text) > max_body() for text in [body.promptBody or "", *body.unitPrompts.values()]):
+        raise _bad_request(f"A prompt can be up to {max_body():,} characters.")
     account = await load_owned_account(body.accountId, user)
     units, default_id = prompts_view(account)
     by_id = {u.id: u for u in units}
