@@ -634,6 +634,17 @@ async def regenerate_cover_letter(
     }
 
 
+# ---------- Limits ------------------------------------------------------------
+
+
+@router.get("/limits")
+async def limits(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Sizes the editors enforce, from this deployment's settings: the longest resume prompt."""
+    from app.resume_prompts import max_body
+
+    return {"promptMaxChars": max_body()}
+
+
 # ---------- Model catalog -----------------------------------------------------
 
 

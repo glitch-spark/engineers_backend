@@ -292,3 +292,40 @@ async def test_a_template_without_a_file_name_still_counts_as_a_template(db):
 
     a, b = acc.resumePrompts
     assert (a.templateName, b.templateName) == ("HTML template", "")  # name set iff there is a template
+
+
+async def test_the_prompt_limit_comes_from_the_setting(db, monkeypatch):
+    from app import resume_queue
+    from app.config import get_settings
+    from app.routers.resume import limits
+
+    owner = await _owner()
+    acc = Account(name="Blake", createdBy=owner.id)
+    monkeypatch.setattr(get_settings(), "RESUME_PROMPT_MAX_CHARS", 50000)
+
+    apply_prompts(acc, [_p(1, body="x" * 40000)], "new-1")  # over the old 30,000: fine now
+    with pytest.raises(PromptError, match="50,000"):
+        apply_prompts(acc, [_p(1, body="x" * 50001)], "new-1")
+    assert await limits(owner) == {"promptMaxChars": 50000}
+
+    monkeypatch.setattr(get_settings(), "RESUME_PROMPT_MAX_CHARS", 100)
+    with pytest.raises(PromptError):
+        apply_prompts(acc, [_p(1, body="x" * 101)], "new-1")
+    assert resume_queue.max_body() == 100  # one-off prompts are cut to the same length
+
+
+async def test_the_user_prompt_and_eval_prompt_follow_the_setting(db, monkeypatch):
+    from app.config import get_settings
+    from app.routers.profile import ProfileUpdate, update_profile
+    from app.routers.prompt_eval import RunIn, create_run
+
+    owner = await _owner()
+    monkeypatch.setattr(get_settings(), "RESUME_PROMPT_MAX_CHARS", 50000)
+    await update_profile(ProfileUpdate(username="Athen", email="athen@x.io", resumePromptBody="x" * 60000), owner)
+    assert len(owner.resumePromptBody) == 50000  # was cut at 30,000 whatever the setting
+
+    RunIn(accountId="a", promptBody="x" * 40000)  # no fixed 30,000 cap on the model
+    monkeypatch.setattr(get_settings(), "RESUME_PROMPT_MAX_CHARS", 100)
+    monkeypatch.setattr("app.routers.prompt_eval.require_model", lambda *a, **k: "m")
+    with pytest.raises(HTTPException, match="100 characters"):
+        await create_run(RunIn(accountId="a", promptBody="x" * 101), owner)

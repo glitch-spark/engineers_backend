@@ -17,12 +17,19 @@ from app.models.account import PageFormat, PromptRole, ResumePrompt
 
 MAX_PROMPTS = 10
 MAX_NAME = 60
-MAX_BODY = 30000
 MAX_TEMPLATE_BYTES = 2 * 1024 * 1024
 # All of a profile's templates (the default's counted twice: it is mirrored into styleTemplate), well under
 # MongoDB's 16 MB document limit.
 MAX_TOTAL_TEMPLATE_BYTES = 8 * 1024 * 1024
 DEFAULT_NAME = "Default"
+
+
+def max_body() -> int:
+    """The longest resume prompt, in characters (RESUME_PROMPT_MAX_CHARS)."""
+    from app.config import get_settings
+
+    return max(1, get_settings().RESUME_PROMPT_MAX_CHARS)
+
 LEGACY_ID = "default"
 _ROLES = set(get_args(PromptRole))
 _FORMATS = set(get_args(PageFormat))
@@ -123,8 +130,8 @@ def apply_prompts(account: Any, prompts: list[dict], default_id: Optional[str]) 
         if name.lower() in names:
             raise PromptError("Another prompt already has this name")
         names.add(name.lower())
-        if len(body) > MAX_BODY:
-            raise PromptError(f"A prompt can be up to {MAX_BODY} characters")
+        if len(body) > max_body():
+            raise PromptError(f"A prompt can be up to {max_body():,} characters")
         roles = list(raw.get("roles") or ([raw["role"]] if raw.get("role") else []))
         if any(r not in _ROLES for r in roles) or len(set(roles)) != len(roles):
             raise PromptError("Each role can be marked once, from the list")
