@@ -64,6 +64,11 @@ def _openai_model_for(purpose: str, settings) -> str:
 _REASONING_FAMILIES = ("gpt-5", "gpt-6")
 
 
+def is_reasoning_model(model: str) -> bool:
+    """OpenAI models that take a reasoning effort (and, on chat completions, max_completion_tokens, not max_tokens)."""
+    return (model or "").startswith(_REASONING_FAMILIES)
+
+
 async def _openai_responses(
     prompt: str, model: Optional[str] = None, effort: Optional[str] = None, *, temperature: Optional[float] = None
 ) -> tuple[str, dict]:
@@ -76,7 +81,7 @@ async def _openai_responses(
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     resolved = model or settings.RESUME_OPENAI_MODEL
     kwargs: dict = {"model": resolved, "input": prompt}
-    if resolved.startswith(_REASONING_FAMILIES):
+    if is_reasoning_model(resolved):
         resolved_effort = effort or (getattr(settings, "RESUME_REASONING_EFFORT", None) or "low").strip()
         kwargs["reasoning"] = {"effort": resolved_effort}
     elif temperature is not None and not resolved.startswith(("o1", "o3", "o4")):  # reasoning models reject it

@@ -258,3 +258,19 @@ async def test_job_extract_uses_its_own_model_when_set(monkeypatch):
         OPENAI_API_KEY="k", RESUME_OPENAI_MODEL="gpt-4o-mini", JOB_EXTRACT_MODEL=""))
     await router.complete_with_fallback("p", None, purpose="job_extract")
     assert seen == ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o-mini"]
+
+
+def test_reasoning_models_are_the_gpt_5_and_gpt_6_families():
+    from app.llm_router import is_reasoning_model
+
+    assert is_reasoning_model("gpt-6-luna") and is_reasoning_model("gpt-5-mini")
+    assert not is_reasoning_model("gpt-4o-mini") and not is_reasoning_model("gpt-4.1-mini")
+    assert not is_reasoning_model("")
+
+
+def test_ai_review_caps_reasoning_models_with_max_completion_tokens():
+    from app.routers.ai_review import _output_limit
+
+    settings = SimpleNamespace(AI_REASONING_EFFORT="low")
+    assert _output_limit("gpt-6-luna", 1500, settings) == {"max_completion_tokens": 1500, "reasoning_effort": "low"}
+    assert _output_limit("gpt-4.1-mini", 800, settings) == {"max_tokens": 800}

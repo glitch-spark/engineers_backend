@@ -40,11 +40,11 @@ class Settings(BaseSettings):
     SLACK_SIGNING_SECRET: Optional[str] = None
     JWT_EXPIRES_MIN: int = 720
     OPENAI_API_KEY: Optional[str] = None
-    # Streamed AI Review (interview): chat-completions, long-form. Mini is enough.
-    OPENAI_MODEL: str = "gpt-4o-mini"
-    # High-quality structured generation: resume HTML, screening answers, scoring.
-    # Use a smarter model — output ships to users and judgment matters.
-    RESUME_OPENAI_MODEL: str = "gpt-5-mini"
+    # Streamed AI Review (interview): chat-completions, long-form. A budget model is enough.
+    # (GPT-4o mini, the old default, leaves the OpenAI API on 2027-01-14.)
+    OPENAI_MODEL: str = "gpt-6-luna"
+    # OpenAI calls outside the model catalog: interview scoring, analyze rollup and chat, job posting extraction.
+    RESUME_OPENAI_MODEL: str = "gpt-6-luna"
     # Anthropic key for the selectable Claude models (app/model_catalog.py). Unset hides them.
     ANTHROPIC_API_KEY: Optional[str] = None
     # Only for user-level Anthropic keys (sk-ant-usr-...): the workspace every request is billed to.
@@ -86,8 +86,8 @@ class Settings(BaseSettings):
     # New interviews must link a resume or say why there's none (app/interview_resume_link.py). Off until the form
     # that sends the link is deployed, so open tabs on the older form can still create interviews.
     INTERVIEW_RESUME_LINK_REQUIRED: bool = False
-    # Reasoning effort for non-resume gpt-5* calls (interview rollup,
-    # follow-up chat). Same rationale as RESUME_REASONING_EFFORT: the
+    # Reasoning effort for non-resume gpt-5*/gpt-6* calls (interview rollup,
+    # follow-up chat, AI Review, extraction). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for
     # these synthesis/chat tasks. minimal | low | medium | high.
     AI_REASONING_EFFORT: str = "low"
@@ -96,8 +96,8 @@ class Settings(BaseSettings):
     AI_CHAT_MAX_TOKENS: int = 800
     AI_REVIEW_MAX_TOKENS: int = 1500
     # Cheap structured-extraction tasks: parsing Q&A from transcripts, rollup tips.
-    # No real reasoning, just JSON shape. Mini saves ~50% per call.
-    EXTRACTION_MODEL: str = "gpt-4o-mini"
+    # No real reasoning, just JSON shape. The cheapest model is enough.
+    EXTRACTION_MODEL: str = "gpt-6-luna"
     # Job Applies: OpenAI model that reads job postings (locations, work mode, clearance). Empty = RESUME_OPENAI_MODEL.
     JOB_EXTRACT_MODEL: str = ""
     # Service account for writing Job Applies exports into a Google Sheet shared with its email as Editor:

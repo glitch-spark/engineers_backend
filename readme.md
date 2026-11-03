@@ -37,7 +37,7 @@ uvicorn app.main:app --reload
 | `SLACK_BOT_TOKEN` | no | Slack bot token; Slack messages are no-ops when unset (setup in `docs/slack-interview-bot.md`) |
 | `JWT_EXPIRES_MIN` | no | JWT lifetime in minutes; default 720 (12 h) |
 | `OPENAI_API_KEY` | no* | Required for `/ai-review/*` and `/resume/generate`; those routes 503 without it |
-| `RESUME_OPENAI_MODEL` | no | OpenAI model for the interview features and job extraction (not the resume/cover letter/screening selector); default `gpt-5-mini` |
+| `RESUME_OPENAI_MODEL` | no | OpenAI model for the interview features and job extraction (not the resume/cover letter/screening selector); default `gpt-6-luna` |
 | `ANTHROPIC_API_KEY` | no | Enables the Anthropic presets in the resume / cover letter / screening model picker; hidden without it. `OPENAI_API_KEY` enables the OpenAI presets the same way |
 | `ANTHROPIC_WORKSPACE_ID` | no | Only for user-level Anthropic keys (`sk-ant-usr-…`), which are not tied to a workspace: the workspace id (`wrkspc_…`) sent with every request |
 | `RESUME_DEFAULT_MODEL`, `COVER_LETTER_DEFAULT_MODEL`, `SCREENING_DEFAULT_MODEL` | no | Default model per task when a request doesn't pick one (provider-prefixed ids); defaults `anthropic:claude-sonnet-5-5`, `anthropic:claude-opus-5-5`, `anthropic:claude-sonnet-5-5` |
