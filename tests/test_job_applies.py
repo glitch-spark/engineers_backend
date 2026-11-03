@@ -538,19 +538,26 @@ async def test_tailor_rejects_profile_outside_run(client, staff_user, auth_heade
     assert r.status_code == 400
 
 
-async def test_tailor_forwards_requested_models(client, staff_user, auth_header, anthropic_key):
+async def test_tailor_forwards_requested_models(client, staff_user, auth_header, anthropic_key, monkeypatch):
+    from app import model_catalog
     from app.models import ResumeApplication
 
+    patched = model_catalog.get_settings().model_copy(update={"OPENAI_API_KEY": "sk-test"})
+    monkeypatch.setattr(model_catalog, "get_settings", lambda: patched)
     h = auth_header(staff_user)
     _, rows, _, _ = await _two_profile_run(client, h, staff_user)
     row = rows["https://jobs.example.com/remote"]
     r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h, json={
-        "resumeModel": "anthropic:claude-opus-5-5", "coverLetter": True,
+        "resumeModel": "openai:gpt-6-luna", "coverLetter": True,
         "coverLetterModel": "anthropic:claude-fable-5-1"})
     assert r.status_code == 200, r.text
     job = await ResumeApplication.get(r.json()["tailored"]["jobId"])
-    assert job.resumeModelId == "openai:gpt-4o-mini"  # Job Applies always tailors with GPT-4o mini
+    assert job.resumeModelId == "openai:gpt-6-luna"
     assert job.coverLetterModelId == "anthropic:claude-fable-5-1"
+    # Job Applies only tailors with its cheap models, whatever is picked on other pages.
+    r = await client.post(f"/job-applies/rows/{row['_id']}/tailor", headers=h,
+                          json={"resumeModel": "anthropic:claude-opus-5-5"})
+    assert r.status_code == 400 and "Job Applies" in r.json()["detail"]
 
 
 async def test_tailor_unknown_model_is_400(client, staff_user, auth_header, anthropic_key):

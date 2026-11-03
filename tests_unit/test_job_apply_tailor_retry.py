@@ -7,11 +7,12 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 os.environ["RESUME_QUEUE_DISABLED"] = "1"
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from beanie import init_beanie
+from fastapi import HTTPException
 from mongomock_motor import AsyncMongoMockClient
 
 from app import resume_queue
@@ -19,7 +20,9 @@ from app.job_apply.schema import JobExtraction
 from app.models import Account, ResumeApplication, UserExtra
 from app.models.job_apply import JobApplicationLog, JobApplyRow, JobApplyRun, ProfileGates, RunSelection
 from app.routers import resume as resume_router
-from app.routers.job_applies import TailorAllBody, TailorBody, _tailor_row, tailor_all, tailor_row
+from app.routers.job_applies import (
+    TailorAllBody, TailorBody, _tailor_row, cancel_tailoring, list_resume_models, tailor_all, tailor_row,
+)
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -100,23 +103,126 @@ async def test_tailor_all_at_the_cap_still_retries_failed_ones(db, monkeypatch, 
         assert await ResumeApplication.find_all().count() == 1
 
 
-async def test_job_applies_always_tailors_with_gpt_4o_mini(db):
-    owner, account, run, _row, _done = await _setup("completed")
-    rows = [
+@pytest.fixture
+def openai_on(monkeypatch):
+    """OpenAI configured (the catalog hides its models without a key), today pinned to 2026-11-03; nothing is called."""
+    from app import model_catalog
+
+    patched = model_catalog.get_settings().model_copy(update={"OPENAI_API_KEY": "sk-test"})
+    monkeypatch.setattr(model_catalog, "get_settings", lambda: patched)
+    monkeypatch.setattr(model_catalog, "_today", lambda: date(2026, 11, 3))
+
+
+async def _two_rows(owner, account, run):
+    return [
         await JobApplyRow(
             runId=run.id, userId=owner.id, rowIndex=i, url=f"https://jobs.example.com/{i}", company="Globex",
             jdText="We need a frontend engineer.", profileGates=[ProfileGates(accountId=str(account.id))],
         ).insert()
         for i in (1, 2)
     ]
-    other = "anthropic:claude-opus-5-5"  # whatever was picked elsewhere is ignored
 
-    await tailor_row(str(rows[0].id), TailorBody.model_validate({"accountId": str(account.id), "resumeModel": other}), owner)
-    await tailor_all(str(run.id), TailorAllBody.model_validate({"rowIds": [str(rows[1].id)], "resumeModel": other}), owner)
 
-    for row in rows:
-        job = await ResumeApplication.get((await JobApplyRow.get(row.id)).tailored[str(account.id)])
-        assert job.resumeModelId == "openai:gpt-4o-mini"
+async def _models_of(rows, account):
+    return [
+        (await ResumeApplication.get((await JobApplyRow.get(row.id)).tailored[str(account.id)])).resumeModelId
+        for row in rows
+    ]
+
+
+async def test_job_applies_tailors_with_the_picked_cheap_model(db, openai_on):
+    owner, account, run, _row, _done = await _setup("completed")
+    rows = await _two_rows(owner, account, run)
+    luna = "openai:gpt-6-luna"
+
+    await tailor_row(str(rows[0].id), TailorBody.model_validate({"accountId": str(account.id), "resumeModel": luna}), owner)
+    await tailor_all(str(run.id), TailorAllBody.model_validate({"rowIds": [str(rows[1].id)], "resumeModel": luna}), owner)
+
+    assert await _models_of(rows, account) == [luna, luna]
+
+
+async def test_job_applies_without_a_model_uses_todays_default(db, openai_on):
+    owner, account, run, _row, _done = await _setup("completed")
+    rows = await _two_rows(owner, account, run)
+
+    await tailor_row(str(rows[0].id), TailorBody(accountId=str(account.id)), owner)
+    await tailor_all(str(run.id), TailorAllBody(rowIds=[str(rows[1].id)]), owner)
+
+    assert await _models_of(rows, account) == ["openai:gpt-4o-mini"] * 2  # through 2026
+
+
+@pytest.mark.parametrize("model", ["anthropic:claude-opus-5-5", "openai:gpt-6-astra", "openai:nope"])
+async def test_job_applies_rejects_other_resume_models(db, openai_on, model):
+    owner, account, run, _row, _done = await _setup("completed")
+    rows = await _two_rows(owner, account, run)
+
+    for call in (
+        tailor_row(str(rows[0].id), TailorBody(accountId=str(account.id), resumeModel=model), owner),
+        tailor_all(str(run.id), TailorAllBody(rowIds=[str(rows[1].id)], resumeModel=model), owner),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await call
+        assert exc.value.status_code == 400 and model in exc.value.detail
+    assert await ResumeApplication.find_all().count() == 1  # only _setup's
+
+
+async def test_resume_models_lists_the_cheap_openai_models(db, openai_on, monkeypatch):
+    from app import model_catalog
+
+    owner = await UserExtra(name="Athen", email="athen@x.io").insert()
+    out = await list_resume_models(owner)
+    assert out["defaultId"] == "openai:gpt-4o-mini"
+    assert [m["id"] for m in out["models"]] == list(model_catalog.JOB_APPLIES_RESUME_MODELS)
+    assert out["providers"] == [{"id": "openai", "label": "OpenAI"}]
+    assert [m["id"] for m in out["models"] if m["isDefault"]] == ["openai:gpt-4o-mini"]
+
+    monkeypatch.setattr(model_catalog, "_today", lambda: date(2027, 1, 14))  # GPT-4o mini retired
+    out = await list_resume_models(owner)
+    assert out["defaultId"] == "openai:gpt-6-luna"
+    assert "openai:gpt-4o-mini" not in [m["id"] for m in out["models"]]
+
+
+async def test_cancel_tailoring_removes_only_queued_jobs(db, openai_on):
+    owner, account, run, _row, done = await _setup("completed")
+    rows = await _two_rows(owner, account, run)
+    await tailor_all(str(run.id), TailorAllBody(rowIds=[str(r.id) for r in rows]), owner)
+    running_id = (await JobApplyRow.get(rows[1].id)).tailored[str(account.id)]
+    await ResumeApplication.get_motor_collection().update_one(
+        {"_id": running_id}, {"$set": {"status": "in_progress"}}
+    )  # the worker already took this one
+    queued_id = (await JobApplyRow.get(rows[0].id)).tailored[str(account.id)]
+
+    assert await cancel_tailoring(str(run.id), owner) == {"cancelled": 1}
+
+    assert await ResumeApplication.get(queued_id) is None
+    assert (await JobApplyRow.get(rows[0].id)).tailored == {}  # can be tailored again
+    assert (await ResumeApplication.get(running_id)).status == "in_progress"
+    assert (await ResumeApplication.get(done.id)).status == "completed"
+    assert await cancel_tailoring(str(run.id), owner) == {"cancelled": 0}
+    preview = await tailor_all(str(run.id), TailorAllBody(rowIds=[str(rows[0].id)], dryRun=True), owner)
+    assert preview["queued"] == 1
+
+
+async def test_cancel_tailoring_keeps_a_queued_job_an_applied_mark_uses(db, openai_on):
+    owner, account, run, _row, _done = await _setup("completed")
+    rows = await _two_rows(owner, account, run)
+    await tailor_all(str(run.id), TailorAllBody(rowIds=[str(rows[0].id)]), owner)
+    job_id = (await JobApplyRow.get(rows[0].id)).tailored[str(account.id)]
+    await JobApplyRow.get_motor_collection().update_one(
+        {"_id": rows[0].id},
+        {"$set": {"appliedResumes": [{"accountId": str(account.id), "tailoredJobId": str(job_id)}]}},
+    )
+
+    assert await cancel_tailoring(str(run.id), owner) == {"cancelled": 0}
+    assert (await ResumeApplication.get(job_id)).status == "queued"
+
+
+async def test_cancel_tailoring_is_only_for_the_runs_owner(db, openai_on):
+    owner, _account, run, _row, _done = await _setup("completed")
+    stranger = await UserExtra(name="Eve", email="eve@x.io").insert()
+    with pytest.raises(HTTPException) as exc:
+        await cancel_tailoring(str(run.id), stranger)
+    assert exc.value.status_code == 404
 
 
 _FULL_JD = (

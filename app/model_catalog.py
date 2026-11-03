@@ -7,6 +7,7 @@ active entry is that provider's recommendation for the task."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from typing import Literal, Optional
 
 from app.config import get_settings
@@ -49,13 +50,25 @@ class ModelSpec:
     supports_effort: bool = True
     # Off: never offered, defaulted to or fallen back to; requests saved with it use the task default instead.
     active: bool = True
+    # The provider's retirement date (UTC): from that day on the model counts as off. Its price is kept for reports.
+    retires: Optional[date] = None
 
 
-def _spec(provider, api_model, label, tier, best_for, price_in, price_out, supports_effort=True, active=True):
+def _spec(provider, api_model, label, tier, best_for, price_in, price_out, supports_effort=True, active=True,
+          retires=None):
     return ModelSpec(
         f"{provider}:{api_model}", provider, api_model, label, tier, best_for, price_in, price_out, supports_effort,
-        active,
+        active, retires,
     )
+
+
+def _today() -> date:
+    """Today in UTC; tests replace it."""
+    return datetime.now(timezone.utc).date()
+
+
+def _in_service(spec: ModelSpec, today: Optional[date] = None) -> bool:
+    return spec.active and (spec.retires is None or (today or _today()) < spec.retires)
 
 
 # Prices: Anthropic from the Claude API price table, OpenAI from OpenAI's pricing page (standard tier).
@@ -81,7 +94,7 @@ _SPECS: tuple[ModelSpec, ...] = (
     _spec("openai", "gpt-5.4-mini", "GPT-5.4 mini", "budget", "Good quality at a low price", 0.75, 4.5),
     _spec("openai", "gpt-5-mini", "GPT-5 mini", "budget", "Low cost; proven for resumes here", 0.25, 2),
     _spec("openai", "gpt-4o-mini", "GPT-4o mini", "budget",
-          "Older non-reasoning mini; fast and cheap", 0.15, 0.6, supports_effort=False),
+          "Older non-reasoning mini; fast and cheap", 0.15, 0.6, supports_effort=False, retires=date(2027, 1, 14)),
     _spec("openai", "gpt-6-luna", "GPT-6 Luna", "budget",
           "Built for focused, high-volume work; cheapest", 0.1, 0.5),
 )
@@ -131,6 +144,13 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
     ],
 }
 
+# Job Applies tailors in bulk: budget OpenAI models only. GPT-4o mini is the default through 2026 (the resume
+# prompts were tuned on it); GPT-6 Luna from 2027, before GPT-4o mini's retirement.
+JOB_APPLIES_RESUME_MODELS: tuple[str, ...] = (
+    _O + "gpt-6-luna", _O + "gpt-5-mini", _O + "gpt-5.4-mini", _O + "gpt-4o-mini",
+)
+_JOB_APPLIES_LUNA_FROM = date(2027, 1, 1)
+
 
 def _provider_configured(provider: Provider) -> bool:
     settings = get_settings()
@@ -139,7 +159,7 @@ def _provider_configured(provider: Provider) -> bool:
 
 
 def _preset_ids(task: Task, provider: Provider) -> list[str]:
-    return [model_id for model_id, _tag in PRESETS[(task, provider)] if _BY_ID[model_id].active]
+    return [model_id for model_id, _tag in PRESETS[(task, provider)] if _in_service(_BY_ID[model_id])]
 
 
 def _is_retired(model_id: str) -> bool:
@@ -150,7 +170,7 @@ def is_inactive(model_id: Optional[str]) -> bool:
     """A known model that has been switched off, or one from a removed provider."""
     wanted = (model_id or "").strip()
     spec = _BY_ID.get(wanted)
-    return (spec is not None and not spec.active) or _is_retired(wanted)
+    return (spec is not None and not _in_service(spec)) or _is_retired(wanted)
 
 
 def preset_tag(task: Task, model_id: str) -> Optional[str]:
@@ -213,11 +233,27 @@ def validate_requested(task: Task, model_id: Optional[str], user: Optional[UserE
         raise ModelNotAvailable(f"Unknown model '{wanted}'.")
     if not spec.active:
         raise ModelNotAvailable(f"{spec.label} is turned off; pick another model.")
+    if not _in_service(spec):
+        raise ModelNotAvailable(f"{spec.label} was retired by {PROVIDER_LABEL[spec.provider]}; pick another model.")
     if wanted not in _preset_ids(task, spec.provider):
         raise ModelNotAvailable(f"Model '{wanted}' can't be used for {task.replace('_', ' ')}.")
     if not _provider_configured(spec.provider):
         raise ModelNotAvailable(f"Model '{wanted}' is not configured on this server.")
     return spec
+
+
+def job_applies_resume_models(today: Optional[date] = None) -> list[ModelSpec]:
+    """The resume models Job Applies offers: still in service, provider configured, cheapest first."""
+    return [
+        spec for spec in (_BY_ID[i] for i in JOB_APPLIES_RESUME_MODELS)
+        if _in_service(spec, today) and _provider_configured(spec.provider)
+    ]
+
+
+def job_applies_resume_default(today: Optional[date] = None) -> str:
+    """GPT-4o mini through 2026, GPT-6 Luna from 2027-01-01 (whether or not OpenAI is configured: the runner falls
+    back as for any request)."""
+    return _O + ("gpt-4o-mini" if (today or _today()) < _JOB_APPLIES_LUNA_FROM else "gpt-6-luna")
 
 
 def fallback_chain(task: Task, requested_id: Optional[str], user: Optional[UserExtra] = None) -> list[ModelSpec]:

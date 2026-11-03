@@ -27,6 +27,10 @@ from app.job_apply.resume_parse import health
 from app.job_apply.scoring import band as score_band
 from app.job_apply.prompt_suggest import job_roles, suggest_unit
 from app.job_apply.sheet import MAX_BYTES, SheetError, parse_sheet
+from app.model_catalog import (
+    PROVIDER_LABEL, ModelNotAvailable, job_applies_resume_default, job_applies_resume_models, public_view,
+    validate_requested,
+)
 from app.models import Account, ResumeApplication, UserExtra
 from app.job_apply.schema import Clearance, GateResult, JobExtraction, Location, Term, WorkAuth, WorkMode
 from app.models.account import Resume, ResumePrompt
@@ -960,6 +964,42 @@ async def cancel_run(run_id: str, user: Annotated[UserExtra, Depends(get_current
     return await _run_out(await JobApplyRun.get(run.id))
 
 
+@router.post("/runs/{run_id}/cancel-tailoring")
+async def cancel_tailoring(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Remove this run's tailored resumes still waiting in the queue, so they never run (nor count toward today's
+    limit). Ones already generating finish. Rows lose their link to a removed one, so it can be tailored again."""
+    run = await _owned_run(run_id, user)
+    links: dict = {}  # tailored job id -> profile id
+    async for doc in JobApplyRow.get_motor_collection().find(
+        {"runId": run.id, "tailored": {"$ne": {}}}, {"tailored": 1, "appliedResumes": 1}
+    ):
+        marked = {str(m.get("tailoredJobId")) for m in doc.get("appliedResumes") or [] if m.get("tailoredJobId")}
+        for acc, job_id in (doc.get("tailored") or {}).items():
+            if job_id and str(job_id) not in marked:  # same guard as replacing one in _tailor_row
+                links[job_id] = acc
+    if not links:
+        return {"cancelled": 0}
+    jobs = ResumeApplication.get_motor_collection()
+    waiting = {"_id": {"$in": list(links)}, "status": "queued", "fixedFrom": None}
+    queued = [d["_id"] async for d in jobs.find(waiting, {"_id": 1})]
+    if not queued:
+        return {"cancelled": 0}
+    # Matching on the status keeps this safe against the worker: a job it claimed meanwhile is in_progress, stays.
+    await jobs.delete_many({**waiting, "_id": {"$in": queued}})
+    kept = {d["_id"] async for d in jobs.find({"_id": {"$in": queued}}, {"_id": 1})}
+    removed = [i for i in queued if i not in kept]
+    by_profile: dict[str, list] = {}
+    for i in removed:
+        by_profile.setdefault(links[i], []).append(i)
+    now = datetime.utcnow()
+    for acc, gone in by_profile.items():  # one update per profile: a run has a few
+        await JobApplyRow.get_motor_collection().update_many(
+            {"runId": run.id, f"tailored.{acc}": {"$in": gone}},
+            {"$unset": {f"tailored.{acc}": ""}, "$set": {"updatedAt": now}},
+        )
+    return {"cancelled": len(removed)}
+
+
 @router.post("/runs/{run_id}/retry-failed")
 async def retry_failed(run_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     run = await _owned_run(run_id, user)
@@ -1620,13 +1660,41 @@ async def _tailor_row(
     return job
 
 
-# Job Applies tailors in bulk, so its resumes always use this cheap model, whatever is picked on other pages.
-JOB_APPLIES_RESUME_MODEL = "openai:gpt-4o-mini"
+def _job_applies_resume_model(model_id: Optional[str]) -> str:
+    """Job Applies tailors in bulk, so only the cheap models of `job_applies_resume_models` are allowed, whatever is
+    picked on other pages. Blank = the default for today."""
+    wanted = (model_id or "").strip()
+    if not wanted:
+        return job_applies_resume_default()
+    try:
+        validate_requested("resume", wanted)
+    except ModelNotAvailable as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    if wanted not in {s.id for s in job_applies_resume_models()}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{wanted}' can't be used for Job Applies tailoring."
+        )
+    return wanted
+
+
+@router.get("/resume-models")
+async def list_resume_models(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """The resume models the tailor dialog offers (same shape as GET /resume/models)."""
+    default_id = job_applies_resume_default()
+    models = job_applies_resume_models()
+    providers = list(dict.fromkeys(m.provider for m in models))
+    return {
+        "task": "resume",
+        "defaultId": default_id,
+        "providers": [{"id": p, "label": PROVIDER_LABEL[p]} for p in providers],
+        "models": [public_view(s, "resume", default_id) for s in models],
+    }
 
 
 class TailorBody(BaseModel):
     accountId: Optional[str] = None
     coverLetter: bool = False
+    resumeModel: Optional[str] = None  # one of GET /job-applies/resume-models; blank = today's default
     coverLetterModel: Optional[str] = None  # catalog id (GET /resume/models); blank = server default
 
 
@@ -1636,6 +1704,7 @@ class TailorAllBody(BaseModel):
     # Only these jobs (the ones ticked in the table), instead of every suggested job.
     rowIds: Optional[list[str]] = Field(default=None, max_length=1000)
     coverLetter: bool = False
+    resumeModel: Optional[str] = None
     coverLetterModel: Optional[str] = None
     dryRun: bool = False  # count what would be queued, queue nothing
 
@@ -1648,7 +1717,7 @@ async def tailor_row(row_id: str, body: TailorBody, user: Annotated[UserExtra, D
     owner = await UserExtra.get(row.userId)
     if run is None or owner is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    resume_model = JOB_APPLIES_RESUME_MODEL
+    resume_model = _job_applies_resume_model(body.resumeModel)
     cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     job = await _tailor_row(
         row, run, owner, body.accountId, body.coverLetter,
@@ -1666,7 +1735,7 @@ async def tailor_all(run_id: str, body: TailorAllBody, user: Annotated[UserExtra
     cap; redoing a failed one adds no job, so the cap doesn't limit it. `dryRun` only counts."""
     run = await _owned_run(run_id, user)
     owner = await UserExtra.get(run.userId)
-    resume_model = JOB_APPLIES_RESUME_MODEL
+    resume_model = _job_applies_resume_model(body.resumeModel)
     cover_letter_model = require_model("cover_letter", body.coverLetterModel, owner)
     chosen = set(body.accountIds or [str(s.accountId) for s in run.selection])
     if body.rowIds is not None:  # the ticked jobs of this run, whatever view they were ticked in
