@@ -82,7 +82,7 @@ bids and interviews always cover the same days. **Per week** = total ÷ weeks in
 | Bids | self + bidder |
 | Self / caller interviews | Rounds held (`interview_rounds`) of interviews with `accountId` = profile, split self / caller by `split_rounds_by_day` |
 | Interviews per bid | all rounds ÷ all bids in the span; `null` at 0 bids; `lowVolume` when bids < 30 (`interview_rates.MIN_BIDS`) |
-| Tailor score | mean `matchScore.total` of the profile's tailored resumes applied with in the span: `job_application_log` entries (`accountId` = profile, `appliedAt` in span) with `tailoredJobId` whose `resumeapplications` record has no `fixedFrom` |
+| Tailor score | mean `matchScore.total` of every tailored resume generated for the profile in the span (Resume Generator and Job Applies, applied with or not): completed `resumeapplications` with this `accountId`, no `fixedFrom`, by `createdAt`. `tailoredResumes` counts them all, scored or not |
 | Job-match score | mean score of applies with a non-tailored resume in the span: log entries with `resumeId` and a `score`, plus log entries whose `tailoredJobId` record has `fixedFrom` (a fixed-resume fork) and a `matchScore` |
 
 Both scores are returned with `n` (how many entries the mean covers) and shown whenever `n > 0`: a profile can use

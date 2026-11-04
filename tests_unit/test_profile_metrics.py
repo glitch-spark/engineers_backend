@@ -193,8 +193,11 @@ async def test_scores_split(db):
             userId=user.id, accountId=acc.id, companyName="A", companyNameLower="a", jobDescription="jd", **kw,
         ).insert()
 
-    tailored = await application(matchScore={"total": 80, "band": "strong"})
-    fixed = await application(matchScore={"total": 60, "band": "ok"}, fixedFrom="r1")
+    tailored = await application(status="completed", createdAt=at, matchScore={"total": 80, "band": "strong"})
+    fixed = await application(status="completed", createdAt=at, matchScore={"total": 60, "band": "ok"}, fixedFrom="r1")
+    await application(status="completed", createdAt=at, source="generator", matchScore={"total": 90, "band": "strong"})
+    await application(status="completed", createdAt=at)  # tailored, never scored: counted, no score
+    await application(status="failed", createdAt=at, matchScore={"total": 10, "band": "weak"})  # no resume made
 
     async def log(i, **kw):
         await JobApplicationLog(userId=user.id, url=f"u{i}", accountId=key, fileKey=f"f{i}", appliedAt=at, **kw).insert()
@@ -204,7 +207,10 @@ async def test_scores_split(db):
     await log(3, tailoredJobId=str(fixed.id))
     await log(4, resumeId="r2")  # no score: skipped
     got = await pm.scores([key], START, END)
-    assert got[key]["tailored"] == [80] and sorted(got[key]["match"]) == [60, 70]
+    # Every tailored resume made counts, applied with (80) or not (90, unscored); the applied log adds only the
+    # uploaded resume (70) and the fixed-resume fork (60).
+    assert sorted(got[key]["tailored"]) == [80, 90] and sorted(got[key]["match"]) == [60, 70]
+    assert got[key]["tailoredResumes"] == 3
 
 
 def _weekly(start: date, weeks: int, self_bids=0, bidder=0, self_iv=0, caller=0):
@@ -218,7 +224,7 @@ def _weekly(start: date, weeks: int, self_bids=0, bidder=0, self_iv=0, caller=0)
     }
 
 
-NO_SCORES = {"tailored": [], "match": []}
+NO_SCORES = {"tailored": [], "match": [], "tailoredResumes": 0}
 
 
 def test_summarize_values():
@@ -229,6 +235,7 @@ def test_summarize_values():
         "interviewsPerWeek": 2.5, "selfInterviewsPerWeek": 2.0, "callerInterviewsPerWeek": 0.5,
         "interviewsPerBid": 0.0595, "lowVolume": False,
         "tailorScore": {"avg": 81.0, "n": 2}, "matchScore": {"avg": 70.0, "n": 1},
+        "tailoredResumes": 0,
         "bids": 168, "selfBids": 120, "bidderBids": 48, "interviews": 10, "selfInterviews": 8, "callerInterviews": 2,
     }
 
@@ -289,8 +296,8 @@ async def test_collect_clips_scores_to_each_span(db):
     await log(2, new, datetime(2026, 10, 21, 12))
     await log(3, old, datetime(2026, 10, 14, 12))
     out = await pm.collect([old, new], 4, date(2026, 11, 3))
-    assert out[str(new.id)][3] == {"tailored": [], "match": [72]}
-    assert out[str(old.id)][3] == {"tailored": [], "match": [73]}
+    assert out[str(new.id)][3] == {"tailored": [], "match": [72], "tailoredResumes": 0}
+    assert out[str(old.id)][3] == {"tailored": [], "match": [73], "tailoredResumes": 0}
 
 
 async def test_collect_gives_each_profile_only_its_own_counts(db):
@@ -320,8 +327,8 @@ async def test_collect_gives_each_profile_only_its_own_counts(db):
     assert weekly_a[date(2026, 10, 26)]["selfBids"] == 2
     assert weekly_b[MON] == {"selfBids": 3, "bidderBids": 1, "selfInterviews": 0, "callerInterviews": 1}
     assert weekly_b[date(2026, 10, 26)]["selfBids"] == 0
-    assert scores_a == {"tailored": [], "match": [70]}
-    assert scores_b == {"tailored": [], "match": [80, 90]}
+    assert scores_a == {"tailored": [], "match": [70], "tailoredResumes": 0}
+    assert scores_b == {"tailored": [], "match": [80, 90], "tailoredResumes": 0}
 
 
 async def _lifetime_history(user, acc):

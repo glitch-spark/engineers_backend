@@ -144,51 +144,76 @@ async def interview_rounds(
     return dict(out)
 
 
-async def _dated_scores(account_ids: list[str], start: date, end: date) -> list[tuple[str, date, str, int]]:
-    """(accountId, local day applied, "tailored" | "match", score) for the jobs applied to in [start, end].
+async def _dated_scores(account_ids: list[str], start: date, end: date) -> list[tuple[str, date, str, Optional[int]]]:
+    """(accountId, local day, "tailored" | "match", score or None) over [start, end].
 
-    A tailored resume scores as its application's match; a fixed-resume fork is an uploaded resume, so "match".
-    An uploaded resume (resumeId) uses the score kept on its log entry. No score: skipped."""
+    "tailored": every tailored resume generated for the profile that day (Resume Generator and Job Applies, applied
+    with or not), its score None when it was never scored. "match": the jobs applied to with an uploaded resume
+    (resumeId, the score kept on its log entry) or a fixed-resume fork (an uploaded resume copied for the job);
+    unscored ones are skipped."""
     tz = app_tz()
+    first, last = local_day_start_utc(start, tz), local_day_start_utc(end + timedelta(days=1), tz)
+    out = []
+    oids = [PydanticObjectId(a) for a in account_ids if PydanticObjectId.is_valid(a)]
+    tailored = ResumeApplication.get_motor_collection().find(
+        {"accountId": {"$in": oids}, "status": "completed", "fixedFrom": None,
+         "createdAt": {"$gte": first, "$lt": last}},
+        {"accountId": 1, "createdAt": 1, "matchScore": 1},
+    )
+    async for d in tailored:
+        match = as_match(d.get("matchScore"))  # a bare number on old records
+        total = match.get("total") if isinstance(match, dict) else None
+        day = d["createdAt"].replace(tzinfo=timezone.utc).astimezone(tz).date()
+        out.append((str(d["accountId"]), day, "tailored", int(total) if total is not None else None))
     # Only the fields scored: an entry also keeps its job description.
     cursor = JobApplicationLog.get_motor_collection().find(
-        {
-            "accountId": {"$in": account_ids},
-            "appliedAt": {"$gte": local_day_start_utc(start, tz), "$lt": local_day_start_utc(end + timedelta(days=1), tz)},
-        },
+        {"accountId": {"$in": account_ids}, "appliedAt": {"$gte": first, "$lt": last}},
         {"accountId": 1, "appliedAt": 1, "resumeId": 1, "tailoredJobId": 1, "score.total": 1},
     )
     entries = [e async for e in cursor]
     ids = [PydanticObjectId(t) for e in entries if (t := e.get("tailoredJobId")) and PydanticObjectId.is_valid(t)]
-    apps = {}
+    forks = {}
     if ids:
-        cursor = ResumeApplication.get_motor_collection().find({"_id": {"$in": ids}}, {"matchScore": 1, "fixedFrom": 1})
-        apps = {d["_id"]: d async for d in cursor}
-    out = []
+        cursor = ResumeApplication.get_motor_collection().find(
+            {"_id": {"$in": ids}, "fixedFrom": {"$ne": None}}, {"matchScore": 1},
+        )
+        forks = {d["_id"]: d async for d in cursor}
     for e in entries:
         tailored_id = e.get("tailoredJobId")
-        if tailored_id:
-            doc = apps.get(PydanticObjectId(tailored_id)) if PydanticObjectId.is_valid(tailored_id) else None
-            doc = doc or {}
-            match = as_match(doc.get("matchScore"))  # a bare number on old records
+        if tailored_id:  # a tailored resume is counted above, when it was made; only forks are applies here
+            doc = forks.get(PydanticObjectId(tailored_id)) if PydanticObjectId.is_valid(tailored_id) else None
+            match = as_match((doc or {}).get("matchScore"))
             total = match.get("total") if isinstance(match, dict) else None
-            kind = "match" if doc.get("fixedFrom") else "tailored"
         elif e.get("resumeId") and e.get("score"):
-            total, kind = e["score"].get("total"), "match"
+            total = e["score"].get("total")
         else:
             continue
         if total is not None:
             day = e["appliedAt"].replace(tzinfo=timezone.utc).astimezone(tz).date()
-            out.append((e["accountId"], day, kind, int(total)))
+            out.append((e["accountId"], day, "match", int(total)))
     return out
 
 
-async def scores(account_ids: list[str], start: date, end: date) -> dict[str, dict[str, list[int]]]:
-    """accountId -> {"tailored": [...], "match": [...]} resume scores of the jobs applied to in [start, end]."""
-    out = {a: {"tailored": [], "match": []} for a in account_ids}
-    for account_id, _day, kind, total in await _dated_scores(account_ids, start, end):
-        out[account_id][kind].append(total)
+def _score_lists(entries, first: date, last: Optional[date] = None) -> dict:
+    """{"tailored": scores, "match": scores, "tailoredResumes": count} of the (day, kind, score) entries in
+    [first, last]; an unscored tailored resume counts toward tailoredResumes only."""
+    out = {"tailored": [], "match": [], "tailoredResumes": 0}
+    for day, kind, total in entries:
+        if day < first or (last is not None and day > last):
+            continue
+        if kind == "tailored":
+            out["tailoredResumes"] += 1
+        if total is not None:
+            out[kind].append(total)
     return out
+
+
+async def scores(account_ids: list[str], start: date, end: date) -> dict[str, dict]:
+    """accountId -> {"tailored": [...], "match": [...], "tailoredResumes": n} over [start, end]."""
+    dated: dict = defaultdict(list)
+    for account_id, day, kind, total in await _dated_scores(account_ids, start, end):
+        dated[account_id].append((day, kind, total))
+    return {a: _score_lists(dated.get(a, ()), start, end) for a in account_ids}
 
 
 def _per_week(total: int, n_weeks: int) -> Optional[float]:
@@ -228,6 +253,7 @@ def summarize(account_id: str, start: date, n_weeks: int, counts: dict, score_li
         "lowVolume": bids < MIN_BIDS,
         "tailorScore": _score(score_lists["tailored"]),
         "matchScore": _score(score_lists["match"]),
+        "tailoredResumes": score_lists.get("tailoredResumes", 0),
         # Totals over the span (All time shows these instead of the per-week values).
         "bids": bids,
         "selfBids": total["selfBids"],
@@ -280,7 +306,7 @@ async def collect(
         created = a.createdAt.replace(tzinfo=timezone.utc).astimezone(tz).date()
         start, end, n = span(weeks, today, since or today, created)
         spans[str(a.id)] = (start, end, n if since else 0)
-    out = {k: (s, n, {}, {"tailored": [], "match": []}) for k, (s, _e, n) in spans.items()}
+    out = {k: (s, n, {}, _score_lists((), s)) for k, (s, _e, n) in spans.items()}
     live = [a for a in accounts if spans[str(a.id)][2]]
     if not live:
         return out
@@ -304,11 +330,7 @@ async def collect(
         for day, (mine, caller) in rounds.get(key, {}).items():
             if day in daily:
                 daily[day]["selfInterviews"], daily[day]["callerInterviews"] = mine, caller
-        score_lists = {"tailored": [], "match": []}
-        for day, kind, total in dated.get(key, ()):
-            if first <= day <= last:
-                score_lists[kind].append(total)
-        out[key] = (first, n, daily, score_lists)
+        out[key] = (first, n, daily, _score_lists(dated.get(key, ()), first, last))
     return out
 
 
@@ -365,9 +387,5 @@ async def lifetime(accounts: list[Account | ProfileSpan], today: date) -> dict[s
             "selfBids": selfs.get(key, 0), "bidderBids": bidder.get(key, 0),
             "selfInterviews": sum(v[0] for v in held), "callerInterviews": sum(v[1] for v in held),
         }
-        score_lists = {"tailored": [], "match": []}
-        for day, kind, total in dated.get(key, ()):
-            if day >= day0:
-                score_lists[kind].append(total)
-        out[key] = (day0, (today - day0).days // 7 + 1, {today: totals}, score_lists)
+        out[key] = (day0, (today - day0).days // 7 + 1, {today: totals}, _score_lists(dated.get(key, ()), day0))
     return out
