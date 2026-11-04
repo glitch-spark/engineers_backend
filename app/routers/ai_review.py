@@ -11,6 +11,7 @@ from app import ai_usage
 from app.config import get_settings
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK, STAGE_LABELS
 from app.deps import get_current_user
+from app.llm_router import is_reasoning_model
 from app.models import Account, AiReviewRun, GlobalPrompt, Interview, InterviewChatLog, Skill, UserExtra
 from app.routers._util import doc_to_dict, to_object_id
 from app.security import decode_token
@@ -105,6 +106,13 @@ def _combined_stage_text(iv: Interview, field: str) -> str:
     return getattr(iv, field, "") or ""
 
 
+def _output_limit(model: str, max_tokens: int, settings) -> dict:
+    """Chat-completions output cap: reasoning models (gpt-5/gpt-6) take max_completion_tokens and an effort."""
+    if is_reasoning_model(model):
+        return {"max_completion_tokens": max_tokens, "reasoning_effort": settings.AI_REASONING_EFFORT}
+    return {"max_tokens": max_tokens}
+
+
 def _sse(data: dict, event: Optional[str] = None) -> str:
     out = ""
     if event:
@@ -177,7 +185,7 @@ async def stream_ai_review(
     openai_key = getattr(settings, "OPENAI_API_KEY", None)
     if not openai_key:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OPENAI_API_KEY is not configured on the server")
-    model_name = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+    model_name = getattr(settings, "OPENAI_MODEL", "gpt-6-luna")
 
     from openai import AsyncOpenAI
 
@@ -192,7 +200,7 @@ async def stream_ai_review(
                 model=model_name,
                 stream=True,
                 stream_options={"include_usage": True},
-                max_tokens=settings.AI_REVIEW_MAX_TOKENS,
+                **_output_limit(model_name, settings.AI_REVIEW_MAX_TOKENS, settings),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
@@ -391,7 +399,7 @@ async def interview_chat(
     openai_key = getattr(settings, "OPENAI_API_KEY", None)
     if not openai_key:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OPENAI_API_KEY is not configured")
-    model_name = getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+    model_name = getattr(settings, "OPENAI_MODEL", "gpt-6-luna")
 
     from openai import AsyncOpenAI
 
@@ -411,7 +419,7 @@ async def interview_chat(
         completion = await client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=settings.AI_CHAT_MAX_TOKENS,
+            **_output_limit(model_name, settings.AI_CHAT_MAX_TOKENS, settings),
         )
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))

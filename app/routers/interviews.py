@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
 from app.interview_resume_link import ResumeLinkIn, build_link, resolve_link, search_matches
+from app.llm_router import is_reasoning_model
 from app.models import (
     Account,
     AnalyzeChatLog,
@@ -1481,7 +1482,7 @@ async def analyze_interviews(
         try:
             # Style + judgment work — bump to higher-quality model.
             rollup_kwargs: dict = {"model": settings.RESUME_OPENAI_MODEL, "input": rollup_prompt}
-            if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+            if is_reasoning_model(settings.RESUME_OPENAI_MODEL):
                 rollup_kwargs["reasoning"] = {"effort": settings.AI_REASONING_EFFORT}
             rollup_res = await client.responses.create(**rollup_kwargs)
             await ai_usage.record(
@@ -1615,7 +1616,7 @@ async def analyze_chat(
         "messages": chat_messages,
         "max_completion_tokens": settings.AI_CHAT_MAX_TOKENS,
     }
-    if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
+    if is_reasoning_model(settings.RESUME_OPENAI_MODEL):
         chat_kwargs["reasoning_effort"] = settings.AI_REASONING_EFFORT
     try:
         completion = await client.chat.completions.create(**chat_kwargs)

@@ -5,6 +5,7 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,16 @@ def use_settings(monkeypatch):
 
     apply()
     return apply
+
+
+@pytest.fixture(autouse=True)
+def today(monkeypatch):
+    """Pins "today" (before GPT-4o mini's retirement); call it with another date to move it."""
+    def move(day):
+        monkeypatch.setattr(mc, "_today", lambda: day)
+
+    move(date(2026, 11, 3))
+    return move
 
 
 def ids(models):
@@ -100,6 +111,37 @@ def test_gpt_4o_mini_is_resume_only(use_settings):
     for task in ("cover_letter", "screening"):
         with pytest.raises(mc.ModelNotAvailable):
             mc.validate_requested(task, O + "gpt-4o-mini", None)
+
+
+@pytest.mark.parametrize("day", [date(2027, 1, 14), date(2027, 6, 1)])
+def test_gpt_4o_mini_is_off_from_its_retirement_date(use_settings, today, day):
+    today(date(2027, 1, 13))
+    assert O + "gpt-4o-mini" in ids(mc.available_models("resume", None))
+    today(day)
+    assert O + "gpt-4o-mini" not in ids(mc.available_models("resume", None))
+    assert mc.is_inactive(O + "gpt-4o-mini")
+    with pytest.raises(mc.ModelNotAvailable, match="retired by OpenAI"):
+        mc.validate_requested("resume", O + "gpt-4o-mini", None)
+    assert O + "gpt-4o-mini" not in ids(mc.fallback_chain("resume", O + "gpt-4o-mini"))
+    assert mc.api_model_cost("gpt-4o-mini", {"input": 1_000_000}) == pytest.approx(0.15)  # old usage still priced
+
+
+@pytest.mark.parametrize("day,default,offered", [
+    (date(2026, 12, 31), "gpt-4o-mini", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini", "gpt-4o-mini"]),
+    (date(2027, 1, 1), "gpt-6-luna", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini", "gpt-4o-mini"]),
+    (date(2027, 1, 14), "gpt-6-luna", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini"]),
+])
+def test_job_applies_resume_models_and_default_by_date(use_settings, today, day, default, offered):
+    today(day)
+    assert mc.job_applies_resume_default() == O + default
+    assert ids(mc.job_applies_resume_models()) == [O + m for m in offered]
+    use_settings(OPENAI_API_KEY=None)
+    assert mc.job_applies_resume_models() == []
+
+
+def test_job_applies_resume_models_are_resume_presets(use_settings):
+    resume = ids(mc.available_models("resume", None))
+    assert all(m in resume for m in mc.JOB_APPLIES_RESUME_MODELS)  # so the runner's fallback chain accepts them
 
 
 def test_defaults_per_task(use_settings):

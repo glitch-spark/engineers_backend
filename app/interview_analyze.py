@@ -18,6 +18,7 @@ from typing import List, Optional
 
 from app import ai_usage
 from app.config import get_settings
+from app.llm_router import is_reasoning_model
 from app.models import Interview, InterviewQuestion
 
 log = logging.getLogger(__name__)
@@ -97,10 +98,10 @@ async def extract_and_score(interview: Interview, stage_id: Optional[str] = None
 
     try:
         # Extraction is pure JSON shaping — cheaper model is fine.
-        ext_res = await client.responses.create(
-            model=settings.EXTRACTION_MODEL,
-            input=extract_prompt,
-        )
+        ext_kwargs: dict = {"model": settings.EXTRACTION_MODEL, "input": extract_prompt}
+        if is_reasoning_model(settings.EXTRACTION_MODEL):
+            ext_kwargs["reasoning"] = {"effort": settings.AI_REASONING_EFFORT}
+        ext_res = await client.responses.create(**ext_kwargs)
         await ai_usage.record(
             provider="openai", model=settings.EXTRACTION_MODEL, usage=ai_usage.openai_usage(ext_res),
             feature="interview_extract", user_id=interview.createdBy, ref_id=interview.id,
@@ -143,8 +144,10 @@ async def extract_and_score(interview: Interview, stage_id: Optional[str] = None
     try:
         # Scoring is mechanical (0-10 + one-liners) — minimal reasoning.
         sc_kwargs: dict = {"model": settings.RESUME_OPENAI_MODEL, "input": score_prompt}
-        if settings.RESUME_OPENAI_MODEL.startswith("gpt-5"):
-            sc_kwargs["reasoning"] = {"effort": "minimal"}
+        if is_reasoning_model(settings.RESUME_OPENAI_MODEL):
+            # gpt-5 takes "minimal"; later families may not.
+            effort = "minimal" if settings.RESUME_OPENAI_MODEL.startswith("gpt-5") else settings.AI_REASONING_EFFORT
+            sc_kwargs["reasoning"] = {"effort": effort}
         sc_res = await client.responses.create(**sc_kwargs)
         await ai_usage.record(
             provider="openai", model=settings.RESUME_OPENAI_MODEL, usage=ai_usage.openai_usage(sc_res),
