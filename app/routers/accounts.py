@@ -12,7 +12,7 @@ from app import resume_files
 from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.profile_metrics import WEEK_CHOICES, collect, peer_average, span, summarize
+from app.profile_metrics import WEEK_CHOICES, ProfileSpan, collect, peer_average, span, summarize
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
@@ -373,7 +373,7 @@ async def list_profile_metrics(
         if userId and userId != str(user.id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
         query["createdBy"] = user.id
-    accounts = await Account.find(query).to_list()
+    accounts = await Account.find(query).project(ProfileSpan).to_list()
     today = datetime.now(app_tz()).date()
     start, end, _ = span(weeks, today, date.min, date.min)
     collected = await collect(accounts, weeks, today)
@@ -389,12 +389,12 @@ async def get_profile_metrics(
 ) -> dict:
     """One profile's metrics row, its week-by-week counts and the owner's other active profiles' average."""
     _check_weeks(weeks)
-    acc = await Account.get(to_object_id(account_id))
+    acc = await Account.find_one({"_id": to_object_id(account_id)}).project(ProfileSpan)
     if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     query: dict[str, Any] = archive_status_query("active")
     query["createdBy"] = acc.createdBy
-    accounts = await Account.find(query).to_list()
+    accounts = await Account.find(query).project(ProfileSpan).to_list()
     if all(a.id != acc.id for a in accounts):
         accounts.append(acc)
     collected = await collect(accounts, weeks, datetime.now(app_tz()).date())

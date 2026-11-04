@@ -271,4 +271,6 @@ class JobApplicationLog(TimestampedDocument):
             IndexModel([("userId", ASCENDING), ("url", ASCENDING), ("fileKey", ASCENDING)], unique=True, name="user_url_file"),
             IndexModel([("userId", ASCENDING), ("appliedAt", DESCENDING)], name="user_recent"),
             IndexModel([("runId", ASCENDING)], name="run"),
+            # Profile metrics: a profile's applies over its weeks (app/profile_metrics.py).
+            IndexModel([("accountId", ASCENDING), ("appliedAt", DESCENDING)], name="account_recent"),
         ]

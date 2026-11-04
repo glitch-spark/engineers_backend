@@ -261,3 +261,32 @@ async def test_collect_clips_scores_to_each_span(db):
     out = await pm.collect([old, new], 4, date(2026, 11, 3))
     assert out[str(new.id)][3] == {"tailored": [], "match": [72]}
     assert out[str(old.id)][3] == {"tailored": [], "match": [73]}
+
+
+async def test_collect_gives_each_profile_only_its_own_counts(db):
+    user = await UserExtra(name="Ana", email="ana@x.io").insert()
+    a = await Account(name="A", createdBy=user.id, createdAt=datetime(2026, 1, 1)).insert()
+    b = await Account(name="B", createdBy=user.id, createdAt=datetime(2026, 1, 1)).insert()
+    ka, kb = str(a.id), str(b.id)
+    await _plan(user, date(2026, 10, 20), {ka: 5, kb: 3})
+    await _plan(user, date(2026, 10, 27), {ka: 2})
+    at = datetime(2026, 10, 21, 15)
+    for i, acc in enumerate((a, a, b)):
+        bidder = await Bidder(createdBy=user.id, name=f"B{i}", profileId=acc.id, rate=1, screenshotFolderUrl=f"s{i}").insert()
+        await Bid(bidderId=bidder.id, ownerId=user.id, jobKey=f"k{i}", firstAt=at, status="approved").insert()
+    await _round(user, a, ("intro", datetime(2026, 10, 20, 15), "completed", False))
+    await _round(user, b, ("tech", datetime(2026, 10, 22, 15), "completed", True))
+    for i, (acc, total) in enumerate(((a, 70), (b, 80), (b, 90))):
+        await JobApplicationLog(
+            userId=user.id, url=f"u{i}", accountId=str(acc.id), fileKey=f"f{i}", resumeId="r", appliedAt=at,
+            score={"total": total, "band": "ok"},
+        ).insert()
+    out = await pm.collect([a, b], 4, date(2026, 11, 3))
+    _s, _n, weekly_a, scores_a = out[ka]
+    _s, _n, weekly_b, scores_b = out[kb]
+    assert weekly_a[MON] == {"selfBids": 5, "bidderBids": 2, "selfInterviews": 1, "callerInterviews": 0}
+    assert weekly_a[date(2026, 10, 26)]["selfBids"] == 2
+    assert weekly_b[MON] == {"selfBids": 3, "bidderBids": 1, "selfInterviews": 0, "callerInterviews": 1}
+    assert weekly_b[date(2026, 10, 26)]["selfBids"] == 0
+    assert scores_a == {"tailored": [], "match": [70]}
+    assert scores_b == {"tailored": [], "match": [80, 90]}

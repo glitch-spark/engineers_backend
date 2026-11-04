@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from beanie import PydanticObjectId
+from pydantic import BaseModel, Field
 
 from app.bids.windows import BidSchedule, schedule_from_settings
 from app.config import get_settings
@@ -20,6 +21,15 @@ from app.models import Account, Bid, Bidder, DailyPlan, Interview, JobApplicatio
 from app.models.resume_application import ResumeApplication, as_match
 
 WEEK_CHOICES = (4, 8, 12)
+
+
+class ProfileSpan(BaseModel):
+    """The Account fields `collect` reads: metrics project these, since a whole profile carries its templates and
+    resumes."""
+
+    id: PydanticObjectId = Field(alias="_id")
+    createdBy: PydanticObjectId
+    createdAt: datetime = Field(default_factory=datetime.utcnow)  # as on Account (TimestampedDocument)
 
 
 def since_date() -> date:
@@ -116,30 +126,36 @@ async def _dated_scores(account_ids: list[str], start: date, end: date) -> list[
     A tailored resume scores as its application's match; a fixed-resume fork is an uploaded resume, so "match".
     An uploaded resume (resumeId) uses the score kept on its log entry. No score: skipped."""
     tz = app_tz()
-    entries = await JobApplicationLog.find({
-        "accountId": {"$in": account_ids},
-        "appliedAt": {"$gte": local_day_start_utc(start, tz), "$lt": local_day_start_utc(end + timedelta(days=1), tz)},
-    }).to_list()
-    ids = [PydanticObjectId(e.tailoredJobId) for e in entries if e.tailoredJobId and PydanticObjectId.is_valid(e.tailoredJobId)]
+    # Only the fields scored: an entry also keeps its job description.
+    cursor = JobApplicationLog.get_motor_collection().find(
+        {
+            "accountId": {"$in": account_ids},
+            "appliedAt": {"$gte": local_day_start_utc(start, tz), "$lt": local_day_start_utc(end + timedelta(days=1), tz)},
+        },
+        {"accountId": 1, "appliedAt": 1, "resumeId": 1, "tailoredJobId": 1, "score.total": 1},
+    )
+    entries = [e async for e in cursor]
+    ids = [PydanticObjectId(t) for e in entries if (t := e.get("tailoredJobId")) and PydanticObjectId.is_valid(t)]
     apps = {}
     if ids:
         cursor = ResumeApplication.get_motor_collection().find({"_id": {"$in": ids}}, {"matchScore": 1, "fixedFrom": 1})
         apps = {d["_id"]: d async for d in cursor}
     out = []
     for e in entries:
-        if e.tailoredJobId:
-            doc = apps.get(PydanticObjectId(e.tailoredJobId)) if PydanticObjectId.is_valid(e.tailoredJobId) else None
+        tailored_id = e.get("tailoredJobId")
+        if tailored_id:
+            doc = apps.get(PydanticObjectId(tailored_id)) if PydanticObjectId.is_valid(tailored_id) else None
             doc = doc or {}
             match = as_match(doc.get("matchScore"))  # a bare number on old records
             total = match.get("total") if isinstance(match, dict) else None
             kind = "match" if doc.get("fixedFrom") else "tailored"
-        elif e.resumeId and e.score:
-            total, kind = e.score.total, "match"
+        elif e.get("resumeId") and e.get("score"):
+            total, kind = e["score"].get("total"), "match"
         else:
             continue
         if total is not None:
-            day = e.appliedAt.replace(tzinfo=timezone.utc).astimezone(tz).date()
-            out.append((e.accountId, day, kind, int(total)))
+            day = e["appliedAt"].replace(tzinfo=timezone.utc).astimezone(tz).date()
+            out.append((e["accountId"], day, kind, int(total)))
     return out
 
 
@@ -204,9 +220,19 @@ def peer_average(rows: list[dict]) -> Optional[dict]:
     return out
 
 
-async def collect(accounts: list[Account], weeks: int, today: date) -> dict[str, tuple[date, int, dict, dict]]:
+def _by_account(counts: dict[tuple[str, date], object]) -> dict[str, dict[date, object]]:
+    """(account id, Monday) -> v regrouped as account id -> {Monday: v}, so each profile reads only its own."""
+    out: dict = defaultdict(dict)
+    for (key, monday), v in counts.items():
+        out[key][monday] = v
+    return out
+
+
+async def collect(
+    accounts: list[Account | ProfileSpan], weeks: int, today: date,
+) -> dict[str, tuple[date, int, dict, dict]]:
     """accountId -> (start Monday, weeks measured, weekly counts, score lists) over each profile's own span; every
-    source (scores too) is loaded once over the widest of them and clipped to each profile's span."""
+    source (scores too) is loaded once over the widest of them, grouped by profile and clipped to each one's span."""
     tz, since = app_tz(), since_date()
     spans = {}
     for a in accounts:
@@ -219,24 +245,26 @@ async def collect(accounts: list[Account], weeks: int, today: date) -> dict[str,
     start, end = min(spans[str(a.id)][0] for a in live), max(spans[str(a.id)][1] for a in live)
     keys, ids = {str(a.id) for a in live}, [a.id for a in live]
     loaded = {
-        "selfBids": await self_bids(list({a.createdBy for a in live}), keys, start, end),
-        "bidderBids": await bidder_bids(ids, start, end, schedule_from_settings()),
+        "selfBids": _by_account(await self_bids(list({a.createdBy for a in live}), keys, start, end)),
+        "bidderBids": _by_account(await bidder_bids(ids, start, end, schedule_from_settings())),
     }
-    rounds = await interview_rounds(ids, start, end)
-    dated = await _dated_scores(list(keys), start, end)
+    rounds = _by_account(await interview_rounds(ids, start, end))
+    dated: dict = defaultdict(list)
+    for k, day, kind, total in await _dated_scores(list(keys), start, end):
+        dated[k].append((day, kind, total))
     for key in keys:
-        first, _e, n = spans[key]
+        first, last, n = spans[key]
         weekly = {first + timedelta(weeks=i): dict.fromkeys(_COUNTS, 0) for i in range(n)}
         for name, counts in loaded.items():
-            for (k, monday), v in counts.items():
-                if k == key and monday in weekly:
+            for monday, v in counts.get(key, {}).items():
+                if monday in weekly:
                     weekly[monday][name] = v
-        for (k, monday), (mine, caller) in rounds.items():
-            if k == key and monday in weekly:
+        for monday, (mine, caller) in rounds.get(key, {}).items():
+            if monday in weekly:
                 weekly[monday]["selfInterviews"], weekly[monday]["callerInterviews"] = mine, caller
         score_lists = {"tailored": [], "match": []}
-        for k, day, kind, total in dated:
-            if k == key and first <= day <= spans[key][1]:
+        for day, kind, total in dated.get(key, ()):
+            if first <= day <= last:
                 score_lists[kind].append(total)
         out[key] = (first, n, weekly, score_lists)
     return out
