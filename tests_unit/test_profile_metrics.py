@@ -229,6 +229,7 @@ def test_summarize_values():
         "interviewsPerWeek": 2.5, "selfInterviewsPerWeek": 2.0, "callerInterviewsPerWeek": 0.5,
         "interviewsPerBid": 0.0595, "lowVolume": False,
         "tailorScore": {"avg": 81.0, "n": 2}, "matchScore": {"avg": 70.0, "n": 1},
+        "bids": 168, "selfBids": 120, "bidderBids": 48, "interviews": 10, "selfInterviews": 8, "callerInterviews": 2,
     }
 
 
@@ -321,3 +322,47 @@ async def test_collect_gives_each_profile_only_its_own_counts(db):
     assert weekly_b[date(2026, 10, 26)]["selfBids"] == 0
     assert scores_a == {"tailored": [], "match": [70]}
     assert scores_b == {"tailored": [], "match": [80, 90]}
+
+
+async def _lifetime_history(user, acc):
+    key = str(acc.id)
+    await _plan(user, date(2026, 6, 2), {key: 4})  # long before any 12-week window
+    await _plan(user, date(2026, 11, 4), {key: 2})  # today: the current week counts too
+    bidder = await Bidder(createdBy=user.id, name="B", profileId=acc.id, rate=1, screenshotFolderUrl="s").insert()
+    for i, (at, status) in enumerate([
+        (datetime(2026, 3, 10, 15), "approved"), (datetime(2026, 11, 4, 10), "pending"),
+        (datetime(2026, 5, 1, 15), "rejected"),
+    ]):
+        await Bid(bidderId=bidder.id, ownerId=user.id, jobKey=f"k{i}", firstAt=at, status=status).insert()
+    await _round(user, acc, ("intro", datetime(2026, 4, 1, 15), "completed", False))
+    await _round(user, acc, ("tech", datetime(2026, 11, 3, 15), "completed", True))
+    await JobApplicationLog(
+        userId=user.id, url="u", accountId=key, fileKey="f", resumeId="r", appliedAt=datetime(2026, 2, 1, 12),
+        score={"total": 70, "band": "ok"},
+    ).insert()
+
+
+async def test_lifetime_counts_the_whole_history(db):
+    user, acc = await _setup()
+    await _lifetime_history(user, acc)
+    row = pm.summarize(str(acc.id), *(await pm.lifetime([acc], date(2026, 11, 4)))[str(acc.id)])
+    assert (row["bids"], row["selfBids"], row["bidderBids"]) == (8, 6, 2)
+    assert (row["interviews"], row["selfInterviews"], row["callerInterviews"]) == (2, 1, 1)
+    assert row["interviewsPerBid"] == 0.25 and row["lowVolume"] is True
+    assert row["matchScore"] == {"avg": 70.0, "n": 1} and row["tailorScore"] == {"avg": None, "n": 0}
+
+
+async def test_lifetime_self_bids_start_at_launch(db, monkeypatch):
+    _unset_since(monkeypatch)
+    await pm.record_launch(date(2026, 10, 31))  # self bids counted from Nov 1
+    user, acc = await _setup()
+    await _lifetime_history(user, acc)
+    row = pm.summarize(str(acc.id), *(await pm.lifetime([acc], date(2026, 11, 4)))[str(acc.id)])
+    assert (row["selfBids"], row["bidderBids"], row["interviews"]) == (2, 2, 2)
+
+
+async def test_period_rows_carry_totals(db):
+    user, acc = await _setup()
+    await _plan(user, date(2026, 10, 20), {str(acc.id): 5})
+    row = pm.summarize(str(acc.id), *(await pm.collect([acc], 4, date(2026, 11, 3)))[str(acc.id)])
+    assert (row["bids"], row["selfBids"], row["bidsPerWeek"]) == (5, 5, 1.2)

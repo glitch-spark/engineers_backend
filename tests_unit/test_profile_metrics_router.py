@@ -24,6 +24,7 @@ pytestmark = [
 ROW_KEYS = {
     "accountId", "spanWeeks", "bidsPerWeek", "selfBidsPerWeek", "bidderBidsPerWeek", "interviewsPerWeek",
     "selfInterviewsPerWeek", "callerInterviewsPerWeek", "interviewsPerBid", "lowVolume", "tailorScore", "matchScore",
+    "bids", "selfBids", "bidderBids", "interviews", "selfInterviews", "callerInterviews",
 }
 OLD = datetime(2020, 1, 1)
 
@@ -65,6 +66,18 @@ async def test_list_weeks_validated(db):
     ana = await _user("ana")
     with pytest.raises(HTTPException) as e:
         await list_profile_metrics(ana, weeks=5, userId="")
+    assert e.value.status_code == 422
+
+
+async def test_list_all_time(db):
+    ana = await _user("ana")
+    a = await _acct(ana, "A")
+    out = await list_profile_metrics(ana, weeks="all", userId="")
+    assert out["weeks"] == "all" and [r["accountId"] for r in out["rows"]] == [str(a.id)]
+    assert out["selfBidsSince"] is None  # tests measure from 0001-01-01: no launch day to name
+    assert set(out["rows"][0]) == ROW_KEYS
+    with pytest.raises(HTTPException) as e:
+        await list_profile_metrics(ana, weeks="forever", userId="")
     assert e.value.status_code == 422
 
 

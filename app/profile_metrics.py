@@ -228,6 +228,13 @@ def summarize(account_id: str, start: date, n_weeks: int, counts: dict, score_li
         "lowVolume": bids < MIN_BIDS,
         "tailorScore": _score(score_lists["tailored"]),
         "matchScore": _score(score_lists["match"]),
+        # Totals over the span (All time shows these instead of the per-week values).
+        "bids": bids,
+        "selfBids": total["selfBids"],
+        "bidderBids": total["bidderBids"],
+        "interviews": interviews,
+        "selfInterviews": total["selfInterviews"],
+        "callerInterviews": total["callerInterviews"],
     }
 
 
@@ -302,4 +309,65 @@ async def collect(
             if first <= day <= last:
                 score_lists[kind].append(total)
         out[key] = (first, n, daily, score_lists)
+    return out
+
+
+async def _lifetime_self_bids(owner_ids: list, account_ids: set[str], since: Optional[date]) -> dict[str, int]:
+    """account id -> self bids typed per profile on logged days from the launch day on (none before launch). Reads
+    only the per-profile map of each plan."""
+    if since is None:
+        return {}
+    cursor = DailyPlan.get_motor_collection().find(
+        {"userId": {"$in": owner_ids}, "date": {"$gte": _midnight(since)}, "loggedAt": {"$ne": None}},
+        {"done.bidsSelfByProfile": 1},
+    )
+    out: dict = defaultdict(int)
+    async for d in cursor:
+        for account_id, n in ((d.get("done") or {}).get("bidsSelfByProfile") or {}).items():
+            if account_id in account_ids:
+                out[account_id] += n
+    return dict(out)
+
+
+async def _lifetime_bidder_bids(account_ids: list[PydanticObjectId]) -> dict[str, int]:
+    """account id -> every approved and pending bid of the profile's bidders (archived ones too), counted by the
+    database rather than loaded."""
+    profile_of = {b.id: str(b.profileId) async for b in Bidder.find({"profileId": {"$in": account_ids}})}
+    pipeline = [
+        {"$match": {"bidderId": {"$in": list(profile_of)}, "status": {"$in": ["approved", "pending"]}}},
+        {"$group": {"_id": "$bidderId", "n": {"$sum": 1}}},
+    ]
+    out: dict = defaultdict(int)
+    for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None):
+        out[profile_of[g["_id"]]] += g["n"]
+    return dict(out)
+
+
+async def lifetime(accounts: list[Account | ProfileSpan], today: date) -> dict[str, tuple[date, int, dict, dict]]:
+    """accountId -> (creation day, weeks since then, {today: totals}, score lists), shaped like `collect` so
+    `summarize` reads it: every bid, interview round and scored application since each profile was created, through
+    today (this week too). Self bids count from the launch day on: they weren't typed per profile before."""
+    if not accounts:
+        return {}
+    tz = app_tz()
+    created = {str(a.id): a.createdAt.replace(tzinfo=timezone.utc).astimezone(tz).date() for a in accounts}
+    keys, ids, first = set(created), [a.id for a in accounts], min(created.values())
+    selfs = await _lifetime_self_bids(list({a.createdBy for a in accounts}), keys, await since_date())
+    bidder = await _lifetime_bidder_bids(ids)
+    rounds = _by_account(await interview_rounds(ids, first, today))
+    dated: dict = defaultdict(list)
+    for k, day, kind, total in await _dated_scores(list(keys), first, today):
+        dated[k].append((day, kind, total))
+    out = {}
+    for key, day0 in created.items():
+        held = [v for day, v in rounds.get(key, {}).items() if day >= day0]
+        totals = {
+            "selfBids": selfs.get(key, 0), "bidderBids": bidder.get(key, 0),
+            "selfInterviews": sum(v[0] for v in held), "callerInterviews": sum(v[1] for v in held),
+        }
+        score_lists = {"tailored": [], "match": []}
+        for day, kind, total in dated.get(key, ()):
+            if day >= day0:
+                score_lists[kind].append(total)
+        out[key] = (day0, (today - day0).days // 7 + 1, {today: totals}, score_lists)
     return out

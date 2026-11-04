@@ -12,7 +12,9 @@ from app import resume_files
 from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.profile_metrics import WEEK_CHOICES, ProfileSpan, collect, peer_average, span, summarize, weekly_from_daily
+from app.profile_metrics import (
+    WEEK_CHOICES, ProfileSpan, collect, lifetime, peer_average, since_date, span, summarize, weekly_from_daily,
+)
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
@@ -377,11 +379,15 @@ def _check_weeks(weeks: int) -> None:
 @router.get("/metrics")
 async def list_profile_metrics(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    weeks: int = Query(4),
+    weeks: str = Query("4"),
     userId: str = Query(""),
 ) -> dict:
-    """Per-profile weekly rates over the last completed weeks, for the user's active profiles (admin: any/all)."""
-    _check_weeks(weeks)
+    """Per-profile weekly rates over the last completed weeks, or totals since each profile was created
+    (weeks=all), for the user's active profiles (admin: any/all)."""
+    all_time = str(weeks) == "all"
+    if not all_time:
+        weeks = int(weeks) if str(weeks).isdigit() else 0
+        _check_weeks(weeks)
     query: dict[str, Any] = archive_status_query("active")
     if user.role == "admin":
         if userId:
@@ -392,10 +398,19 @@ async def list_profile_metrics(
         query["createdBy"] = user.id
     accounts = await Account.find(query).project(ProfileSpan).to_list()
     today = datetime.now(app_tz()).date()
-    start, end, _ = span(weeks, today, date.min, date.min)
-    collected = await collect(accounts, weeks, today)
+    if all_time:
+        collected = await lifetime(accounts, today)
+        first = min((vals[0] for vals in collected.values()), default=today)
+        start, end = first, today
+    else:
+        start, end, _ = span(weeks, today, date.min, date.min)
+        collected = await collect(accounts, weeks, today)
     rows = [summarize(aid, *vals) for aid, vals in collected.items()]
-    return {"start": start.isoformat(), "end": end.isoformat(), "weeks": weeks, "rows": rows}
+    out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": weeks, "rows": rows}
+    if all_time:  # self bids exist per profile only from the launch day: the list says so
+        since = await since_date()
+        out["selfBidsSince"] = since.isoformat() if since and since > date.min else None
+    return out
 
 
 @router.get("/{account_id}/metrics")
