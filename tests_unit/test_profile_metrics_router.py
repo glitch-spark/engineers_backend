@@ -100,6 +100,8 @@ async def test_detail_weekly_and_peers(db):
     assert len(out["weekly"]) == 4
     assert set(out["weekly"][0]) == {"week", "selfBids", "bidderBids", "selfInterviews", "callerInterviews"}
     assert [w["week"] for w in out["weekly"]] == sorted(w["week"] for w in out["weekly"])
+    assert len(out["daily"]) == 28 and out["daily"][0]["day"] == out["weekly"][0]["week"]
+    assert set(out["daily"][0]) == {"day", "selfBids", "bidderBids", "selfInterviews", "callerInterviews"}
     assert out["peers"] is None
     b = await _acct(ana, "B")
     out = await get_profile_metrics(str(a.id), ana, weeks=4)

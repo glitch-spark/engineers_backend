@@ -92,7 +92,7 @@ def _midnight(day: date) -> datetime:
 
 
 async def self_bids(owner_ids: list, account_ids: set[str], start: date, end: date) -> dict[tuple[str, date], int]:
-    """(account id, Monday) -> self bids typed per profile in the owners' daily plans; logged (followed-up) days only."""
+    """(account id, day) -> self bids typed per profile in the owners' daily plans; logged (followed-up) days only."""
     plans = await DailyPlan.find({
         "userId": {"$in": owner_ids}, "date": {"$gte": _midnight(start), "$lte": _midnight(end)},
         "loggedAt": {"$ne": None},  # a goal-only day hasn't been followed up: no bids yet
@@ -101,14 +101,14 @@ async def self_bids(owner_ids: list, account_ids: set[str], start: date, end: da
     for p in plans:
         for account_id, n in p.done.bidsSelfByProfile.items():
             if account_id in account_ids:
-                out[(account_id, _monday(p.date.date()))] += n
+                out[(account_id, p.date.date())] += n
     return dict(out)
 
 
 async def bidder_bids(
     account_ids: list[PydanticObjectId], start: date, end: date, sched: BidSchedule,
 ) -> dict[tuple[str, date], int]:
-    """(account id, Monday) -> approved and pending bids of the profile's bidders (archived ones too), by report day."""
+    """(account id, report day) -> approved and pending bids of the profile's bidders (archived ones too)."""
     profile_of = {b.id: str(b.profileId) async for b in Bidder.find({"profileId": {"$in": account_ids}})}
     # Report days don't align with UTC midnight: query a day wider on each side, then filter by report day.
     bids = await Bid.find({
@@ -119,14 +119,14 @@ async def bidder_bids(
     for b in bids:
         day = bid_report_day(b.firstAt, sched)
         if start <= day <= end:
-            out[(profile_of[b.bidderId], _monday(day))] += 1
+            out[(profile_of[b.bidderId], day)] += 1
     return dict(out)
 
 
 async def interview_rounds(
     account_ids: list[PydanticObjectId], start: date, end: date,
 ) -> dict[tuple[str, date], list[int]]:
-    """(account id, Monday) -> [self rounds, caller rounds] held on the app's local days, by the interview's profile."""
+    """(account id, local day) -> [self rounds, caller rounds] held that day, by the interview's profile."""
     tz = app_tz()
     first = local_day_start_utc(start, tz)
     last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
@@ -140,7 +140,7 @@ async def interview_rounds(
     out: dict = defaultdict(lambda: [0, 0])
     for iv in ivs:
         for day, _group, is_caller, _stage in split_rounds_by_day(iv, first, last, tz):
-            out[(str(iv.accountId), _monday(day))][int(is_caller)] += 1
+            out[(str(iv.accountId), day)][int(is_caller)] += 1
     return dict(out)
 
 
@@ -199,11 +199,20 @@ def _score(values: list[int]) -> dict:
     return {"avg": round(sum(values) / len(values), 1) if values else None, "n": len(values)}
 
 
-def summarize(account_id: str, start: date, n_weeks: int, weekly: dict, score_lists: dict) -> dict:
-    """One profile's row. `weekly`: Monday -> {selfBids, bidderBids, selfInterviews, callerInterviews}, already
-    clipped to its span. No weeks measured: nothing per week and no rate."""
-    weeks = [weekly.get(start + timedelta(weeks=i), {}) for i in range(n_weeks)]
-    total = {k: sum(w.get(k, 0) for w in weeks) for k in _COUNTS}
+def weekly_from_daily(daily: dict[date, dict]) -> dict[date, dict]:
+    """Monday -> the counts of its days, so the Day and Week views always add up to the same totals."""
+    out: dict = {}
+    for day, counts in daily.items():
+        week = out.setdefault(_monday(day), dict.fromkeys(_COUNTS, 0))
+        for k in _COUNTS:
+            week[k] += counts.get(k, 0)
+    return out
+
+
+def summarize(account_id: str, start: date, n_weeks: int, counts: dict, score_lists: dict) -> dict:
+    """One profile's row. `counts`: day (or Monday) -> {selfBids, bidderBids, selfInterviews, callerInterviews},
+    already clipped to its span. No weeks measured: nothing per week and no rate."""
+    total = {k: sum(c.get(k, 0) for c in counts.values()) for k in _COUNTS}
     bids = total["selfBids"] + total["bidderBids"]
     interviews = total["selfInterviews"] + total["callerInterviews"]
     return {
@@ -245,18 +254,19 @@ def peer_average(rows: list[dict]) -> Optional[dict]:
 
 
 def _by_account(counts: dict[tuple[str, date], object]) -> dict[str, dict[date, object]]:
-    """(account id, Monday) -> v regrouped as account id -> {Monday: v}, so each profile reads only its own."""
+    """(account id, day) -> v regrouped as account id -> {day: v}, so each profile reads only its own."""
     out: dict = defaultdict(dict)
-    for (key, monday), v in counts.items():
-        out[key][monday] = v
+    for (key, day), v in counts.items():
+        out[key][day] = v
     return out
 
 
 async def collect(
     accounts: list[Account | ProfileSpan], weeks: int, today: date,
 ) -> dict[str, tuple[date, int, dict, dict]]:
-    """accountId -> (start Monday, weeks measured, weekly counts, score lists) over each profile's own span; every
-    source (scores too) is loaded once over the widest of them, grouped by profile and clipped to each one's span."""
+    """accountId -> (start Monday, weeks measured, daily counts, score lists) over each profile's own span; every
+    source (scores too) is loaded once over the widest of them, grouped by profile and clipped to each one's span.
+    The daily counts hold every day of the span, zeros included."""
     tz, since = app_tz(), await since_date()
     spans = {}
     for a in accounts:
@@ -279,17 +289,17 @@ async def collect(
         dated[k].append((day, kind, total))
     for key in keys:
         first, last, n = spans[key]
-        weekly = {first + timedelta(weeks=i): dict.fromkeys(_COUNTS, 0) for i in range(n)}
+        daily = {first + timedelta(days=i): dict.fromkeys(_COUNTS, 0) for i in range(7 * n)}
         for name, counts in loaded.items():
-            for monday, v in counts.get(key, {}).items():
-                if monday in weekly:
-                    weekly[monday][name] = v
-        for monday, (mine, caller) in rounds.get(key, {}).items():
-            if monday in weekly:
-                weekly[monday]["selfInterviews"], weekly[monday]["callerInterviews"] = mine, caller
+            for day, v in counts.get(key, {}).items():
+                if day in daily:
+                    daily[day][name] = v
+        for day, (mine, caller) in rounds.get(key, {}).items():
+            if day in daily:
+                daily[day]["selfInterviews"], daily[day]["callerInterviews"] = mine, caller
         score_lists = {"tailored": [], "match": []}
         for day, kind, total in dated.get(key, ()):
             if first <= day <= last:
                 score_lists[kind].append(total)
-        out[key] = (first, n, weekly, score_lists)
+        out[key] = (first, n, daily, score_lists)
     return out

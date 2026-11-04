@@ -12,7 +12,7 @@ from app import resume_files
 from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
-from app.profile_metrics import WEEK_CHOICES, ProfileSpan, collect, peer_average, span, summarize
+from app.profile_metrics import WEEK_CHOICES, ProfileSpan, collect, peer_average, span, summarize, weekly_from_daily
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
@@ -404,7 +404,8 @@ async def get_profile_metrics(
     user: Annotated[UserExtra, Depends(get_current_user)],
     weeks: int = Query(4),
 ) -> dict:
-    """One profile's metrics row, its week-by-week counts and the owner's other active profiles' average."""
+    """One profile's metrics row, its day-by-day and week-by-week counts and the owner's other active profiles'
+    average."""
     _check_weeks(weeks)
     acc = await Account.find_one({"_id": to_object_id(account_id)}).project(ProfileSpan)
     if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
@@ -416,14 +417,11 @@ async def get_profile_metrics(
         accounts.append(acc)
     collected = await collect(accounts, weeks, datetime.now(app_tz()).date())
     me = str(acc.id)
-    start, n_weeks, weekly, scores = collected[me]
-    row = summarize(me, start, n_weeks, weekly, scores)
-    row["weekly"] = [
-        {"week": (start + timedelta(weeks=i)).isoformat(),
-         **{k: weekly.get(start + timedelta(weeks=i), {}).get(k, 0)
-            for k in ("selfBids", "bidderBids", "selfInterviews", "callerInterviews")}}
-        for i in range(n_weeks)
-    ]
+    start, n_weeks, daily, scores = collected[me]
+    row = summarize(me, start, n_weeks, daily, scores)
+    # Both views oldest first; collect gives every day of the span, so every week is there too.
+    row["daily"] = [{"day": d.isoformat(), **c} for d, c in sorted(daily.items())]
+    row["weekly"] = [{"week": m.isoformat(), **c} for m, c in sorted(weekly_from_daily(daily).items())]
     row["peers"] = peer_average([summarize(aid, *v) for aid, v in collected.items() if aid != me])
     return row
 

@@ -127,13 +127,13 @@ async def test_self_bids_logged_days_only(db):
     key = str(acc.id)
     await _plan(user, date(2026, 10, 20), {key: 5})
     await _plan(user, date(2026, 10, 21), {key: 7}, logged=False)
-    assert await pm.self_bids([user.id], {key}, START, END) == {(key, MON): 5}
+    assert await pm.self_bids([user.id], {key}, START, END) == {(key, date(2026, 10, 20)): 5}
 
 
 async def test_self_bids_ignores_unknown_keys(db):
     user, acc = await _setup()
     await _plan(user, date(2026, 10, 20), {str(acc.id): 5, "f" * 24: 9})
-    assert await pm.self_bids([user.id], {str(acc.id)}, START, END) == {(str(acc.id), MON): 5}
+    assert await pm.self_bids([user.id], {str(acc.id)}, START, END) == {(str(acc.id), date(2026, 10, 20)): 5}
 
 
 async def test_bidder_bids_statuses(db):
@@ -149,7 +149,7 @@ async def test_bidder_bids_statuses(db):
     for i, (bidder, status) in enumerate(bids):
         await Bid(bidderId=bidder.id, ownerId=user.id, jobKey=f"k{i}", firstAt=at, status=status).insert()
     got = await pm.bidder_bids([acc.id], START, END, schedule_from_settings())
-    assert got == {(str(acc.id), MON): 3}
+    assert got == {(str(acc.id), date(2026, 10, 21)): 3}
 
 
 async def _round(user, acc, *rounds):
@@ -171,14 +171,16 @@ async def test_interview_rounds_self_caller(db):
         ("tech", datetime(2026, 10, 21, 15), "completed", True),
         ("hiring_manager", datetime(2026, 10, 22, 15), "canceled", False),
     )
-    assert await pm.interview_rounds([acc.id], START, END) == {(str(acc.id), MON): [1, 1]}
+    assert await pm.interview_rounds([acc.id], START, END) == {
+        (str(acc.id), date(2026, 10, 20)): [1, 0], (str(acc.id), date(2026, 10, 21)): [0, 1],
+    }
 
 
 async def test_interview_week_uses_local_day(db, monkeypatch):
     monkeypatch.setattr(pm, "app_tz", lambda: ZoneInfo("America/New_York"))
     user, acc = await _setup()
     await _round(user, acc, ("intro", datetime(2026, 10, 26, 3, 0), "completed", False))  # Sun Oct 25 23:00 local
-    assert await pm.interview_rounds([acc.id], START, END) == {(str(acc.id), MON): [1, 0]}
+    assert await pm.interview_rounds([acc.id], START, END) == {(str(acc.id), date(2026, 10, 25)): [1, 0]}
 
 
 async def test_scores_split(db):
@@ -261,8 +263,12 @@ async def test_collect_keeps_the_profiles_own_weeks(db):
     user, acc = await _setup()
     key = str(acc.id)
     await _plan(user, date(2026, 10, 20), {key: 5})
-    start, n_weeks, weekly, scores = (await pm.collect([acc], 4, date(2026, 11, 3)))[key]
+    start, n_weeks, daily, scores = (await pm.collect([acc], 4, date(2026, 11, 3)))[key]
     assert (start, n_weeks) == (date(2026, 10, 5), 4)
+    assert sorted(daily) == [date(2026, 10, 5) + timedelta(days=i) for i in range(28)]  # every day, zeros too
+    assert daily[date(2026, 10, 20)]["selfBids"] == 5 and daily[date(2026, 10, 21)]["selfBids"] == 0
+    weekly = pm.weekly_from_daily(daily)
+    assert sorted(weekly) == [date(2026, 10, 5) + timedelta(weeks=i) for i in range(4)]
     assert weekly[MON]["selfBids"] == 5 and weekly[date(2026, 10, 5)]["selfBids"] == 0
     assert scores == NO_SCORES
 
@@ -305,8 +311,10 @@ async def test_collect_gives_each_profile_only_its_own_counts(db):
             score={"total": total, "band": "ok"},
         ).insert()
     out = await pm.collect([a, b], 4, date(2026, 11, 3))
-    _s, _n, weekly_a, scores_a = out[ka]
-    _s, _n, weekly_b, scores_b = out[kb]
+    _s, _n, daily_a, scores_a = out[ka]
+    _s, _n, daily_b, scores_b = out[kb]
+    weekly_a, weekly_b = pm.weekly_from_daily(daily_a), pm.weekly_from_daily(daily_b)
+    assert daily_a[date(2026, 10, 21)]["bidderBids"] == 2 and daily_b[date(2026, 10, 22)]["callerInterviews"] == 1
     assert weekly_a[MON] == {"selfBids": 5, "bidderBids": 2, "selfInterviews": 1, "callerInterviews": 0}
     assert weekly_a[date(2026, 10, 26)]["selfBids"] == 2
     assert weekly_b[MON] == {"selfBids": 3, "bidderBids": 1, "selfInterviews": 0, "callerInterviews": 1}
