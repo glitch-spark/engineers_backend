@@ -9,7 +9,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.interview_rounds import split_rounds_by_day  # noqa: E402
-from app.models.plan_common import Counts  # noqa: E402
+from app.models.plan_common import Counts, DoneCounts  # noqa: E402
 from app.plan_auto import effective_daily_done, weekly_done  # noqa: E402
 
 UTC = ZoneInfo("UTC")
@@ -40,7 +40,7 @@ def _day(interviews_self=0, interviews_caller=0, stages=None):
 
 def _plan(done=None, logged=True):
     return SimpleNamespace(
-        done=Counts(**(done or {})),
+        done=DoneCounts(**(done or {})),
         loggedAt=datetime(2026, 10, 1, 20) if logged else None,
     )
 
@@ -112,7 +112,7 @@ def test_effective_daily_done_bids_typed_interviews_from_records():
 
 def test_effective_daily_done_without_plan_is_interviews_only():
     done = effective_daily_done(None, _day(2, 1))
-    assert done == Counts(interviewsSelf=2, interviewsCaller=1)
+    assert done == DoneCounts(interviewsSelf=2, interviewsCaller=1)
 
 
 def test_weekly_done_sums_logged_days_bids_and_week_interviews():

@@ -14,7 +14,7 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.models import DailyPlan, Transaction, UserExtra
 from app.models.weekly_plan import WeeklyPlan
-from app.models.plan_common import Counts
+from app.models.plan_common import Counts, DoneCounts
 
 pytestmark = pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning")
 
@@ -33,7 +33,7 @@ async def make_user(name, role="staff", **kw):
 
 
 async def plan(user, day, self_bids, bidder_bids):
-    await DailyPlan(userId=user.id, date=datetime(2026, 10, day), year=2026, weekNumber=40, done=Counts(bidsSelf=self_bids, bidsBidder=bidder_bids),
+    await DailyPlan(userId=user.id, date=datetime(2026, 10, day), year=2026, weekNumber=40, done=DoneCounts(bidsSelf=self_bids, bidsBidder=bidder_bids),
                     loggedAt=datetime(2026, 10, day, 20)).insert()
 
 

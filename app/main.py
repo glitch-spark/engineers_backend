@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -58,6 +59,14 @@ async def lifespan(app: FastAPI):
             log.info("Assigned folders to %d bidders", n)
     except Exception:
         log.exception("Bidder folder backfill failed")
+    if resume_queue.queue_enabled():  # the deployed backend: local runs share its database and must not record it
+        try:
+            from app.dashboard_stats import app_tz
+            from app.profile_metrics import record_launch
+
+            await record_launch(datetime.now(app_tz()).date())
+        except Exception:
+            log.exception("Recording the profile metrics launch day failed")
     sweep = None
     if job_apply_worker.worker_enabled():
         # Restarts Job Applies runs whose worker died (redeploy/crash); see app/job_apply/worker.py.

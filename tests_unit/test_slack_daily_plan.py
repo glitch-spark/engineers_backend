@@ -111,6 +111,13 @@ def test_daily_plan_text_splits_self_bids_by_region():
     ]
 
 
+def test_daily_plan_text_other_regions_complete_the_self_total():
+    plan = _plan(goal=Counts(bidsSelf=150, bidsSelfUs=80, bidsSelfEu=40, bidsSelfLatam=30, bidsBidder=100))
+    done = Counts(bidsSelf=136, bidsSelfUs=70, bidsSelfEu=40, bidsSelfLatam=20, bidsBidder=100)  # 6 Canada / Asia
+    lines = daily_plan_text(plan, _owner(), done=done).splitlines()
+    assert lines[5] == "             US 70/80 · EU 40/40 · LATAM 20/30 · Other 6"
+
+
 def test_daily_plan_text_interview_stages_follow_pipeline_order():
     done = Counts(interviewsSelf=7)
     rounds = {"self": {"final": 1, "cultural": 2, "tech_round_2": 1, "live_coding": 1, "intro": 1, "panel": 1}}

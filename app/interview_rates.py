@@ -4,8 +4,8 @@ range, in one region or all of them, plus each user's bids and interviews per da
 Counted as the plans count them (app/plan_auto.py), on the app's local days:
 - bids are the applies typed in daily plans' Done, on followed-up (logged) days only. All = self + bidder applies (the
   Leaderboard's "bids done"); a region = that region's self applies (bidsSelfUs / Eu / Latam), and US also the bidder
-  applies: bidders only apply to US jobs. Self applies typed as a plain total (before the region split) have no
-  region, so they count under All only;
+  applies: bidders only apply to US jobs. The rest of the self total has no region (applies typed for Canada, Asia
+  or no-region profiles, or a plain total saved before the region split), so it counts under All only;
 - interviews are the rounds held (app/interview_rounds.py), in the region of the interview's profile.
 Every non-admin user is ranked, as on the Leaderboard; below MIN_BIDS bids a rate is shown but not ranked.
 """

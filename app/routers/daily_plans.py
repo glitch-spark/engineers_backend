@@ -14,10 +14,11 @@ from app.alerts import app_week_key
 from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.daily_plan import DailyPlan
-from app.models.plan_common import BidsIn, ChecklistItems, Counts, bids_of
+from app.models.plan_common import BidsIn, ChecklistItems, Counts, DoneCounts, bids_of
 from app.dashboard_stats import app_tz
 from app.models.plan_common import monday_of
 from app.plan_auto import day_goal, effective_daily_done, empty_day, interview_counts, weekly_plans_for
+from app.plan_profiles import derive_self_bids, owner_profiles, profile_regions
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
@@ -40,9 +41,10 @@ def _midnight(d: date) -> datetime:
     return datetime(d.year, d.month, d.day)
 
 
-def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly) -> dict:
+def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly, profiles: Optional[list] = None) -> dict:
+    """`profiles` is the owner's; the week view sends them once, so it passes None and the key is left out."""
     goal, items = day_goal(plan, weekly)
-    return {
+    out = {
         "date": day.isoformat(),
         "exists": plan is not None,
         "userId": str(uid),
@@ -53,6 +55,9 @@ def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly) 
         "notes": plan.notes if plan else "",
         "loggedAt": plan.loggedAt.isoformat() if plan and plan.loggedAt else None,
     }
+    if profiles is not None:
+        out["profiles"] = profiles
+    return out
 
 
 async def _interviews(uid, start: date, end: date) -> dict:
@@ -97,6 +102,7 @@ async def list_week(
         days.append(sunday)
     return {
         "weekStart": monday.isoformat(),
+        "profiles": await owner_profiles(uid),
         "days": [_day_out(uid, d, by_date.get(d), interviews.get(d, empty_day()), weekly) for d in days],
     }
 
@@ -110,7 +116,10 @@ async def get_day(
     when = parse_ymd(day, "date")
     uid = await read_subject(user, userId)
     interviews = await _interviews(uid, when, when)
-    return _day_out(uid, when, await _find(uid, when), interviews.get(when, empty_day()), await _weekly(uid, when))
+    return _day_out(
+        uid, when, await _find(uid, when), interviews.get(when, empty_day()), await _weekly(uid, when),
+        await owner_profiles(uid),
+    )
 
 
 @router.put("/{day}")
@@ -134,7 +143,14 @@ async def put_day(
     goal, _items = day_goal(plan, weekly)
     plan.goal = Counts(**bids_of(goal))
     plan.goalItems = body.goalItems
-    plan.done = Counts(**bids_of(body.done))
+    profiles = await owner_profiles(user.id)  # one read: validation and the response
+    by = {pid: n for pid, n in body.done.bidsSelfByProfile.items() if n}
+    if by:
+        regions = await profile_regions(profiles, by)
+        by = {pid: by[pid] for pid in regions}
+        plan.done = DoneCounts(**{**bids_of(body.done), **derive_self_bids(by, regions)}, bidsSelfByProfile=by)
+    else:
+        plan.done = DoneCounts(**bids_of(body.done))
     plan.notes = body.notes
     if plan.loggedAt is None:
         plan.loggedAt = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -145,7 +161,7 @@ async def put_day(
 
     auto_day = (await _interviews(user.id, when, when)).get(when, empty_day())
     await _sync_slack(plan, user, effective_daily_done(plan, auto_day), auto_day["rounds"])
-    return _day_out(user.id, when, plan, auto_day, weekly)
+    return _day_out(user.id, when, plan, auto_day, weekly, profiles)
 
 
 @router.delete("/{day}")

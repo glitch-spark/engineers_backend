@@ -533,6 +533,10 @@ def daily_plan_text(
     bids = [_plan_row("Self", f"{done.bidsSelf} / {goal.bidsSelf}")]
     if any(getattr(c, f, 0) for c in (done, goal) for f, _ in _REGION_LABELS):
         split = " · ".join(f"{label} {getattr(done, f, 0)}/{getattr(goal, f, 0)}" for f, label in _REGION_LABELS)
+        # Canada, Asia and no-region profiles (or a pre-split total) count in Self only: show them so the parts add up.
+        other = done.bidsSelf - sum(getattr(done, f, 0) for f, _ in _REGION_LABELS)
+        if other > 0:
+            split += f" · Other {other}"
         bids.append(f"{_PLAN_VALUE_INDENT}{split}")
     bids.append(_plan_row("Bidder", f"{done.bidsBidder} / {goal.bidsBidder}"))
     sections.append(["Bids", *bids])

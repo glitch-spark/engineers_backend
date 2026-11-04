@@ -8,7 +8,7 @@ is typed per day; interviews Done always comes from the Interviews page
 """
 
 from datetime import date, timedelta
-from typing import Annotated
+from typing import Annotated, Dict
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
@@ -23,7 +23,7 @@ BID_FIELDS = ("bidsSelf", *SELF_REGIONS, "bidsBidder")
 
 
 class Bids(BaseModel):
-    bidsSelf: Count = 0  # self total: the regions' sum, or a pre-split total
+    bidsSelf: Count = 0  # self total: regions plus other-region profiles (Canada, Asia, none), or a pre-split total
     bidsSelfUs: Count = 0
     bidsSelfEu: Count = 0
     bidsSelfLatam: Count = 0
@@ -35,6 +35,12 @@ class Counts(Bids):
     interviewsCaller: Count = 0
 
 
+class DoneCounts(Counts):
+    """A day's Done: self bids typed per profile (accountId hex -> count) are kept beside the totals."""
+
+    bidsSelfByProfile: Dict[str, Count] = {}
+
+
 def bids_of(c: Bids) -> dict[str, int]:
     """The bid fields of `c`, to copy into another Counts."""
     return {f: getattr(c, f) for f in BID_FIELDS}
@@ -43,7 +49,10 @@ def bids_of(c: Bids) -> dict[str, int]:
 class _SelfTotal(BaseModel):
     @model_validator(mode="after")
     def self_total_from_regions(self):
-        """Typed self bids: once any region is set, the total is their sum."""
+        """Typed self bids: once any region is set, the total is their sum (per-profile saves derive both; an
+        all-zero map is dropped on save, so it doesn't count as typed per profile)."""
+        if any((getattr(self, "bidsSelfByProfile", None) or {}).values()):
+            return self
         regions = sum(getattr(self, f) for f in SELF_REGIONS)
         if regions:
             self.bidsSelf = regions
@@ -52,6 +61,8 @@ class _SelfTotal(BaseModel):
 
 class BidsIn(Bids, _SelfTotal):
     """Bids typed on a day (goal in the morning, Done at follow-up)."""
+
+    bidsSelfByProfile: Dict[str, Count] = {}
 
 
 class CountsIn(Counts, _SelfTotal):

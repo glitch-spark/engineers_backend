@@ -133,6 +133,9 @@ class Settings(BaseSettings):
     BID_RECORDS_START: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
+    # Profile metrics start here (YYYY-MM-DD): earlier weeks are not shown. Unset = the day after this release first
+    # started on the deployed backend, recorded once in the database (app/profile_metrics.py record_launch).
+    PROFILE_METRICS_SINCE: Optional[str] = None
 
     @field_validator("AUTH_SECRET")
     @classmethod
@@ -163,7 +166,7 @@ class Settings(BaseSettings):
             return None
         return str(v).strip() or None
 
-    @field_validator("BID_RECORDS_START", mode="before")
+    @field_validator("BID_RECORDS_START", "PROFILE_METRICS_SINCE", mode="before")
     @classmethod
     def _validate_records_start(cls, v: object) -> Optional[str]:
         if v is None:
