@@ -49,8 +49,9 @@ def bids_of(c: Bids) -> dict[str, int]:
 class _SelfTotal(BaseModel):
     @model_validator(mode="after")
     def self_total_from_regions(self):
-        """Typed self bids: once any region is set, the total is their sum (per-profile saves derive both)."""
-        if getattr(self, "bidsSelfByProfile", None):
+        """Typed self bids: once any region is set, the total is their sum (per-profile saves derive both; an
+        all-zero map is dropped on save, so it doesn't count as typed per profile)."""
+        if any((getattr(self, "bidsSelfByProfile", None) or {}).values()):
             return self
         regions = sum(getattr(self, f) for f in SELF_REGIONS)
         if regions:

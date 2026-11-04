@@ -29,3 +29,8 @@ def test_regions_cannot_be_negative():
 def test_bids_of_copies_every_bid_field():
     c = Counts(bidsSelf=6, bidsSelfUs=1, bidsSelfEu=2, bidsSelfLatam=3, bidsBidder=4, interviewsSelf=9)
     assert Counts(**bids_of(c)) == Counts(bidsSelf=6, bidsSelfUs=1, bidsSelfEu=2, bidsSelfLatam=3, bidsBidder=4)
+
+
+def test_all_zero_profile_map_still_sums_regions():
+    assert BidsIn(bidsSelfByProfile={"a": 0}, bidsSelfUs=3).bidsSelf == 3
+    assert BidsIn(bidsSelfByProfile={"a": 5}, bidsSelf=9, bidsSelfUs=5).bidsSelf == 9  # put_day derives both
