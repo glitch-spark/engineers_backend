@@ -9,4 +9,4 @@ if len(os.environ.get("AUTH_SECRET", "")) < 32:
 os.environ["REDIS_URL"] = ""
 
 # Profile metrics measure every completed week unless a test sets a start date (a developer .env can't move it).
-os.environ["PROFILE_METRICS_SINCE"] = ""
+os.environ["PROFILE_METRICS_SINCE"] = "0001-01-01"

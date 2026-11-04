@@ -133,9 +133,9 @@ class Settings(BaseSettings):
     BID_RECORDS_START: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
-    # Profile metrics start here (YYYY-MM-DD): earlier weeks are not shown. Defaults to the release Monday, the first
-    # week self bids are typed per profile. Set it empty for every completed week.
-    PROFILE_METRICS_SINCE: Optional[str] = "2026-11-10"
+    # Profile metrics start here (YYYY-MM-DD): earlier weeks are not shown. Unset = the day after this release first
+    # started on the deployed backend, recorded once in the database (app/profile_metrics.py record_launch).
+    PROFILE_METRICS_SINCE: Optional[str] = None
 
     @field_validator("AUTH_SECRET")
     @classmethod

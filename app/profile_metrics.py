@@ -1,7 +1,7 @@
 """Profile metrics: a profile's weekly bids, interviews and scores over its last completed weeks.
 
 Weeks run Monday to Sunday and only completed ones count. A profile is measured from the latest of the window's
-first Monday, the first Monday on or after PROFILE_METRICS_SINCE and the Monday of the week it was created.
+first Monday, the first Monday on or after the launch day (`since_date`) and the Monday of the week it was created.
 """
 from __future__ import annotations
 
@@ -32,10 +32,34 @@ class ProfileSpan(BaseModel):
     createdAt: datetime = Field(default_factory=datetime.utcnow)  # as on Account (TimestampedDocument)
 
 
-def since_date() -> date:
-    """PROFILE_METRICS_SINCE as a date; date.min when unset."""
-    s = get_settings().PROFILE_METRICS_SINCE
-    return date.fromisoformat(s) if s else date.min
+# Where the deployed backend records the day self bids start being typed per profile (one document, never updated).
+_LAUNCH = {"_id": "profileMetricsSince"}
+_launched: Optional[date] = None
+
+
+def _settings_collection():
+    return Account.get_motor_collection().database["app_settings"]
+
+
+async def record_launch(today: date) -> None:
+    """Called at startup by the deployed backend only: the first release to run there starts metrics the next day.
+    Later restarts and deploys keep the date already recorded."""
+    await _settings_collection().update_one(
+        _LAUNCH, {"$setOnInsert": {"value": (today + timedelta(days=1)).isoformat(), "at": datetime.utcnow()}},
+        upsert=True,
+    )
+
+
+async def since_date() -> Optional[date]:
+    """PROFILE_METRICS_SINCE when set, else the recorded launch day; None before the deployed backend recorded one
+    (nothing is measured yet)."""
+    global _launched
+    if s := get_settings().PROFILE_METRICS_SINCE:
+        return date.fromisoformat(s)
+    if _launched is None:
+        doc = await _settings_collection().find_one(_LAUNCH)
+        _launched = date.fromisoformat(doc["value"]) if doc else None
+    return _launched
 
 
 def span(weeks: int, today: date, since: date, created: date) -> tuple[date, date, int]:
@@ -233,11 +257,12 @@ async def collect(
 ) -> dict[str, tuple[date, int, dict, dict]]:
     """accountId -> (start Monday, weeks measured, weekly counts, score lists) over each profile's own span; every
     source (scores too) is loaded once over the widest of them, grouped by profile and clipped to each one's span."""
-    tz, since = app_tz(), since_date()
+    tz, since = app_tz(), await since_date()
     spans = {}
     for a in accounts:
         created = a.createdAt.replace(tzinfo=timezone.utc).astimezone(tz).date()
-        spans[str(a.id)] = span(weeks, today, since, created)
+        start, end, n = span(weeks, today, since or today, created)
+        spans[str(a.id)] = (start, end, n if since else 0)
     out = {k: (s, n, {}, {"tailored": [], "match": []}) for k, (s, _e, n) in spans.items()}
     live = [a for a in accounts if spans[str(a.id)][2]]
     if not live:

@@ -69,7 +69,8 @@ the derived ones.
 (`dashboard_stats.app_tz`), as the weekly plans. Only **completed** weeks count: the current week is left out.
 
 **Launch clamp.** The span starts at the latest of: the window's first Monday; the first Monday on or after
-`PROFILE_METRICS_SINCE` (new setting, ISO date, default the release date); the Monday of the week holding the
+the launch day — `PROFILE_METRICS_SINCE` when set, otherwise the day after this release first started on the
+deployed backend (recorded once in `app_settings`; nothing is measured before that); the Monday of the week holding the
 profile's `createdAt` (local day). All of a profile's metrics use this one span, so
 bids and interviews always cover the same days. **Per week** = total ÷ weeks in the span. A span of 0 weeks returns
 `null` metrics (UI: "Not enough history yet").

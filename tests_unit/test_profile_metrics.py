@@ -51,17 +51,40 @@ def test_span_no_completed_week():
     assert span(4, TODAY, date(2026, 11, 3), LONG_AGO)[2] == 0
 
 
-def test_since_defaults_to_the_release_monday(monkeypatch):
+def test_since_is_unset_by_default(monkeypatch):
     monkeypatch.delenv("PROFILE_METRICS_SINCE", raising=False)
-    assert Settings(_env_file=None).PROFILE_METRICS_SINCE == "2026-11-10"
-    assert Settings(_env_file=None, PROFILE_METRICS_SINCE="").PROFILE_METRICS_SINCE is None
+    assert Settings(_env_file=None).PROFILE_METRICS_SINCE is None
 
 
-def test_since_date(monkeypatch):
-    assert pm.since_date() == date.min  # tests_unit/conftest.py blanks it
+def _unset_since(monkeypatch):
+    monkeypatch.setattr(pm, "get_settings", lambda: get_settings().model_copy(update={"PROFILE_METRICS_SINCE": None}))
+    monkeypatch.setattr(pm, "_launched", None)
+
+
+async def test_since_date_setting_wins(db, monkeypatch):
+    assert await pm.since_date() == date.min  # tests_unit/conftest.py sets 0001-01-01
+    await pm.record_launch(date(2026, 11, 5))
     dated = get_settings().model_copy(update={"PROFILE_METRICS_SINCE": "2026-11-10"})
     monkeypatch.setattr(pm, "get_settings", lambda: dated)
-    assert pm.since_date() == date(2026, 11, 10)
+    assert await pm.since_date() == date(2026, 11, 10)
+
+
+async def test_since_date_is_the_day_after_launch(db, monkeypatch):
+    _unset_since(monkeypatch)
+    assert await pm.since_date() is None  # the deployed backend hasn't started this release yet
+    await pm.record_launch(date(2026, 11, 5))
+    assert await pm.since_date() == date(2026, 11, 6)
+    await pm.record_launch(date(2026, 12, 1))  # a later deploy keeps the first date
+    monkeypatch.setattr(pm, "_launched", None)
+    assert await pm.since_date() == date(2026, 11, 6)
+
+
+async def test_collect_measures_nothing_before_launch(db, monkeypatch):
+    _unset_since(monkeypatch)
+    user, acc = await _setup()
+    await _plan(user, date(2026, 10, 20), {str(acc.id): 5})
+    _start, n_weeks, weekly, _scores = (await pm.collect([acc], 4, date(2026, 11, 3)))[str(acc.id)]
+    assert n_weeks == 0 and weekly == {}
 
 
 def test_bid_report_day_cutoff():
