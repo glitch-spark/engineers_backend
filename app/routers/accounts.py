@@ -13,7 +13,8 @@ from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.profile_metrics import (
-    WEEK_CHOICES, ProfileSpan, collect, lifetime, peer_average, since_date, span, summarize, weekly_from_daily,
+    WEEK_CHOICES, ProfileSpan, collect, collect_range, lifetime, peer_average, since_date, span, summarize,
+    weekly_from_daily,
 )
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
@@ -397,7 +398,7 @@ async def list_profile_metrics(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
         query["createdBy"] = user.id
     accounts = await Account.find(query).project(ProfileSpan).to_list()
-    today = datetime.now(app_tz()).date()
+    today = _today()
     if all_time:
         collected = await lifetime(accounts, today)
         first = min((vals[0] for vals in collected.values()), default=today)
@@ -417,28 +418,49 @@ async def list_profile_metrics(
 async def get_profile_metrics(
     account_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
-    weeks: int = Query(4),
+    period: str = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month (default: today); custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
 ) -> dict:
-    """One profile's metrics row, its day-by-day and week-by-week counts and the owner's other active profiles'
-    average."""
-    _check_weeks(weeks)
+    """One profile's totals over a week, a month, a custom range or all time (the Statistics tabs' periods), its
+    day-by-day and week-by-week counts and the owner's other active profiles' average totals over the same days.
+    The current week or month runs to today."""
+    from app import interview_rates as ir
+    from app.routers.metrics import _stats_days
+
+    if period not in ("week", "month", "custom", "all"):
+        raise HTTPException(status_code=422, detail="period must be week, month, custom or all")
     acc = await Account.find_one({"_id": to_object_id(account_id)}).project(ProfileSpan)
     if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    today = _today()
+    if period == "all":
+        start, end, label = acc.createdAt.replace(tzinfo=timezone.utc).astimezone(app_tz()).date(), today, "All time"
+    else:
+        day, until = _stats_days(period, date, to)
+        start, end = ir.window(period, day, until)
+        label = ir.label(period, start, end)
+        end = min(end, today)
     query: dict[str, Any] = archive_status_query("active")
     query["createdBy"] = acc.createdBy
     accounts = await Account.find(query).project(ProfileSpan).to_list()
     if all(a.id != acc.id for a in accounts):
         accounts.append(acc)
-    collected = await collect(accounts, weeks, datetime.now(app_tz()).date())
+    collected = await collect_range(accounts, start, end)
     me = str(acc.id)
-    start, n_weeks, daily, scores = collected[me]
-    row = summarize(me, start, n_weeks, daily, scores)
-    # Both views oldest first; collect gives every day of the span, so every week is there too.
+    row = summarize(me, *collected[me])
+    _, _, daily, _ = collected[me]
+    row.update(start=start.isoformat(), end=end.isoformat(), label=label, period=period)
+    # Both views oldest first; a week cut by the range keeps only its days in the range.
     row["daily"] = [{"day": d.isoformat(), **c} for d, c in sorted(daily.items())]
     row["weekly"] = [{"week": m.isoformat(), **c} for m, c in sorted(weekly_from_daily(daily).items())]
     row["peers"] = peer_average([summarize(aid, *v) for aid, v in collected.items() if aid != me])
     return row
+
+
+def _today() -> date:
+    """The app's local today: the current week or month runs to it."""
+    return datetime.now(app_tz()).date()
 
 
 @router.get("/{account_id}")

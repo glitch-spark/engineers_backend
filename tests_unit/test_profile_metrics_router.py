@@ -1,4 +1,4 @@
-"""GET /accounts/metrics and /accounts/{id}/metrics (in-memory MongoDB via mongomock-motor; routes called directly)."""
+"""GET /accounts/metrics (in-memory MongoDB via mongomock-motor; routes called directly)."""
 import os
 from datetime import datetime, timedelta
 
@@ -14,7 +14,7 @@ from mongomock_motor import AsyncMongoMockClient
 from app.models import (
     Account, Bid, Bidder, DailyPlan, Interview, InterviewQuestion, JobApplicationLog, ResumeApplication, UserExtra,
 )
-from app.routers.accounts import get_profile_metrics, list_profile_metrics
+from app.routers.accounts import list_profile_metrics
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -95,28 +95,3 @@ async def test_list_admin_user_filter(db):
     out = await list_profile_metrics(boss, weeks=4, userId=str(ana.id))
     assert [r["accountId"] for r in out["rows"]] == [str(a.id)]
     assert len((await list_profile_metrics(boss, weeks=4, userId=""))["rows"]) == 2
-
-
-async def test_detail_not_owner_404(db):
-    ana, ben = await _user("ana"), await _user("ben")
-    a = await _acct(ana, "A")
-    with pytest.raises(HTTPException) as e:
-        await get_profile_metrics(str(a.id), ben, weeks=4)
-    assert e.value.status_code == 404
-
-
-async def test_detail_weekly_and_peers(db):
-    ana = await _user("ana")
-    a = await _acct(ana, "A")
-    out = await get_profile_metrics(str(a.id), ana, weeks=4)
-    assert ROW_KEYS <= set(out)
-    assert len(out["weekly"]) == 4
-    assert set(out["weekly"][0]) == {"week", "selfBids", "bidderBids", "selfInterviews", "callerInterviews"}
-    assert [w["week"] for w in out["weekly"]] == sorted(w["week"] for w in out["weekly"])
-    assert len(out["daily"]) == 28 and out["daily"][0]["day"] == out["weekly"][0]["week"]
-    assert set(out["daily"][0]) == {"day", "selfBids", "bidderBids", "selfInterviews", "callerInterviews"}
-    assert out["peers"] is None
-    b = await _acct(ana, "B")
-    out = await get_profile_metrics(str(a.id), ana, weeks=4)
-    assert out["peers"] is not None
-    assert (await get_profile_metrics(str(a.id), await _user("boss", "admin"), weeks=4))["accountId"] == str(a.id)

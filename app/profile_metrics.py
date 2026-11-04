@@ -279,7 +279,8 @@ def peer_average(rows: list[dict]) -> Optional[dict]:
 
     out: dict = {f: mean(f, 1) for f in (
         "bidsPerWeek", "selfBidsPerWeek", "bidderBidsPerWeek", "interviewsPerWeek", "selfInterviewsPerWeek",
-        "callerInterviewsPerWeek",
+        "callerInterviewsPerWeek", "bids", "selfBids", "bidderBids", "interviews", "selfInterviews",
+        "callerInterviews", "tailoredResumes",
     )}
     out["interviewsPerBid"] = mean("interviewsPerBid", 4)
     out["tailorScore"], out["matchScore"] = score("tailorScore"), score("matchScore")
@@ -311,27 +312,53 @@ async def collect(
     if not live:
         return out
     start, end = min(spans[str(a.id)][0] for a in live), max(spans[str(a.id)][1] for a in live)
-    keys, ids = {str(a.id) for a in live}, [a.id for a in live]
-    loaded = {
-        "selfBids": _by_account(await self_bids(list({a.createdBy for a in live}), keys, start, end)),
+    sources = await _load(live, start, end)
+    for a in live:
+        first, last, n = spans[str(a.id)]
+        out[str(a.id)] = (first, n, *_days(str(a.id), first, last, sources))
+    return out
+
+
+async def collect_range(
+    accounts: list[Account | ProfileSpan], start: date, end: date,
+) -> dict[str, tuple[date, int, dict, dict]]:
+    """accountId -> (start, weeks the range touches, daily counts, score lists) over the days [start, end], every
+    day present (zeros too). Unlike `collect` nothing is clamped: each source counts on its own days (self bids exist
+    only once they are typed per profile)."""
+    days = (end - start).days + 1
+    if days <= 0 or not accounts:
+        return {str(a.id): (start, 0, {}, _score_lists((), start)) for a in accounts}
+    sources = await _load(accounts, start, end)
+    return {str(a.id): (start, -(-days // 7), *_days(str(a.id), start, end, sources)) for a in accounts}
+
+
+async def _load(accounts: list[Account | ProfileSpan], start: date, end: date) -> tuple[dict, dict, dict]:
+    """Every source over [start, end] for these profiles, one query each, grouped by profile: (bids by kind,
+    interview rounds, dated scores)."""
+    keys, ids = {str(a.id) for a in accounts}, [a.id for a in accounts]
+    bids = {
+        "selfBids": _by_account(await self_bids(list({a.createdBy for a in accounts}), keys, start, end)),
         "bidderBids": _by_account(await bidder_bids(ids, start, end, schedule_from_settings())),
     }
     rounds = _by_account(await interview_rounds(ids, start, end))
     dated: dict = defaultdict(list)
     for k, day, kind, total in await _dated_scores(list(keys), start, end):
         dated[k].append((day, kind, total))
-    for key in keys:
-        first, last, n = spans[key]
-        daily = {first + timedelta(days=i): dict.fromkeys(_COUNTS, 0) for i in range(7 * n)}
-        for name, counts in loaded.items():
-            for day, v in counts.get(key, {}).items():
-                if day in daily:
-                    daily[day][name] = v
-        for day, (mine, caller) in rounds.get(key, {}).items():
+    return bids, rounds, dated
+
+
+def _days(key: str, first: date, last: date, sources: tuple[dict, dict, dict]) -> tuple[dict, dict]:
+    """One profile's (daily counts for every day of [first, last], score lists) out of the loaded sources."""
+    bids, rounds, dated = sources
+    daily = {first + timedelta(days=i): dict.fromkeys(_COUNTS, 0) for i in range((last - first).days + 1)}
+    for name, counts in bids.items():
+        for day, v in counts.get(key, {}).items():
             if day in daily:
-                daily[day]["selfInterviews"], daily[day]["callerInterviews"] = mine, caller
-        out[key] = (first, n, daily, _score_lists(dated.get(key, ()), first, last))
-    return out
+                daily[day][name] = v
+    for day, (mine, caller) in rounds.get(key, {}).items():
+        if day in daily:
+            daily[day]["selfInterviews"], daily[day]["callerInterviews"] = mine, caller
+    return daily, _score_lists(dated.get(key, ()), first, last)
 
 
 async def _lifetime_self_bids(owner_ids: list, account_ids: set[str], since: Optional[date]) -> dict[str, int]:
