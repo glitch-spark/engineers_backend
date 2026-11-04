@@ -194,6 +194,21 @@ def _normalize_country(raw: Optional[str]) -> Optional[str]:
     return code
 
 
+def _region_query(region: str) -> dict:
+    """Mongo filter for the Profiles region filter: "" = every region, "none" = profiles without one."""
+    key = (region or "").strip()
+    if not key:
+        return {}
+    if key == "none":
+        return {"region": {"$in": [None, ""]}}
+    if key not in ALLOWED_REGIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"region must be none or one of: {', '.join(sorted(ALLOWED_REGIONS))}",
+        )
+    return {"region": key}
+
+
 def _normalize_region(raw: Optional[str]) -> Optional[str]:
     """Store one of ALLOWED_REGIONS, or None when cleared/empty."""
     if raw is None:
@@ -318,9 +333,11 @@ async def list_accounts(
     search: str = Query(""),
     userId: str = Query(""),
     status_: str = Query("active", alias="status"),
+    region: str = Query(""),
 ) -> dict:
     is_admin = user.role == "admin"
     query: dict[str, Any] = archive_status_query(status_)
+    query.update(_region_query(region))
     if is_admin:
         if userId:
             query["createdBy"] = to_object_id(userId)

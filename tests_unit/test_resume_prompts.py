@@ -252,7 +252,7 @@ async def test_account_list_strips_unit_bodies_and_templates(db):
     apply_prompts(acc, [_unit(1, "Master")], "new-1")
     await acc.insert()
 
-    out = await list_accounts(owner, page=1, limit=10, search="", userId="", status_="active")
+    out = await list_accounts(owner, page=1, limit=10, search="", userId="", status_="active", region="")
 
     (unit,) = out["accounts"][0]["resumePrompts"] if "accounts" in out else out["data"][0]["resumePrompts"]
     assert "templateHtml" not in unit and "body" not in unit and unit["templateName"] == "Master.html"
