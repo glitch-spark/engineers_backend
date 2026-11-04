@@ -16,7 +16,7 @@ from typing import Any, Optional
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
 from app.models import DailyPlan, WeeklyPlan
-from app.models.plan_common import BID_FIELDS, ChecklistItem, Counts, bids_of
+from app.models.plan_common import BID_FIELDS, ChecklistItem, Counts, DoneCounts, bids_of
 
 
 def empty_day() -> dict:
@@ -66,10 +66,11 @@ async def interviews_split(user_ids: list, start: date, end: date) -> dict:
     }
 
 
-def effective_daily_done(plan: Optional[Any], auto_day: dict) -> Counts:
-    """A day's Done: typed bids (when there is a plan) and its interviews."""
-    return Counts(
+def effective_daily_done(plan: Optional[Any], auto_day: dict) -> DoneCounts:
+    """A day's Done: typed bids, also per profile (when there is a plan), and its interviews."""
+    return DoneCounts(
         **(bids_of(plan.done) if plan else {}),
+        bidsSelfByProfile=plan.done.bidsSelfByProfile if plan else {},
         interviewsSelf=auto_day["self"],
         interviewsCaller=auto_day["caller"],
     )
