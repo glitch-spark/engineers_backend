@@ -15,6 +15,7 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app import profile_metrics as pm
 from app.bids.windows import BidSchedule, schedule_from_settings
+from app.config import Settings, get_settings
 from app.models import (
     Account, Bid, Bidder, DailyPlan, Interview, InterviewQuestion, JobApplicationLog, ResumeApplication, UserExtra,
 )
@@ -48,6 +49,19 @@ def test_span_created_midweek():
 
 def test_span_no_completed_week():
     assert span(4, TODAY, date(2026, 11, 3), LONG_AGO)[2] == 0
+
+
+def test_since_defaults_to_the_release_monday(monkeypatch):
+    monkeypatch.delenv("PROFILE_METRICS_SINCE", raising=False)
+    assert Settings(_env_file=None).PROFILE_METRICS_SINCE == "2026-11-10"
+    assert Settings(_env_file=None, PROFILE_METRICS_SINCE="").PROFILE_METRICS_SINCE is None
+
+
+def test_since_date(monkeypatch):
+    assert pm.since_date() == date.min  # tests_unit/conftest.py blanks it
+    dated = get_settings().model_copy(update={"PROFILE_METRICS_SINCE": "2026-11-10"})
+    monkeypatch.setattr(pm, "get_settings", lambda: dated)
+    assert pm.since_date() == date(2026, 11, 10)
 
 
 def test_bid_report_day_cutoff():
