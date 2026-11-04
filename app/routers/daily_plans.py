@@ -143,9 +143,11 @@ async def put_day(
     goal, _items = day_goal(plan, weekly)
     plan.goal = Counts(**bids_of(goal))
     plan.goalItems = body.goalItems
+    profiles = await owner_profiles(user.id)  # one read: validation and the response
     by = {pid: n for pid, n in body.done.bidsSelfByProfile.items() if n}
     if by:
-        regions = await profile_regions(user.id, by)
+        regions = await profile_regions(profiles, by)
+        by = {pid: by[pid] for pid in regions}
         plan.done = DoneCounts(**{**bids_of(body.done), **derive_self_bids(by, regions)}, bidsSelfByProfile=by)
     else:
         plan.done = DoneCounts(**bids_of(body.done))
@@ -159,7 +161,7 @@ async def put_day(
 
     auto_day = (await _interviews(user.id, when, when)).get(when, empty_day())
     await _sync_slack(plan, user, effective_daily_done(plan, auto_day), auto_day["rounds"])
-    return _day_out(user.id, when, plan, auto_day, weekly, await owner_profiles(user.id))
+    return _day_out(user.id, when, plan, auto_day, weekly, profiles)
 
 
 @router.delete("/{day}")

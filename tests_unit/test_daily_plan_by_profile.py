@@ -108,3 +108,31 @@ async def test_week_includes_profiles(owner):
     assert [p["id"] for p in out["profiles"]] == [str(us.id)]
     assert all("profiles" not in d for d in out["days"])
     assert out["days"][2]["done"]["bidsSelfByProfile"] == {str(us.id): 5}
+
+
+async def test_put_drops_deleted_profile(owner):
+    us, eu = await _profile(owner, "US one", "US"), await _profile(owner, "EU one", "EU")
+    await put_day(DAY, owner, {"done": {"bidsSelfByProfile": {str(us.id): 5, str(eu.id): 3}}})
+    stored = (await _stored()).bidsSelfByProfile
+    await eu.delete()
+    out = await put_day(DAY, owner, {"done": {"bidsSelfByProfile": stored, "bidsSelf": 8, "bidsSelfEu": 3}})
+    done = await _stored()
+    assert done.bidsSelfByProfile == {str(us.id): 5}
+    assert (done.bidsSelf, done.bidsSelfUs, done.bidsSelfEu) == (5, 5, 0)
+    assert out["done"]["bidsSelfByProfile"] == {str(us.id): 5}
+
+
+async def test_put_still_rejects_foreign_profile_beside_deleted(owner):
+    other = await UserExtra(name="Bo", email="bo@x.io").insert()
+    theirs, gone = await _profile(other, "Theirs", "US"), await _profile(owner, "Gone", "EU")
+    await gone.delete()
+    with pytest.raises(HTTPException) as err:
+        await put_day(DAY, owner, {"done": {"bidsSelfByProfile": {str(gone.id): 2, str(theirs.id): 3}}})
+    assert err.value.status_code == 422
+
+
+async def test_put_zero_map_keeps_region_total(owner):
+    us = await _profile(owner, "US one", "US")
+    await put_day(DAY, owner, {"done": {"bidsSelfByProfile": {str(us.id): 0}, "bidsSelfUs": 3}})
+    done = await _stored()
+    assert (done.bidsSelf, done.bidsSelfUs, done.bidsSelfByProfile) == (3, 3, {})
