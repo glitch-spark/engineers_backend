@@ -110,11 +110,11 @@ async def interview_rounds(
     return dict(out)
 
 
-async def scores(account_ids: list[str], start: date, end: date) -> dict[str, dict[str, list[int]]]:
-    """accountId -> {"tailored": [...], "match": [...]} resume scores of the jobs applied to in [start, end].
+async def _dated_scores(account_ids: list[str], start: date, end: date) -> list[tuple[str, date, str, int]]:
+    """(accountId, local day applied, "tailored" | "match", score) for the jobs applied to in [start, end].
 
     A tailored resume scores as its application's match; a fixed-resume fork is an uploaded resume, so "match".
-    An uploaded resume uses the score kept on its log entry. No score: skipped."""
+    An uploaded resume (resumeId) uses the score kept on its log entry. No score: skipped."""
     tz = app_tz()
     entries = await JobApplicationLog.find({
         "accountId": {"$in": account_ids},
@@ -125,7 +125,7 @@ async def scores(account_ids: list[str], start: date, end: date) -> dict[str, di
     if ids:
         cursor = ResumeApplication.get_motor_collection().find({"_id": {"$in": ids}}, {"matchScore": 1, "fixedFrom": 1})
         apps = {d["_id"]: d async for d in cursor}
-    out = {a: {"tailored": [], "match": []} for a in account_ids}
+    out = []
     for e in entries:
         if e.tailoredJobId:
             doc = apps.get(PydanticObjectId(e.tailoredJobId)) if PydanticObjectId.is_valid(e.tailoredJobId) else None
@@ -133,10 +133,21 @@ async def scores(account_ids: list[str], start: date, end: date) -> dict[str, di
             match = as_match(doc.get("matchScore"))  # a bare number on old records
             total = match.get("total") if isinstance(match, dict) else None
             kind = "match" if doc.get("fixedFrom") else "tailored"
+        elif e.resumeId and e.score:
+            total, kind = e.score.total, "match"
         else:
-            total, kind = (e.score.total if e.score else None), "match"
+            continue
         if total is not None:
-            out[e.accountId][kind].append(int(total))
+            day = e.appliedAt.replace(tzinfo=timezone.utc).astimezone(tz).date()
+            out.append((e.accountId, day, kind, int(total)))
+    return out
+
+
+async def scores(account_ids: list[str], start: date, end: date) -> dict[str, dict[str, list[int]]]:
+    """accountId -> {"tailored": [...], "match": [...]} resume scores of the jobs applied to in [start, end]."""
+    out = {a: {"tailored": [], "match": []} for a in account_ids}
+    for account_id, _day, kind, total in await _dated_scores(account_ids, start, end):
+        out[account_id][kind].append(total)
     return out
 
 
@@ -195,7 +206,7 @@ def peer_average(rows: list[dict]) -> Optional[dict]:
 
 async def collect(accounts: list[Account], weeks: int, today: date) -> dict[str, tuple[date, int, dict, dict]]:
     """accountId -> (start Monday, weeks measured, weekly counts, score lists) over each profile's own span; every
-    source is loaded once over the widest of them and clipped per profile."""
+    source (scores too) is loaded once over the widest of them and clipped to each profile's span."""
     tz, since = app_tz(), since_date()
     spans = {}
     for a in accounts:
@@ -212,7 +223,7 @@ async def collect(accounts: list[Account], weeks: int, today: date) -> dict[str,
         "bidderBids": await bidder_bids(ids, start, end, schedule_from_settings()),
     }
     rounds = await interview_rounds(ids, start, end)
-    score_lists = await scores(list(keys), start, end)
+    dated = await _dated_scores(list(keys), start, end)
     for key in keys:
         first, _e, n = spans[key]
         weekly = {first + timedelta(weeks=i): dict.fromkeys(_COUNTS, 0) for i in range(n)}
@@ -223,5 +234,9 @@ async def collect(accounts: list[Account], weeks: int, today: date) -> dict[str,
         for (k, monday), (mine, caller) in rounds.items():
             if k == key and monday in weekly:
                 weekly[monday]["selfInterviews"], weekly[monday]["callerInterviews"] = mine, caller
-        out[key] = (first, n, weekly, score_lists[key])
+        score_lists = {"tailored": [], "match": []}
+        for k, day, kind, total in dated:
+            if k == key and first <= day <= spans[key][1]:
+                score_lists[kind].append(total)
+        out[key] = (first, n, weekly, score_lists)
     return out

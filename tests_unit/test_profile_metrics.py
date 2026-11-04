@@ -228,3 +228,22 @@ async def test_collect_keeps_the_profiles_own_weeks(db):
     assert (start, n_weeks) == (date(2026, 10, 5), 4)
     assert weekly[MON]["selfBids"] == 5 and weekly[date(2026, 10, 5)]["selfBids"] == 0
     assert scores == NO_SCORES
+
+
+async def test_collect_clips_scores_to_each_span(db):
+    user = await UserExtra(name="Ana", email="ana@x.io").insert()
+    old = await Account(name="Old", createdBy=user.id, createdAt=datetime(2026, 1, 1)).insert()
+    new = await Account(name="New", createdBy=user.id, createdAt=datetime(2026, 10, 20)).insert()  # span starts Oct 19
+
+    async def log(i, acc, day):
+        await JobApplicationLog(
+            userId=user.id, url=f"u{i}", accountId=str(acc.id), fileKey=f"f{i}", resumeId="r", appliedAt=day,
+            score={"total": 70 + i, "band": "ok"},
+        ).insert()
+
+    await log(1, new, datetime(2026, 10, 14, 12))  # before the new profile's span
+    await log(2, new, datetime(2026, 10, 21, 12))
+    await log(3, old, datetime(2026, 10, 14, 12))
+    out = await pm.collect([old, new], 4, date(2026, 11, 3))
+    assert out[str(new.id)][3] == {"tailored": [], "match": [72]}
+    assert out[str(old.id)][3] == {"tailored": [], "match": [73]}
