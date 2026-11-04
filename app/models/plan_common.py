@@ -23,7 +23,7 @@ BID_FIELDS = ("bidsSelf", *SELF_REGIONS, "bidsBidder")
 
 
 class Bids(BaseModel):
-    bidsSelf: Count = 0  # self total: the regions' sum, or a pre-split total
+    bidsSelf: Count = 0  # self total: regions plus other-region profiles (Canada, Asia, none), or a pre-split total
     bidsSelfUs: Count = 0
     bidsSelfEu: Count = 0
     bidsSelfLatam: Count = 0
