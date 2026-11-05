@@ -193,6 +193,23 @@ async def test_generator_jobs_are_claimed_before_job_applies_batches(staff_user)
     assert (await resume_queue._claim_one()).id == batch.id
 
 
+async def test_claims_share_slots_fairly_across_users(staff_user, staff_user_2):
+    """A user with a 50-job backlog must not starve a user who just queued one job (same source)."""
+    big = await _queued(staff_user, 5)
+    for i, j in enumerate(big):  # all older than the other user's job
+        await ResumeApplication.get_motor_collection().update_one(
+            {"_id": j.id}, {"$set": {"source": "job_applies", "createdAt": datetime.utcnow() - timedelta(hours=2, minutes=-i)}}
+        )
+    (small,) = await _queued(staff_user_2, 1)
+    await ResumeApplication.get_motor_collection().update_one({"_id": small.id}, {"$set": {"source": "job_applies"}})
+    first = await resume_queue._claim_one()
+    second = await resume_queue._claim_one()
+    assert first.id == big[0].id  # oldest, nobody running yet
+    assert second.id == small.id  # user 1 already has a slot, so user 2 goes next despite being newer
+    third = await resume_queue._claim_one()
+    assert third.userId == staff_user.id
+
+
 async def test_heartbeat_survives_a_failed_write(staff_user, monkeypatch):
     await _queued(staff_user, 1)
     claimed = await resume_queue._claim_one()
@@ -254,3 +271,46 @@ async def test_retry_keeps_requested_models(client, staff_user, auth_header, ran
     assert fresh.status == "queued" and fresh.estimatedCostUsd is None
     assert (fresh.resumeModelId, fresh.coverLetterModelId, fresh.screeningModelId) == (
         "anthropic:claude-opus-5-5", "anthropic:claude-fable-5-1", "anthropic:claude-haiku-4-5")
+
+
+async def _until(cond, tries=200):
+    for _ in range(tries):
+        if cond():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not reached")
+
+
+async def test_new_users_job_starts_when_a_batch_holds_every_slot(staff_user, staff_user_2, monkeypatch):
+    """The reported symptom: one user's Job Applies batch fills every slot, a second user queues a job, and the next
+    slot to free goes to that user, not to the batch's next job."""
+    coll = ResumeApplication.get_motor_collection()
+    batch = await _queued(staff_user, 5)
+    for i, j in enumerate(batch):  # all older than anything queued now
+        await coll.update_one({"_id": j.id}, {"$set": {"source": "job_applies",
+                                                       "createdAt": datetime.utcnow() - timedelta(hours=2, minutes=-i)}})
+    started, release = [], {}
+
+    async def runner(job):
+        started.append(job.id)
+        release[job.id] = asyncio.Event()
+        await release[job.id].wait()
+        await coll.update_one({"_id": job.id}, {"$set": {"status": "completed"}})  # what the real runner records
+
+    monkeypatch.setattr(resume_queue, "RUNNER", runner)
+    monkeypatch.setattr(resume_queue, "_limit", lambda: 2)
+    assert await resume_queue.run_queue_once() == 2
+    await _until(lambda: len(started) == 2)
+    assert set(started) == {batch[0].id, batch[1].id}  # nobody else waiting: the batch takes both slots
+
+    (mine,) = await _queued(staff_user_2, 1)
+    await coll.update_one({"_id": mine.id}, {"$set": {"source": "job_applies"}})
+    release[batch[0].id].set()  # one of the batch's jobs finishes
+    await _until(lambda: len(resume_queue._running) == 1)
+    assert await resume_queue.run_queue_once() == 1
+    await _until(lambda: len(started) == 3)
+    assert started[2] == mine.id  # ahead of batch[2], which is older
+
+    for ev in release.values():
+        ev.set()
+    await asyncio.gather(*list(resume_queue._running))
