@@ -1,6 +1,6 @@
-"""Check resume storage against the configured bucket (AWS S3 or Backblaze B2 via AWS_S3_ENDPOINT_URL).
+"""Check resume storage against the configured bucket (AWS S3 or Backblaze B2 via RESUME_STORAGE_ENDPOINT_URL).
 
-Run from engineers_backend with the storage vars in .env:  python -m scripts.b2_smoke_test
+Run from engineers_backend with the RESUME_STORAGE_* vars in .env:  python -m scripts.b2_smoke_test
 Writes, reads, copies and deletes two small objects under _smoke/; prints a presigned link to try in a browser.
 """
 import time
@@ -11,8 +11,9 @@ from app.resume_service import _s3_client, generate_presigned_get
 
 def main() -> None:
     s = get_settings()
-    bucket = s.AWS_S3_BUCKET
-    print(f"endpoint={s.AWS_S3_ENDPOINT_URL or 'AWS'} region={s.AWS_REGION} bucket={bucket}")
+    bucket = s.RESUME_STORAGE_BUCKET
+    region = s.RESUME_STORAGE_REGION or "(from endpoint)"
+    print(f"endpoint={s.RESUME_STORAGE_ENDPOINT_URL or 'AWS'} region={region} bucket={bucket}")
     s3 = _s3_client()
     key = f"_smoke/{int(time.time())}/Resume.pdf"
     copy = key.replace("Resume.pdf", "Copy.pdf")

@@ -50,7 +50,7 @@ def _archive_key(now: datetime, first_id: object) -> str:
 
 async def _archive(key: str, docs: list[dict]) -> None:
     body = gzip.compress("\n".join(json_util.dumps(d) for d in docs).encode())
-    bucket = get_settings().AWS_S3_BUCKET
+    bucket = get_settings().RESUME_STORAGE_BUCKET
     await asyncio.to_thread(
         _s3_client().put_object,
         Bucket=bucket, Key=key, Body=body, ContentType="application/gzip", ServerSideEncryption="AES256",
@@ -98,7 +98,7 @@ async def _read_archive(key: str) -> dict[str, dict]:
     hit = _archive_cache.get(key)
     if hit is not None:
         return hit
-    bucket = get_settings().AWS_S3_BUCKET
+    bucket = get_settings().RESUME_STORAGE_BUCKET
 
     def fetch() -> bytes:
         return _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()

@@ -476,29 +476,44 @@ def _s3_client():
 
     s = get_settings()
     # S3-compatible store (Backblaze B2) when set, else AWS S3.
-    endpoint = getattr(s, "AWS_S3_ENDPOINT_URL", None)
-    if endpoint and not (s.AWS_ACCESS_KEY_ID and s.AWS_SECRET_ACCESS_KEY):
+    endpoint = getattr(s, "RESUME_STORAGE_ENDPOINT_URL", None)
+    key, secret = s.RESUME_STORAGE_ACCESS_KEY_ID, s.RESUME_STORAGE_SECRET_ACCESS_KEY
+    if endpoint and not (key and secret):
         # Else boto3 would send whatever AWS credentials it finds in the environment to the other store.
-        raise RuntimeError("AWS_S3_ENDPOINT_URL needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+        raise RuntimeError(
+            "RESUME_STORAGE_ENDPOINT_URL needs RESUME_STORAGE_ACCESS_KEY_ID and RESUME_STORAGE_SECRET_ACCESS_KEY"
+        )
     # Path style for custom endpoints: no per-bucket DNS or TLS name needed.
     cfg = Config(signature_version="s3v4", s3={"addressing_style": "path" if endpoint else "virtual"})
-    kwargs = {"region_name": s.AWS_REGION, "config": cfg}
+    kwargs = {"region_name": _storage_region(s), "config": cfg}
     if endpoint:
         kwargs["endpoint_url"] = endpoint
-    if s.AWS_ACCESS_KEY_ID and s.AWS_SECRET_ACCESS_KEY:
-        kwargs["aws_access_key_id"] = s.AWS_ACCESS_KEY_ID
-        kwargs["aws_secret_access_key"] = s.AWS_SECRET_ACCESS_KEY
+    if key and secret:
+        kwargs["aws_access_key_id"] = key
+        kwargs["aws_secret_access_key"] = secret
     return boto3.client("s3", **kwargs)
+
+
+def _storage_region(s) -> Optional[str]:
+    """RESUME_STORAGE_REGION, else read from the endpoint host (s3.us-east-005.backblazeb2.com -> us-east-005)."""
+    if s.RESUME_STORAGE_REGION:
+        return s.RESUME_STORAGE_REGION
+    endpoint = getattr(s, "RESUME_STORAGE_ENDPOINT_URL", None)
+    if not endpoint:
+        return None
+    from app.bids.storage import _endpoint_region
+
+    return _endpoint_region(endpoint)
 
 
 def s3_enabled() -> bool:
     settings = get_settings()
-    return bool(settings.AWS_S3_BUCKET and settings.AWS_REGION)
+    return bool(settings.RESUME_STORAGE_BUCKET and _storage_region(settings))
 
 
 def generate_presigned_get(s3_key: str, expires: int = 900, download_filename: Optional[str] = None) -> str:
     settings = get_settings()
-    params: dict = {"Bucket": settings.AWS_S3_BUCKET, "Key": s3_key}
+    params: dict = {"Bucket": settings.RESUME_STORAGE_BUCKET, "Key": s3_key}
     if download_filename:
         params["ResponseContentDisposition"] = f'attachment; filename="{download_filename}"'
     return _s3_client().generate_presigned_url(
@@ -512,8 +527,8 @@ def _maybe_upload_to_s3(
     pdf_bytes: bytes, profile_name: str, company: str, job_id: Optional[str] = None
 ) -> tuple[Optional[str], Optional[str]]:
     settings = get_settings()
-    bucket = settings.AWS_S3_BUCKET
-    region = settings.AWS_REGION
+    bucket = settings.RESUME_STORAGE_BUCKET
+    region = _storage_region(settings)
     if not bucket or not region:
         return None, None
 

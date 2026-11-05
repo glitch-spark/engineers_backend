@@ -16,7 +16,7 @@ def test_unique_s3_key(monkeypatch):
         def put_object(self, **kw):
             puts.append(kw["Key"])
 
-    monkeypatch.setattr(resume_service, "get_settings", lambda: SimpleNamespace(AWS_S3_BUCKET="b", AWS_REGION="r"))
+    monkeypatch.setattr(resume_service, "get_settings", lambda: SimpleNamespace(RESUME_STORAGE_BUCKET="b", RESUME_STORAGE_REGION="r", RESUME_STORAGE_ENDPOINT_URL=None))
     monkeypatch.setattr(resume_service, "_s3_client", lambda: FakeS3())
     key, _ = resume_service._maybe_upload_to_s3(b"%PDF", "Backend Profile", "Acme Inc", job_id="abc123")
     assert key.endswith("/Backend-Profile/Acme-Inc/abc123/Resume.pdf") or key.endswith("/abc123/Resume.pdf")

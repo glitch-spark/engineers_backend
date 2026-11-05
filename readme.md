@@ -44,9 +44,10 @@ uvicorn app.main:app --reload
 | `JUDGE_DEFAULT_MODEL` | no | Judge for the resume prompt evaluator (Resumes → Prompt Eval): scores each generated resume against a JD in a fresh context; default `anthropic:claude-opus-5-5` |
 | `PROMPT_EVAL_CONCURRENCY` | no | Job descriptions evaluated at once per eval run (each holds one slot for its generate + judge calls); default 4 |
 | `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for prompt-eval judge verdicts, keyed by content hash + model lane. Generated resumes are never stored in Redis; they use only the 7-day Mongo cache. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |
-| `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
-| `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |
-| `AWS_S3_ENDPOINT_URL` | no | S3-compatible store for resumes instead of AWS, e.g. Backblaze B2 `https://s3.us-east-005.backblazeb2.com` with `AWS_REGION=us-east-005`. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` then hold the B2 key ID / application key and are required. Blank = AWS S3 |
+| `RESUME_STORAGE_BUCKET` | no | Bucket for generated and uploaded resumes. Unset = no object storage; PDFs stay inline in MongoDB |
+| `RESUME_STORAGE_ENDPOINT_URL` | no | S3-compatible store, e.g. Backblaze B2 `https://s3.us-east-005.backblazeb2.com`. Blank = AWS S3 |
+| `RESUME_STORAGE_REGION` | no | With an endpoint: optional, read from its host (`us-east-005`). AWS: required |
+| `RESUME_STORAGE_ACCESS_KEY_ID`, `RESUME_STORAGE_SECRET_ACCESS_KEY` | with endpoint | B2 application key ID / application key. Required with an endpoint; for AWS, blank uses the default credential chain |
 | `RESUME_QUEUE_ENABLED`, `JOB_APPLY_WORKER_ENABLED` | deploy only | `1` runs the resume generation queue / Job Applies worker in this process. Set them **only on the deployed backend**: a local backend shares the production database, so with these on it would take real users' jobs. Unset, queued work waits for the deployed worker. `RESUME_QUEUE_DISABLED=1` / `JOB_APPLY_WORKER_DISABLED=1` turn them off even when enabled |
 
 ## Layout
@@ -91,4 +92,4 @@ The repo ships a `Dockerfile` based on `mcr.microsoft.com/playwright/python` so 
 
 1. Connect the repo; Railway auto-detects the Dockerfile.
 2. Bump the service to **1 GB RAM minimum** — Chromium peaks around 400 MB per request.
-3. Set the envs above (`OPENAI_API_KEY`, optional `AWS_REGION`/`AWS_S3_BUCKET`/AWS credentials), plus `RESUME_QUEUE_ENABLED=1` and `JOB_APPLY_WORKER_ENABLED=1` — without them no resume or Job Applies run is ever processed.
+3. Set the envs above (`OPENAI_API_KEY`, optional `RESUME_STORAGE_*` for resume storage), plus `RESUME_QUEUE_ENABLED=1` and `JOB_APPLY_WORKER_ENABLED=1` — without them no resume or Job Applies run is ever processed.

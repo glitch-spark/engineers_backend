@@ -105,14 +105,19 @@ class Settings(BaseSettings):
     # Service account for writing Job Applies exports into a Google Sheet shared with its email as Editor:
     # the key file's JSON (or a path to it). Unset = export disabled with a setup message.
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = None
+    # Resume storage: generated PDFs, uploaded source resumes, retention archive. Unset bucket = PDFs stay
+    # inline in MongoDB. With RESUME_STORAGE_ENDPOINT_URL (S3-compatible, e.g. Backblaze B2:
+    # https://s3.us-east-005.backblazeb2.com) both keys are required and the region defaults to the
+    # endpoint's (us-east-005). Without it = AWS S3, region required.
+    RESUME_STORAGE_BUCKET: Optional[str] = None
+    RESUME_STORAGE_ENDPOINT_URL: Optional[str] = None
+    RESUME_STORAGE_REGION: Optional[str] = None
+    RESUME_STORAGE_ACCESS_KEY_ID: Optional[str] = None
+    RESUME_STORAGE_SECRET_ACCESS_KEY: Optional[str] = None
+    # Only the bidder storage AWS fallback below reads these.
     AWS_REGION: Optional[str] = None
-    AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
-    # S3-compatible endpoint for resume storage, e.g. Backblaze B2: https://s3.us-east-005.backblazeb2.com
-    # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY then hold the B2 key ID / application key, both required,
-    # and AWS_REGION the endpoint's region, e.g. us-east-005). Unset = AWS S3.
-    AWS_S3_ENDPOINT_URL: Optional[str] = None
     # Bidders — screenshot folders are counted in object storage (only "s3" for now). Without an
     # endpoint (AWS S3) the access key / secret / region fall back to the AWS_* values above when
     # unset; with BID_STORAGE_ENDPOINT_URL set there is no AWS fallback (both BID_STORAGE_* keys needed).

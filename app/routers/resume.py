@@ -895,7 +895,7 @@ async def _fetch_pdf_bytes(job: ResumeApplication) -> bytes:
         from app.resume_service import _s3_client
         s = get_settings()
         try:
-            obj = _s3_client().get_object(Bucket=s.AWS_S3_BUCKET, Key=job.s3Key)
+            obj = _s3_client().get_object(Bucket=s.RESUME_STORAGE_BUCKET, Key=job.s3Key)
             return obj["Body"].read()
         except Exception as exc:  # noqa: BLE001
             log.exception("s3 get_object failed for job %s: %s", job.id, exc)

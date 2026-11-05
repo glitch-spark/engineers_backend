@@ -48,7 +48,7 @@ async def copy_file(src: str, dst: str) -> bool:
 
     if not s3_enabled():
         return False
-    bucket = get_settings().AWS_S3_BUCKET
+    bucket = get_settings().RESUME_STORAGE_BUCKET
     await asyncio.to_thread(
         _s3_client().copy_object,
         Bucket=bucket, Key=dst, CopySource={"Bucket": bucket, "Key": src}, ServerSideEncryption="AES256",
