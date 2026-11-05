@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET: Optional[str] = None
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    # S3-compatible endpoint for resume storage, e.g. Backblaze B2: https://s3.us-east-005.backblazeb2.com
+    # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY then hold the B2 key ID / application key, both required,
+    # and AWS_REGION the endpoint's region, e.g. us-east-005). Unset = AWS S3.
+    AWS_S3_ENDPOINT_URL: Optional[str] = None
     # Bidders — screenshot folders are counted in object storage (only "s3" for now). Without an
     # endpoint (AWS S3) the access key / secret / region fall back to the AWS_* values above when
     # unset; with BID_STORAGE_ENDPOINT_URL set there is no AWS fallback (both BID_STORAGE_* keys needed).

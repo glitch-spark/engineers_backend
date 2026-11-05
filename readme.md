@@ -46,6 +46,7 @@ uvicorn app.main:app --reload
 | `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for prompt-eval judge verdicts, keyed by content hash + model lane. Generated resumes are never stored in Redis; they use only the 7-day Mongo cache. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |
 | `AWS_REGION` | no | Enables S3 archiving of generated resumes when set with `AWS_S3_BUCKET` |
 | `AWS_S3_BUCKET` | no | S3 bucket for archived resumes; uploads silently skip if unset |
+| `AWS_S3_ENDPOINT_URL` | no | S3-compatible store for resumes instead of AWS, e.g. Backblaze B2 `https://s3.us-east-005.backblazeb2.com` with `AWS_REGION=us-east-005`. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` then hold the B2 key ID / application key and are required. Blank = AWS S3 |
 | `RESUME_QUEUE_ENABLED`, `JOB_APPLY_WORKER_ENABLED` | deploy only | `1` runs the resume generation queue / Job Applies worker in this process. Set them **only on the deployed backend**: a local backend shares the production database, so with these on it would take real users' jobs. Unset, queued work waits for the deployed worker. `RESUME_QUEUE_DISABLED=1` / `JOB_APPLY_WORKER_DISABLED=1` turn them off even when enabled |
 
 ## Layout

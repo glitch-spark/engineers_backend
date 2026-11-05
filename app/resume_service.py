@@ -475,8 +475,16 @@ def _s3_client():
     from botocore.config import Config
 
     s = get_settings()
-    cfg = Config(signature_version="s3v4", s3={"addressing_style": "virtual"})
+    # S3-compatible store (Backblaze B2) when set, else AWS S3.
+    endpoint = getattr(s, "AWS_S3_ENDPOINT_URL", None)
+    if endpoint and not (s.AWS_ACCESS_KEY_ID and s.AWS_SECRET_ACCESS_KEY):
+        # Else boto3 would send whatever AWS credentials it finds in the environment to the other store.
+        raise RuntimeError("AWS_S3_ENDPOINT_URL needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+    # Path style for custom endpoints: no per-bucket DNS or TLS name needed.
+    cfg = Config(signature_version="s3v4", s3={"addressing_style": "path" if endpoint else "virtual"})
     kwargs = {"region_name": s.AWS_REGION, "config": cfg}
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
     if s.AWS_ACCESS_KEY_ID and s.AWS_SECRET_ACCESS_KEY:
         kwargs["aws_access_key_id"] = s.AWS_ACCESS_KEY_ID
         kwargs["aws_secret_access_key"] = s.AWS_SECRET_ACCESS_KEY
