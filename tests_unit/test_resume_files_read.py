@@ -19,7 +19,7 @@ def s3(monkeypatch):
     client = boto3.client("s3", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="x")
     monkeypatch.setattr(resume_files, "_s3_client", lambda: client)
     monkeypatch.setattr(resume_files, "s3_enabled", lambda: True)
-    monkeypatch.setattr(resume_files, "get_settings", lambda: SimpleNamespace(AWS_S3_BUCKET="bucket"))
+    monkeypatch.setattr(resume_files, "get_settings", lambda: SimpleNamespace(RESUME_STORAGE_BUCKET="bucket"))
     with Stubber(client) as stub:
         yield stub
 

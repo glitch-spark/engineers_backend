@@ -1,5 +1,5 @@
 """Original files of profile resumes (the uploaded PDF/TXT/MD), kept in the same S3 bucket as generated
-resumes. MongoDB keeps only the extracted text plus the S3 key. Without AWS_S3_BUCKET configured nothing is
+resumes. MongoDB keeps only the extracted text plus the S3 key. Without RESUME_STORAGE_BUCKET configured nothing is
 stored and callers fall back to text-only resumes."""
 import asyncio
 import logging
@@ -22,7 +22,7 @@ async def put_resume_file(key: str, data: bytes, content_type: str) -> bool:
     """Upload one original file; False when S3 isn't configured."""
     if not s3_enabled():
         return False
-    bucket = get_settings().AWS_S3_BUCKET
+    bucket = get_settings().RESUME_STORAGE_BUCKET
     await asyncio.to_thread(
         _s3_client().put_object,
         Bucket=bucket, Key=key, Body=data, ContentType=content_type, ServerSideEncryption="AES256",
@@ -38,7 +38,7 @@ async def delete_resume_files(keys: Iterable[str]) -> None:
         return
     try:
         await asyncio.to_thread(
-            _s3_client().delete_objects, Bucket=get_settings().AWS_S3_BUCKET, Delete={"Objects": objects, "Quiet": True}
+            _s3_client().delete_objects, Bucket=get_settings().RESUME_STORAGE_BUCKET, Delete={"Objects": objects, "Quiet": True}
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("could not delete %d profile resume file(s) from s3: %s", len(objects), exc)
@@ -55,7 +55,7 @@ async def read_resume_file(key: str) -> bytes:
     from botocore.exceptions import ClientError
 
     def get() -> bytes:
-        return _s3_client().get_object(Bucket=get_settings().AWS_S3_BUCKET, Key=key)["Body"].read()
+        return _s3_client().get_object(Bucket=get_settings().RESUME_STORAGE_BUCKET, Key=key)["Body"].read()
 
     try:
         return await asyncio.to_thread(get)
