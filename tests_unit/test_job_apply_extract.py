@@ -47,8 +47,18 @@ def test_caps_terms():
         {"term": f"m{i}", "tier": "mentioned"} for i in range(40)
     ]
     ex = parse_extraction(json.dumps({"terms": terms}))
-    assert sum(t.tier == "required" for t in ex.terms) == 15
-    assert len(ex.terms) == 40
+    # An LLM reading keeps 15 terms (each term weighs on the resume match score); required ones first.
+    assert len(ex.terms) == 15
+    assert all(t.tier == "required" for t in ex.terms)
+
+
+def test_cap_drops_soft_skills_before_hard_skills():
+    terms = [{"term": "Leadership", "tier": "required", "soft": True}] + [
+        {"term": f"tool{i}", "tier": "core"} for i in range(15)
+    ]
+    ex = parse_extraction(json.dumps({"terms": terms}))
+    assert len(ex.terms) == 15
+    assert "Leadership" not in [t.term for t in ex.terms]
 
 
 def test_rules_extract():
@@ -243,7 +253,7 @@ async def test_extract_job_keeps_remote_and_unknown():
 def test_prompt_version_is_current():
     from app.job_apply.extract import PROMPT_VERSION
 
-    assert PROMPT_VERSION == "job-extract-v8"  # v6: more regions; v7: tailorLines; v8: work auth only when stated
+    assert PROMPT_VERSION == "job-extract-v9"  # v6: more regions; v7: tailorLines; v8: work auth only when stated; v9: concrete terms, 15 max
 
 
 # ---------- work authorization: only when the posting says so (Honeydew / Veralto / Superlinked, 2026-10-27) ----------

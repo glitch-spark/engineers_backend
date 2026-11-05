@@ -70,7 +70,9 @@ class Settings(BaseSettings):
     RESUME_PROMPT_MAX_CHARS: int = 30000
     # Generation queue (app/resume_queue.py): resumes generating at once, PDF renders (Chromium) at once,
     # and generations a user may queue per day (both the Generator page and Job Applies).
-    RESUME_LLM_CONCURRENCY: int = 3
+    # LLM concurrency only sets throughput: spend is per resume, not per slot, and a waiting slot is just an
+    # asyncio task. Memory is the real cost, which is why renders (Chromium) are capped separately below.
+    RESUME_LLM_CONCURRENCY: int = 10
     RESUME_RENDER_CONCURRENCY: int = 2
     RESUME_DAILY_CAP: int = 300
     # Resume prompt evaluator (app/prompt_eval): JDs evaluated at once per run; each holds one slot for

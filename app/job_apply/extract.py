@@ -22,10 +22,13 @@ from app.job_apply.text import SENIORITY_LEVEL, normalize, seniority_word
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "job-extract-v8"
+PROMPT_VERSION = "job-extract-v9"
 MAX_JD_CHARS = 30_000
 MAX_REQUIRED = 15
+# Rules extraction keeps up to MAX_TERMS. The LLM reading keeps fewer: each term counts in the resume match score,
+# so a long tail of minor terms (GPT-6 Luna lists ~30 where GPT-4o mini listed ~15) lowers every resume's score.
 MAX_TERMS = 40
+LLM_MAX_TERMS = 15
 # A line-number selection this small is treated as a miss: the rules text is used instead.
 TAILOR_MIN_FRACTION = 0.2
 
@@ -57,13 +60,22 @@ JSON shape (use null when the posting doesn't say):
 }}
 
 Rules:
-- terms: skills, tools, technologies, methods or domains a resume screen would look for. Not generic words.
-  At most {max_required} "required" terms and {max_terms} terms in total. Give common aliases/abbreviations.
-- tier comes from the section: Requirements/Qualifications/About you = required; Responsibilities/What you'll do = core;
-  text with no heading = mentioned; Preferred/Nice to have/Bonus = preferred; About the company = context.
-  A line saying "preferred", "a plus", "bonus", "ideally" is preferred. A line saying "required", "must",
-  "minimum", "at least" or "N years" is required, even inside Responsibilities. Ignore benefits and legal text.
-- soft: true for soft skills (communication, leadership, teamwork...).
+- terms: the concrete skills a resume screen checks for, each a name a resume could list in its Skills section:
+  languages, frameworks, libraries, databases, cloud services, tools, platforms, protocols, named methods
+  (Scrum, CI/CD, TDD, microservices), certifications, and technical domains (payments, computer vision).
+  Not a term: phrases about the setting, client or team ("client-facing environments", "nearshore teams",
+  "Microsoft ecosystem", "enterprise web applications", "fast-paced startup"), tasks or duties ("migration
+  planning", "stack upgrades", "code analysis", "refactoring"), names of the job's own activity ("test
+  automation", "API testing", "web development", "technical leadership"), and generic words. When such a phrase
+  names a concrete tool, take the tool only.
+  At most {max_required} "required" terms and {max_terms} terms in total: the most important first.
+  Give common aliases/abbreviations.
+- tier comes from the section: Requirements/Qualifications/About you/Tech stack = required; Responsibilities/What
+  you'll do = core; text with no heading = mentioned; Preferred/Nice to have/Bonus = preferred; About the company =
+  context. A line saying "preferred", "a plus", "bonus", "ideally" is preferred. A line saying "required", "must",
+  "minimum", "at least" or "N years" is required, even inside Responsibilities. A technology named in the job
+  title or in a required line is required wherever else it appears. Ignore benefits and legal text.
+- soft: true for soft skills (communication, leadership, teamwork, ownership...); never "required".
 - minYears: the minimum years of experience asked. A required figure beats a preferred one.
 - degree.level: 1 associate/diploma, 2 bachelor, 3 master, 4 doctorate; the LOWEST degree accepted.
 - isJobPosting: false when the text is not one specific job: an error or "not found" page, a cookie or consent
@@ -121,7 +133,7 @@ def numbered_posting(jd: str) -> str:
 
 def build_prompt(jd: str, run_date: date) -> str:
     return _PROMPT.format(
-        run_date=run_date.isoformat(), max_required=MAX_REQUIRED, max_terms=MAX_TERMS, jd=numbered_posting(jd)
+        run_date=run_date.isoformat(), max_required=MAX_REQUIRED, max_terms=LLM_MAX_TERMS, jd=numbered_posting(jd)
     )
 
 
@@ -176,8 +188,10 @@ def _terms(items: Any) -> list[Term]:
             tier=tier if tier in _TIERS else "mentioned",
             soft=bool(it.get("soft")) or is_soft(name),
         )
-        (required if term.tier == "required" else others).append(term)
-    return (required[:MAX_REQUIRED] + others)[:MAX_TERMS]
+        (required if term.tier == "required" and not term.soft else others).append(term)
+    # Soft skills go last, so the cap drops them before any hard skill.
+    others.sort(key=lambda t: t.soft)
+    return (required[:MAX_REQUIRED] + others)[:LLM_MAX_TERMS]
 
 
 def _line_number(v: Any) -> Optional[int]:

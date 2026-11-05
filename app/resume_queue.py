@@ -252,19 +252,39 @@ def _coll():
     return ResumeApplication.get_motor_collection()
 
 
+async def _fair_user(match: dict) -> Optional[object]:
+    """Of the users with a job matching `match`, the one with the fewest jobs running now (ties: whose oldest
+    waiting job is oldest). A user's big batch then shares the slots instead of holding them all."""
+    waiting = {d["_id"]: d["oldest"] async for d in _coll().aggregate(
+        [{"$match": match}, {"$group": {"_id": "$userId", "oldest": {"$min": "$createdAt"}}}]
+    )}
+    if not waiting:
+        return None
+    running = {d["_id"]: d["n"] async for d in _coll().aggregate(
+        [{"$match": {"status": "in_progress", "attempts": {"$gte": 1}, "userId": {"$in": list(waiting)}}},
+         {"$group": {"_id": "$userId", "n": {"$sum": 1}}}]
+    )}
+    return min(waiting, key=lambda u: (running.get(u, 0), waiting[u]))
+
+
 async def _claim_one() -> Optional[ResumeApplication]:
-    """Atomically take the oldest queued job (exactly one worker gets it). Generator-page jobs go first, so a
-    person waiting on one isn't stuck behind a Job Applies batch."""
+    """Atomically take one queued job (exactly one worker gets it). Generator-page jobs go first, so a person
+    waiting on one isn't stuck behind a Job Applies batch. Within that, the user with the fewest running jobs
+    goes next (round-robin), and that user's oldest job is taken."""
     now = datetime.utcnow()
     update = {"$set": {"status": "in_progress", "step": "generating_resume", "leaseAt": now, "startedAt": now,
                        "updatedAt": now},
               "$inc": {"attempts": 1}}
     for match in ({**_QUEUED, "source": "generator"}, _QUEUED):
-        doc = await _coll().find_one_and_update(
-            match, update, sort=[("createdAt", 1)], return_document=ReturnDocument.AFTER
-        )
-        if doc:
-            return await ResumeApplication.get(doc["_id"])
+        for _ in range(3):  # the chosen user's job may be taken by a concurrent claim; pick again
+            user_id = await _fair_user(match)
+            if user_id is None:
+                break
+            doc = await _coll().find_one_and_update(
+                {**match, "userId": user_id}, update, sort=[("createdAt", 1)], return_document=ReturnDocument.AFTER
+            )
+            if doc:
+                return await ResumeApplication.get(doc["_id"])
     return None
 
 
