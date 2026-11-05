@@ -6,11 +6,12 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.bids.evidence import duration_sec, evidence_for, job_domain
 from app.bids.live_counts import TtlCache
+from app.bids.performance import performance
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
@@ -18,10 +19,12 @@ from app.bids.week import PayWeek, pay_week, week_board
 from app.bids.windows import latest_cutoff, open_window, period_key, schedule_from_settings, window_for
 from app.config import get_settings
 from app.deps import get_current_user
+from app.interview_rates import label, window
 from app.models import UserExtra
 from app.models.bid import Bid
 from app.models.bidder import Bidder
 from app.routers._util import to_object_id
+from app.routers.metrics import _stats_days
 
 router = APIRouter(prefix="/bids", tags=["bids"])
 
@@ -260,6 +263,27 @@ async def bids_week(
     owner = to_object_id(ownerId) if ownerId else None
     bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
     return await week_board(bidders, pw, now, sched, get_bid_storage(), FOLDER_CACHE)
+
+
+@router.get("/performance")
+async def bids_performance(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: str = Query("month"),
+    date: str = Query(""),
+    to: str = Query(""),
+    includeArchived: bool = False,
+    ownerId: Optional[str] = None,
+) -> dict:
+    """Bidder performance for a week, month or custom range: bids, hit days, streaks, interviews and rankings.
+    The current week or month runs to today (report timezone). `ownerId` limits it to one user's bidders."""
+    if period not in ("week", "month", "custom"):
+        raise HTTPException(status_code=422, detail="period must be week, month or custom")
+    today = _now().astimezone(schedule_from_settings().tz).date()
+    day, until = _stats_days(period, date or today.isoformat(), to)
+    start, window_end = window(period, day, until)
+    owner = to_object_id(ownerId) if ownerId else None
+    bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
+    return await performance(bidders, period, start, min(window_end, today), label(period, start, window_end), today)
 
 
 @router.get("/{bid_id}")
