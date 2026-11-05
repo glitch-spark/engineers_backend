@@ -1,14 +1,23 @@
 """Bids → Performance tab: how each bidder's bids add up over a week, month or custom range, on Bid Track days (see
 the bidder performance spec §1).
 
-Pure helpers, no database: the weekly columns, the 50+ day streaks, the previous period to compare with and the top
-performer cards. A 50+ day is a weekday (Monday–Friday) with TARGET or more approved + pending bids; weekends neither
-count nor break a streak.
+The pure helpers (weekly columns, 50+ day streaks, the previous period, the top performer cards) come first, the
+loaders and the response after them. A 50+ day is a weekday (Monday–Friday) with TARGET or more approved + pending
+bids; weekends neither count nor break a streak.
 """
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+from app.bids.records import records_start_utc
+from app.bids.schemas import _iso_utc
+from app.bids.week import DayWindow, _day_counts
+from app.bids.windows import BidSchedule, period_key, schedule_from_settings, window_for
+from app.models import Account, UserExtra
+from app.models.bid import Bid
+from app.models.bidder import Bidder
+from app.profile_metrics import interview_rounds, self_bids
 
 TARGET = 50  # bids a weekday needs to be a 50+ day
 MIN_BIDS_FOR_RATE = 100  # fewer bids than this: the bid→interview rate is too noisy for "Best conversion"
@@ -73,4 +82,110 @@ def rank(rows: list[dict]) -> dict:
         "interviews": top("interviews", lambda r: (-(r["per100"] or 0), name(r))),
         "conversion": top("per100", lambda r: (-r["interviews"], name(r)),
                           [r for r in rows if r["total"] >= MIN_BIDS_FOR_RATE]),
+    }
+
+
+def day_windows(start: date, end: date, sched: BidSchedule) -> list[DayWindow]:
+    """One window per local date of [start, end]: the daily window ending at that date's cutoff."""
+    out = []
+    for i in range((end - start).days + 1):
+        cutoff = datetime.combine(start + timedelta(days=i), sched.daily_at, tzinfo=sched.tz)
+        s, e = window_for("daily", cutoff, sched)
+        out.append(DayWindow(period_key(cutoff), s, e))
+    return out
+
+
+async def day_counts(
+    bidders: list[Bidder], start: date, end: date, sched: BidSchedule,
+) -> dict[tuple[str, date], tuple[int, int, int]]:
+    """{(bidder id, report day): (approved, pending, rejected)} over [start, end]."""
+    windows = day_windows(start, end, sched)
+    days = [date.fromisoformat(w.key) for w in windows]
+    return {(b, days[i]): c for (b, i), c in (await _day_counts(bidders, windows)).items()}
+
+
+async def last_bid_at(bidder_ids: list) -> dict[str, datetime]:
+    """{bidder id: latest firstAt of any of its bids}, whatever the period."""
+    if not bidder_ids:
+        return {}
+    pipeline = [{"$match": {"bidderId": {"$in": bidder_ids}}},
+                {"$group": {"_id": "$bidderId", "at": {"$max": "$firstAt"}}}]
+    return {str(g["_id"]): g["at"] for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None)}
+
+
+def _local_day(at: datetime, sched: BidSchedule) -> date:
+    """The report-timezone date of a stored (naive UTC) moment."""
+    return at.replace(tzinfo=timezone.utc).astimezone(sched.tz).date()
+
+
+def _ratio(n, d, digits):
+    return round(n / d, digits) if d else None
+
+
+async def performance(
+    bidders: list[Bidder], period: str, start: date, end: date, label: str, today: date,
+) -> dict:
+    """The /bids/performance response (spec section 3): per-bidder bids by week, streaks, interviews and the top cards."""
+    sched = schedule_from_settings()
+    prev_start, prev_end = previous_range(period, start, end)
+    counts = await day_counts(bidders, min(prev_start, start), end, sched)
+    weeks = week_columns(start, end)
+    week_of = {date.fromisoformat(w["start"]) + timedelta(days=i): n
+               for n, w in enumerate(weeks) for i in range((date.fromisoformat(w["end"]) - date.fromisoformat(w["start"])).days + 1)}
+
+    rec = records_start_utc(sched)
+    rec_day = rec.astimezone(sched.tz).date() if rec else None
+    ids = list({b.profileId for b in bidders if b.profileId})
+    accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).to_list()} if ids else {}
+    owner_ids = list({b.createdBy for b in bidders})
+    owners = {u.id: u.name for u in await UserExtra.find({"_id": {"$in": owner_ids}}).to_list()} if owner_ids else {}
+    rounds = await interview_rounds(ids, start, end) if ids else {}
+    held = {pid: sum(sum(n) for (acc, _d), n in rounds.items() if acc == str(pid)) for pid in ids}
+    active = [b async for b in Bidder.find({"profileId": {"$in": ids}, "archivedAt": None})] if ids else []
+    typed = await self_bids(list({a.createdBy for a in accounts.values()}), {str(i) for i in ids}, start, end) if ids else {}
+    typed_on = {acc for (acc, _d), n in typed.items() if n}
+    last = await last_bid_at([b.id for b in bidders])
+
+    rows = []
+    for b in bidders:
+        k = str(b.id)
+        mine = {d: sum(c[:2]) for (bid, d), c in counts.items() if bid == k}
+        cur = [(d, c) for (bid, d), c in counts.items() if bid == k and start <= d <= end]
+        weekly = [0] * len(weeks)
+        for d, c in cur:
+            weekly[week_of[d]] += c[0] + c[1]
+        approved, pending, rejected = (sum(c[i] for _d, c in cur) for i in range(3))
+        total = approved + pending
+        prev_total = sum(n for d, n in mine.items() if prev_start <= d <= prev_end)
+        first = max([start, _local_day(b.createdAt, sched)] + ([rec_day] if rec_day else []))
+        end_day = min(end, _local_day(b.archivedAt, sched)) if b.archivedAt else end
+        st = streaks(mine, first, end_day, today)
+        interviews = held[b.profileId] if b.profileId else None
+        shared = bool(b.profileId) and (any(o.profileId == b.profileId and o.id != b.id for o in active)
+                                        or str(b.profileId) in typed_on)
+        rows.append({
+            "id": k, "name": b.name, "ownerName": owners.get(b.createdBy), "profileId": str(b.profileId) if b.profileId else None,
+            "profileName": accounts[b.profileId].name if b.profileId in accounts else None,
+            "status": "archived" if b.archivedAt else "active", "weekly": weekly, "total": total, "approved": approved,
+            "pending": pending, "rejected": rejected, "previousTotal": prev_total,
+            "change": _ratio(total - prev_total, prev_total, 3), **st,
+            "hitRate": _ratio(st["hitDays"], st["weekdays"], 3), "avgPerWeekday": _ratio(total, st["weekdays"], 1),
+            "interviews": interviews, "sharedProfile": shared,
+            "per100": _ratio(interviews * 100, total, 2) if interviews is not None and total >= MIN_BIDS_FOR_RATE else None,
+            "lastBidAt": _iso_utc(last.get(k)),
+        })
+    rows.sort(key=lambda r: (-r["total"], r["name"].lower()))
+
+    total = sum(r["total"] for r in rows)
+    weekdays = sum(r["weekdays"] for r in rows)
+    interviews = sum(held[p] for p in {b.profileId for b in bidders if b.profileId})
+    return {
+        "period": period, "start": start.isoformat(), "end": end.isoformat(), "label": label,
+        "recordsStart": rec_day.isoformat() if rec_day else None, "weeks": weeks, "bidders": rows,
+        "totals": {
+            "total": total, "interviews": interviews, "hitRate": _ratio(sum(r["hitDays"] for r in rows), weekdays, 3),
+            "avgPerWeekday": _ratio(total, weekdays, 1),
+            "per100": _ratio(interviews * 100, total, 2) if total >= MIN_BIDS_FOR_RATE else None,
+        },
+        "top": rank(rows),
     }
