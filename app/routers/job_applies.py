@@ -1309,18 +1309,16 @@ async def update_row_info(row_id: str, body: InfoBody, user: Annotated[UserExtra
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paste the job description first.")
     fields = sent - {"jdText"}
     ex = info.extraction if info else row.extraction
-    reread = ex is None or bool(new_jd and new_jd != current_jd and not fields)
+    # No reading yet, or a new description: read it (one LLM call). The person's other corrections go on top below,
+    # so a pasted description always brings its own terms (a "Not a job page" reading has none).
+    reread = ex is None or bool(new_jd and new_jd != current_jd)
     if reread:
-        # No reading yet, or a new description with nothing else corrected: read it (one LLM call).
         try:
             ex, _ = await worker.EXTRACT(jd, user=user, run_date=run.runDate.date())
         except Exception as exc:  # noqa: BLE001
             log.warning("job info extraction failed: %s", exc)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not read that description.") from exc
     ex = ex.model_copy(deep=True)
-    if not reread and new_jd and new_jd != current_jd:
-        # Description changed alongside other corrections, so it was not re-read. Refresh the short text from rules.
-        ex.tailorJd = tailor_text(jd) or None
     ex.isJobPosting = True
     if "title" in fields:
         ex.title = (body.title or "").strip()

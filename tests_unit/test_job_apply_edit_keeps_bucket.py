@@ -81,6 +81,35 @@ async def test_editing_the_title_keeps_a_worth_applying_job_there(db):
     assert fresh.screen == "valid"
 
 
+async def test_a_pasted_description_is_read_even_with_other_corrections(db, monkeypatch):
+    """A "Not a job page" reading (an error page: no terms) plus a pasted description AND a title edit: the new
+    description is read, so its terms replace the empty ones, and the typed title still wins."""
+    from app.job_apply.schema import Term
+
+    user = await UserExtra(name="Pedro", email="pedro@x.io", role="staff").insert()
+    run = await JobApplyRun(userId=user.id, fileName="sheet", status="screened", screenedAt=datetime.utcnow()).insert()
+    error_page = JobExtraction(isJobPosting=False)
+    row = await JobApplyRow(
+        runId=run.id, userId=user.id, rowIndex=2, url=URL, jdText="Page not found", jdSource="html",
+        status="extracted", extraction=error_page, extractionSource="llm",
+    ).insert()
+    pasted = "Backend engineer. Requirements: Python, PostgreSQL. Fully remote in the US. " * 4
+    reads = []
+
+    async def fake_extract(jd, *, user, run_date):
+        reads.append(jd)
+        return REMOTE_US.model_copy(update={"terms": [Term(term="Python", tier="required")]}), "llm"
+
+    monkeypatch.setattr(worker, "EXTRACT", fake_extract)
+
+    await update_row_info(str(row.id), InfoBody(jdText=pasted, title="Backend Engineer"), user)
+
+    assert reads == [pasted.strip()]
+    fresh = await JobApplyRow.get(row.id)
+    assert [t.term for t in fresh.extraction.terms] == ["Python"]
+    assert fresh.extraction.isJobPosting and fresh.title == "Backend Engineer"
+
+
 async def test_a_changed_posted_date_is_still_taken(db):
     user, row = await worth_applying_row()
     old = date.today() - timedelta(days=400)
