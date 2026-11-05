@@ -94,7 +94,7 @@ resume after restart keeps it.
   (`asyncio.Event`) and every 5 s.
 - **Claiming:** it claims jobs atomically with
   `find_one_and_update({status: "queued"}, {$set: {status: "in_progress", step: "generating_resume", leaseAt: now, startedAt: now}}, sort createdAt)`,
-  oldest first, and keeps at most `RESUME_LLM_CONCURRENCY` jobs (default 3) running.
+  oldest first, and keeps at most `RESUME_LLM_CONCURRENCY` jobs (default 10) running, claiming round-robin across users (fewest running first).
 - **Rendering:** PDF rendering inside `generate_resume` is limited by a module-level semaphore,
   `RESUME_RENDER_CONCURRENCY` (default 2).
 - **Steps:** each job runs the existing `_run_job` steps unchanged: generate, upload, optional screening, optional

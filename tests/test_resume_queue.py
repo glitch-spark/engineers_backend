@@ -193,6 +193,23 @@ async def test_generator_jobs_are_claimed_before_job_applies_batches(staff_user)
     assert (await resume_queue._claim_one()).id == batch.id
 
 
+async def test_claims_share_slots_fairly_across_users(staff_user, staff_user_2):
+    """A user with a 50-job backlog must not starve a user who just queued one job (same source)."""
+    big = await _queued(staff_user, 5)
+    for i, j in enumerate(big):  # all older than the other user's job
+        await ResumeApplication.get_motor_collection().update_one(
+            {"_id": j.id}, {"$set": {"source": "job_applies", "createdAt": datetime.utcnow() - timedelta(hours=2, minutes=-i)}}
+        )
+    (small,) = await _queued(staff_user_2, 1)
+    await ResumeApplication.get_motor_collection().update_one({"_id": small.id}, {"$set": {"source": "job_applies"}})
+    first = await resume_queue._claim_one()
+    second = await resume_queue._claim_one()
+    assert first.id == big[0].id  # oldest, nobody running yet
+    assert second.id == small.id  # user 1 already has a slot, so user 2 goes next despite being newer
+    third = await resume_queue._claim_one()
+    assert third.userId == staff_user.id
+
+
 async def test_heartbeat_survives_a_failed_write(staff_user, monkeypatch):
     await _queued(staff_user, 1)
     claimed = await resume_queue._claim_one()
