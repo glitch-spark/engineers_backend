@@ -2,10 +2,13 @@
 range, in one region or all of them, plus each user's bids and interviews per day, week or month of it.
 
 Counted as the plans count them (app/plan_auto.py), on the app's local days:
-- bids are the applies typed in daily plans' Done, on followed-up (logged) days only. All = self + bidder applies (the
-  Leaderboard's "bids done"); a region = that region's self applies (bidsSelfUs / Eu / Latam), and US also the bidder
-  applies: bidders only apply to US jobs. The rest of the self total has no region (applies typed for Canada, Asia
-  or no-region profiles, or a plain total saved before the region split), so it counts under All only;
+- self bids are the applies typed in daily plans' Done, on followed-up (logged) days only: All = the self total, a
+  region = that region's self applies (bidsSelfUs / Eu / Latam). The rest of the self total has no region (applies
+  typed for Canada, Asia or no-region profiles, or a plain total saved before the region split): All only;
+- bidder bids are Bid Track records (approved + pending), counted to the bidder's owner on the Bid Track day (the
+  daily window ending at the report cutoff), archived bidders included. A region counts the bidders on a profile of
+  that region (a bidder moved to another profile takes its bids along); no profile, or a profile with no region:
+  All only. The bidder count typed in daily plans isn't used here;
 - interviews are the rounds held (app/interview_rounds.py), in the region of the interview's profile.
 Every non-admin user is ranked, as on the Leaderboard; below MIN_BIDS bids a rate is shown but not ranked.
 """
@@ -13,7 +16,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
 
 Period = Literal["week", "month", "custom"]
@@ -26,8 +29,6 @@ MAX_CUSTOM_DAYS = 366
 
 # Applies typed in a daily plan's Done, per region; None = all of them.
 _BID_FIELD = {"Latam": "bidsSelfLatam", "EU": "bidsSelfEu", "US": "bidsSelfUs"}
-# Where bidder applies count: bidders only apply to US jobs.
-BIDDER_REGIONS = ("all", "US")
 
 
 def window(period: Period, day: date, until: Optional[date] = None) -> tuple[date, date]:
@@ -78,17 +79,47 @@ async def _profile_regions() -> tuple[dict, int]:
     return regions, sum(1 for r in regions.values() if not r)
 
 
+async def bidder_bids(user_ids: list, start: date, end: date, region: Region, regions: dict) -> dict:
+    """(Bid Track day, owner id) → approved + pending bids of the owners' bidders (archived included) over
+    [start, end], in the selected region unless `all` (the bidder's profile region)."""
+    from app.bids.performance import day_counts
+    from app.bids.windows import schedule_from_settings
+    from app.models.bidder import Bidder
+
+    bidders = await Bidder.find({"createdBy": {"$in": user_ids}}).to_list()
+    if region != "all":
+        bidders = [b for b in bidders if b.profileId and regions.get(b.profileId) == region]
+    owner = {str(b.id): b.createdBy for b in bidders}
+    out: dict = defaultdict(int)
+    for (bid, day), (approved, pending, _rejected) in (await day_counts(bidders, start, end, schedule_from_settings())).items():
+        if approved + pending:
+            out[(day, owner[bid])] += approved + pending
+    return dict(out)
+
+
+async def bid_records_start() -> Optional[date]:
+    """The report-timezone date of the first Bid Track record; None with no records."""
+    from app.bids.windows import schedule_from_settings
+    from app.models.bid import Bid
+
+    first = await Bid.get_motor_collection().find({}, {"firstAt": 1}).sort("firstAt", 1).limit(1).to_list(1)
+    if not first:
+        return None
+    return first[0]["firstAt"].replace(tzinfo=timezone.utc).astimezone(schedule_from_settings().tz).date()
+
+
 async def counts(
     user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None,
 ) -> dict:
-    """userId → [bids, interviews, bidder bids] over the local days [start, end], in the selected region unless
-    `all`. Bids include the bidder ones (All and US only: see BIDDER_REGIONS). With `days`, also fills
-    (day, userId) → [self bids, bidder bids, interviews] for the per-user charts."""
+    """userId → [bids, interviews, bidder bids, caller interviews] over the local days [start, end], in the selected
+    region unless `all`. Bids are self + bidder (see the module docstring); interviews are the rounds held, of which
+    the caller ones had an enabled caller. With `days`, also fills
+    (day, userId) → [self bids, bidder bids, self interviews, caller interviews] for the per-user charts."""
     from app.dashboard_stats import app_tz, local_day_start_utc
-    from app.interview_rounds import count_interview_rounds, load_interviews_for_window, split_rounds_by_day
+    from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
     from app.models import DailyPlan
 
-    out: dict = defaultdict(lambda: [0, 0, 0])
+    out: dict = defaultdict(lambda: [0, 0, 0, 0])
     field = _BID_FIELD.get(region)
     plans = await DailyPlan.find({
         "userId": {"$in": user_ids},
@@ -96,22 +127,24 @@ async def counts(
         "loggedAt": {"$ne": None},  # a goal-only day hasn't been followed up: no bids yet (plan_auto.weekly_done)
     }).to_list()
     for p in plans:
-        bidder = p.done.bidsBidder if region in BIDDER_REGIONS else 0
         own = getattr(p.done, field) if field else p.done.bidsSelf
-        out[p.userId][0] += own + bidder
-        out[p.userId][2] += bidder
+        out[p.userId][0] += own
         if days is not None:
-            d = days.setdefault((p.date.date(), p.userId), [0, 0, 0])
-            d[0] += own
-            d[1] += bidder
+            days.setdefault((p.date.date(), p.userId), [0, 0, 0, 0])[0] += own
+    for (day, uid), n in (await bidder_bids(user_ids, start, end, region, regions)).items():
+        out[uid][0] += n
+        out[uid][2] += n
+        if days is not None:
+            days.setdefault((day, uid), [0, 0, 0, 0])[1] += n
     tz = app_tz()
     first, last = local_day_start_utc(start, tz), local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     for iv in await load_interviews_for_window(user_ids, first, last):
         if region == "all" or regions.get(iv.accountId) == region:
-            out[iv.createdBy][1] += count_interview_rounds(iv, first, last)[0]
-            if days is not None:
-                for day, *_ in split_rounds_by_day(iv, first, last, tz):
-                    days.setdefault((day, iv.createdBy), [0, 0, 0])[2] += 1
+            for day, _group, is_caller, _stage in split_rounds_by_day(iv, first, last, tz):
+                out[iv.createdBy][1] += 1
+                out[iv.createdBy][3] += int(is_caller)
+                if days is not None:
+                    days.setdefault((day, iv.createdBy), [0, 0, 0, 0])[3 if is_caller else 2] += 1
     return out
 
 
@@ -185,30 +218,32 @@ async def interview_rates(viewer, period: Period, day: date, region: Region, unt
     now = await counts(user_ids, start, end, region, regions, days)
     rows = []
     for uid in by_id:
-        bids, interviews, bidder = now.get(uid, (0, 0, 0))
+        bids, interviews, bidder, caller = now.get(uid, (0, 0, 0, 0))
         if not (bids or interviews) and uid != viewer.id:
             continue  # nothing in this period and region: left off the board
         u = by_id[uid]
         rows.append({
             "userId": str(uid), "name": _display_name(u), "image": getattr(u, "image", None) or None,
             "bids": bids, "selfBids": bids - bidder, "bidderBids": bidder,
-            "interviews": interviews, "rate": rate(bids, interviews),
+            "interviews": interviews, "selfInterviews": interviews - caller, "callerInterviews": caller,
+            "rate": rate(bids, interviews),
             "lowVolume": bids < MIN_BIDS, "isMe": uid == viewer.id,
         })
-    team = [sum(v[i] for k, v in now.items() if k in by_id) for i in range(3)]
+    team = [sum(v[i] for k, v in now.items() if k in by_id) for i in range(4)]
 
     oldest_first = sorted(users, key=lambda u: u.id)
     chart_unit = unit(period, start, end)
+    records_start = await bid_records_start()
 
     return {
         "period": period, "region": region, "start": start.isoformat(), "end": end.isoformat(),
         "label": label(period, start, end), "minBids": MIN_BIDS,
         "rows": ranked(rows),
         "totals": {"bids": team[0], "selfBids": team[0] - team[2], "bidderBids": team[2], "interviews": team[1],
-                   "rate": rate(team[0], team[1])},
-        # Bids shown as self (+bidder): All and US, where the bidder applies count.
-        "bidderSplit": region in BIDDER_REGIONS,
+                   "selfInterviews": team[1] - team[3], "callerInterviews": team[3], "rate": rate(team[0], team[1])},
+        # The first Bid Track record's day: bidder bids before it are 0 (the Bids tab says so).
+        "bidsRecordsStart": records_start.isoformat() if records_start else None,
         "bidsChart": per_user_chart(chart_unit, start, end, oldest_first, days, viewer.id, {"self": 0, "bidder": 1}),
-        "interviewsChart": per_user_chart(chart_unit, start, end, oldest_first, days, viewer.id, {"interviews": 2}),
+        "interviewsChart": per_user_chart(chart_unit, start, end, oldest_first, days, viewer.id, {"self": 2, "caller": 3}),
         "unassignedProfiles": unassigned,
     }
