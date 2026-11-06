@@ -70,8 +70,9 @@ async def _bids(bidder, when: datetime, status: str, n: int) -> None:
 
 
 async def _interview(user, acc, *rounds):
-    """rounds: (stage, when, status)."""
-    history = [{"stage": s, "at": w, "scheduledAt": w, "status": st} for s, w, st in rounds]
+    """rounds: (stage, when, status) or (stage, when, status, True) for a round a caller takes."""
+    history = [{"stage": r[0], "at": r[1], "scheduledAt": r[1], "status": r[2],
+                "caller": {"enabled": True} if len(r) > 3 and r[3] else None} for r in rounds]
     await Interview(
         accountId=acc.id, createdBy=user.id, scheduledAt=rounds[-1][1], companyName="Acme", stageHistory=history,
     ).insert()
@@ -137,7 +138,8 @@ async def test_everyone_is_ranked_by_rate_low_volume_last(db):
         ("Ben", 1, False), ("Ana", 2, False), ("Cy", None, False), ("Dee", None, True)]
     assert "Idle" not in {r["name"] for r in out["rows"]}
     assert out["rows"][-1]["bids"] == 0  # the viewer is listed even with nothing
-    assert out["totals"] == {"bids": 95, "selfBids": 95, "bidderBids": 0, "interviews": 9, "rate": round(9 / 95, 4)}
+    assert out["totals"] == {"bids": 95, "selfBids": 95, "bidderBids": 0, "interviews": 9, "selfInterviews": 9,
+                             "callerInterviews": 0, "rate": round(9 / 95, 4)}
     assert out["label"] == "Oct 19–25, 2026" and out["minBids"] == ir.MIN_BIDS
 
 
@@ -180,7 +182,7 @@ async def test_a_custom_range_counts_its_days(db):
     assert bids == {"Mon 19": {"self": 10, "bidder": 30}, "Tue 20": {"self": 0, "bidder": 0},
                     "Wed 21": {"self": 20, "bidder": 0}}
     ivs = {b["label"]: b["values"][str(ana.id)] for b in out["interviewsChart"]["buckets"]}
-    assert ivs["Tue 20"] == {"interviews": 1}
+    assert ivs["Tue 20"] == {"self": 1, "caller": 0}
 
     for bad in ({"to": ""}, {"to": "2026-10-18"}, {"to": "2027-10-20"}):
         with pytest.raises(HTTPException) as e:
@@ -221,16 +223,16 @@ async def test_interviews_chart_counts_rounds_held_per_user_per_day(db):
     bo = await UserExtra(name="Bo", email="bo@x.io").insert()  # bids but no interviews: left off this chart
     us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
     await _plan(bo, date(2026, 10, 19), bidsSelf=10)
-    await _interview(ana, us, ("intro", IN_WEEK, "passed"), ("tech_round_1", datetime(2026, 10, 22, 15), "scheduled"))
+    await _interview(ana, us, ("intro", IN_WEEK, "passed"), ("tech_round_1", datetime(2026, 10, 22, 15), "scheduled", True))
     await _interview(ana, us, ("intro", IN_WEEK, "canceled"))  # canceled rounds don't count
 
     out = await endpoint(ana, period="week", date="2026-10-21", region="all")
     chart = out["interviewsChart"]
     assert [(u["name"], u["slot"], u["isMe"]) for u in chart["users"]] == [("Ana", 0, True)]
     by_day = {b["label"]: b["values"] for b in chart["buckets"]}
-    assert by_day["Tue 20"] == {str(ana.id): {"interviews": 1}}
-    assert by_day["Thu 22"] == {str(ana.id): {"interviews": 1}}
-    assert by_day["Mon 19"] == {str(ana.id): {"interviews": 0}}
+    assert by_day["Tue 20"] == {str(ana.id): {"self": 1, "caller": 0}}
+    assert by_day["Thu 22"] == {str(ana.id): {"self": 0, "caller": 1}}
+    assert by_day["Mon 19"] == {str(ana.id): {"self": 0, "caller": 0}}
     assert [u["name"] for u in out["bidsChart"]["users"]] == ["Bo"]
     assert out["bidsChart"]["users"][0]["slot"] == 1  # colors stay with the user across charts
     assert (await endpoint(ana, period="week", date="2026-10-21", region="EU"))["interviewsChart"]["users"] == []
@@ -275,3 +277,16 @@ async def test_bids_records_start(db):
     assert (await endpoint(ana, period="week", date="2026-10-21", region="all"))["bidsRecordsStart"] is None
     await _bids(await _bidder(ana, "Bo"), chi(10, 6, 11, 54), "approved", 1)
     assert (await endpoint(ana, period="week", date="2026-10-21", region="all"))["bidsRecordsStart"] == "2026-10-06"
+
+
+async def test_interviews_split_self_and_caller(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
+    await _interview(ana, us, ("intro", IN_WEEK, "completed"), ("tech_round_1", datetime(2026, 10, 22, 15), "completed", True))
+    await _interview(ana, us, ("intro", datetime(2026, 10, 21, 15), "canceled", True))  # not held
+    out = await endpoint(ana, period="week", date="2026-10-21", region="all")
+    r = out["rows"][0]
+    assert (r["interviews"], r["selfInterviews"], r["callerInterviews"]) == (2, 1, 1)
+    assert (out["totals"]["selfInterviews"], out["totals"]["callerInterviews"]) == (1, 1)
+    days = {b["label"]: b["values"][str(ana.id)] for b in out["interviewsChart"]["buckets"]}
+    assert days["Tue 20"] == {"self": 1, "caller": 0} and days["Thu 22"] == {"self": 0, "caller": 1}

@@ -111,14 +111,15 @@ async def bid_records_start() -> Optional[date]:
 async def counts(
     user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None,
 ) -> dict:
-    """userId → [bids, interviews, bidder bids] over the local days [start, end], in the selected region unless
-    `all`. Bids are self + bidder (see the module docstring). With `days`, also fills
-    (day, userId) → [self bids, bidder bids, interviews] for the per-user charts."""
+    """userId → [bids, interviews, bidder bids, caller interviews] over the local days [start, end], in the selected
+    region unless `all`. Bids are self + bidder (see the module docstring); interviews are the rounds held, of which
+    the caller ones had an enabled caller. With `days`, also fills
+    (day, userId) → [self bids, bidder bids, self interviews, caller interviews] for the per-user charts."""
     from app.dashboard_stats import app_tz, local_day_start_utc
-    from app.interview_rounds import count_interview_rounds, load_interviews_for_window, split_rounds_by_day
+    from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
     from app.models import DailyPlan
 
-    out: dict = defaultdict(lambda: [0, 0, 0])
+    out: dict = defaultdict(lambda: [0, 0, 0, 0])
     field = _BID_FIELD.get(region)
     plans = await DailyPlan.find({
         "userId": {"$in": user_ids},
@@ -129,20 +130,21 @@ async def counts(
         own = getattr(p.done, field) if field else p.done.bidsSelf
         out[p.userId][0] += own
         if days is not None:
-            days.setdefault((p.date.date(), p.userId), [0, 0, 0])[0] += own
+            days.setdefault((p.date.date(), p.userId), [0, 0, 0, 0])[0] += own
     for (day, uid), n in (await bidder_bids(user_ids, start, end, region, regions)).items():
         out[uid][0] += n
         out[uid][2] += n
         if days is not None:
-            days.setdefault((day, uid), [0, 0, 0])[1] += n
+            days.setdefault((day, uid), [0, 0, 0, 0])[1] += n
     tz = app_tz()
     first, last = local_day_start_utc(start, tz), local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     for iv in await load_interviews_for_window(user_ids, first, last):
         if region == "all" or regions.get(iv.accountId) == region:
-            out[iv.createdBy][1] += count_interview_rounds(iv, first, last)[0]
-            if days is not None:
-                for day, *_ in split_rounds_by_day(iv, first, last, tz):
-                    days.setdefault((day, iv.createdBy), [0, 0, 0])[2] += 1
+            for day, _group, is_caller, _stage in split_rounds_by_day(iv, first, last, tz):
+                out[iv.createdBy][1] += 1
+                out[iv.createdBy][3] += int(is_caller)
+                if days is not None:
+                    days.setdefault((day, iv.createdBy), [0, 0, 0, 0])[3 if is_caller else 2] += 1
     return out
 
 
@@ -216,17 +218,18 @@ async def interview_rates(viewer, period: Period, day: date, region: Region, unt
     now = await counts(user_ids, start, end, region, regions, days)
     rows = []
     for uid in by_id:
-        bids, interviews, bidder = now.get(uid, (0, 0, 0))
+        bids, interviews, bidder, caller = now.get(uid, (0, 0, 0, 0))
         if not (bids or interviews) and uid != viewer.id:
             continue  # nothing in this period and region: left off the board
         u = by_id[uid]
         rows.append({
             "userId": str(uid), "name": _display_name(u), "image": getattr(u, "image", None) or None,
             "bids": bids, "selfBids": bids - bidder, "bidderBids": bidder,
-            "interviews": interviews, "rate": rate(bids, interviews),
+            "interviews": interviews, "selfInterviews": interviews - caller, "callerInterviews": caller,
+            "rate": rate(bids, interviews),
             "lowVolume": bids < MIN_BIDS, "isMe": uid == viewer.id,
         })
-    team = [sum(v[i] for k, v in now.items() if k in by_id) for i in range(3)]
+    team = [sum(v[i] for k, v in now.items() if k in by_id) for i in range(4)]
 
     oldest_first = sorted(users, key=lambda u: u.id)
     chart_unit = unit(period, start, end)
@@ -237,10 +240,10 @@ async def interview_rates(viewer, period: Period, day: date, region: Region, unt
         "label": label(period, start, end), "minBids": MIN_BIDS,
         "rows": ranked(rows),
         "totals": {"bids": team[0], "selfBids": team[0] - team[2], "bidderBids": team[2], "interviews": team[1],
-                   "rate": rate(team[0], team[1])},
+                   "selfInterviews": team[1] - team[3], "callerInterviews": team[3], "rate": rate(team[0], team[1])},
         # The first Bid Track record's day: bidder bids before it are 0 (the Bids tab says so).
         "bidsRecordsStart": records_start.isoformat() if records_start else None,
         "bidsChart": per_user_chart(chart_unit, start, end, oldest_first, days, viewer.id, {"self": 0, "bidder": 1}),
-        "interviewsChart": per_user_chart(chart_unit, start, end, oldest_first, days, viewer.id, {"interviews": 2}),
+        "interviewsChart": per_user_chart(chart_unit, start, end, oldest_first, days, viewer.id, {"self": 2, "caller": 3}),
         "unassignedProfiles": unassigned,
     }
