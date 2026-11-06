@@ -14,10 +14,12 @@ from app.bids.records import records_start_utc
 from app.bids.schemas import _iso_utc
 from app.bids.week import DayWindow, _day_counts
 from app.bids.windows import BidSchedule, period_key, schedule_from_settings, window_for
-from app.models import Account, UserExtra
+from app.dashboard_stats import app_tz, local_day_start_utc
+from app.interview_rounds import split_rounds_by_day
+from app.models import Account, Interview, UserExtra
 from app.models.bid import Bid
 from app.models.bidder import Bidder
-from app.profile_metrics import interview_rounds, self_bids
+from app.profile_metrics import self_bids
 
 TARGET = 50  # bids a weekday needs to be a 50+ day
 MIN_BIDS_FOR_RATE = 100  # fewer bids than this: the bid→interview rate is too noisy for "Best conversion"
@@ -132,6 +134,37 @@ async def last_bid_at(bidder_ids: list) -> dict[str, datetime]:
     return {str(g["_id"]): g["at"] for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None)}
 
 
+async def interview_credit(profile_ids: list, bidder_ids: list, start: date, end: date) -> tuple[dict, dict]:
+    """Rounds held in [start, end] (local days), credited by who applied: ({bidder id: rounds} of interviews tagged to
+    one of `bidder_ids`, {profile id: rounds} of untagged interviews on one of `profile_ids`). Interviews tagged self
+    are no bidder's. Untagged ones (from before "Applied by") go to every bidder on their profile."""
+    tz = app_tz()
+    first = local_day_start_utc(start, tz)
+    last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
+    whose = [c for c in ({"accountId": {"$in": profile_ids}} if profile_ids else None,
+                         {"appliedBy.bidderId": {"$in": bidder_ids}} if bidder_ids else None) if c]
+    if not whose:
+        return {}, {}
+    ivs = await Interview.find({"$and": [
+        {"$or": whose},
+        {"$or": [{"scheduledAt": {"$gte": first, "$lte": last}}, {"stageHistory.scheduledAt": {"$gte": first, "$lte": last}}]},
+    ]}).to_list()
+    tagged: dict[str, int] = {}
+    untagged: dict[str, int] = {}
+    wanted_profiles = {str(p) for p in profile_ids}
+    wanted_bidders = {str(b) for b in bidder_ids}
+    for iv in ivs:
+        n = len(split_rounds_by_day(iv, first, last, tz))
+        if not n:
+            continue
+        if iv.appliedBy is None:
+            if str(iv.accountId) in wanted_profiles:
+                untagged[str(iv.accountId)] = untagged.get(str(iv.accountId), 0) + n
+        elif iv.appliedBy.kind == "bidder" and str(iv.appliedBy.bidderId) in wanted_bidders:
+            tagged[str(iv.appliedBy.bidderId)] = tagged.get(str(iv.appliedBy.bidderId), 0) + n
+    return tagged, untagged
+
+
 def _local_day(at: datetime, sched: BidSchedule) -> date:
     """The report-timezone date of a stored (naive UTC) moment."""
     return at.replace(tzinfo=timezone.utc).astimezone(sched.tz).date()
@@ -158,8 +191,7 @@ async def performance(
     accounts = {a.id: a for a in await Account.find({"_id": {"$in": ids}}).to_list()} if ids else {}
     owner_ids = list({b.createdBy for b in bidders})
     owners = {u.id: u.name for u in await UserExtra.find({"_id": {"$in": owner_ids}}).to_list()} if owner_ids else {}
-    rounds = await interview_rounds(ids, start, end) if ids else {}
-    held = {pid: sum(sum(n) for (acc, _d), n in rounds.items() if acc == str(pid)) for pid in ids}
+    tagged, untagged = await interview_credit(ids, [b.id for b in bidders], start, end)
     active = [b async for b in Bidder.find({"profileId": {"$in": ids}, "archivedAt": None})] if ids else []
     typed = await self_bids(list({a.createdBy for a in accounts.values()}), {str(i) for i in ids}, start, end) if ids else {}
     typed_on = {acc for (acc, _d), n in typed.items() if n}
@@ -179,7 +211,8 @@ async def performance(
         first = max([start, _local_day(b.createdAt, sched)] + ([rec_day] if rec_day else []))
         end_day = min(end, _local_day(b.archivedAt, sched)) if b.archivedAt else end
         st = streaks(mine, first, end_day, today)
-        interviews = held[b.profileId] if b.profileId else None
+        from_profile = untagged.get(str(b.profileId), 0) if b.profileId else 0
+        interviews = tagged.get(k, 0) + from_profile if b.profileId or k in tagged else None
         shared_with = sorted({o.name for o in active if b.profileId and o.profileId == b.profileId and o.id != b.id},
                              key=str.lower)
         profile_self_bids = bool(b.profileId) and str(b.profileId) in typed_on
@@ -192,6 +225,7 @@ async def performance(
             "hitRate": _ratio(st["hitDays"], st["weekdays"], 3), "avgPerWeekday": _ratio(total, st["weekdays"], 1),
             "interviews": interviews, "sharedProfile": bool(shared_with) or profile_self_bids,
             "sharedWith": shared_with, "profileSelfBids": profile_self_bids,
+            "untaggedInterviews": from_profile,
             "days": day_strip(mine, start, end, first, end_day, today),
             "per100": _ratio(interviews * 100, total, 2) if interviews is not None and total >= MIN_BIDS_FOR_RATE else None,
             "lastBidAt": _iso_utc(last.get(k)),
@@ -200,7 +234,7 @@ async def performance(
 
     total = sum(r["total"] for r in rows)
     weekdays = sum(r["weekdays"] for r in rows)
-    interviews = sum(held[p] for p in {b.profileId for b in bidders if b.profileId})
+    interviews = sum(tagged.values()) + sum(untagged.values())  # each round once: by its bidder, or by its profile
     return {
         "period": period, "start": start.isoformat(), "end": end.isoformat(), "label": label,
         "recordsStart": rec_day.isoformat() if rec_day else None, "weeks": weeks, "bidders": rows,

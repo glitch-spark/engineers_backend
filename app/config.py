@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     # New interviews must link a resume or say why there's none (app/interview_resume_link.py). Off until the form
     # that sends the link is deployed, so open tabs on the older form can still create interviews.
     INTERVIEW_RESUME_LINK_REQUIRED: bool = False
+    # New interviews must say who applied, self or a bidder (routers/interviews.py). Off until the form that sends
+    # it is deployed, for the same reason; the form itself always asks.
+    INTERVIEW_APPLIED_BY_REQUIRED: bool = False
     # Reasoning effort for non-resume gpt-5*/gpt-6* calls (interview rollup,
     # follow-up chat, AI Review, extraction). Same rationale as RESUME_REASONING_EFFORT: the
     # medium default bills heavy hidden reasoning tokens. low is plenty for

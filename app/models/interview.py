@@ -151,6 +151,15 @@ class InterviewResumeLink(BaseModel):
         return _utc_json(v)
 
 
+class InterviewAppliedBy(BaseModel):
+    """Who applied for the job: the profile's owner (self) or one of the owner's bidders. Bidders → Performance
+    credits a bidder with the interviews tagged to them (app/bids/performance.py)."""
+
+    kind: Literal["self", "bidder"]
+    bidderId: Optional[PydanticObjectId] = None  # bidder only
+    bidderName: Optional[str] = None  # the bidder's name when saved, so it still reads after a rename or archive
+
+
 class SlackThread(BaseModel):
     """An interview's #caller thread: its main post."""
 
@@ -180,6 +189,8 @@ class Interview(TimestampedDocument):
     slackThread: Optional[SlackThread] = None
     # Which resume and job this interview came from (None = not linked yet: older interviews).
     resumeLink: Optional[InterviewResumeLink] = None
+    # Who applied for the job (None = not set: interviews from before the field existed).
+    appliedBy: Optional[InterviewAppliedBy] = None
 
     @field_serializer("scheduledAt", "endsAt", when_used="json")
     def _times_utc(self, v: Optional[datetime]) -> Optional[str]:
