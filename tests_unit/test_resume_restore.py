@@ -150,3 +150,18 @@ async def test_download_answers_410_for_a_missing_file(env, monkeypatch):
     with pytest.raises(HTTPException) as e:
         await resume_router.download_job(str(job.id), owner, format="pdf")
     assert e.value.status_code == 410
+    # Chromium keeps a 410 with no cache headers forever: once the file is made again, the browser would still
+    # answer "gone" from its cache without asking the server.
+    assert e.value.headers["Cache-Control"] == "no-store"
+
+
+async def test_a_downloaded_pdf_is_not_cached_either(env, monkeypatch):
+    owner, _acc, job = await _job()
+
+    class Stored:
+        def get_object(self, **kw):
+            return {"Body": type("B", (), {"read": lambda self: b"%PDF-1"})()}
+
+    monkeypatch.setattr(resume_service, "_s3_client", lambda: Stored())
+    res = await resume_router.download_job(str(job.id), owner, format="pdf")
+    assert res.body == b"%PDF-1" and res.headers["Cache-Control"] == "no-store"

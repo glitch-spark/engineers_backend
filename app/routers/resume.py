@@ -883,6 +883,10 @@ def _folder_header(folder: str) -> str:
     return quote(folder, safe=_FOLDER_HEADER_SAFE)
 
 
+# A job's PDF can change in place (restore-pdf), so its download is never answered from the browser's cache.
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
 async def _fetch_pdf_bytes(job: ResumeApplication) -> bytes:
     """PDF bytes for a job — pulled from S3 when configured, else inline
     pdfData. Used by both single + bulk zip downloads."""
@@ -898,7 +902,9 @@ async def _fetch_pdf_bytes(job: ResumeApplication) -> bytes:
             if is_missing(exc):
                 # Files from before the 2026-11-05 storage move weren't copied: POST /jobs/{id}/restore-pdf makes it again.
                 log.warning("resume job %s: PDF missing from storage (%s)", job.id, job.s3Key)
-                raise HTTPException(status_code=status.HTTP_410_GONE, detail="The resume file is missing from storage.")
+                # no-store: Chromium caches a bare 410 forever, so after a restore the browser would still say "gone".
+                raise HTTPException(status_code=status.HTTP_410_GONE, detail="The resume file is missing from storage.",
+                                    headers=_NO_STORE)
             log.exception("s3 get_object failed for job %s: %s", job.id, exc)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="PDF fetch failed")
     if job.pdfData:
@@ -959,14 +965,15 @@ async def download_job(
         return Response(
             content=pdf,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="Resume.pdf"', "X-Folder": _folder_header(folder)},
+            headers={"Content-Disposition": f'attachment; filename="Resume.pdf"', "X-Folder": _folder_header(folder),
+                     **_NO_STORE},
         )
     zip_bytes = _build_zip([(f"{folder}/Resume.pdf", pdf)])
     zip_name = f"{_safe_folder(job.companyName or 'company')}.zip"
     return Response(
         content=zip_bytes,
         media_type="application/zip",
-        headers={"Content-Disposition": content_disposition(zip_name)},
+        headers={"Content-Disposition": content_disposition(zip_name), **_NO_STORE},
     )
 
 
