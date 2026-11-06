@@ -17,7 +17,7 @@ from app.deps import get_current_user
 from app import google_sheets, resume_files, resume_queue
 from app.job_apply import file_links, fixed_forks, gsheet, jd_store, sheet_checks, tailored_score, worker
 from app.job_apply.extract import tailor_text
-from app.job_apply.sheet_links import exported_to
+from app.job_apply.sheet_links import exported_to, score_cells
 from app.job_apply.sheet_checks import sheet_text
 from app.job_apply.fetch import route as fetch_route
 from app.job_apply.screening import (
@@ -1956,8 +1956,10 @@ async def row_resume_file(
 # ---------- export to Google Sheets ----------
 
 # One row per application with a resume to send. Re-tailoring fills the new link into the row it went to
-# (app/job_apply/sheet_links.py finds it again by Profile and Job URL).
-EXPORT_HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume"]
+# (app/job_apply/sheet_links.py finds it again by Profile and Job URL), with that resume's score. Match Score is a
+# number so the column sorts and filters; Band is its word (strong / good / fair / weak). New columns go at the end:
+# sheet_links reads A and D and writes E-G, and tabs exported before keep their layout.
+EXPORT_HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume", "Match Score", "Band"]
 
 
 class ExportBody(BaseModel):
@@ -2029,6 +2031,8 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
 
     rows = await JobApplyRow.find(await _rows_query(run, view="suggested")).sort("+rowIndex").to_list()
     ctx = await _app_context(run, rows)
+    # tailored resumes finished before match scoring have no score yet: score them now, as the rows list does
+    await tailored_score.backfill(ctx.tailored, [i for r in rows for i in _tailored_ids(r)])
     accounts = {str(a.id): a for a in await Account.find({"_id": {"$in": [s.accountId for s in run.selection]}}).to_list()}
     resumes = {str(r.id): r for a in accounts.values() for r in a.resumes}
     tab = f"Apply · {_today_label(user)}"
@@ -2050,6 +2054,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                 continue
             if app.get("tailoredJobId"):
                 link = file_links.file_url("tailored", app["tailoredJobId"])
+                score = score_cells((ctx.tailored.get(app["tailoredJobId"]) or {}).get("matchScore"))
                 with_tailored += 1
             else:
                 resume = resumes.get(app["resumeId"])
@@ -2057,8 +2062,9 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
                     no_file += 1  # the original PDF isn't stored, so there's nothing to link to
                     continue
                 link = file_links.file_url("resume", app["resumeId"], account_id=acc, company=_company_label(row))
+                score = score_cells(app["score"])
             name = accounts[acc].name if acc in accounts else "Profile"
-            out.append([*map(sheet_text, (name, row.company, row.title, row.url)), _download_cell(link)])
+            out.append([*map(sheet_text, (name, row.company, row.title, row.url)), _download_cell(link), *score])
             marks.append((row.id, acc))
 
     async with httpx.AsyncClient() as http:
@@ -2066,7 +2072,7 @@ async def export_sheet(run_id: str, body: ExportBody, user: Annotated[UserExtra,
             info = await google_sheets.sheet_info(http, sheet_id)
             written = None
             if not body.dryRun and out:
-                if not await google_sheets.ensure_tab(http, sheet_id, tab, EXPORT_HEADER, info):
+                if not await google_sheets.ensure_tab(http, sheet_id, tab, EXPORT_HEADER, info, filter=True):
                     await google_sheets.update_range(http, sheet_id, google_sheets._a1(tab, "A1"), [EXPORT_HEADER])
                 written = await google_sheets.append_rows(http, sheet_id, tab, out)
         except google_sheets.SheetsError as exc:

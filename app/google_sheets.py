@@ -122,10 +122,12 @@ async def sheet_info(client: httpx.AsyncClient, sheet_id: str) -> dict:
 
 
 async def ensure_tab(
-    client: httpx.AsyncClient, sheet_id: str, title: str, header: list[str], info: dict, checkbox: Optional[str] = None
+    client: httpx.AsyncClient, sheet_id: str, title: str, header: list[str], info: dict, checkbox: Optional[str] = None,
+    filter: bool = False,
 ) -> bool:
     """Create the tab with a bold, frozen header if it doesn't exist; `checkbox` names the header column that gets
-    tick boxes (the export's "Applied")."""
+    tick boxes (the export's "Applied"). `filter` turns on the header's sort / filter dropdowns, over every row the
+    header's columns will have (rows appended later are inside it). An existing tab is left as it is."""
     if title in info["tabs"]:
         return False
     added = await _call(
@@ -151,6 +153,11 @@ async def ensure_tab(
                                              "startColumnIndex": col, "endColumnIndex": col + 1},
                                    "rule": {"condition": {"type": "BOOLEAN"}}}}
         )
+    if filter:
+        # no endRowIndex: the filter runs to the bottom of the tab
+        requests.append({"setBasicFilter": {"filter": {"range": {
+            "sheetId": tab_id, "startRowIndex": 0, "startColumnIndex": 0, "endColumnIndex": len(header),
+        }}}})
     await _call(client, "POST", f"{API}/{sheet_id}:batchUpdate", json={"requests": requests})
     return True
 

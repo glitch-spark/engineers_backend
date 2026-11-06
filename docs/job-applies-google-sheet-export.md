@@ -30,16 +30,25 @@ shared Google Sheet. Each row has a **Download** link for the resume to send. Th
 
 ## What gets written
 
-| Date | Profile | Company | Title | Job URL | Resume | Resume type | Score | Posted | Applied |
-|---|---|---|---|---|---|---|---|---|---|
+| Profile | Company Name | Job Title | Job URL | Download Resume | Match Score | Band |
+|---|---|---|---|---|---|---|
 
-- **Tabs:** one tab per day, named like `2026-10-02`. It is created on first use, with a bold frozen header and
-  an **Applied** checkbox column. Later exports that day append to the same tab.
-- **Rows:** one per application still to go: a job × a profile it is open to that has a matching uploaded resume,
-  is tailor-only, or has a tailored resume for it. Applications already marked applied are left out.
-- **Resume:** the profile's tailored resume when it's ready. Otherwise its uploaded resume that meets the
-  threshold, which has to have its original PDF stored in S3.
-- **Rows left out:** jobs still tailoring, with nothing to apply with, or already exported. The dialog shows how
-  many of each.
-- **Download links:** they work without logging in and expire after 30 days. Each opens only that one PDF.
-- **Applied ticks:** ticking Applied in the sheet does not sync back into the app.
+- **Tabs:** one tab per day, named like `Apply · 2026-11-06` (the date is in your timezone). It is created on first
+  use with a bold, frozen header and the sort / filter dropdowns turned on. Later exports that day add to the same
+  tab. The run's job checks go to their own `Checks · …` tab instead (**Export checks**).
+- **Rows:** one per application with a resume ready to send: a job × a profile it is open to. Applications already
+  marked applied are left out.
+- **Resume:** the profile's tailored resume when it's ready. Otherwise its uploaded resume that meets the minimum
+  score, which has to have its original file stored.
+- **Match Score / Band:** the score (0–100) of the resume in that row against the job, and its band: **strong**
+  (80+), **good** (65–79), **fair** (50–64) or **weak** (under 50). The score is a number, so sorting or filtering
+  on it works numerically. It's blank if the resume couldn't be scored. When a re-tailored resume replaces a row's
+  link, its score replaces the old one.
+- **Rows left out:** applications still tailoring or needing a tailored resume (export again once they're done),
+  uploaded resumes without a stored file, and rows already in this sheet. The dialog shows how many of each. Another
+  sheet gets every row again.
+- **Download links:** they work without logging in and expire after 30 days. Each downloads `<Company>.zip`
+  holding that one resume.
+- **Edits in the sheet:** nothing typed or ticked in the sheet syncs back into the app.
+- **Tabs from before Match Score:** today's tab, if it already existed, gets the new header but no filter
+  dropdowns (an existing tab is never changed beyond its header). Older tabs keep their five columns.
