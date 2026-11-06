@@ -729,12 +729,13 @@ async def list_caller_rounds(
     stage: str = Query(""),
     status_: str = Query("", alias="status"),
     callerId: str = Query(""),
+    creatorId: str = Query("", description="only this user's interviews"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=200),
     dir: str = Query("desc"),
 ) -> dict:
-    """Callers list: every user's caller rounds, one row per round, by start time (desc by default), paginated.
-    `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
+    """Callers list: every user's caller rounds (or `creatorId`'s), one row per round, by start time (desc by
+    default), paginated. `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
     if status_ and status_ not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     f_dt = parse_date(from_) if from_ else None
@@ -750,7 +751,10 @@ async def list_caller_rounds(
         if hi is not None:
             rng["$lt"] = hi
         in_range["scheduledAt"] = rng
-    rows = await Interview.find({"stageHistory": {"$elemMatch": in_range}}).to_list()
+    query: dict[str, Any] = {"stageHistory": {"$elemMatch": in_range}}
+    if creatorId:
+        query["createdBy"] = to_object_id(creatorId)
+    rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
     if dir != "asc":
