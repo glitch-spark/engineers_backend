@@ -7,7 +7,8 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 os.environ["RESUME_QUEUE_DISABLED"] = "1"
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import HTTPException
@@ -16,6 +17,8 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app import interview_rates as ir
 from app.models import Account, DailyPlan, Interview, InterviewQuestion, UserExtra
+from app.models.bid import Bid
+from app.models.bidder import Bidder
 from app.routers.metrics import interview_rates as endpoint
 
 pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie internals
@@ -25,12 +28,13 @@ pytestmark = [  # pre-existing utcnow defaults (app/models/base.py) and Beanie i
 
 DAY = date(2026, 10, 21)  # a Wednesday: week Oct 19–25
 IN_WEEK = datetime(2026, 10, 20, 15)  # 15:00 UTC: Oct 20 in any app time zone from UTC-12 to UTC+8
+CHI = ZoneInfo("America/Chicago")  # the Bid Track report timezone
 
 
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["interview-rates-unit"]
-    await init_beanie(database=database, document_models=[UserExtra, Account, DailyPlan, Interview, InterviewQuestion])
+    await init_beanie(database=database, document_models=[UserExtra, Account, DailyPlan, Interview, InterviewQuestion, Bid, Bidder])
 
 
 async def _plan(user, day: date, logged=True, **done):
@@ -39,6 +43,30 @@ async def _plan(user, day: date, logged=True, **done):
         userId=user.id, date=datetime(day.year, day.month, day.day), year=day.year, weekNumber=43, done=done,
         loggedAt=datetime(day.year, day.month, day.day, 20) if logged else None,
     ).insert()
+
+
+def chi(month, day, hh, mm=0, ss=0) -> datetime:
+    return datetime(2026, month, day, hh, mm, ss, tzinfo=CHI)
+
+
+async def _bidder(owner, name, profile=None, archived=False) -> Bidder:
+    return await Bidder(
+        createdBy=owner.id, name=name, rate=0.5, folder=name.lower(), screenshotFolderUrl=f"s3://shots/{name.lower()}/",
+        profileId=profile.id if profile else None, archivedAt=datetime(2026, 11, 1) if archived else None,
+        createdAt=datetime(2026, 1, 1),
+    ).insert()
+
+
+_job = iter(range(10**6))
+
+
+async def _bids(bidder, when: datetime, status: str, n: int) -> None:
+    """`n` Bid Track records of `bidder` first captured at `when` (an aware time, e.g. chi(...))."""
+    first = when.astimezone(timezone.utc).replace(tzinfo=None)
+    for _ in range(n):
+        job = f"job{next(_job)}"
+        await Bid(bidderId=bidder.id, ownerId=bidder.createdBy, jobKey=f"{bidder.folder}/x/{job}", firstAt=first,
+                  status=status, screenshots=[]).insert()
 
 
 async def _interview(user, acc, *rounds):
@@ -72,20 +100,19 @@ async def test_applies_come_from_followed_up_daily_plans_by_region(db):
     def row(out):
         return {k: out["rows"][0][k] for k in ("bids", "interviews", "rate", "lowVolume")}
 
-    assert row(await endpoint(ana, period="week", date="2026-10-21", region="all")) == {  # self 55 + bidder 40
-        "bids": 95, "interviews": 2, "rate": round(2 / 95, 4), "lowVolume": False}
+    assert row(await endpoint(ana, period="week", date="2026-10-21", region="all")) == {  # typed bidder 40: ignored
+        "bids": 55, "interviews": 2, "rate": round(2 / 55, 4), "lowVolume": False}
     assert row(await endpoint(ana, period="week", date="2026-10-21", region="Latam")) == {
         "bids": 40, "interviews": 1, "rate": 0.025, "lowVolume": False}
     assert row(await endpoint(ana, period="week", date="2026-10-21", region="EU")) == {
         "bids": 10, "interviews": 1, "rate": 0.1, "lowVolume": True}
     out = await endpoint(ana, period="week", date="2026-10-21", region="all")
-    assert (out["rows"][0]["selfBids"], out["rows"][0]["bidderBids"], out["bidderSplit"]) == (55, 40, True)
-    assert (out["totals"]["selfBids"], out["totals"]["bidderBids"]) == (55, 40)
+    assert (out["rows"][0]["selfBids"], out["rows"][0]["bidderBids"]) == (55, 0)
+    assert (out["totals"]["selfBids"], out["totals"]["bidderBids"]) == (55, 0)
     out = await endpoint(ana, period="week", date="2026-10-21", region="Latam")
-    assert (out["rows"][0]["selfBids"], out["rows"][0]["bidderBids"], out["bidderSplit"]) == (40, 0, False)
-    out = await endpoint(ana, period="week", date="2026-10-21", region="US")  # bidders apply to US jobs only
-    assert row(out) == {"bids": 40, "interviews": 0, "rate": 0.0, "lowVolume": False}
-    assert (out["rows"][0]["selfBids"], out["rows"][0]["bidderBids"], out["bidderSplit"]) == (0, 40, True)
+    assert (out["rows"][0]["selfBids"], out["rows"][0]["bidderBids"]) == (40, 0)
+    out = await endpoint(ana, period="week", date="2026-10-21", region="US")
+    assert row(out) == {"bids": 0, "interviews": 0, "rate": None, "lowVolume": True}
 
 
 async def test_everyone_is_ranked_by_rate_low_volume_last(db):
@@ -141,7 +168,8 @@ async def test_a_custom_range_counts_its_days(db):
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
     await _plan(ana, date(2026, 10, 18), bidsSelf=50)  # the day before: outside the range
-    await _plan(ana, date(2026, 10, 19), bidsSelf=10, bidsBidder=30)
+    await _plan(ana, date(2026, 10, 19), bidsSelf=10, bidsBidder=99)  # typed bidder: ignored
+    await _bids(await _bidder(ana, "Bo", us), chi(10, 19, 10), "approved", 30)
     await _plan(ana, date(2026, 10, 21), bidsSelf=20)
     await _interview(ana, us, ("intro", IN_WEEK, "passed"))
 
@@ -164,9 +192,11 @@ async def test_bids_chart_splits_self_and_bidder_per_user_per_day_oldest_user_fi
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     bo = await UserExtra(name="Bo", email="bo@x.io").insert()
     cy = await UserExtra(name="Cy", email="cy@x.io").insert()  # no bids: left off the chart
-    await _plan(bo, date(2026, 10, 19), bidsSelfUs=4, bidsSelfEu=6, bidsSelf=10, bidsBidder=20)
+    await _plan(bo, date(2026, 10, 19), bidsSelfUs=4, bidsSelfEu=6, bidsSelf=10, bidsBidder=99)  # typed: ignored
+    await _bids(await _bidder(bo, "BoBidder"), chi(10, 19, 10), "pending", 20)  # no profile: All only
     await _plan(ana, date(2026, 10, 19), bidsSelfUs=3, bidsSelf=3)
-    await _plan(ana, date(2026, 10, 21), bidsSelfEu=5, bidsSelf=5, bidsBidder=7)
+    await _plan(ana, date(2026, 10, 21), bidsSelfEu=5, bidsSelf=5)
+    await _bids(await _bidder(ana, "AnaBidder"), chi(10, 21, 10), "approved", 7)
 
     chart = (await endpoint(bo, period="week", date="2026-10-21", region="all"))["bidsChart"]
     assert chart["unit"] == "day"
@@ -176,7 +206,7 @@ async def test_bids_chart_splits_self_and_bidder_per_user_per_day_oldest_user_fi
     assert by_day["Wed 21"] == {str(ana.id): {"self": 5, "bidder": 7}, str(bo.id): {"self": 0, "bidder": 0}}
     assert str(cy.id) not in by_day["Mon 19"]
 
-    eu = (await endpoint(bo, period="week", date="2026-10-21", region="EU"))["bidsChart"]  # no bidder outside US
+    eu = (await endpoint(bo, period="week", date="2026-10-21", region="EU"))["bidsChart"]  # bidders without a profile: All only
     assert {b["label"]: b["values"] for b in eu["buckets"]}["Mon 19"] == {
         str(ana.id): {"self": 0, "bidder": 0}, str(bo.id): {"self": 6, "bidder": 0}}
     assert [u["slot"] for u in eu["users"]] == [0, 1]  # colors stay with the user
@@ -204,3 +234,44 @@ async def test_interviews_chart_counts_rounds_held_per_user_per_day(db):
     assert [u["name"] for u in out["bidsChart"]["users"]] == ["Bo"]
     assert out["bidsChart"]["users"][0]["slot"] == 1  # colors stay with the user across charts
     assert (await endpoint(ana, period="week", date="2026-10-21", region="EU"))["interviewsChart"]["users"] == []
+
+
+async def test_bidder_bids_come_from_bid_track_records_by_profile_region(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    us = await Account(name="US", region="US", createdBy=ana.id).insert()
+    eu = await Account(name="EU", region="EU", createdBy=ana.id).insert()
+    b_us, b_eu, b_none = await _bidder(ana, "Bo", us), await _bidder(ana, "Cy", eu), await _bidder(ana, "Di")
+    b_old = await _bidder(ana, "Ed", us, archived=True)
+    await _bids(b_us, chi(10, 20, 10), "approved", 3)
+    await _bids(b_us, chi(10, 20, 11), "pending", 2)
+    await _bids(b_us, chi(10, 20, 12), "rejected", 4)
+    await _bids(b_eu, chi(10, 21, 10), "pending", 5)
+    await _bids(b_none, chi(10, 22, 10), "approved", 1)
+    await _bids(b_old, chi(10, 20, 10), "approved", 2)
+    await _plan(ana, date(2026, 10, 20), bidsSelfUs=10, bidsSelf=10, bidsBidder=40)  # typed bidder: ignored
+
+    def row(out):
+        return out["rows"][0]["selfBids"], out["rows"][0]["bidderBids"]
+
+    assert row(await endpoint(ana, period="week", date="2026-10-21", region="all")) == (10, 13)
+    assert row(await endpoint(ana, period="week", date="2026-10-21", region="US")) == (10, 7)
+    assert row(await endpoint(ana, period="week", date="2026-10-21", region="EU")) == (0, 5)
+    out = await endpoint(ana, period="week", date="2026-10-21", region="all")
+    assert "bidderSplit" not in out and out["totals"]["bidderBids"] == 13
+
+
+async def test_a_bid_at_the_cutoff_counts_on_the_next_day(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    b = await _bidder(ana, "Bo")
+    await _bids(b, chi(10, 20, 18, 29, 59), "approved", 1)
+    await _bids(b, chi(10, 20, 18, 30), "approved", 1)
+    out = await endpoint(ana, period="week", date="2026-10-21", region="all")
+    days = {b["label"]: b["values"].get(str(ana.id), {}).get("bidder", 0) for b in out["bidsChart"]["buckets"]}
+    assert (days["Tue 20"], days["Wed 21"]) == (1, 1)
+
+
+async def test_bids_records_start(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    assert (await endpoint(ana, period="week", date="2026-10-21", region="all"))["bidsRecordsStart"] is None
+    await _bids(await _bidder(ana, "Bo"), chi(10, 6, 11, 54), "approved", 1)
+    assert (await endpoint(ana, period="week", date="2026-10-21", region="all"))["bidsRecordsStart"] == "2026-10-06"
