@@ -261,3 +261,17 @@ async def test_caller_rounds_list_pages_newest_first_and_filters(client):
         ranged = (await c.get("/interviews/caller-rounds", params=span)).json()
         assert [r["companyName"] for r in ranged["rounds"]] == ["Co8"]
         assert (await c.get("/interviews/caller-rounds", params={"status": "nope"})).status_code == 400
+
+
+async def test_caller_rounds_list_filters_by_owner(client):
+    owner, other = await make_user(), await make_user("Kim")
+    await make_interview(owner)
+    await make_interview(other)
+    await make_interview(other)
+    async with client(owner) as c:
+        mine = (await c.get("/interviews/caller-rounds", params={"creatorId": str(other.id)})).json()
+        assert mine["pagination"]["total"] == 2 and {r["interviewId"] for r in mine["rounds"]} == set(mine["interviews"])
+        assert {i["createdBy"]["_id"] for i in mine["interviews"].values()} == {str(other.id)}
+        every = (await c.get("/interviews/caller-rounds")).json()
+        assert every["pagination"]["total"] == 3
+        assert (await c.get("/interviews/caller-rounds", params={"creatorId": "nope"})).status_code == 400

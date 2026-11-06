@@ -38,7 +38,7 @@ from app.resume_service import (
     s3_enabled,
     trim_jd,
 )
-from app.resume_prompts import default_prompt_body, find_prompt, unit_template
+from app.resume_prompts import find_prompt, job_template, resolve_prompt_body
 from app.routers._util import doc_to_dict, load_owned_account, require_model, to_object_id
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -155,16 +155,11 @@ async def _run_job(
     owner = await UserExtra.get(user_id)
     # The resume unit the job was queued with (Job Applies): its HTML template and page format. No unit, or a unit
     # deleted / emptied since → the profile's (default unit's) template.
-    unit = find_prompt(account, job.promptId) if job.promptId else None
-    template_html, page_format = unit_template(unit) if unit is not None and unit.templateHtml else (None, None)
+    template_html, page_format = job_template(account, job.promptId)
 
     # Resolve resume content-prompt: per-generation > account > user > default.
-    resolved_prompt_body = (prompt_body_override or "").strip()
-    if not resolved_prompt_body:
-        resolved_prompt_body = default_prompt_body(account).strip()
-    if not resolved_prompt_body:
-        resolved_prompt_body = (owner.resumePromptBody or "").strip() if owner else ""
     # Empty → no content guidance sent to the LLM (system rules only).
+    resolved_prompt_body = resolve_prompt_body(account, owner, prompt_body_override)
 
     # Resolve screening prompt: account > user. Empty → no guidance sent.
     resolved_screening = (account.screeningPrompt or "").strip()
@@ -898,6 +893,12 @@ async def _fetch_pdf_bytes(job: ResumeApplication) -> bytes:
             obj = _s3_client().get_object(Bucket=s.RESUME_STORAGE_BUCKET, Key=job.s3Key)
             return obj["Body"].read()
         except Exception as exc:  # noqa: BLE001
+            from app.resume_restore import is_missing
+
+            if is_missing(exc):
+                # Files from before the 2026-11-05 storage move weren't copied: POST /jobs/{id}/restore-pdf makes it again.
+                log.warning("resume job %s: PDF missing from storage (%s)", job.id, job.s3Key)
+                raise HTTPException(status_code=status.HTTP_410_GONE, detail="The resume file is missing from storage.")
             log.exception("s3 get_object failed for job %s: %s", job.id, exc)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="PDF fetch failed")
     if job.pdfData:
@@ -1044,6 +1045,25 @@ async def retry_job(
     resume_queue.wake()
 
     return {"jobId": str(job.id), "status": job.status}
+
+
+@router.post("/jobs/{job_id}/restore-pdf")
+async def restore_job_pdf(
+    job_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """Make a completed job's missing PDF again (app/resume_restore.py): a tailored resume is regenerated from its
+    stored JD and prompt, a fixed fork re-copied from the profile's file. Same access as the download. Takes about a
+    minute for a regeneration; download it afterwards as usual."""
+    from app.resume_restore import RestoreError, restore_pdf
+
+    job = await ResumeApplication.get(to_object_id(job_id))
+    if job is None or (user.role not in ("admin", "interview_manager") and str(job.userId) != str(user.id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    try:
+        return await restore_pdf(job)
+    except RestoreError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message)
 
 
 @router.delete("/jobs/{job_id}")

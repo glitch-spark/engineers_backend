@@ -4,10 +4,12 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any, Iterable, List, Optional
+from typing import Annotated, Any, Iterable, List, Literal, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from beanie import PydanticObjectId
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -26,7 +28,10 @@ from app.models import (
     UserExtra,
 )
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
-from app.models.interview import InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus
+from app.models.bidder import Bidder
+from app.models.interview import (
+    InterviewAppliedBy, InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus,
+)
 from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
     ENDED_STATUSES,
@@ -135,6 +140,11 @@ class RoundIn(BaseModel):
     caller: Optional[CallerIn] = None
 
 
+class AppliedByIn(BaseModel):
+    kind: Literal["self", "bidder"]
+    bidderId: Optional[str] = None  # bidder only: one of the profile owner's bidders
+
+
 class InterviewCreate(BaseModel):
     accountId: str
     companyName: Optional[str] = None
@@ -153,6 +163,8 @@ class InterviewCreate(BaseModel):
     caller: Optional[CallerIn] = None
     # The resume / job it came from, or why none was found (app/interview_resume_link.py).
     resumeLink: Optional[ResumeLinkIn] = None
+    # Who applied for the job; required when INTERVIEW_APPLIED_BY_REQUIRED is on.
+    appliedBy: Optional[AppliedByIn] = None
 
 
 class StageCreate(RoundIn):
@@ -190,6 +202,8 @@ class InterviewUpdate(BaseModel):
     stageHistory: Optional[Any] = None
     # Re-link (absent = keep the link; changing the profile drops a link to the old profile's resume).
     resumeLink: Optional[ResumeLinkIn] = None
+    # Absent = keep who applied.
+    appliedBy: Optional[AppliedByIn] = None
 
 
 def _round_caller(
@@ -715,12 +729,13 @@ async def list_caller_rounds(
     stage: str = Query(""),
     status_: str = Query("", alias="status"),
     callerId: str = Query(""),
+    creatorId: str = Query("", description="only this user's interviews"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=200),
     dir: str = Query("desc"),
 ) -> dict:
-    """Callers list: every user's caller rounds, one row per round, by start time (desc by default), paginated.
-    `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
+    """Callers list: every user's caller rounds (or `creatorId`'s), one row per round, by start time (desc by
+    default), paginated. `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
     if status_ and status_ not in STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
     f_dt = parse_date(from_) if from_ else None
@@ -736,7 +751,10 @@ async def list_caller_rounds(
         if hi is not None:
             rng["$lt"] = hi
         in_range["scheduledAt"] = rng
-    rows = await Interview.find({"stageHistory": {"$elemMatch": in_range}}).to_list()
+    query: dict[str, Any] = {"stageHistory": {"$elemMatch": in_range}}
+    if creatorId:
+        query["createdBy"] = to_object_id(creatorId)
+    rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
     if dir != "asc":
@@ -775,6 +793,19 @@ async def resume_match(
     """One search result's full snapshot (with the job description), for the form's preview."""
     account_oid = await _account_for_write(accountId, user)
     return (await build_link(match_id, account_oid, user)).model_dump(mode="json")
+
+
+@router.get("/applied-by-options")
+async def applied_by_options(
+    accountId: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """The "Applied by" choices for an interview on this profile: its owner's active bidders, by name, `onProfile` for
+    the ones assigned to it. Same access as using the profile on an interview."""
+    account_oid = await _account_for_write(accountId, user)
+    account = await Account.get(account_oid)
+    bidders = await Bidder.find({"createdBy": account.createdBy, "archivedAt": None}).sort("name").to_list()
+    return {"bidders": [{"id": str(b.id), "name": b.name, "onProfile": b.profileId == account_oid} for b in bidders]}
 
 
 @router.get("/{iv_id}")
@@ -860,6 +891,18 @@ async def _account_for_write(account_id: str, user: UserExtra) -> Any:
     return account_oid
 
 
+async def _applied_by(body: AppliedByIn, account_id: PydanticObjectId) -> InterviewAppliedBy:
+    """Self, or a bidder of the profile's owner (archived ones too: an older interview keeps its bidder). 422 else."""
+    if body.kind == "self":
+        return InterviewAppliedBy(kind="self")
+    account = await Account.get(account_id)
+    bidder = await Bidder.get(PydanticObjectId(body.bidderId)) if body.bidderId and ObjectId.is_valid(body.bidderId) else None
+    if bidder is None or account is None or bidder.createdBy != account.createdBy:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Applied by: pick Self or one of the profile owner's bidders.")
+    return InterviewAppliedBy(kind="bidder", bidderId=bidder.id, bidderName=bidder.name)
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_interview(
     body: InterviewCreate,
@@ -874,6 +917,12 @@ async def create_interview(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Pick the resume for this company, or tick No company found.",
         )
+    if body.appliedBy is None and get_settings().INTERVIEW_APPLIED_BY_REQUIRED:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Pick who applied for this job (Self or a bidder). Reload the page if you don't see the field.",
+        )
+    applied_by = await _applied_by(body.appliedBy, account_oid) if body.appliedBy else None
     first = body.round or _legacy_round(body)
     first.caller = await _resolve_caller(first.caller)
     entry = _build_round(first, user=user, source="create")
@@ -891,6 +940,7 @@ async def create_interview(
         mainTechStack=(body.mainTechStack or "").strip() or None,
         stageHistory=[],
         resumeLink=link,
+        appliedBy=applied_by,
     )
     iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
@@ -951,6 +1001,8 @@ async def update_interview(
         iv.resumeLink = await resolve_link(body.resumeLink, iv.accountId, user)
     elif iv.accountId != previous_account and iv.resumeLink and iv.resumeLink.kind != "none":
         iv.resumeLink = None  # it was the old profile's resume
+    if body.appliedBy is not None:
+        iv.appliedBy = await _applied_by(body.appliedBy, iv.accountId)
 
     # Legacy stage move (board drag from a stale tab): append / re-date a round.
     new_sched = iv.scheduledAt

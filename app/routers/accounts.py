@@ -608,6 +608,27 @@ async def upload_resume(
     return doc_to_dict(acc)
 
 
+def _can_open_resume_files(acc: Optional[Account], user: UserExtra) -> bool:
+    """Owner, admin, or an interview manager (they open everyone's interviews and share their resumes)."""
+    return acc is not None and (user.role in ("admin", "interview_manager") or str(acc.createdBy) == str(user.id))
+
+
+@router.get("/{account_id}/resume-files")
+async def resume_files_list(
+    account_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """The profile's resumes whose original file is stored (to send one with an interview brief): id, file name and
+    upload time, no text. Same access as /resumes/{id}/file."""
+    acc = await Account.get(to_object_id(account_id))
+    if not _can_open_resume_files(acc, user):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    return {"resumes": [
+        {"id": str(r.id), "filename": r.filename, "uploadedAt": r.uploadedAt.isoformat() + "Z" if r.uploadedAt else None}
+        for r in acc.resumes if r.s3Key
+    ]}
+
+
 @router.get("/{account_id}/resumes/{resume_id}/file")
 async def resume_file_url(
     account_id: str,
@@ -617,7 +638,7 @@ async def resume_file_url(
     """Short-lived download link for a resume's original file. Owner, admin, or an interview manager (they open
     everyone's interviews, so they can save the resume an interview came from)."""
     acc = await Account.get(to_object_id(account_id))
-    if acc is None or (user.role not in ("admin", "interview_manager") and str(acc.createdBy) != str(user.id)):
+    if not _can_open_resume_files(acc, user):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     resume = next((r for r in acc.resumes if str(r.id) == resume_id), None)
     if resume is None or not resume.s3Key:

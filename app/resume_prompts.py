@@ -99,6 +99,21 @@ def unit_template(unit: ResumePrompt) -> tuple[Optional[str], str]:
     return unit.templateHtml or None, unit.pageFormat or "A4"
 
 
+def job_template(account: Any, prompt_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(template HTML, page format) a resume job is generated with: its unit's, when the unit still exists and has a
+    template; else (None, None) = the profile's (default unit's) template."""
+    unit = find_prompt(account, prompt_id) if prompt_id else None
+    return unit_template(unit) if unit is not None and unit.templateHtml else (None, None)
+
+
+def resolve_prompt_body(account: Any, owner: Any, override: Optional[str]) -> str:
+    """The resume content prompt: the job's own (override) > the profile's default unit > the user's. '' = none."""
+    body = (override or "").strip() or default_prompt_body(account).strip()
+    if not body and owner is not None:
+        body = (getattr(owner, "resumePromptBody", None) or "").strip()
+    return body
+
+
 def _mirror_default(account: Any, units: list[ResumePrompt], default_id: str) -> None:
     default = next(u for u in units if u.id == default_id)
     account.resumePrompts = units

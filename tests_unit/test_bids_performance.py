@@ -258,3 +258,85 @@ async def test_per100_and_last_bid(db, records_start):
     await make_round(p2, owner, datetime(2026, 10, 7, 15))
     r = await run([big])
     assert r["bidders"][0]["per100"] == 0.5 and r["totals"]["per100"] == 0.5
+
+
+async def test_days_strip_marks_each_weekday(db, records_start):
+    owner = await make_user()
+    a = await make_bidder(owner, "Ana")
+    late = await make_bidder(owner, "Late")
+    late.createdAt = datetime(2026, 11, 3, 16)  # Tue 10:00 Chicago
+    await late.save()
+    await add_bid(a, chi(10, 30, 10), "approved", 70)  # Fri before: outside the week
+    await add_bid(a, chi(11, 2, 10), "approved", 50)
+    await add_bid(a, chi(11, 3, 10), "pending", 10)
+    await add_bid(a, chi(11, 3, 11), "rejected", 60)  # rejected bids never count
+    await add_bid(a, chi(11, 4, 10), "pending", 20)
+    await add_bid(late, chi(11, 4, 10), "approved", 55)
+    r = await run([a, late], date(2026, 11, 2), date(2026, 11, 4), "week", date(2026, 11, 4))
+    rows = {x["name"]: x for x in r["bidders"]}
+    assert rows["Ana"]["days"] == [
+        {"day": "2026-11-02", "bids": 50, "state": "hit"},
+        {"day": "2026-11-03", "bids": 10, "state": "miss"},
+        {"day": "2026-11-04", "bids": 20, "state": "open"},  # today, still under 50
+    ]
+    assert [d["state"] for d in rows["Late"]["days"]] == ["none", "miss", "hit"]  # created Tue; today hit 50+
+
+
+async def test_days_strip_skips_weekends_and_archived_days(db, records_start):
+    owner = await make_user()
+    a = await make_bidder(owner, "Ana", archived_at=datetime(2026, 10, 7, 15))  # archived Wed Oct 7
+    r = await run([a], date(2026, 10, 2), date(2026, 10, 9), "custom", date(2026, 11, 4))
+    days = r["bidders"][0]["days"]
+    assert [d["day"] for d in days] == ["2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09"]
+    assert [d["state"] for d in days] == ["miss", "miss", "miss", "miss", "none", "none"]
+
+
+async def test_shared_with_names_the_other_bidders(db, records_start):
+    owner = await make_user()
+    p, q = [await Account(name=n, createdBy=owner.id).insert() for n in ("P", "Q")]
+    a, b = await make_bidder(owner, "Ana", p), await make_bidder(owner, "Bo", p)
+    await make_bidder(owner, "Old", p, archived_at=datetime(2026, 10, 10))
+    c = await make_bidder(owner, "Cy", q)
+    await DailyPlan(userId=owner.id, date=datetime(2026, 10, 9), year=2026, weekNumber=41,
+                    done={"bidsSelfByProfile": {str(q.id): 3}}, loggedAt=datetime(2026, 10, 9, 20)).insert()
+    r = await run([a, b, c])
+    rows = {x["name"]: x for x in r["bidders"]}
+    assert rows["Ana"]["sharedWith"] == ["Bo"] and rows["Bo"]["sharedWith"] == ["Ana"]
+    assert rows["Ana"]["profileSelfBids"] is False
+    assert rows["Cy"]["sharedWith"] == [] and rows["Cy"]["profileSelfBids"] is True
+
+
+async def tagged_round(profile, owner, at, applied):
+    await Interview(
+        accountId=profile.id, createdBy=owner.id, scheduledAt=at, companyName="Acme", appliedBy=applied,
+        stageHistory=[{"stage": "intro", "at": at, "scheduledAt": at, "status": "completed"}],
+    ).insert()
+
+
+async def test_interviews_go_to_the_bidder_who_applied(db, records_start):
+    owner = await make_user()
+    p, q = [await Account(name=n, createdBy=owner.id).insert() for n in ("P", "Q")]
+    a, b = await make_bidder(owner, "Ana", p), await make_bidder(owner, "Bo", p)
+    moved = await make_bidder(owner, "Mo", q)
+    when = datetime(2026, 10, 7, 15)
+    await tagged_round(p, owner, when, {"kind": "bidder", "bidderId": a.id, "bidderName": "Ana"})
+    await tagged_round(p, owner, when, {"kind": "bidder", "bidderId": a.id, "bidderName": "Ana"})
+    await tagged_round(p, owner, when, {"kind": "self"})  # the owner's own application: no bidder's
+    await make_round(p, owner, when)  # untagged (older): still every P bidder's
+    await tagged_round(p, owner, when, {"kind": "bidder", "bidderId": moved.id, "bidderName": "Mo"})  # Mo was on P then
+    r = await run([a, b, moved])
+    rows = {x["name"]: x for x in r["bidders"]}
+    assert (rows["Ana"]["interviews"], rows["Ana"]["untaggedInterviews"]) == (3, 1)
+    assert (rows["Bo"]["interviews"], rows["Bo"]["untaggedInterviews"]) == (1, 1)
+    assert (rows["Mo"]["interviews"], rows["Mo"]["untaggedInterviews"]) == (1, 0)  # follows the bidder, not the profile
+    assert r["totals"]["interviews"] == 4  # each round once; the self one is no bidder's
+
+
+async def test_tagged_interviews_count_for_a_bidder_without_profile(db, records_start):
+    owner = await make_user()
+    p = await Account(name="P", createdBy=owner.id).insert()
+    loose, none = await make_bidder(owner, "Lo"), await make_bidder(owner, "No")
+    await tagged_round(p, owner, datetime(2026, 10, 7, 15), {"kind": "bidder", "bidderId": loose.id, "bidderName": "Lo"})
+    r = await run([loose, none])
+    rows = {x["name"]: x for x in r["bidders"]}
+    assert rows["Lo"]["interviews"] == 1 and rows["No"]["interviews"] is None
