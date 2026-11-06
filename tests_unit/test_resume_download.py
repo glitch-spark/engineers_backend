@@ -102,3 +102,26 @@ async def test_admins_and_interview_managers_download_anyones_resume(db, monkeyp
     with pytest.raises(HTTPException) as e:
         await accounts.resume_file_url(str(acc.id), rid, other)
     assert e.value.status_code == 404
+
+
+async def test_resume_files_lists_stored_originals_with_the_same_access(db):
+    """For sending a resume with an interview brief: the profile's resumes that have their original file, no text."""
+    from fastapi import HTTPException
+
+    from app.models.account import Resume
+    from app.routers import accounts
+
+    owner, job = await _job("Alex", "Acme")
+    acc = await Account.get(job.accountId)
+    acc.resumes = [Resume(filename="cv.pdf", markdown="secret text", s3Key="k/cv.pdf"),
+                   Resume(filename="notes.md", markdown="text only")]
+    await acc.save()
+    manager = await UserExtra(name="Puma", email="puma@x.io", role="interview_manager").insert()
+    other = await UserExtra(name="Ben", email="ben@x.io").insert()
+    for user in (owner, manager):
+        out = await accounts.resume_files_list(str(acc.id), user)
+        assert [r["filename"] for r in out["resumes"]] == ["cv.pdf"]
+        assert out["resumes"][0]["id"] == str(acc.resumes[0].id) and "markdown" not in out["resumes"][0]
+    with pytest.raises(HTTPException) as e:
+        await accounts.resume_files_list(str(acc.id), other)
+    assert e.value.status_code == 404
