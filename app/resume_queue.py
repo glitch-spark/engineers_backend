@@ -220,7 +220,9 @@ _running: set[asyncio.Task] = set()
 # Fields the queue (claim, heartbeat, applied marks) owns; the runner never writes them back.
 _QUEUE_OWNED = frozenset({"_id", "id", "createdAt", "leaseAt", "attempts", "countsAsBid", "source", "jobApplyRowId",
                           "promptOverride", "promptId", "promptName", "templateName", "resumeModelId", "coverLetterModelId",
-                          "screeningModelId", "coverLetterHook"})
+                          "screeningModelId", "coverLetterHook",
+                          # app/resume_restore.py owns these
+                          "pdfRegeneratedAt", "pdfRestoreLeaseAt"})
 
 
 class Superseded(Exception):

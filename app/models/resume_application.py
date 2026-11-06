@@ -97,6 +97,10 @@ class ResumeApplication(TimestampedDocument):
     pdfData: Optional[str] = None    # base64-encoded; survives without S3
     s3Key: Optional[str] = None
     s3Url: Optional[str] = None
+    # Set when a missing PDF was made again (app/resume_restore.py): regenerated from the stored JD and prompt, or a
+    # fixed fork re-copied from the profile's file. The lease keeps two restores of one job from running at once.
+    pdfRegeneratedAt: Optional[datetime] = None
+    pdfRestoreLeaseAt: Optional[datetime] = None
     # Logical reading-order text — use instead of copy-pasting from the PDF.
     plainText: Optional[str] = None
     # Set when retention moved the heavy text (JD, plainText, cover letter, screening) to this S3 archive.
