@@ -7,17 +7,31 @@ is found again by Profile + Job URL, and if it's gone the sheet is left alone. A
 resume job: it is logged and skipped.
 """
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from beanie import PydanticObjectId
 
 from app import google_sheets
 from app.job_apply import file_links
+from app.job_apply.scoring import band
+from app.models.resume_application import as_match
 
 log = logging.getLogger(__name__)
 
-_PROFILE, _URL = 0, 3  # columns A (Profile) and D (Job URL) of the export; E is Download Resume
+_PROFILE, _URL = 0, 3  # columns A (Profile) and D (Job URL) of the export; E-G: Download Resume, Match Score, Band
+
+
+def score_cells(match: Any) -> list:
+    """The Match Score and Band cells for a resume's score with the job: [total, band], or blanks without one. The
+    total goes in as a number, so the column sorts and filters numerically. `match` is a stored matchScore (dict, or a
+    bare number on early records), a TailoredMatch, or None."""
+    match = as_match(match)
+    if hasattr(match, "model_dump"):
+        match = match.model_dump()
+    if not isinstance(match, dict) or match.get("total") is None:
+        return ["", ""]
+    return [int(match["total"]), match.get("band") or band(int(match["total"]))]
 
 
 def _matches(cells: list[str], url: str, profile: str) -> bool:
@@ -51,7 +65,7 @@ def exported_to(row, acc: str, sheet_id: Optional[str]) -> bool:
     return sheet_id is None or not places or sheet_id in places
 
 
-async def _fill_one(http, row, acc: str, sheet_id: str, where: dict, profile: str, link: str) -> bool:
+async def _fill_one(http, row, acc: str, sheet_id: str, where: dict, profile: str, link: str, score: list) -> bool:
     from app.models.job_apply import JobApplyRow
 
     tab, recorded = where["tab"], int(where.get("row") or 0)
@@ -60,8 +74,9 @@ async def _fill_one(http, row, acc: str, sheet_id: str, where: dict, profile: st
     if n is None:
         log.info("exported row for %s / %s is gone from %s; link not filled", row.url, profile, tab)
         return False
+    # the link and the new resume's score together, so the row never shows one resume's link with another's score
     await google_sheets.update_range(
-        http, sheet_id, google_sheets._a1(tab, f"E{n}"), [[f'=HYPERLINK("{link}","Download")']],
+        http, sheet_id, google_sheets._a1(tab, f"E{n}:G{n}"), [[f'=HYPERLINK("{link}","Download")', *score]],
     )
     if n != recorded:
         in_new = sheet_id in ((row.exportedSheets or {}).get(acc) or {})
@@ -71,7 +86,8 @@ async def _fill_one(http, row, acc: str, sheet_id: str, where: dict, profile: st
 
 
 async def fill_link(job) -> bool:
-    """Write `job`'s download link into its exported row, in every sheet it was exported to. True when any is written."""
+    """Write `job`'s download link and match score into its exported row, in every sheet it was exported to. True when
+    any is written."""
     from app.models import Account
     from app.models.job_apply import JobApplyRow
 
@@ -86,6 +102,7 @@ async def fill_link(job) -> bool:
         account = await Account.get(PydanticObjectId(acc))
         profile = account.name if account else "Profile"
         link = file_links.file_url("tailored", str(job.id))
+        score = score_cells(getattr(job, "matchScore", None))
     except Exception as exc:  # noqa: BLE001 — never fail the resume job over the sheet
         log.warning("filling the sheet link for resume %s failed: %s", getattr(job, "id", "?"), exc)
         return False
@@ -93,7 +110,7 @@ async def fill_link(job) -> bool:
     async with httpx.AsyncClient() as http:
         for sheet_id, where in places.items():
             try:
-                filled = await _fill_one(http, row, acc, sheet_id, where, profile, link) or filled
+                filled = await _fill_one(http, row, acc, sheet_id, where, profile, link, score) or filled
             except Exception as exc:  # noqa: BLE001 — one sheet's problem doesn't stop the others
                 log.warning("filling the sheet link for resume %s in %s failed: %s", getattr(job, "id", "?"), sheet_id, exc)
     return filled

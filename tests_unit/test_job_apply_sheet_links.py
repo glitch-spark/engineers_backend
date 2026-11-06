@@ -6,9 +6,10 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from types import SimpleNamespace  # noqa: E402
 
-from app.job_apply.sheet_links import export_places, exported_to, find_row  # noqa: E402
+from app.job_apply.schema import TailoredMatch  # noqa: E402
+from app.job_apply.sheet_links import export_places, exported_to, find_row, score_cells  # noqa: E402
 
-HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume"]
+HEADER = ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume", "Match Score", "Band"]
 URL = "https://boards.greenhouse.io/acme/jobs/9"
 
 
@@ -17,7 +18,7 @@ def sheet(*rows):
 
 
 def r(profile, url):
-    return [profile, "Acme", "Engineer", url, '=HYPERLINK("https://api.example.com/job-applies/files/x","Download")']
+    return [profile, "Acme", "Engineer", url, '=HYPERLINK("https://api.example.com/job-applies/files/x","Download")', 72, "good"]
 
 
 def test_find_row_same_row():
@@ -63,3 +64,18 @@ def test_export_places_merges_old_and_new():
         legacy={"eric": {"sheetId": "s1", "tab": "2026-10-03", "row": 2}},
     )
     assert export_places(r, "eric") == {"s2": {"tab": "Apply · 2026-10-06", "row": None}, "s1": {"tab": "2026-10-03", "row": 2}}
+
+
+def test_score_cells():
+    # a stored matchScore, a TailoredMatch, an uploaded resume's bare total, an early record's bare number
+    assert score_cells({"total": 82, "band": "strong", "knockouts": [], "missing": []}) == [82, "strong"]
+    assert score_cells(TailoredMatch(total=66, band="good")) == [66, "good"]
+    assert score_cells(49) == [49, "weak"]
+    assert score_cells(64.6) == [65, "good"]
+    # no score (never scored, or tried and couldn't be): blank cells, which sort to the bottom
+    assert score_cells(None) == ["", ""] and score_cells({}) == ["", ""]
+
+
+def test_score_is_a_number_so_the_column_sorts():
+    total, band = score_cells({"total": 100, "band": "strong"})
+    assert isinstance(total, int) and total == 100 and band == "strong"

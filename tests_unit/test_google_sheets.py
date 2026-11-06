@@ -154,3 +154,25 @@ async def test_clear_range(service_account):
         await google_sheets.clear_range(c, SID, "'Checks · a'!A2:Z")
     method, path, _ = calls[-1]
     assert method == "POST" and path.endswith(":clear") and "Checks" in path
+
+
+def _filters(calls):
+    return [r["setBasicFilter"] for _, _, body in calls if body and "requests" in body
+            for r in body["requests"] if "setBasicFilter" in r]
+
+
+async def test_ensure_tab_turns_on_the_header_filter(service_account):
+    calls = []
+    async with mock(_recorder(calls)) as c:
+        await google_sheets.ensure_tab(c, SID, "t", ["Profile", "Download Resume", "Match Score", "Band"], {"tabs": {}}, filter=True)
+    [f] = _filters(calls)
+    # every column of the header, from the header row down with no end, so rows appended later are inside it
+    assert f["filter"]["range"] == {"sheetId": 9, "startRowIndex": 0, "startColumnIndex": 0, "endColumnIndex": 4}
+
+
+async def test_ensure_tab_filter_is_opt_in(service_account):
+    calls = []
+    async with mock(_recorder(calls)) as c:
+        await google_sheets.ensure_tab(c, SID, "Checks", ["Sheet row", "Result"], {"tabs": {}})
+        assert await google_sheets.ensure_tab(c, SID, "Checks", ["Sheet row"], {"tabs": {"Checks": 9}}, filter=True) is False
+    assert _filters(calls) == []  # off by default, and an existing tab (maybe with its own filter) is left alone

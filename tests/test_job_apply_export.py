@@ -22,20 +22,21 @@ def fakes(monkeypatch):
 @pytest.fixture
 def sheets(monkeypatch):
     # values: tab -> rows written with update_range from A1 (headers, the Checks tab); updates / cleared: every call
-    state = {"tabs": {}, "rows": [], "error": None, "values": {}, "updates": [], "cleared": [], "checkbox": {}}
+    state = {"tabs": {}, "rows": [], "error": None, "values": {}, "updates": [], "cleared": [], "checkbox": {}, "filter": {}}
 
     async def info(client, sid):
         if state["error"]:
             raise google_sheets.SheetsError(state["error"])
         return {"title": "Applies", "tabs": dict(state["tabs"])}
 
-    async def ensure(client, sid, title, header, info_, checkbox=None):
+    async def ensure(client, sid, title, header, info_, checkbox=None, filter=False):
         if not title.startswith("Checks · "):
             state["header"] = header  # the application rows' tab
         if title in state["tabs"]:
             return False
         state["tabs"][title] = 1
         state["checkbox"][title] = checkbox
+        state["filter"][title] = filter
         return True
 
     def split(a1):
@@ -110,12 +111,20 @@ async def test_export_rows_per_job_and_profile(client, staff_user, auth_header, 
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["added"] == 3 and body["waiting"] == 1 and body["tab"] == sheets["tab"]
-    assert sheets["header"] == EXPORT_HEADER == ["Profile", "Company Name", "Job Title", "Job URL", "Download Resume"]
+    assert sheets["header"] == EXPORT_HEADER == [
+        "Profile", "Company Name", "Job Title", "Job URL", "Download Resume", "Match Score", "Band"]
     assert sheets["checkbox"][sheets["tab"]] is None
+    assert sheets["filter"][sheets["tab"]] is True  # sort / filter dropdowns on the header
     by = {(row[0], row[3]): row for row in sheets["rows"]}
     assert set(by) == {("Tharun", "https://jobs.example.com/remote"), ("Eric", "https://jobs.example.com/remote"),
                        ("Eric", "https://boards.greenhouse.io/acme/jobs/9")}
-    assert all(len(row) == 5 and row[4].startswith('=HYPERLINK("') and "/job-applies/files/" in row[4] for row in by.values())
+    assert all(len(row) == 7 and row[4].startswith('=HYPERLINK("') and "/job-applies/files/" in row[4] for row in by.values())
+    # Eric's uploaded resume: the score it was picked with, as a number, and its band
+    for url in ("https://jobs.example.com/remote", "https://boards.greenhouse.io/acme/jobs/9"):
+        total, band = by[("Eric", url)][5:7]
+        assert isinstance(total, int) and total >= 60 and band in ("strong", "good", "fair")
+    # Tharun's tailored resume here has no text to score: blanks, not a 0
+    assert by[("Tharun", "https://jobs.example.com/remote")][5:7] == ["", ""]
 
     again = (await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={})).json()  # saved link reused
     assert again["added"] == 0 and again["alreadyExported"] == 3 and again["waiting"] == 1
@@ -223,10 +232,12 @@ async def test_the_same_rows_can_go_to_another_sheet(client, staff_user, auth_he
     assert second["added"] == 3 and second["alreadyExported"] == 0
 
 
-async def _tailor_and_finish(client, h, row_id, account_id, pdf="JVBERi0xLjc="):
+async def _tailor_and_finish(client, h, row_id, account_id, pdf="JVBERi0xLjc=", match=None):
     t = (await client.post(f"/job-applies/rows/{row_id}/tailor", headers=h, json={"accountId": account_id})).json()["tailored"]
-    await ResumeApplication.get_motor_collection().update_one(
-        {"_id": PydanticObjectId(t["jobId"])}, {"$set": {"status": "completed", "step": "done", "pdfData": pdf}})
+    done = {"status": "completed", "step": "done", "pdfData": pdf}
+    if match is not None:
+        done["matchScore"] = match
+    await ResumeApplication.get_motor_collection().update_one({"_id": PydanticObjectId(t["jobId"])}, {"$set": done})
     return await ResumeApplication.get(PydanticObjectId(t["jobId"]))
 
 
@@ -272,7 +283,7 @@ def sheet_cells(monkeypatch, sheets):
             return await base_update(client, sid, a1, values)
         writes.append((a1, values))
         n = int(a1.split("!E")[1].split(":")[0])
-        sheets["rows"][n - 2][4] = values[0][0]
+        sheets["rows"][n - 2][4:4 + len(values[0])] = values[0]
 
     monkeypatch.setattr(google_sheets, "read_range", read)
     monkeypatch.setattr(google_sheets, "update_range", update)
@@ -285,14 +296,18 @@ async def test_retailored_resume_updates_its_exported_row(client, staff_user, au
     h = auth_header(staff_user)
     run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
     gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
-    first = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id))
+    first = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id), match={"total": 58, "band": "fair"})
     await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
     row = next(r for r in sheets["rows"] if (r[0], r[3]) == ("Tharun", gh["url"]))
     before = row[4]
-    second = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id))
+    assert row[5:7] == [58, "fair"]
+    second = await _tailor_and_finish(client, h, gh["_id"], str(tharun.id), match={"total": 81, "band": "strong"})
     assert await sheet_links.fill_link(second) is True
     assert await sheet_links.fill_link(first) is False  # an older resume finishing late doesn't win
     assert len(sheet_cells) == 1 and row[4] != before and row[4].startswith('=HYPERLINK("')
+    # the score moves with the link: link and score are written in one go (E:G)
+    [(a1, _)] = sheet_cells
+    assert a1.endswith(":G" + a1.split("!E")[1].split(":")[0]) and row[5:7] == [81, "strong"]
 
 
 async def test_fill_link_sheet_error_is_swallowed(client, staff_user, auth_header, sheets, sheet_cells, monkeypatch):
@@ -460,3 +475,17 @@ async def test_export_checks_needs_a_sheet_link(client, staff_user, auth_header,
     run_id = await screened_run(client, h)
     r = await client.post(f"/job-applies/runs/{run_id}/export-checks", headers=h, json={})
     assert r.status_code == 400 and "Paste the Google Sheet link" in r.json()["error"]
+
+
+async def test_export_writes_the_tailored_resumes_score(client, staff_user, auth_header, sheets):
+    h = auth_header(staff_user)
+    run_id, rows, tharun, eric, t = await _run(client, h, staff_user)
+    gh = rows["https://boards.greenhouse.io/acme/jobs/9"]
+    await ResumeApplication.get_motor_collection().update_one(
+        {"_id": PydanticObjectId(t["jobId"])}, {"$set": {"matchScore": {"total": 74, "band": "good", "knockouts": [], "missing": []}}})
+    await _tailor_and_finish(client, h, gh["_id"], str(tharun.id), match=91)  # an early record's bare number
+    await client.post(f"/job-applies/runs/{run_id}/export-sheet", headers=h, json={"sheetUrl": GSHEET})
+    by = {(row[0], row[3]): row for row in sheets["rows"]}
+    assert by[("Tharun", "https://jobs.example.com/remote")][5:7] == [74, "good"]
+    assert by[("Tharun", gh["url"])][5:7] == [91, "strong"]
+
