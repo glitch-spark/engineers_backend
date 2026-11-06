@@ -7,6 +7,7 @@ router). Behaviour matches the Interviews board's own stage badges.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -92,36 +93,47 @@ def _dt_in_range(dt: Optional[datetime], start: datetime, end: datetime) -> bool
     return _as_aware(start) <= d <= _as_aware(end)  # type: ignore[operator]
 
 
-def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str, Any]]:
-    """Trail of (stage, scheduledAt, status, caller) — history keeps its own dates,
-    statuses and callers; the tip falls back to the interview-level values."""
-    trail: list[tuple[str, Optional[datetime], str, Any]] = []
+@dataclass
+class MergedRound:
+    """One interview round: consecutive history entries of one stage merged (newer non-empty values win)."""
 
-    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any, caller: Any) -> None:
+    stage: str
+    at: Optional[datetime]
+    status: str
+    caller: Any
+    entry_id: Optional[str]  # the last history entry merged in; None for a round only the interview-level tip has
+
+
+def merged_rounds(iv: Interview) -> list[MergedRound]:
+    """The interview's rounds in history order. History keeps its own dates, statuses and callers; the tip (the
+    interview-level stage) falls back to the interview-level values. Statistics → Interviews and → Callers both count
+    from this."""
+    trail: list[MergedRound] = []
+
+    def push(stage_raw: Any, dt: Optional[datetime], status_raw: Any, caller: Any, entry_id: Optional[str]) -> None:
         stage = _norm_stage(stage_raw)
         if not stage:
             return
         status = _norm_status(status_raw)
-        if trail and trail[-1][0] == stage:
-            _, prev_dt, prev_status, prev_caller = trail[-1]
-            trail[-1] = (
-                stage,
-                dt if dt is not None else prev_dt,
-                status or prev_status,
-                caller if caller is not None else prev_caller,
-            )
+        if trail and trail[-1].stage == stage:
+            last = trail[-1]
+            last.at = dt if dt is not None else last.at
+            last.status = status or last.status
+            last.caller = caller if caller is not None else last.caller
+            last.entry_id = entry_id or last.entry_id
             return
-        trail.append((stage, dt, status, caller))
+        trail.append(MergedRound(stage, dt, status, caller, entry_id))
 
     for h in (iv.stageHistory or []):
-        push(
-            getattr(h, "stage", None),
-            getattr(h, "scheduledAt", None),
-            getattr(h, "status", None),
-            getattr(h, "caller", None),
-        )
-    push(iv.stage, iv.scheduledAt, iv.status, getattr(iv, "caller", None))
+        push(getattr(h, "stage", None), getattr(h, "scheduledAt", None), getattr(h, "status", None),
+             getattr(h, "caller", None), getattr(h, "id", None))
+    push(iv.stage, iv.scheduledAt, iv.status, getattr(iv, "caller", None), None)
     return trail
+
+
+def _dated_rounds(iv: Interview) -> list[tuple[str, Optional[datetime], str, Any]]:
+    """Trail of (stage, scheduledAt, status, caller): `merged_rounds` without the entry ids."""
+    return [(r.stage, r.at, r.status, r.caller) for r in merged_rounds(iv)]
 
 
 def count_interview_rounds(
