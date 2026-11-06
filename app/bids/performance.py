@@ -67,6 +67,25 @@ def streaks(counts: dict[date, int], first: date, last: date, today: date) -> di
     return {"longestStreak": longest, "currentStreak": run, "hitDays": hits, "weekdays": n}
 
 
+def day_strip(counts: dict[date, int], start: date, end: date, first: date, last: date, today: date) -> list[dict]:
+    """One entry per weekday of [start, end] with its bids and state: "hit" (50+), "miss", "open" (today, under 50
+    so far) or "none" (the bidder didn't exist yet, was archived, or before bid records). Same rules as `streaks`."""
+    out = []
+    for i in range((end - start).days + 1):
+        d = start + timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        n = counts.get(d, 0)
+        if d < first or d > last or d > today:
+            state = "none"
+        elif n >= TARGET:
+            state = "hit"
+        else:
+            state = "open" if d == today else "miss"
+        out.append({"day": d.isoformat(), "bids": n, "state": state})
+    return out
+
+
 def rank(rows: list[dict]) -> dict:
     """Top 3 bidder ids for each card; a row with 0 or no value for a card isn't on it."""
     name = lambda r: r["name"].lower()
@@ -161,8 +180,9 @@ async def performance(
         end_day = min(end, _local_day(b.archivedAt, sched)) if b.archivedAt else end
         st = streaks(mine, first, end_day, today)
         interviews = held[b.profileId] if b.profileId else None
-        shared = bool(b.profileId) and (any(o.profileId == b.profileId and o.id != b.id for o in active)
-                                        or str(b.profileId) in typed_on)
+        shared_with = sorted({o.name for o in active if b.profileId and o.profileId == b.profileId and o.id != b.id},
+                             key=str.lower)
+        profile_self_bids = bool(b.profileId) and str(b.profileId) in typed_on
         rows.append({
             "id": k, "name": b.name, "ownerName": owners.get(b.createdBy), "profileId": str(b.profileId) if b.profileId else None,
             "profileName": accounts[b.profileId].name if b.profileId in accounts else None,
@@ -170,7 +190,9 @@ async def performance(
             "pending": pending, "rejected": rejected, "previousTotal": prev_total,
             "change": _ratio(total - prev_total, prev_total, 3), **st,
             "hitRate": _ratio(st["hitDays"], st["weekdays"], 3), "avgPerWeekday": _ratio(total, st["weekdays"], 1),
-            "interviews": interviews, "sharedProfile": shared,
+            "interviews": interviews, "sharedProfile": bool(shared_with) or profile_self_bids,
+            "sharedWith": shared_with, "profileSelfBids": profile_self_bids,
+            "days": day_strip(mine, start, end, first, end_day, today),
             "per100": _ratio(interviews * 100, total, 2) if interviews is not None and total >= MIN_BIDS_FOR_RATE else None,
             "lastBidAt": _iso_utc(last.get(k)),
         })
