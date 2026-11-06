@@ -749,8 +749,8 @@ async def caller_stats(
     to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
 ) -> dict:
-    """Statistics → Callers: each caller's statement, pending and scheduled rounds (app/caller_stats.py), for every
-    signed-in user. Marking a round rejected stays with caller managers."""
+    """Statistics → Callers: each caller's interviews done and pass rate, by round type, against self rounds and week
+    by week, plus the rounds held (app/caller_stats.py), for every signed-in user."""
     from app import caller_stats as cs
 
     day, until = _stats_days(period, date, to)

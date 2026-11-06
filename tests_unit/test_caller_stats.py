@@ -79,50 +79,80 @@ async def _interview(owner, acc, *rounds, company="Acme"):
     ).insert()
 
 
-async def test_each_callers_interviews_by_the_period_they_were_held_in(db):
+async def _october():
+    """Ana (US). Muhammad: intro passed Oct 3, tech rejected Oct 6, intro awaiting Oct 20, intro canceled Oct 8, intro
+    still scheduled Oct 25 (date passed), a home assessment Oct 9 (not counted), intro passed Sep 15 (another period).
+    Pietro: intro passed Oct 2, 5, 13 and (completed then passed, one round) Oct 12; final rejected Oct 14.
+    Self rounds: intro passed Oct 10, live coding rejected Oct 11."""
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
-    eu = await Account(name="Ana EU", createdBy=ana.id, region="EU").insert()
-    mu, pi, idle = await _caller("Muhammad"), await _caller("Pietro", "rose"), await _caller("Zed")
+    mu, pi = await _caller("Muhammad"), await _caller("Pietro", "rose")
     await _interview(ana, us, _round(at(10, 3), "passed", mu), company="Acme")
-    await _interview(ana, us, _round(at(10, 6), "rejected", mu), company="Beta")
-    await _interview(ana, us, _round(at(10, 20), "completed", mu), company="Cora")  # this period's, awaiting
-    await _interview(ana, us, _round(at(9, 28), "completed", mu), company="Dune")  # an earlier period's, awaiting
-    await _interview(ana, us, _round(at(9, 15), "passed", mu))  # an earlier period's, decided
-    await _interview(ana, us, _round(at(10, 25), "scheduled", mu))  # time passed, still scheduled
-    await _interview(ana, us, _round(at(11, 5), "scheduled", mu))  # after the period
-    await _interview(ana, us, _round(at(11, 2), "completed", mu))  # held after the period
-    await _interview(ana, eu, _round(at(10, 7), "canceled", pi))
-    await _interview(ana, eu, _round(at(10, 8), "rejected", typed="Someone"))
-    await _interview(ana, us, _round(at(10, 9), "passed", mu, enabled=False))  # no caller requested
+    await _interview(ana, us, _round(at(10, 6), "rejected", mu, stage="tech_round_1"), company="Beta")
+    await _interview(ana, us, _round(at(10, 20), "completed", mu), company="Cora")
+    await _interview(ana, us, _round(at(10, 8), "canceled", mu), company="Dune")
+    await _interview(ana, us, _round(at(10, 25), "scheduled", mu), company="Echo")
+    await _interview(ana, us, _round(at(10, 9), "passed", mu, stage="home_assessment"), company="Fizz")
+    await _interview(ana, us, _round(at(9, 15), "passed", mu), company="Gone")
+    for d in (2, 5, 13):
+        await _interview(ana, us, _round(at(10, d), "passed", pi), company=f"P{d}")
+    await _interview(ana, us, _round(at(10, 12), "completed", pi), _round(at(10, 12, 16), "passed", pi), company="Twice")
+    await _interview(ana, us, _round(at(10, 14), "rejected", pi, stage="final"), company="Fin")
+    await _interview(ana, us, _round(at(10, 10), "passed", enabled=False), company="SelfA")
+    await _interview(ana, us, _round(at(10, 11), "rejected", enabled=False, stage="live_coding"), company="SelfB")
+    return mu, pi
 
+
+async def test_callers_done_pass_rate_and_ranking(db):
+    await _october()
     out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
-
     assert out["label"] == "Oct 2026"
     rows = {c["name"]: c for c in out["callers"]}
-    assert [c["name"] for c in out["callers"]] == ["Muhammad", "Pietro", "Zed", "Unassigned"]
-    assert rows["Muhammad"]["counts"] == {
-        "passed": 1, "rejected": 1, "canceled": 0, "awaiting": 1, "outdated": 1, "scheduled": 1}
-    assert rows["Muhammad"]["passRate"] == 0.5 and rows["Muhammad"]["color"] == "sky"
-    assert rows["Pietro"]["counts"]["canceled"] == 1 and rows["Pietro"]["passRate"] is None
-    assert not any(rows["Zed"]["counts"].values())
-    assert rows["Unassigned"]["callerId"] is None and rows["Unassigned"]["passRate"] == 0.0
+    assert rows["Muhammad"]["counts"] == {"passed": 1, "rejected": 1, "awaiting": 1, "canceled": 1, "scheduled": 1}
+    assert (rows["Muhammad"]["done"], rows["Muhammad"]["passRate"], rows["Muhammad"]["ranked"]) == (3, 0.5, False)
+    assert (rows["Pietro"]["done"], rows["Pietro"]["passRate"], rows["Pietro"]["ranked"]) == (5, 0.8, True)
+    assert out["team"]["passRate"] == 0.7143 and out["team"]["done"] == 8
+    assert (rows["Pietro"]["vsTeam"], rows["Muhammad"]["vsTeam"]) == (0.0857, -0.2143)
+    assert "outdated" not in rows["Muhammad"]["counts"]
+    assert rows["Muhammad"]["color"] == "sky"
 
-    mine = {(r["company"], r["section"]): r for r in out["rounds"] if r["callerId"] == str(mu.id)}
-    assert set(mine) == {("Acme", "period"), ("Beta", "period"), ("Cora", "period"), ("Dune", "outdated"),
-                         ("Acme", "scheduled")}
-    assert (mine[("Cora", "period")]["result"], mine[("Cora", "period")]["daysWaiting"]) == ("awaiting", 10)
-    assert (mine[("Dune", "outdated")]["roundDate"], mine[("Dune", "outdated")]["daysWaiting"]) == (
-        "2026-09-28T15:00:00Z", 32)
-    assert mine[("Acme", "scheduled")]["stale"]
+
+async def test_pass_rate_by_round_type_and_self(db):
+    await _october()
+    out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
+    mu = next(c for c in out["callers"] if c["name"] == "Muhammad")
+    assert mu["byType"]["tech"] == {"done": 1, "passed": 0, "rejected": 1, "passRate": 0.0}
+    assert mu["byType"]["final"] == {"done": 0, "passed": 0, "rejected": 0, "passRate": None}
+    assert set(mu["byType"]) == {"intro", "tech", "hiring", "panel", "final"}
+    assert (out["self"]["done"], out["self"]["passRate"]) == (2, 0.5)
+    assert out["self"]["byType"]["tech"]["passRate"] == 0.0 and out["self"]["byType"]["intro"]["passRate"] == 1.0
+    assert out["team"]["byType"]["final"] == {"done": 1, "passed": 0, "rejected": 1, "passRate": 0.0}
+
+
+async def test_weekly_buckets_add_up(db):
+    mu, pi = await _october()
+    out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
+    assert out["weekly"]["unit"] == "week"
+    assert sum(b["callers"].get(str(mu.id), {"done": 0})["done"] for b in out["weekly"]["buckets"]) == 3
+    assert sum(b["callers"].get(str(pi.id), {"done": 0})["done"] for b in out["weekly"]["buckets"]) == 5
+    assert sum(b["all"]["done"] for b in out["weekly"]["buckets"]) == out["team"]["done"]
+
+
+async def test_rounds_list_only_rounds_held_in_the_period(db):
+    mu, pi = await _october()
+    out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
+    mine = [r for r in out["rounds"] if r["callerId"] == str(mu.id)]
+    assert sorted(r["result"] for r in mine) == ["awaiting", "canceled", "passed", "rejected"]
+    assert all("section" not in r and "stale" not in r for r in out["rounds"])
+    assert sum(1 for r in out["rounds"] if r["callerId"] == str(pi.id)) == 5  # Twice is one round
     assert all(r["engineer"] == "Ana" for r in out["rounds"])
-    assert str(idle.id) not in {r["callerId"] for r in out["rounds"]}
 
-    sep = {c["name"]: c for c in (await cs.caller_stats("month", date(2026, 9, 1), "all", now=NOW))["callers"]}
-    assert (sep["Muhammad"]["counts"]["passed"], sep["Muhammad"]["counts"]["awaiting"]) == (1, 1)
 
-    eu_only = await cs.caller_stats("month", date(2026, 10, 1), "EU", now=NOW)
-    assert {r["callerId"] for r in eu_only["rounds"]} == {str(pi.id), None}
+async def test_region_without_caller_rounds_has_no_rates(db):
+    await _october()
+    out = await cs.caller_stats("month", date(2026, 10, 1), "EU", now=NOW)
+    assert all(c["done"] == 0 for c in out["callers"]) and out["team"]["passRate"] is None
+    assert out["self"]["done"] == 0 and out["rounds"] == []
 
 
 async def test_a_typed_caller_name_counts_for_that_caller(db):
