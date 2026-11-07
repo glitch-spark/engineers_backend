@@ -260,6 +260,19 @@ async def test_job_extract_uses_its_own_model_when_set(monkeypatch):
     assert seen == ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o-mini"]
 
 
+def test_job_extract_model_falls_back_once_it_retires(monkeypatch):
+    from datetime import date
+
+    import app.llm_router as router
+    import app.model_catalog as catalog
+
+    settings = SimpleNamespace(RESUME_OPENAI_MODEL="gpt-6-luna", JOB_EXTRACT_MODEL="gpt-4o-mini")
+    monkeypatch.setattr(catalog, "_today", lambda: date(2027, 1, 13))
+    assert router._openai_model_for("job_extract", settings) == "gpt-4o-mini"
+    monkeypatch.setattr(catalog, "_today", lambda: date(2027, 1, 14))
+    assert router._openai_model_for("job_extract", settings) == "gpt-6-luna"
+
+
 def test_reasoning_models_are_the_gpt_5_and_gpt_6_families():
     from app.llm_router import is_reasoning_model
 
