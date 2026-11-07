@@ -56,8 +56,10 @@ def _temperature_for(purpose: str) -> Optional[float]:
 
 
 def _openai_model_for(purpose: str, settings) -> str:
-    if purpose == "job_extract" and (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip():
-        return settings.JOB_EXTRACT_MODEL.strip()
+    model = (getattr(settings, "JOB_EXTRACT_MODEL", "") or "").strip()
+    # A retired model (GPT-4o mini from 2027-01-14) falls back to RESUME_OPENAI_MODEL instead of failing every read.
+    if purpose == "job_extract" and model and not is_inactive(f"openai:{model}"):
+        return model
     return settings.RESUME_OPENAI_MODEL
 
 
