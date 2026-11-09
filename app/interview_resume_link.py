@@ -16,7 +16,7 @@ from beanie import PydanticObjectId
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 
-from app.models.interview import InterviewResumeLink, NoMatchReason
+from app.models.interview import Interview, InterviewResumeLink, NoMatchReason
 from app.models.resume_application import as_match
 
 MAX_MATCHES = 20
@@ -213,3 +213,10 @@ async def resolve_link(body: ResumeLinkIn, account_oid: PydanticObjectId, user) 
     if not body.matchId:
         raise _bad("Pick a resume, or tick No company found.")
     return await build_link(body.matchId, account_oid, user)
+
+
+async def linked_interview_names(job_id: PydanticObjectId, limit: int = 5) -> list[str]:
+    """Companies of the interviews linked to this generated resume (at most `limit`): deleting it would leave their
+    resume download with nothing to fetch."""
+    cursor = Interview.get_motor_collection().find({"resumeLink.resumeJobId": job_id}, {"companyName": 1}).limit(limit)
+    return [(d.get("companyName") or "").strip() or "an untitled company" async for d in cursor]

@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
 from app.deps import get_current_user
+from app.interview_resume_link import linked_interview_names
 from app.job_apply.file_links import content_disposition
 from app.job_apply.schema import TailoredMatch
 from app.models import Account, ResumeApplication, UserExtra
@@ -1077,10 +1078,24 @@ async def restore_job_pdf(
 async def delete_job(
     job_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    force: bool = False,
 ) -> dict:
+    """Deletes a generated resume. One an interview links to answers 409 naming the interview(s) unless `force`: the
+    interview keeps its link (and its frozen job description), but its resume download has nothing left to fetch."""
     job = await ResumeApplication.get(to_object_id(job_id))
     if job is None or (user.role != "admin" and str(job.userId) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if not force:
+        linked = await linked_interview_names(job.id)
+        if linked:
+            names = ", ".join(linked)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"This resume is linked to the interview{'s' if len(linked) > 1 else ''} for {names}. "
+                    "Deleting it breaks the resume download there."
+                ),
+            )
     await job.delete()
     return {"ok": True}
 
