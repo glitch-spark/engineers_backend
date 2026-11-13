@@ -403,6 +403,34 @@ async def _lifetime_bidder_bids(account_ids: list[PydanticObjectId]) -> dict[str
     return dict(out)
 
 
+async def apply_dates(accounts: list[Account | ProfileSpan]) -> dict[str, tuple[Optional[date], Optional[date]]]:
+    """accountId -> (first, last) day the profile applied, whatever the period, from two sources only: its bidders'
+    Bid Track bids (approved + pending, archived bidders too, on the Bid Track day) and the self bids typed for it in
+    logged daily plans. (None, None) with neither."""
+    days: dict = defaultdict(list)
+    ids = [a.id for a in accounts]
+    profile_of = {b.id: str(b.profileId) async for b in Bidder.find({"profileId": {"$in": ids}})}
+    if profile_of:
+        sched = schedule_from_settings()
+        pipeline = [
+            {"$match": {"bidderId": {"$in": list(profile_of)}, "status": {"$in": ["approved", "pending"]}}},
+            {"$group": {"_id": "$bidderId", "first": {"$min": "$firstAt"}, "last": {"$max": "$firstAt"}}},
+        ]
+        for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None):
+            days[profile_of[g["_id"]]] += [bid_report_day(g["first"], sched), bid_report_day(g["last"], sched)]
+    keys = {str(i) for i in ids}
+    cursor = DailyPlan.get_motor_collection().find(
+        {"userId": {"$in": list({a.createdBy for a in accounts})}, "loggedAt": {"$ne": None},
+         "done.bidsSelfByProfile": {"$exists": True}},
+        {"date": 1, "done.bidsSelfByProfile": 1},
+    )
+    async for d in cursor:
+        for account_id, n in ((d.get("done") or {}).get("bidsSelfByProfile") or {}).items():
+            if account_id in keys and n:
+                days[account_id].append(d["date"].date())
+    return {k: (min(days[k]), max(days[k])) if days.get(k) else (None, None) for k in keys}
+
+
 async def lifetime(accounts: list[Account | ProfileSpan], today: date) -> dict[str, tuple[date, int, dict, dict]]:
     """accountId -> (creation day, weeks since then, {today: totals}, score lists), shaped like `collect` so
     `summarize` reads it: every bid, interview round and scored application since each profile was created, through

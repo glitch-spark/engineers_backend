@@ -67,3 +67,41 @@ async def test_rounds_split_by_who_applied(db):
     assert (row["interviews"], row["selfAppliedInterviews"], row["bidderAppliedInterviews"],
             row["unsetAppliedInterviews"]) == (4, 2, 1, 1)
     assert (row["selfInterviews"], row["callerInterviews"]) == (3, 1)  # who took them, unchanged
+
+
+_job = iter(range(10**6))
+
+
+async def _bidder(owner, acc, name="Bo", archived=False) -> Bidder:
+    return await Bidder(createdBy=owner.id, name=name, profileId=acc.id, rate=1, screenshotFolderUrl=f"s3://{name}/",
+                        archivedAt=datetime(2026, 11, 1) if archived else None).insert()
+
+
+async def _bids(bidder, when: datetime, status: str, n: int = 1) -> None:
+    first = when.astimezone(timezone.utc).replace(tzinfo=None)
+    for _ in range(n):
+        await Bid(bidderId=bidder.id, ownerId=bidder.createdBy, jobKey=f"k{next(_job)}", firstAt=first, status=status,
+                  screenshots=[]).insert()
+
+
+async def _plan(owner, day: date, by_profile: dict, logged=True) -> None:
+    await DailyPlan(userId=owner.id, date=datetime(day.year, day.month, day.day), year=day.year, weekNumber=1,
+                    done={"bidsSelfByProfile": by_profile},
+                    loggedAt=datetime(day.year, day.month, day.day, 20) if logged else None).insert()
+
+
+async def test_apply_dates_from_bids_and_self_bids(db):
+    ana, a = await _owner_profile()
+    b = await Account(name="B", region="US", createdBy=ana.id).insert()
+    c = await Account(name="C", region="US", createdBy=ana.id).insert()
+    old = await _bidder(ana, a, archived=True)
+    await _bids(old, chi(10, 10, 10), "approved")
+    await _bids(old, chi(11, 2, 19), "pending")  # after the 18:30 cutoff: Bid Track's Nov 3
+    await _bids(old, chi(10, 1, 10), "rejected")  # not an apply
+    await _plan(ana, date(2026, 10, 30), {str(a.id): 3})
+    await _plan(ana, date(2026, 11, 9), {str(a.id): 5}, logged=False)  # not followed up: doesn't count
+    await _plan(ana, date(2026, 11, 8), {str(b.id): 2})
+    out = await pm.apply_dates([a, b, c])
+    assert out[str(a.id)] == (date(2026, 10, 10), date(2026, 11, 3))
+    assert out[str(b.id)] == (date(2026, 11, 8), date(2026, 11, 8))
+    assert out[str(c.id)] == (None, None)
