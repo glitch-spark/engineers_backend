@@ -396,7 +396,8 @@ def _list_range(from_: str, to: str) -> tuple[date, date]:
 @router.get("/metrics")
 async def list_profile_metrics(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    weeks: Annotated[str, Query()] = "4",
+    # No from / to and no weeks = All time (the page); older pages always send weeks.
+    weeks: Annotated[str, Query()] = "all",
     userId: Annotated[str, Query()] = "",
     from_: Annotated[str, Query(alias="from")] = "",
     to: Annotated[str, Query()] = "",

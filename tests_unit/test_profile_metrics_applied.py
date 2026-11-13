@@ -166,3 +166,12 @@ async def test_list_bad_ranges(db, today):
         with pytest.raises(HTTPException) as e:
             await _list(ana, from_=f, to=t)
         assert e.value.status_code == 400, (f, t)
+
+
+async def test_list_without_dates_or_weeks_is_all_time(db, today):
+    """The page asks for All time with no from / to: that must not fall back to the old 4-week default."""
+    ana, a = await _owner_profile()
+    await _plan(ana, date(2026, 11, 7), {str(a.id): 4})
+    out = await _list(ana)
+    assert out["weeks"] == "all" and out["start"] == "2026-01-05"
+    assert out["rows"][0]["spanWeeks"] > 0 and out["rows"][0]["selfBids"] == 4
