@@ -422,3 +422,42 @@ async def test_another_users_bidder_invite_routes_404(api):
     api.login(other)
     for path in ("invite", "reset-login"):
         assert (await api.post(f"/bidders/{mine.id}/{path}")).status_code == 404
+
+
+async def test_restore_brings_an_archived_bidder_back(api):
+    me = await make_user(); api.login(me)
+    b = await make_bidder(me, "Puma", archived=True, folder="puma", registeredAt=datetime.now(timezone.utc),
+                          username="puma", passwordHash="x", tokenVersion=1)
+    res = await api.post(f"/bidders/{b.id}/restore")
+    assert res.status_code == 200
+    out = res.json()
+    assert out["status"] == "active" and out["archivedAt"] is None and out["folder"] == "puma"
+    stored = await Bidder.get(b.id)
+    # Same login; the token bump from archiving stays, so old extension sessions stay signed out.
+    assert stored.archivedAt is None and stored.username == "puma" and stored.tokenVersion == 1
+    active = (await api.get("/bidders")).json()["bidders"]
+    assert [x["_id"] for x in active] == [str(b.id)]
+
+
+async def test_restore_unregistered_bidder_is_invited_and_can_get_a_code(api):
+    me = await make_user(); api.login(me)
+    b = (await api.post("/bidders", json=body(name="Puma"))).json()["bidder"]
+    await api.delete(f"/bidders/{b['_id']}")
+    out = (await api.post(f"/bidders/{b['_id']}/restore")).json()
+    assert out["status"] == "invited" and out["inviteExpiresAt"] is None
+    assert (await api.post(f"/bidders/{b['_id']}/invite")).status_code == 200
+
+
+async def test_restore_active_bidder_is_a_no_op(api):
+    me = await make_user(); api.login(me)
+    b = await make_bidder(me, "Puma", folder="puma")
+    res = await api.post(f"/bidders/{b.id}/restore")
+    assert res.status_code == 200 and res.json()["archivedAt"] is None
+
+
+async def test_restore_another_users_bidder_is_404(api):
+    me, other = await make_user("Pedro"), await make_user("Maria")
+    mine = await make_bidder(me, "Puma", archived=True, folder="puma")
+    api.login(other)
+    assert (await api.post(f"/bidders/{mine.id}/restore")).status_code == 404
+    assert (await Bidder.get(mine.id)).archivedAt is not None

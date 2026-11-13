@@ -137,6 +137,7 @@ class RoundIn(BaseModel):
     interviewerName: Optional[str] = None
     note: Optional[str] = ""
     transcript: Optional[str] = ""
+    statusNote: Optional[str] = ""
     caller: Optional[CallerIn] = None
 
 
@@ -170,6 +171,8 @@ class InterviewCreate(BaseModel):
 class StageCreate(RoundIn):
     # Add next round: optionally mark the previous (scheduled/completed) round passed.
     markPreviousPassed: bool = False
+    # The caller's feedback on the previous round, saved when it is marked passed.
+    previousStatusNote: Optional[str] = None
 
 
 class StagePatch(BaseModel):
@@ -180,6 +183,8 @@ class StagePatch(BaseModel):
     interviewerName: Optional[str] = None
     transcript: Optional[str] = None
     note: Optional[str] = None
+    # The reason / feedback for the status. Absent with a new status = cleared (it described the old one).
+    statusNote: Optional[str] = None
     caller: Optional[CallerIn] = None
     # Caller rounds only; owner or admin.
     confirmed: Optional[bool] = None
@@ -245,6 +250,19 @@ def mark_previous_passed(history: list[InterviewStageEvent]) -> bool:
         tip.status = InterviewStatus.passed
         return True
     return False
+
+
+STATUS_NOTE_MAX = 2000
+
+
+def _status_note(raw: Optional[str]) -> str:
+    note = (raw or "").strip()
+    if len(note) > STATUS_NOTE_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"The reason / feedback can be at most {STATUS_NOTE_MAX} characters.",
+        )
+    return note
 
 
 def round_ends_at(start: datetime, ends: Optional[datetime]) -> datetime:
@@ -592,6 +610,7 @@ def flatten_rounds(
                 "roundId": e.get("id"),
                 "stage": _normalize_stage(e.get("stage")),
                 "status": normalize_status(e.get("status")),
+                "statusNote": (e.get("statusNote") or "").strip() or None,
                 "scheduledAt": _iso_utc(start),
                 "endsAt": _iso_utc(e.get("endsAt")),
                 "companyName": iv.get("companyName"),
@@ -861,6 +880,7 @@ def _build_round(
         interviewerName=(rnd.interviewerName or "").strip() or None,
         note=rnd.note or "",
         transcript=rnd.transcript or "",
+        statusNote=_status_note(rnd.statusNote),
     )
     if rnd.caller is not None:
         entry.caller = _round_caller(rnd.caller, starts_at=start, previous=None)
@@ -1072,8 +1092,9 @@ async def add_interview_stage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{entry.stage} cannot directly follow itself",
         )
-    if body.markPreviousPassed:
-        mark_previous_passed(iv.stageHistory)
+    previous_note = _status_note(body.previousStatusNote) if body.previousStatusNote is not None else None
+    if body.markPreviousPassed and mark_previous_passed(iv.stageHistory) and previous_note is not None:
+        iv.stageHistory[-1].statusNote = previous_note
     iv.stageHistory.append(entry)
     _sync_top_from_tip(iv)
     await _save_interview(iv)
@@ -1147,6 +1168,7 @@ async def update_interview_stage(
         if body.endsAt and ends is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
         entry.endsAt = round_ends_at(entry.scheduledAt, ends)
+    old_status = _status_value(entry.status)
     if body.status is not None:
         if body.status == "":
             entry.status = None
@@ -1154,6 +1176,10 @@ async def update_interview_stage(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
         else:
             entry.status = InterviewStatus(body.status)
+    if body.statusNote is not None:
+        entry.statusNote = _status_note(body.statusNote)
+    elif _status_value(entry.status) != old_status:
+        entry.statusNote = ""  # the saved reason was about the previous status
     if body.interviewerName is not None:
         entry.interviewerName = body.interviewerName.strip() or None
     transcript_changed = body.transcript is not None and body.transcript != entry.transcript
