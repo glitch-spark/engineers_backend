@@ -90,6 +90,8 @@ class InterviewStageEvent(BaseModel):
     status: Optional[InterviewStatus] = None
     transcript: str = ""
     note: str = ""
+    # Why the round got its status: the recruiter's reason (canceled) or feedback (passed / rejected).
+    statusNote: str = ""
     # Per-round details (phase 2). The interview-level interviewerName/caller
     # mirror the latest round's for one release.
     interviewerName: Optional[str] = None

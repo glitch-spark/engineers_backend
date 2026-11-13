@@ -146,6 +146,18 @@ async def archive_bidder(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post("/{bidder_id}/restore")
+async def restore_bidder(bidder_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Undo an archive: back in lists and reports. A registered bidder signs in to the extension again with
+    their username and password (archiving signed them out); an unregistered one needs a new invite code."""
+    bidder = await _load_owned(bidder_id, user)
+    if bidder.archivedAt is not None:
+        bidder.archivedAt = None
+        await bidder.save()
+    account = await Account.get(bidder.profileId) if bidder.profileId else None
+    return bidder_out(bidder, account.name if account else None)
+
+
 @router.post("/{bidder_id}/invite")
 async def new_invite(bidder_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     bidder = await _load_owned(bidder_id, user)
