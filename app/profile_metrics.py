@@ -83,6 +83,8 @@ def bid_report_day(first_at: datetime, sched: BidSchedule) -> date:
 _COUNTS = ("selfBids", "bidderBids", "selfInterviews", "callerInterviews",
            # the same interviews by who applied for the job (Interview.appliedBy; unset = not recorded)
            "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews")
+# "Applied by" (Interview.appliedBy) is on every interview saved from this day on: the self / bidder rates count from it.
+APPLIED_BY_SINCE = date(2026, 11, 6)
 _APPLIED = {"self": 2, "bidder": 3}  # interview_rounds' slot per appliedBy kind; anything else is unset (4)
 
 
@@ -401,6 +403,18 @@ async def _lifetime_bidder_bids(account_ids: list[PydanticObjectId]) -> dict[str
     for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None):
         out[profile_of[g["_id"]]] += g["n"]
     return dict(out)
+
+
+def _source_rate(interviews: int, bids: int) -> dict:
+    return {"interviews": interviews, "bids": bids, "rate": round(interviews / bids, 4) if bids else None,
+            "lowVolume": bids < MIN_BIDS}
+
+
+def source_rates(totals: dict) -> tuple[dict, dict]:
+    """(self rate, bidder rate) from summed counts: self-applied interviews / self bids, bidder-applied interviews /
+    bidder bids. Interviews with no "Applied by" count toward neither."""
+    return (_source_rate(totals.get("selfAppliedInterviews", 0), totals.get("selfBids", 0)),
+            _source_rate(totals.get("bidderAppliedInterviews", 0), totals.get("bidderBids", 0)))
 
 
 async def apply_dates(accounts: list[Account | ProfileSpan]) -> dict[str, tuple[Optional[date], Optional[date]]]:

@@ -105,3 +105,64 @@ async def test_apply_dates_from_bids_and_self_bids(db):
     assert out[str(a.id)] == (date(2026, 10, 10), date(2026, 11, 3))
     assert out[str(b.id)] == (date(2026, 11, 8), date(2026, 11, 8))
     assert out[str(c.id)] == (None, None)
+
+
+@pytest.fixture
+def today(monkeypatch):
+    from app.routers import accounts
+
+    monkeypatch.setattr(accounts, "_today", lambda: date(2026, 11, 13))
+
+
+async def _list(user, **kw):
+    from app.routers.accounts import list_profile_metrics
+
+    return await list_profile_metrics(user, **{"userId": "", **kw})
+
+
+async def test_list_date_range_and_rates_from_nov_6(db, today):
+    ana, a = await _owner_profile()
+    await _plan(ana, date(2026, 11, 5), {str(a.id): 5})
+    await _plan(ana, date(2026, 11, 7), {str(a.id): 10})
+    await _iv(ana, a, applied={"kind": "self"}, rounds=[at(11, 5)])
+    await _iv(ana, a, applied={"kind": "self"}, rounds=[at(11, 7)])
+    bo = await _bidder(ana, a)
+    await _bids(bo, chi(11, 7, 10), "approved", 20)
+    await _iv(ana, a, applied={"kind": "bidder", "bidderName": "Bo"}, rounds=[at(11, 7)])
+    await _iv(ana, a, applied=None, rounds=[at(11, 7)])
+    out = await _list(ana, from_="2026-11-02", to="2026-11-08")
+    row = out["rows"][0]
+    assert (out["start"], out["end"], out["ratesSince"]) == ("2026-11-02", "2026-11-08", "2026-11-06")
+    assert (row["interviews"], row["selfAppliedInterviews"], row["bidderAppliedInterviews"],
+            row["unsetAppliedInterviews"]) == (4, 2, 1, 1)
+    assert row["selfRate"] == {"interviews": 1, "bids": 10, "rate": 0.1, "lowVolume": True}
+    assert row["bidderRate"] == {"interviews": 1, "bids": 20, "rate": 0.05, "lowVolume": True}
+    assert (row["firstApply"], row["lastApply"]) == ("2026-11-05", "2026-11-07")
+
+
+async def test_list_range_before_nov_6_has_no_rates(db, today):
+    ana, a = await _owner_profile()
+    out = await _list(ana, from_="2026-10-01", to="2026-10-31")
+    assert out["ratesSince"] is None
+    assert out["rows"][0]["selfRate"] is None and out["rows"][0]["bidderRate"] is None
+
+
+async def test_list_all_time_rates_since_nov_6(db, today):
+    ana, a = await _owner_profile()
+    await _plan(ana, date(2026, 11, 7), {str(a.id): 4})
+    await _iv(ana, a, applied={"kind": "self"}, rounds=[at(11, 7)])
+    out = await _list(ana, weeks="all")
+    assert out["ratesSince"] == "2026-11-06"
+    assert out["rows"][0]["selfRate"] == {"interviews": 1, "bids": 4, "rate": 0.25, "lowVolume": True}
+    assert out["rows"][0]["bidderRate"] == {"interviews": 0, "bids": 0, "rate": None, "lowVolume": True}
+
+
+async def test_list_bad_ranges(db, today):
+    from fastapi import HTTPException
+
+    ana, _ = await _owner_profile()
+    for f, t in [("2026-11-02", ""), ("", "2026-11-02"), ("2026-11-09", "2026-11-02"), ("nope", "2026-11-02"),
+                 ("2025-01-01", "2026-11-02")]:
+        with pytest.raises(HTTPException) as e:
+            await _list(ana, from_=f, to=t)
+        assert e.value.status_code == 400, (f, t)

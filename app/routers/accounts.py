@@ -13,8 +13,8 @@ from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.profile_metrics import (
-    WEEK_CHOICES, ProfileSpan, collect, collect_range, lifetime, peer_average, since_date, span, summarize,
-    weekly_from_daily,
+    APPLIED_BY_SINCE, WEEK_CHOICES, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
+    since_date, source_rates, span, summarize, weekly_from_daily,
 )
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
@@ -377,16 +377,38 @@ def _check_weeks(weeks: int) -> None:
         raise HTTPException(status_code=422, detail=f"weeks must be one of {list(WEEK_CHOICES)}")
 
 
+MAX_LIST_RANGE_DAYS = 366
+
+
+def _list_range(from_: str, to: str) -> tuple[date, date]:
+    """The Profiles list's from / to (both YYYY-MM-DD, from <= to, at most MAX_LIST_RANGE_DAYS days); 400 otherwise."""
+    try:
+        start, end = date.fromisoformat(from_), date.fromisoformat(to)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from and to must both be YYYY-MM-DD")
+    if start > end:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from must be on or before to")
+    if (end - start).days + 1 > MAX_LIST_RANGE_DAYS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"at most {MAX_LIST_RANGE_DAYS} days")
+    return start, end
+
+
 @router.get("/metrics")
 async def list_profile_metrics(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    weeks: str = Query("4"),
-    userId: str = Query(""),
+    weeks: Annotated[str, Query()] = "4",
+    userId: Annotated[str, Query()] = "",
+    from_: Annotated[str, Query(alias="from")] = "",
+    to: Annotated[str, Query()] = "",
 ) -> dict:
-    """Per-profile weekly rates over the last completed weeks, or totals since each profile was created
-    (weeks=all), for the user's active profiles (admin: any/all)."""
-    all_time = str(weeks) == "all"
-    if not all_time:
+    """Per-profile totals for the user's active profiles (admin: any/all) over the days [from, to], or since each
+    profile was created (no from / to, or weeks=all), or the last completed `weeks` (older pages). Each row also has the
+    self and bidder interview-per-bid rates from APPLIED_BY_SINCE on, and the profile's first and last apply day."""
+    in_range = bool(from_ or to)
+    all_time = not in_range and str(weeks) == "all"
+    if in_range:
+        range_start, range_end = _list_range(from_, to)
+    elif not all_time:
         weeks = int(weeks) if str(weeks).isdigit() else 0
         _check_weeks(weeks)
     query: dict[str, Any] = archive_status_query("active")
@@ -399,7 +421,10 @@ async def list_profile_metrics(
         query["createdBy"] = user.id
     accounts = await Account.find(query).project(ProfileSpan).to_list()
     today = _today()
-    if all_time:
+    if in_range:
+        start, end = range_start, range_end
+        collected = await collect_range(accounts, start, end)
+    elif all_time:
         collected = await lifetime(accounts, today)
         first = min((vals[0] for vals in collected.values()), default=today)
         start, end = first, today
@@ -407,7 +432,25 @@ async def list_profile_metrics(
         start, end, _ = span(weeks, today, date.min, date.min)
         collected = await collect(accounts, weeks, today)
     rows = [summarize(aid, *vals) for aid, vals in collected.items()]
-    out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": weeks, "rows": rows}
+
+    # Self / bidder rates only over days with "Applied by" (the period's days from APPLIED_BY_SINCE on).
+    rates_from = max(start, APPLIED_BY_SINCE)
+    window = await collect_range(accounts, rates_from, end) if rates_from <= end and accounts else {}
+    dates = await apply_dates(accounts) if accounts else {}
+    for row in rows:
+        vals = window.get(row["accountId"])
+        if vals is None:
+            row["selfRate"] = row["bidderRate"] = None
+        else:
+            daily = vals[2]
+            totals = {k: sum(c.get(k, 0) for c in daily.values()) for k in
+                      ("selfBids", "bidderBids", "selfAppliedInterviews", "bidderAppliedInterviews")}
+            row["selfRate"], row["bidderRate"] = source_rates(totals)
+        first_apply, last_apply = dates.get(row["accountId"], (None, None))
+        row["firstApply"] = first_apply.isoformat() if first_apply else None
+        row["lastApply"] = last_apply.isoformat() if last_apply else None
+    out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": None if in_range else weeks, "rows": rows,
+           "ratesSince": rates_from.isoformat() if rates_from <= end else None}
     if all_time:  # self bids exist per profile only from the launch day: the list says so
         since = await since_date()
         out["selfBidsSince"] = since.isoformat() if since and since > date.min else None
