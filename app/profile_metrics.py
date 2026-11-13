@@ -153,6 +153,60 @@ async def interview_rounds(
     return dict(out)
 
 
+# Profile → Metrics "Rounds" card, in display order. Groups as on the Interviews board; home assessments are their own
+# type here (every other count leaves them out); AI interviews never count.
+ROUND_TYPES = ("intro", "tech", "hiring", "panel", "final", "home_assessment")
+
+
+async def profile_rounds(account_ids: list[PydanticObjectId], start: date, end: date) -> dict[str, list[dict]]:
+    """account id -> [{type, result}] for each round held on a local day in [start, end], by its interview's
+    profile. Rounds are merged as on Statistics (consecutive entries of one stage are one round); `result` is
+    app.caller_stats.round_result of its status, so canceled and still-scheduled rounds are kept but aren't done."""
+    from app.caller_stats import round_result
+    from app.interview_rounds import _breakdown_group, merged_rounds
+
+    tz = app_tz()
+    first = local_day_start_utc(start, tz)
+    last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
+    ivs = await Interview.find({
+        "accountId": {"$in": account_ids},
+        "$or": [
+            {"scheduledAt": {"$gte": first, "$lte": last}},
+            {"stageHistory.scheduledAt": {"$gte": first, "$lte": last}},
+        ],
+    }).to_list()
+    out: dict[str, list[dict]] = defaultdict(list)
+    for iv in ivs:
+        for rd in merged_rounds(iv):
+            kind = "home_assessment" if rd.stage == "home_assessment" else _breakdown_group(rd.stage)
+            if kind is None or rd.at is None:
+                continue
+            held = rd.at if rd.at.tzinfo else rd.at.replace(tzinfo=timezone.utc)
+            if start <= held.astimezone(tz).date() <= end:
+                out[str(iv.accountId)].append({"type": kind, "result": round_result(rd.status)})
+    return dict(out)
+
+
+def rounds_summary(rounds: list[dict]) -> dict:
+    """{byType: {type: {done, passed, rejected, passRate}}, awaiting, scheduled, passRate} of `profile_rounds`
+    records. done = passed + rejected + awaiting (held, no result yet); pass rate = passed / (passed + rejected), None
+    with none decided. The overall pass rate leaves home assessments out; awaiting and scheduled count every type."""
+    from app.interview_rates import rate
+
+    def stats(mine: list[dict]) -> dict:
+        n = {k: sum(1 for r in mine if r["result"] == k) for k in ("passed", "rejected", "awaiting")}
+        return {"done": n["passed"] + n["rejected"] + n["awaiting"], "passed": n["passed"], "rejected": n["rejected"],
+                "passRate": rate(n["passed"] + n["rejected"], n["passed"])}
+
+    rounds_only = stats([r for r in rounds if r["type"] != "home_assessment"])
+    return {
+        "byType": {t: stats([r for r in rounds if r["type"] == t]) for t in ROUND_TYPES},
+        "awaiting": sum(1 for r in rounds if r["result"] == "awaiting"),
+        "scheduled": sum(1 for r in rounds if r["result"] == "scheduled"),
+        "passRate": rounds_only["passRate"],
+    }
+
+
 async def _dated_scores(account_ids: list[str], start: date, end: date) -> list[tuple[str, date, str, Optional[int]]]:
     """(accountId, local day, "tailored" | "match", score or None) over [start, end].
 

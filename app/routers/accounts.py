@@ -14,7 +14,7 @@ from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.profile_metrics import (
     APPLIED_BY_SINCE, WEEK_CHOICES, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
-    since_date, source_rates, span, summarize, weekly_from_daily,
+    profile_rounds, rounds_summary, since_date, source_rates, span, summarize, weekly_from_daily,
 )
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
@@ -499,6 +499,13 @@ async def get_profile_metrics(
     row["daily"] = [{"day": d.isoformat(), **c} for d, c in sorted(daily.items())]
     row["weekly"] = [{"week": m.isoformat(), **c} for m, c in sorted(weekly_from_daily(daily).items())]
     row["peers"] = peer_average([summarize(aid, *v) for aid, v in collected.items() if aid != me])
+    # Rounds by type with pass rates; the peers' pass rate pools the other profiles' rounds, so a profile with one
+    # round doesn't weigh like one with forty.
+    rounds = await profile_rounds([a.id for a in accounts], start, end)
+    row["rounds"] = rounds_summary(rounds.get(me, []))
+    row["passRate"] = row["rounds"]["passRate"]
+    if row["peers"] is not None:
+        row["peers"]["passRate"] = rounds_summary([r for aid, rs in rounds.items() if aid != me for r in rs])["passRate"]
     return row
 
 
