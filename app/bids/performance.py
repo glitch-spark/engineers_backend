@@ -216,6 +216,8 @@ async def performance(
         shared_with = sorted({o.name for o in active if b.profileId and o.profileId == b.profileId and o.id != b.id},
                              key=str.lower)
         profile_self_bids = bool(b.profileId) and str(b.profileId) in typed_on
+        pay = round(approved * b.rate, 2)  # pending isn't paid yet
+        reviewed = approved + rejected
         rows.append({
             "id": k, "name": b.name, "ownerName": owners.get(b.createdBy), "profileId": str(b.profileId) if b.profileId else None,
             "profileName": accounts[b.profileId].name if b.profileId in accounts else None,
@@ -229,12 +231,17 @@ async def performance(
             "days": day_strip(mine, start, end, first, end_day, today),
             "per100": _ratio(interviews * 100, total, 2) if interviews is not None and total >= MIN_BIDS_FOR_RATE else None,
             "lastBidAt": _iso_utc(last.get(k)),
+            "rate": b.rate, "pay": pay, "reviewed": reviewed, "approvalRate": _ratio(approved, reviewed, 3),
+            "costPerInterview": _ratio(pay, interviews, 2) if interviews else None,
         })
     rows.sort(key=lambda r: (-r["total"], r["name"].lower()))
 
     total = sum(r["total"] for r in rows)
     weekdays = sum(r["weekdays"] for r in rows)
     interviews = sum(tagged.values()) + sum(untagged.values())  # each round once: by its bidder, or by its profile
+    pay = round(sum(r["pay"] for r in rows), 2)
+    approved = sum(r["approved"] for r in rows)
+    rejected = sum(r["rejected"] for r in rows)
     return {
         "period": period, "start": start.isoformat(), "end": end.isoformat(), "label": label,
         "recordsStart": rec_day.isoformat() if rec_day else None, "weeks": weeks, "bidders": rows,
@@ -242,6 +249,9 @@ async def performance(
             "total": total, "interviews": interviews, "hitRate": _ratio(sum(r["hitDays"] for r in rows), weekdays, 3),
             "avgPerWeekday": _ratio(total, weekdays, 1),
             "per100": _ratio(interviews * 100, total, 2) if total >= MIN_BIDS_FOR_RATE else None,
+            "pay": pay, "approved": approved, "rejected": rejected,
+            "approvalRate": _ratio(approved, approved + rejected, 3),
+            "costPerInterview": _ratio(pay, interviews, 2) if interviews else None,
         },
         "top": rank(rows),
     }

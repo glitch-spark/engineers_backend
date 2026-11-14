@@ -340,3 +340,31 @@ async def test_tagged_interviews_count_for_a_bidder_without_profile(db, records_
     r = await run([loose, none])
     rows = {x["name"]: x for x in r["bidders"]}
     assert rows["Lo"]["interviews"] == 1 and rows["No"]["interviews"] is None
+
+
+async def test_pay_approval_and_cost_per_interview(db, records_start):
+    owner = await make_user()
+    p = await Account(name="P", createdBy=owner.id).insert()
+    ana, bo = await make_bidder(owner, "Ana", p), await make_bidder(owner, "Bo")
+    await add_bid(ana, chi(10, 6, 10), "approved", 30)
+    await add_bid(ana, chi(10, 6, 11), "pending", 5)
+    await add_bid(ana, chi(10, 6, 12), "rejected", 10)
+    await add_bid(bo, chi(10, 7, 10), "approved", 3)
+    await make_round(p, owner, chi(10, 8, 10))
+    await make_round(p, owner, chi(10, 9, 10))
+    out = await run([ana, bo])
+    rows = {r["name"]: r for r in out["bidders"]}
+    a = rows["Ana"]
+    assert (a["rate"], a["pay"], a["reviewed"], a["approvalRate"], a["costPerInterview"]) == (0.5, 15.0, 40, 0.75, 7.5)
+    b = rows["Bo"]
+    assert (b["pay"], b["interviews"], b["costPerInterview"]) == (1.5, None, None)   # no profile: interviews unknown
+    t = out["totals"]
+    assert (t["pay"], t["approved"], t["rejected"], t["approvalRate"], t["costPerInterview"]) == (16.5, 33, 10, 0.767, 8.25)
+
+
+async def test_no_reviews_no_approval_rate(db, records_start):
+    owner = await make_user()
+    ana = await make_bidder(owner, "Ana")
+    await add_bid(ana, chi(10, 6, 10), "pending", 4)
+    row = (await run([ana]))["bidders"][0]
+    assert (row["reviewed"], row["approvalRate"], row["pay"]) == (0, None, 0.0)
