@@ -51,11 +51,13 @@ def _best(rows: list[dict], value, *, lowest: bool = False) -> Optional[dict]:
 
 
 def bidder_tops(rows: list[dict]) -> dict:
-    """Each measure's best active bidder: most bids; best interviews per 100 bids (100+ bids); lowest cost per interview
-    (3+ interviews). Ties: more bids, then name."""
+    """Each measure's best active bidder: most bids; longest streak; most interviews; best interviews per 100 bids
+    (100+ bids); lowest cost per interview (3+ interviews). Ties: more bids, then name."""
     rows = [r for r in rows if r["status"] == "active"]
     return {
         "bids": _best(rows, lambda r: r["total"] or None),
+        "streak": _best(rows, lambda r: r["longestStreak"] or None),
+        "interviews": _best(rows, lambda r: r["interviews"] or None),
         "per100": _best(rows, lambda r: r["per100"]),
         "costPerInterview": _best(
             rows, lambda r: r["costPerInterview"] if (r["interviews"] or 0) >= MIN_COST_INTERVIEWS else None, lowest=True),

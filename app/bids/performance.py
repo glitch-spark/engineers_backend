@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from app.bids.records import records_start_utc
 from app.bids.schemas import _iso_utc
 from app.bids.week import DayWindow, _day_counts
+from app.bids.schemas import bidder_status
 from app.bids.windows import BidSchedule, period_key, schedule_from_settings, window_for
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import split_rounds_by_day
@@ -255,6 +256,8 @@ async def performance(
             "per100": _ratio(interviews * 100, total, 2) if interviews is not None and total >= MIN_BIDS_FOR_RATE else None,
             "lastBidAt": _iso_utc(last.get(k)),
             "rate": b.rate, "pay": pay, "reviewed": reviewed, "approvalRate": _ratio(approved, reviewed, 3),
+            "bidderStatus": bidder_status(b), "country": b.country, "toReview": pending,
+            "dayCells": None, "week": None,  # the pay week board's cells (week mode; set by the route)
             "costPerInterview": _ratio(pay, interviews, 2) if interviews else None,
         })
     rows.sort(key=lambda r: (-r["total"], r["name"].lower()))
@@ -272,7 +275,8 @@ async def performance(
             "total": total, "interviews": interviews, "hitRate": _ratio(sum(r["hitDays"] for r in rows), weekdays, 3),
             "avgPerWeekday": _ratio(total, weekdays, 1),
             "per100": _ratio(interviews * 100, total, 2) if total >= MIN_BIDS_FOR_RATE else None,
-            "pay": pay, "approved": approved, "rejected": rejected,
+            "pay": pay, "approved": approved, "rejected": rejected, "toReview": sum(r["pending"] for r in rows),
+            "days": None, "today": None,
             "approvalRate": _ratio(approved, approved + rejected, 3),
             "costPerInterview": _ratio(pay, interviews, 2) if interviews else None,
         },

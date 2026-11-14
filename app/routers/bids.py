@@ -328,6 +328,19 @@ async def bids_performance(
     bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
     out = await performance(bidders, period, p.start, p.end, p.label, p.today, columns=p.columns)
     out["payWeek"] = _pay_week_out(p.pay_week, now.astimezone(timezone.utc)) if p.pay_week else None
+    if p.pay_week:
+        # Money and "to review" come from the pay week board (the pay-week window, folder counts before records start),
+        # so they match /bids/week, the weekly report and actual pay; the performance measures stay on report days.
+        board = await week_board(bidders, p.pay_week, now, schedule_from_settings(), get_bid_storage(), FOLDER_CACHE)
+        cells = {r["id"]: r for r in board["bidders"]}
+        for row in out["bidders"]:
+            if row["id"] in cells:
+                row["dayCells"], row["week"] = cells[row["id"]]["days"], cells[row["id"]]["week"]
+        t = board["totals"]
+        out["totals"].update({"toReview": t["toReview"], "pay": t["pay"], "days": t["days"]})
+        today = next((d for d in out["payWeek"]["days"] if d["isToday"]), None)
+        cell = next((d for d in t["days"] if today and d["day"] == today["day"]), None)
+        out["totals"]["today"] = {"day": cell["day"], "approved": cell["approved"], "pending": cell["pending"]} if cell else None
     return out
 
 
