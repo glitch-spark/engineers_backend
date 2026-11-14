@@ -82,7 +82,10 @@ def bid_report_day(first_at: datetime, sched: BidSchedule) -> date:
 
 _COUNTS = ("selfBids", "bidderBids", "selfInterviews", "callerInterviews",
            # the same interviews by who applied for the job (Interview.appliedBy; unset = not recorded)
-           "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews")
+           "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews",
+           # the same rounds by type (they add up to selfInterviews + callerInterviews)
+           "intro", "tech", "hiring", "panel", "final")
+_GROUP_SLOT = {g: 5 + i for i, g in enumerate(("intro", "tech", "hiring", "panel", "final"))}
 _APPLIED = {"self": 2, "bidder": 3}  # interview_rounds' slot per appliedBy kind; anything else is unset (4)
 
 
@@ -161,8 +164,9 @@ async def bids_by_bidder(
 async def interview_rounds(
     account_ids: list[PydanticObjectId], start: date, end: date,
 ) -> dict[tuple[str, date], list[int]]:
-    """(account id, local day) -> [self rounds, caller rounds, self-applied, bidder-applied, unset-applied] held that
-    day, by the interview's profile: who took each round, and who applied for the job (Interview.appliedBy)."""
+    """(account id, local day) -> [self rounds, caller rounds, self-applied, bidder-applied, unset-applied, intro,
+    tech, hiring, panel, final] held that day, by the interview's profile: who took each round, who applied for the
+    job (Interview.appliedBy) and the round's type."""
     tz = app_tz()
     first = local_day_start_utc(start, tz)
     last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
@@ -173,13 +177,14 @@ async def interview_rounds(
             {"stageHistory.scheduledAt": {"$gte": first, "$lte": last}},
         ],
     }).to_list()
-    out: dict = defaultdict(lambda: [0, 0, 0, 0, 0])
+    out: dict = defaultdict(lambda: [0] * 10)
     for iv in ivs:
         applied = _APPLIED.get(iv.appliedBy.kind if iv.appliedBy else "", 4)
-        for day, _group, is_caller, _stage in split_rounds_by_day(iv, first, last, tz):
+        for day, group, is_caller, _stage in split_rounds_by_day(iv, first, last, tz):
             counts = out[(str(iv.accountId), day)]
             counts[int(is_caller)] += 1
             counts[applied] += 1
+            counts[_GROUP_SLOT[group]] += 1
     return dict(out)
 
 
@@ -189,8 +194,8 @@ ROUND_TYPES = ("intro", "tech", "hiring", "panel", "final", "home_assessment")
 
 
 async def profile_rounds(account_ids: list[PydanticObjectId], start: date, end: date) -> dict[str, list[dict]]:
-    """account id -> [{type, result}] for each round held on a local day in [start, end], by its interview's
-    profile. Rounds are merged as on Statistics (consecutive entries of one stage are one round); `result` is
+    """account id -> [{type, result, caller, day}] for each round held on a local day in [start, end], by its
+    interview's profile; `caller`: it has an enabled caller (else the owner took it), `day`: the local day held. Rounds are merged as on Statistics (consecutive entries of one stage are one round); `result` is
     app.caller_stats.round_result of its status, so canceled and still-scheduled rounds are kept but aren't done."""
     from app.caller_stats import round_result
     from app.interview_rounds import _breakdown_group, merged_rounds
@@ -212,25 +217,31 @@ async def profile_rounds(account_ids: list[PydanticObjectId], start: date, end: 
             if kind is None or rd.at is None:
                 continue
             held = rd.at if rd.at.tzinfo else rd.at.replace(tzinfo=timezone.utc)
-            if start <= held.astimezone(tz).date() <= end:
-                out[str(iv.accountId)].append({"type": kind, "result": round_result(rd.status)})
+            day = held.astimezone(tz).date()
+            if start <= day <= end:
+                is_caller = bool(rd.caller is not None and getattr(rd.caller, "enabled", False))
+                out[str(iv.accountId)].append(
+                    {"type": kind, "result": round_result(rd.status), "caller": is_caller, "day": day})
     return dict(out)
 
 
 def rounds_summary(rounds: list[dict]) -> dict:
-    """{byType: {type: {done, passed, rejected, passRate}}, awaiting, scheduled, passRate} of `profile_rounds`
-    records. done = passed + rejected + awaiting (held, no result yet); pass rate = passed / (passed + rejected), None
-    with none decided. The overall pass rate leaves home assessments out; awaiting and scheduled count every type."""
+    """{byType: {type: {done, self, caller, passed, rejected, passRate}}, awaiting, scheduled, passRate} of
+    `profile_rounds` records. done = passed + rejected + awaiting (held, no result yet), split into self / caller by
+    who took them (home assessments: 0 / 0); pass rate = passed / (passed + rejected), None with none decided. The overall pass rate leaves home assessments out; awaiting and scheduled count every type."""
     from app.interview_rates import rate
 
-    def stats(mine: list[dict]) -> dict:
+    def stats(mine: list[dict], split: bool = True) -> dict:
         n = {k: sum(1 for r in mine if r["result"] == k) for k in ("passed", "rejected", "awaiting")}
-        return {"done": n["passed"] + n["rejected"] + n["awaiting"], "passed": n["passed"], "rejected": n["rejected"],
+        done = [r for r in mine if r["result"] in ("passed", "rejected", "awaiting")]
+        callers = sum(1 for r in done if r.get("caller")) if split else 0
+        return {"done": len(done), "self": len(done) - callers if split else 0, "caller": callers,
+                "passed": n["passed"], "rejected": n["rejected"],
                 "passRate": rate(n["passed"] + n["rejected"], n["passed"])}
 
     rounds_only = stats([r for r in rounds if r["type"] != "home_assessment"])
     return {
-        "byType": {t: stats([r for r in rounds if r["type"] == t]) for t in ROUND_TYPES},
+        "byType": {t: stats([r for r in rounds if r["type"] == t], t != "home_assessment") for t in ROUND_TYPES},
         "awaiting": sum(1 for r in rounds if r["result"] == "awaiting"),
         "scheduled": sum(1 for r in rounds if r["result"] == "scheduled"),
         "passRate": rounds_only["passRate"],

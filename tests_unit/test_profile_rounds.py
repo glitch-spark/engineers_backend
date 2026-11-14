@@ -71,11 +71,11 @@ async def test_rounds_by_type_with_pass_rates(db):
     await _iv(ana, a, [("ai_interview", at(11, 9), "passed")])
     await _iv(ana, a, [("home_assessment", at(11, 10), "passed"), ("intro", at(10, 1), "passed")])  # Oct 1: outside
     s = await _summary(a)
-    assert s["byType"]["intro"] == {"done": 3, "passed": 1, "rejected": 1, "passRate": 0.5}
-    assert s["byType"]["tech"] == {"done": 2, "passed": 1, "rejected": 1, "passRate": 0.5}
-    assert s["byType"]["hiring"] == {"done": 0, "passed": 0, "rejected": 0, "passRate": None}
+    assert s["byType"]["intro"] == {"done": 3, "self": 3, "caller": 0, "passed": 1, "rejected": 1, "passRate": 0.5}
+    assert s["byType"]["tech"] == {"done": 2, "self": 2, "caller": 0, "passed": 1, "rejected": 1, "passRate": 0.5}
+    assert s["byType"]["hiring"] == {"done": 0, "self": 0, "caller": 0, "passed": 0, "rejected": 0, "passRate": None}
     assert s["byType"]["final"]["done"] == 0 and s["byType"]["panel"]["passRate"] is None
-    assert s["byType"]["home_assessment"] == {"done": 1, "passed": 1, "rejected": 0, "passRate": 1.0}
+    assert s["byType"]["home_assessment"] == {"done": 1, "self": 0, "caller": 0, "passed": 1, "rejected": 0, "passRate": 1.0}
     assert list(s["byType"]) == list(pm.ROUND_TYPES)
     assert (s["awaiting"], s["scheduled"]) == (1, 1)
     assert s["passRate"] == 0.5  # 2 passed / 4 decided; the home assessment is left out
@@ -92,7 +92,7 @@ async def test_same_stage_entries_are_one_round(db):
     await _iv(ana, a, [("intro", at(11, 3), "scheduled"), ("intro", at(11, 4), "scheduled"),
                        ("intro", at(11, 5), "passed")])
     s = await _summary(a)
-    assert s["byType"]["intro"] == {"done": 1, "passed": 1, "rejected": 0, "passRate": 1.0}
+    assert s["byType"]["intro"] == {"done": 1, "self": 1, "caller": 0, "passed": 1, "rejected": 0, "passRate": 1.0}
     assert s["scheduled"] == 0
 
 
@@ -124,6 +124,42 @@ async def test_profile_metrics_endpoint_returns_rounds_and_peer_rate(db, today):
     from app.routers.accounts import get_profile_metrics
 
     out = await get_profile_metrics(str(a.id), ana, period="month", date="2026-11-13", to="")
-    assert out["rounds"]["byType"]["intro"] == {"done": 1, "passed": 1, "rejected": 0, "passRate": 1.0}
+    assert out["rounds"]["byType"]["intro"] == {"done": 1, "self": 1, "caller": 0, "passed": 1, "rejected": 0, "passRate": 1.0}
     assert out["passRate"] == 1.0
     assert out["peers"]["passRate"] == 0.3333
+
+
+async def _iv_by(owner, acc, entries):
+    """Like _iv, each entry (stage, when, status, caller enabled?) carrying a caller request."""
+    history = [{"stage": s, "at": w, "scheduledAt": w, "status": st, "caller": {"enabled": on, "callerName": "Cal"}}
+               for s, w, st, on in entries]
+    await Interview(accountId=acc.id, createdBy=owner.id, scheduledAt=entries[-1][1], companyName="Acme",
+                    stageHistory=history).insert()
+
+
+async def test_rounds_split_self_and_caller_per_type(db):
+    ana, a = await _owner_profile()
+    await _iv_by(ana, a, [("intro", at(11, 3), "passed", True)])
+    await _iv_by(ana, a, [("intro", at(11, 4), "rejected", False)])
+    await _iv_by(ana, a, [("intro", at(11, 5), "scheduled", True)])         # not done: in neither count
+    await _iv_by(ana, a, [("home_assessment", at(11, 6), "completed", False)])
+    s = await _summary(a)
+    assert (s["byType"]["intro"]["self"], s["byType"]["intro"]["caller"]) == (1, 1)
+    assert (s["byType"]["home_assessment"]["self"], s["byType"]["home_assessment"]["caller"]) == (0, 0)
+
+
+async def test_daily_round_types_add_up_to_interviews(db, today):
+    ana, a = await _owner_profile()
+    await _iv(ana, a, [("intro", at(11, 3), "passed")])
+    await _iv(ana, a, [("tech_round_1", at(11, 3), "passed")])
+    await _iv(ana, a, [("final", at(11, 4), "rejected")])
+    await _iv(ana, a, [("home_assessment", at(11, 4), "passed")])
+    from app.routers.accounts import get_profile_metrics
+
+    out = await get_profile_metrics(str(a.id), ana, period="month", date="2026-11-13", to="")
+    nov3 = next(d for d in out["daily"] if d["day"] == "2026-11-03")
+    assert (nov3["intro"], nov3["tech"], nov3["final"]) == (1, 1, 0)
+    assert sum(d["final"] for d in out["daily"]) == 1
+    for d in out["daily"] + out["weekly"]:
+        types = sum(d[k] for k in ("intro", "tech", "hiring", "panel", "final"))
+        assert types == d["selfInterviews"] + d["callerInterviews"]

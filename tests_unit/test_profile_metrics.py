@@ -172,7 +172,8 @@ async def test_interview_rounds_self_caller(db):
         ("hiring_manager", datetime(2026, 10, 22, 15), "canceled", False),
     )
     assert await pm.interview_rounds([acc.id], START, END) == {
-        (str(acc.id), date(2026, 10, 20)): [1, 0, 0, 0, 1], (str(acc.id), date(2026, 10, 21)): [0, 1, 0, 0, 1],
+        (str(acc.id), date(2026, 10, 20)): [1, 0, 0, 0, 1, 1, 0, 0, 0, 0],
+        (str(acc.id), date(2026, 10, 21)): [0, 1, 0, 0, 1, 0, 1, 0, 0, 0],
     }
 
 
@@ -180,7 +181,7 @@ async def test_interview_week_uses_local_day(db, monkeypatch):
     monkeypatch.setattr(pm, "app_tz", lambda: ZoneInfo("America/New_York"))
     user, acc = await _setup()
     await _round(user, acc, ("intro", datetime(2026, 10, 26, 3, 0), "completed", False))  # Sun Oct 25 23:00 local
-    assert await pm.interview_rounds([acc.id], START, END) == {(str(acc.id), date(2026, 10, 25)): [1, 0, 0, 0, 1]}
+    assert await pm.interview_rounds([acc.id], START, END) == {(str(acc.id), date(2026, 10, 25)): [1, 0, 0, 0, 1, 1, 0, 0, 0, 0]}
 
 
 async def test_scores_split(db):
@@ -324,9 +325,9 @@ async def test_collect_gives_each_profile_only_its_own_counts(db):
     _s, _n, daily_b, scores_b = out[kb]
     weekly_a, weekly_b = pm.weekly_from_daily(daily_a), pm.weekly_from_daily(daily_b)
     assert daily_a[date(2026, 10, 21)]["bidderBids"] == 2 and daily_b[date(2026, 10, 22)]["callerInterviews"] == 1
-    assert weekly_a[MON] == {"selfBids": 5, "bidderBids": 2, "selfInterviews": 1, "callerInterviews": 0, "selfAppliedInterviews": 0, "bidderAppliedInterviews": 0, "unsetAppliedInterviews": 1}
+    assert weekly_a[MON] == {"selfBids": 5, "bidderBids": 2, "selfInterviews": 1, "callerInterviews": 0, "selfAppliedInterviews": 0, "bidderAppliedInterviews": 0, "unsetAppliedInterviews": 1, "intro": 1, "tech": 0, "hiring": 0, "panel": 0, "final": 0}
     assert weekly_a[date(2026, 10, 26)]["selfBids"] == 2
-    assert weekly_b[MON] == {"selfBids": 3, "bidderBids": 1, "selfInterviews": 0, "callerInterviews": 1, "selfAppliedInterviews": 0, "bidderAppliedInterviews": 0, "unsetAppliedInterviews": 1}
+    assert weekly_b[MON] == {"selfBids": 3, "bidderBids": 1, "selfInterviews": 0, "callerInterviews": 1, "selfAppliedInterviews": 0, "bidderAppliedInterviews": 0, "unsetAppliedInterviews": 1, "intro": 0, "tech": 1, "hiring": 0, "panel": 0, "final": 0}
     assert weekly_b[date(2026, 10, 26)]["selfBids"] == 0
     assert scores_a == {"tailored": [], "match": [70], "tailoredResumes": 0}
     assert scores_b == {"tailored": [], "match": [80, 90], "tailoredResumes": 0}
