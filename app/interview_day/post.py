@@ -161,14 +161,16 @@ async def refresh_today(
     if local is None:
         return False
     day, tz = local
-    stored = await InterviewDayPost.find_one(InterviewDayPost.day == day)
-    if stored is None:
-        return False
-    if interview_id is not None and not await _is_affected(stored, interview_id, deleted, date.fromisoformat(day), tz):
+    if await InterviewDayPost.find_one(InterviewDayPost.day == day) is None:
         return False
     async with _refresh_lock:
+        # Read inside the lock: an earlier refresh may have just saved the interview into (or out of) the post.
         stored = await InterviewDayPost.find_one(InterviewDayPost.day == day)
         if stored is None:
+            return False
+        if interview_id is not None and not await _is_affected(
+            stored, interview_id, deleted, date.fromisoformat(day), tz,
+        ):
             return False
         messages, text, listed = await _build(date.fromisoformat(day), tz)
         channel, ts = stored.channel, list(stored.ts)

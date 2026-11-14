@@ -383,9 +383,10 @@ async def test_the_write_does_not_wait_for_slack(api, stubbed_refresh, admin):
     stubbed_refresh.side_effect = slow
     iv = await owned(admin, "Acme", 9)
     async with api(admin) as client:
-        await patch_round(client, iv, move_to(DAY + timedelta(days=2)))  # answered while the refresh is stuck
+        # answered while the refresh is stuck (a timeout, so a regression fails instead of hanging)
+        await asyncio.wait_for(patch_round(client, iv, move_to(DAY + timedelta(days=2))), timeout=5)
     release.set()
-    await interviews.drain_day_post_refreshes()
+    await asyncio.wait_for(interviews.drain_day_post_refreshes(), timeout=5)
     stubbed_refresh.assert_awaited_once()
 
 
@@ -473,3 +474,41 @@ async def test_moving_a_round_onto_today_refreshes_the_post(api, real_refresh, s
         await patch_round(client, later, move_to(DAY, 16))
     await interviews.drain_day_post_refreshes()
     assert "Later" in text_of(slack.of("chat.update")[0]["blocks"])
+
+
+async def test_a_second_refresh_sees_what_the_first_saved(slack, monkeypatch):
+    """Write 1 moves X onto today and its refresh is stuck in Slack; write 2 moves X off today. Write 2's refresh
+    must wait for the lock and then see X listed, or the post would keep showing X."""
+    import asyncio
+
+    await add("Keep", 9)
+    x = await add("Mover", 9, day=DAY + timedelta(days=1))
+    await post.run_day_post(chi(5, 2))
+    slack.calls.clear()
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    inner = slack_bot._slack_api
+
+    async def gated(method, body):
+        if method == "chat.update" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await inner(method, body)
+
+    monkeypatch.setattr(slack_bot, "_slack_api", gated)
+    x.stageHistory[0].scheduledAt = chi(14).astimezone(timezone.utc)
+    await x.save()
+    first = asyncio.create_task(post.refresh_today(chi(8), interview_id=str(x.id)))
+    await asyncio.wait_for(entered.wait(), timeout=5)  # R1 has rendered X and waits on Slack, holding the lock
+
+    x.stageHistory[0].scheduledAt = chi(15, day=DAY + timedelta(days=1)).astimezone(timezone.utc)
+    await x.save()
+    second = asyncio.create_task(post.refresh_today(chi(8), interview_id=str(x.id)))
+    await asyncio.sleep(0.05)
+    assert not second.done()  # queued behind the first
+    release.set()
+    assert await asyncio.wait_for(first, timeout=5) is True
+    assert await asyncio.wait_for(second, timeout=5) is True
+    last = slack.of("chat.update")[-1]
+    assert "Mover" not in text_of(last["blocks"]) and "Keep" in text_of(last["blocks"])
+    assert str(x.id) not in (await stored_post()).interviewIds
