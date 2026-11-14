@@ -14,6 +14,8 @@ from pydantic import BaseModel
 
 from app.config import get_settings
 from app.deps import get_current_user
+from app.interview_day.actions import process_confirm_click
+from app.interview_day.blocks import CONFIRM_ACTION_ID
 from app.models import UserExtra
 from app.slack_bot import (
     normalize_slack_id,
@@ -144,16 +146,14 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> d
     actions = payload.get("actions") or []
     action = actions[0] if actions and isinstance(actions[0], dict) else {}
     action_id = str(action.get("action_id") or "")
-    if not is_transaction_action(action_id):
-        return {"ok": True}
     user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
-    background.add_task(
-        process_transaction_click,
-        action_id,
-        str(action.get("value") or ""),
-        str(user.get("id") or ""),
-        str(payload.get("response_url") or ""),
-    )
+    value = str(action.get("value") or "")
+    slack_user_id = str(user.get("id") or "")
+    response_url = str(payload.get("response_url") or "")
+    if action_id == CONFIRM_ACTION_ID:
+        background.add_task(process_confirm_click, value, slack_user_id, response_url)
+    elif is_transaction_action(action_id):
+        background.add_task(process_transaction_click, action_id, value, slack_user_id, response_url)
     return {"ok": True}
 
 

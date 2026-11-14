@@ -191,3 +191,12 @@ def test_is_assigned_caller_and_can_confirm():
     assert caller_access.is_assigned_caller(iv, stranger) is False
     assert caller_access.can_confirm(iv, iv.stageHistory[0], user) is True
     assert caller_access.can_confirm(iv, iv.stageHistory[0], stranger) is False
+
+
+async def test_inactive_user_caller_cannot_confirm(client):
+    owner = await make_user()
+    caller = await UserExtra(name="Cal", email="cal@x.io", role="staff", isActive=False).insert()
+    iv = await make_interview(owner, caller_id=str(caller.id), kind="user", name="Cal")
+    r = await confirm(client, caller, iv)
+    assert (r.status_code, r.json()["detail"]) == (403, "Only the caller or an interview manager can confirm.")
+    assert (await Interview.get(iv.id)).stageHistory[-1].confirmed is False

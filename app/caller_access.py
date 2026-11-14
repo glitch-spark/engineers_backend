@@ -13,6 +13,10 @@ MANAGER_ROLES = ("admin", "interview_manager")
 
 
 def _is_user_caller(entry: InterviewStageEvent, user: UserExtra) -> bool:
+    """The user is this round's platform-user caller. A deactivated user is not (get_current_user only checks the
+    account exists, so a still-valid token must not open anything here)."""
+    if getattr(user, "isActive", True) is False:
+        return False
     caller = entry.caller
     return bool(
         caller is not None
@@ -24,10 +28,7 @@ def _is_user_caller(entry: InterviewStageEvent, user: UserExtra) -> bool:
 
 
 def is_assigned_caller(iv: Interview, user: UserExtra) -> bool:
-    """The user is the platform-user caller of at least one round of this interview. A deactivated user is not
-    (get_current_user only checks the account exists, so a still-valid token must not open anything here)."""
-    if getattr(user, "isActive", True) is False:
-        return False
+    """The user is the platform-user caller of at least one round of this interview (and active)."""
     return any(_is_user_caller(e, user) for e in iv.stageHistory)
 
 
