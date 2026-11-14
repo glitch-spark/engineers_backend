@@ -16,6 +16,7 @@ from app.profile_metrics import (
     WEEK_CHOICES, bids_by_bidder, interviews_by_caller, ProfileSpan, apply_dates, collect, collect_range, days_from, lifetime,
     load_sources, peer_average, profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
+from app.profile_alerts import profile_alerts
 from app.profile_compare import (
     all_time_start, benchmark_cache, compared_window, region_tops, created_day, empty_stats, pass_counts, pool, window_stats,
 )
@@ -466,8 +467,11 @@ async def list_profile_metrics(
         row["firstApply"] = first_apply.isoformat() if first_apply else None
         row["lastApply"] = last_apply.isoformat() if last_apply else None
     out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": None if in_range else weeks, "rows": rows}
-    await _add_compare(out, accounts, start, end, today, all_time=all_time,
-                       one_owner=user.role != "admin" or bool(userId), range_sources=range_sources)
+    one_owner = user.role != "admin" or bool(userId)
+    await _add_compare(out, accounts, start, end, today, all_time=all_time, one_owner=one_owner,
+                       range_sources=range_sources)
+    # The banners: one owner's profiles only (as the comparison), whatever the date filter.
+    out["alerts"] = await profile_alerts(accounts, today) if one_owner else None
     if all_time:  # self bids exist per profile only from the launch day: the list says so
         since = await since_date()
         out["selfBidsSince"] = since.isoformat() if since and since > date.min else None

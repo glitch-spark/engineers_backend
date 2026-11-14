@@ -217,3 +217,23 @@ async def test_computes_run_one_at_a_time():
     other = (date(2026, 10, 1), date(2026, 10, 31))
     await asyncio.gather(cache.get(NOV), cache.get(other))
     assert peak == 1
+
+
+async def test_peek_returns_none_and_warms_the_window():
+    compute, calls = _counting()
+    cache = pc.BenchmarkCache(compute, clock=Clock())
+    assert cache.peek(NOV) is None
+    assert cache.peek(NOV) is None                    # one warm-up already running: not a second
+    await cache.wait_refreshes()
+    assert cache.peek(NOV) == {"n": 1} and len(calls) == 1
+
+
+async def test_peek_serves_stale_and_refreshes():
+    compute, calls = _counting()
+    clock = Clock()
+    cache = pc.BenchmarkCache(compute, clock=clock)
+    await cache.get(NOV)
+    clock.t = 1000
+    assert cache.peek(NOV) == {"n": 1}
+    await cache.wait_refreshes()
+    assert cache.peek(NOV) == {"n": 2} and len(calls) == 2

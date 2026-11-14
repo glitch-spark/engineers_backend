@@ -224,6 +224,17 @@ class BenchmarkCache:
             self._entries[window] = (now, value)
             return value
 
+    def peek(self, window: tuple[date, date]) -> Optional[dict]:
+        """The cached value without waiting: a usable entry as `get` serves it (refreshing a stale one in the
+        background); a missing one returns None and starts one background compute, unless a compute for it is
+        already running, so a later call finds it."""
+        hit = self._usable(window)
+        if hit is None or self._clock() - hit[0] > self._fresh:
+            lock = self._locks.get(window)
+            if window not in self._refreshing and not (lock and lock.locked()):
+                self._refreshing[window] = asyncio.create_task(self._refresh(window))
+        return hit[1] if hit else None
+
     async def _refresh(self, window) -> None:
         try:
             self._entries[window] = (self._clock(), await self._run(window))
