@@ -51,7 +51,7 @@ def rd(result, kind="intro", day=date(2026, 11, 3), caller=False):
 def test_week_count_starts_at_creation():
     d = daily({date(2026, 11, 16): {"bidderBids": 8}})
     s = pc.window_stats(date(2026, 11, 15), NOV, d, scores(), [])
-    assert (s["weeks"], s["bids"]) == (2, 8)
+    assert (s["days"], s["bids"]) == (14, 8)
     assert pc.pool([s])["bidsPerWeek"] == 4.0
 
 
@@ -208,3 +208,13 @@ async def test_range_before_launch_has_no_comparison(db, today, monkeypatch):
     assert out["comparedFrom"] is None
     assert out["compare"] == {"this": None, "peers": None}
     assert out["bids"] == 5
+
+
+def test_per_week_uses_exact_weeks_so_young_profiles_keep_pace():
+    window = (date(2026, 11, 1), date(2026, 11, 13))
+    ten_a_day = lambda first: daily({first + timedelta(days=i): {"bidderBids": 10} for i in range((window[1] - first).days + 1)}, *window)  # noqa: E731
+    young = pc.window_stats(date(2026, 11, 12), window, ten_a_day(date(2026, 11, 12)), scores(), [])
+    old = pc.window_stats(date(2026, 1, 1), window, ten_a_day(window[0]), scores(), [])
+    assert (young["days"], old["days"]) == (2, 13)
+    assert pc.pool([young], drop_idle=False)["bidsPerWeek"] == pc.pool([old], drop_idle=False)["bidsPerWeek"] == 70.0
+    assert pc.pool([young], drop_idle=False)["days"] == 2

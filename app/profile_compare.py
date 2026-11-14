@@ -4,7 +4,8 @@ same fair way.
 - The compared window starts no earlier than the launch day (`profile_metrics.since_date`): before it self bids
   weren't recorded per profile, and tailor scores were measured differently.
 - A profile counts from its own creation day inside the window, so a young profile isn't diluted by weeks it didn't
-  exist; one created after the window isn't there at all.
+  exist; one created after the window isn't there at all. Per week = per day x 7 (exact weeks, never rounded up, so
+  a 2-day-old profile keeps the same pace as a 13-day-old one).
 - Averages keep only profiles with at least one bid in the window (idle profiles would pull them toward zero).
 - Volumes (per week) are means over those profiles; rates and scores are pooled, so a profile with 3 bids doesn't
   weigh like one with 300.
@@ -25,7 +26,7 @@ from app.models import Account
 log = logging.getLogger(__name__)
 
 COMPARE_KEYS = (
-    "profiles", "bids", "decided", "bidsPerWeek", "interviewsPerWeek", "tailoredResumesPerWeek", "interviewsPerBid",
+    "profiles", "days", "bids", "decided", "bidsPerWeek", "interviewsPerWeek", "tailoredResumesPerWeek", "interviewsPerBid",
     "passRate", "tailorScore", "matchScore",
 )
 
@@ -51,7 +52,7 @@ def window_stats(
     days = [c for d, c in daily.items() if first <= d <= last]
     mine = [r for r in rounds if first <= r["day"] <= last and r["type"] != "home_assessment"]
     return {
-        "weeks": -(-((last - first).days + 1) // 7),
+        "days": (last - first).days + 1,
         "bids": sum(c.get("selfBids", 0) + c.get("bidderBids", 0) for c in days),
         "interviews": sum(c.get("selfInterviews", 0) + c.get("callerInterviews", 0) for c in days),
         "tailored": score_lists.get("tailoredResumes", 0),
@@ -72,20 +73,23 @@ def _score(values: list[int]) -> dict:
 
 def pool(stats: list[Optional[dict]], *, drop_idle: bool = True) -> Optional[dict]:
     """CompareStats (`COMPARE_KEYS`) of these `window_stats`: per-week values are means over the profiles, rates and
-    scores pooled. Absent profiles (None) are skipped, idle ones (no bids) too unless `drop_idle` is False; None when
+    scores pooled; `days` is the profiles' mean days in the window (one profile: its own, so the page can hold back
+    a volume verdict on a profile younger than a week). Absent profiles (None) are skipped, idle ones (no bids) too unless `drop_idle` is False; None when
     nothing is left."""
     kept = [s for s in stats if s is not None and (s["bids"] > 0 or not drop_idle)]
     if not kept:
         return None
     bids = sum(s["bids"] for s in kept)
+    per_week = lambda field: _mean([s[field] * 7 / s["days"] for s in kept])  # noqa: E731
     decided = sum(s["passed"] + s["rejected"] for s in kept)
     return {
         "profiles": len(kept),
+        "days": round(sum(s["days"] for s in kept) / len(kept)),
         "bids": bids,
         "decided": decided,
-        "bidsPerWeek": _mean([s["bids"] / s["weeks"] for s in kept]),
-        "interviewsPerWeek": _mean([s["interviews"] / s["weeks"] for s in kept]),
-        "tailoredResumesPerWeek": _mean([s["tailored"] / s["weeks"] for s in kept]),
+        "bidsPerWeek": per_week("bids"),
+        "interviewsPerWeek": per_week("interviews"),
+        "tailoredResumesPerWeek": per_week("tailored"),
         "interviewsPerBid": round(sum(s["interviews"] for s in kept) / bids, 4) if bids else None,
         "passRate": rate(decided, sum(s["passed"] for s in kept)),
         "tailorScore": _score([v for s in kept for v in s["tailorScores"]]),
@@ -95,7 +99,7 @@ def pool(stats: list[Optional[dict]], *, drop_idle: bool = True) -> Optional[dic
 
 def empty_stats() -> dict:
     """CompareStats with nobody to compare: zero counts, no rates or scores."""
-    return {"profiles": 0, "bids": 0, "decided": 0, "bidsPerWeek": None, "interviewsPerWeek": None,
+    return {"profiles": 0, "days": 0, "bids": 0, "decided": 0, "bidsPerWeek": None, "interviewsPerWeek": None,
             "tailoredResumesPerWeek": None, "interviewsPerBid": None, "passRate": None,
             "tailorScore": {"avg": None, "n": 0}, "matchScore": {"avg": None, "n": 0}}
 
@@ -133,6 +137,12 @@ class BenchmarkCache:
         self._entries: dict[tuple[date, date], tuple[float, dict]] = {}
         self._locks: dict[tuple[date, date], asyncio.Lock] = {}
         self._refreshing: dict[tuple[date, date], asyncio.Task] = {}
+        # One compute at a time: each loads every owner's sources for seconds, and they share the API process.
+        self._one_at_a_time = asyncio.Semaphore(1)
+
+    async def _run(self, window) -> dict:
+        async with self._one_at_a_time:
+            return await self._compute(window)
 
     def clear(self) -> None:
         self._entries.clear()
@@ -153,7 +163,7 @@ class BenchmarkCache:
             hit = self._usable(window)  # another request computed it while this one waited
             if hit:
                 return hit[1]
-            value = await self._compute(window)
+            value = await self._run(window)
             now = self._clock()
             self._entries = {k: v for k, v in self._entries.items() if now - v[0] <= self._keep}
             self._entries[window] = (now, value)
@@ -161,7 +171,7 @@ class BenchmarkCache:
 
     async def _refresh(self, window) -> None:
         try:
-            self._entries[window] = (self._clock(), await self._compute(window))
+            self._entries[window] = (self._clock(), await self._run(window))
         except Exception:
             log.exception("profile metrics benchmark refresh failed for %s", window)
         finally:

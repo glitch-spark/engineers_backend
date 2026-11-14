@@ -149,7 +149,7 @@ Interviews / bid column (blank with 0 bids).
   under the range label. Totals on the cards (bids, interviews, tailored) and the Rounds table keep the full range.
   On All time this means comparisons cover Nov 5 → today; `lifetime()` isn't needed for the benchmark.
 - **Per week over the weeks a profile existed** in the compared window (from `max(window start, its creation day)`,
-  at least one week), not the window's full length — today `collect_range` divides every profile by the whole range,
+  exact weeks: days ÷ 7, never rounded up — changed after the final review), not the window's full length — today `collect_range` divides every profile by the whole range,
   so a profile created mid-month is diluted.
 - **Who's averaged**: active profiles with **at least one bid in the compared window**, every owner (admin and
   interview-manager owners included: user picked "every owner"). Idle profiles (live: 7 of 57 had no bids Nov 1–13)

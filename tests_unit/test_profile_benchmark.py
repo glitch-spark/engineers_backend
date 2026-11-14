@@ -200,3 +200,20 @@ async def test_concurrent_misses_compute_once():
     cache = pc.BenchmarkCache(compute, clock=Clock())
     a, b = await asyncio.gather(cache.get(NOV), cache.get(NOV))
     assert a is b and len(calls) == 1
+
+
+async def test_computes_run_one_at_a_time():
+    active, peak = 0, 0
+
+    async def compute(window):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"w": window}
+
+    cache = pc.BenchmarkCache(compute, clock=Clock())
+    other = (date(2026, 10, 1), date(2026, 10, 31))
+    await asyncio.gather(cache.get(NOV), cache.get(other))
+    assert peak == 1
