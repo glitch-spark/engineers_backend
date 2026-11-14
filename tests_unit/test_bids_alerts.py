@@ -141,6 +141,32 @@ async def test_archive_idle_and_expired_invite(db):
     assert out["flags"] == []
 
 
+async def test_dates_are_report_days(db):
+    pedro = await user("Pedro")
+    ana = await bidder(pedro, "Ana")
+    at = datetime(2026, 11, 11, 19, 0, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)  # after 18:30
+    await Bid(bidderId=ana.id, ownerId=pedro.id, jobKey="ana/x/late", jobUrl="https://j.example/x", jobTitle="x",
+              firstAt=at, status="approved", screenshots=[]).insert()
+    out = await alerts(pedro)
+    assert out["flags"][0]["detail"] == {"lastBidDay": "2026-11-12"}   # Wed 19:00 belongs to Thu's report day
+
+
+async def test_bids_today_end_inactive(db):
+    pedro = await user("Pedro")
+    ana = await bidder(pedro, "Ana")
+    await bids(ana, 11, 12, 30)
+    await bids(ana, 11, 18, 5)                        # back today after Fri, Mon, Tue quiet
+    assert kinds(await alerts(pedro)) == {}
+
+
+async def test_newly_registered_bidders_get_time_to_start(db):
+    pedro = await user("Pedro")
+    await Bidder(createdBy=pedro.id, name="Late", rate=0.5, folder="late", screenshotFolderUrl="s3://shots/late/",
+                 createdAt=datetime(2026, 10, 1), registeredAt=datetime(2026, 11, 12)).insert()
+    out = await alerts(pedro)
+    assert out["flags"] == [] and out["archive"] == []
+
+
 async def test_admin_needs_an_owner(db):
     root, maria = await user("Root", "admin"), await user("Maria")
     bo = await bidder(maria, "Bo")

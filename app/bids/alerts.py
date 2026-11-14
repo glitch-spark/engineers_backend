@@ -73,8 +73,12 @@ async def bid_alerts(bidders: list[Bidder], today: date, now: datetime) -> dict:
     for b in sorted(active, key=lambda x: x.name.lower()):
         k = str(b.id)
         approved, pending, rejected = per[k]
-        last_day = _local_day(last[k], sched).isoformat() if k in last else None
-        old_enough = _local_day(b.createdAt, sched) <= first
+        # The report day (a bid after the daily cutoff counts for the next day), as the Pay week board shows it.
+        last_day = bid_report_day(last[k], sched).isoformat() if k in last else None
+        # A bidder's clock starts when they could bid: created, or registered later (a new invite code).
+        started = max(b.createdAt, b.registeredAt) if b.registeredAt else b.createdAt
+        old_enough = _local_day(started, sched) <= first
+        bid_today = sum(counts.get((k, today), (0, 0, 0))) > 0
         if b.registeredAt is None:
             if b.inviteExpiresAt and b.inviteExpiresAt <= naive_now:
                 out["archive"].append({"bidderId": k, "name": b.name, "reason": "invite_expired",
@@ -84,7 +88,7 @@ async def bid_alerts(bidders: list[Bidder], today: date, now: datetime) -> dict:
             out["archive"].append({"bidderId": k, "name": b.name, "reason": "idle", "since": last_day})
             continue
         flag = None
-        if old_enough and all(sum(counts.get((k, d), (0, 0, 0))) == 0 for d in quiet):
+        if old_enough and not bid_today and all(sum(counts.get((k, d), (0, 0, 0))) == 0 for d in quiet):
             flag = ("inactive", {"lastBidDay": last_day})
         elif old_enough and approved + rejected >= MIN_REVIEWED and rejected / (approved + rejected) >= REJECT_SHARE:
             top = reasons[k].most_common(1)
