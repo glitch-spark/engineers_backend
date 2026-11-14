@@ -184,3 +184,20 @@ async def test_list_setup_units_for_older_profiles(db, today):
     by = {a["name"]: a for a in (await _accounts(ana))["accounts"]}
     assert [(u["hasTemplate"], u["hasPrompt"]) for u in by["L"]["setupUnits"]] == [(True, True)]
     assert by["M"]["setupUnits"][0]["hasTemplate"] is True
+
+
+async def test_list_reads_interview_rounds_once(db, today, monkeypatch):
+    from app.routers import accounts
+
+    ana, _a = await _ana_with_a()
+    calls = []
+    real = accounts.profile_rounds
+
+    async def counting(ids, start, end):
+        calls.append((start, end))
+        return await real(ids, start, end)
+
+    monkeypatch.setattr(accounts, "profile_rounds", counting)
+    out = await _list(ana, **NOV)
+    assert len(calls) == 1
+    assert out["rows"][0]["rounds"]["decided"] == 2 and out["rows"][0]["compare"]["decided"] == 2

@@ -479,27 +479,25 @@ async def _add_compare(out: dict, accounts: list[ProfileSpan], start: date, end:
     presets send whole periods) and starts where the benchmark's would, so both ask the cache for the same one. An
     admin viewing every owner gets no `compare` / `mine`: that is the benchmark's work, uncached, on every load."""
     ids = [a.id for a in accounts]
-    if accounts and start <= end:
-        held = await profile_rounds(ids, start, end)
-    else:
-        held = {}
-    by_id = {str(a.id): a for a in accounts}
-    for row in out["rows"]:
-        row["name"] = by_id[row["accountId"]].name if row["accountId"] in by_id else ""
-        row["rounds"] = pass_counts(held.get(row["accountId"], []))
-        row["compare"] = None
-    out["comparedFrom"] = out["comparedTo"] = None
-    out["mine"] = None
     first = await all_time_start(today) if all_time else start
     last = min(end, today)
     window = await compared_window(first, last) if first <= last else None
-    if not window:
-        return
-    out["comparedFrom"], out["comparedTo"] = window[0].isoformat(), window[1].isoformat()
-    if not one_owner or not accounts:
+    compared = bool(window and one_owner and accounts)
+    # One read of the interviews covers both the row's range and the window (the window never ends after `end`).
+    since = min(start, window[0]) if compared else start
+    held = await profile_rounds(ids, since, end) if accounts and since <= end else {}
+    by_id = {str(a.id): a for a in accounts}
+    for row in out["rows"]:
+        row["name"] = by_id[row["accountId"]].name if row["accountId"] in by_id else ""
+        row["rounds"] = pass_counts([r for r in held.get(row["accountId"], []) if start <= r["day"] <= end])
+        row["compare"] = None
+    out["comparedFrom"] = window[0].isoformat() if window else None
+    out["comparedTo"] = window[1].isoformat() if window else None
+    out["mine"] = None
+    if not compared:
         return
     sources = range_sources if range_sources is not None else await load_sources(accounts, *window)
-    rounds = await profile_rounds(ids, *window)
+    rounds = held  # window_stats keeps only the rounds inside the window (and after the profile's creation)
     stats = {}
     for a in accounts:
         key = str(a.id)
