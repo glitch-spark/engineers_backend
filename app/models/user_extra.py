@@ -48,6 +48,9 @@ class UserExtra(TimestampedDocument):
     slackDigestHour: Optional[int] = None
     slackDigestMinute: Optional[int] = None
 
+    # Calendar colour when this user is taken as a caller (None = a stable colour derived from the id).
+    callerColor: Optional[str] = None
+
     class Settings:
         name = "userextras"
         indexes = [
