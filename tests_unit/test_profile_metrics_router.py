@@ -26,7 +26,7 @@ ROW_KEYS = {
     "selfInterviewsPerWeek", "callerInterviewsPerWeek", "interviewsPerBid", "lowVolume", "tailorScore", "matchScore",
     "bids", "selfBids", "bidderBids", "interviews", "selfInterviews", "callerInterviews", "tailoredResumes",
     "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews",
-    "selfRate", "bidderRate", "firstApply", "lastApply",
+    "firstApply", "lastApply",
 }
 OLD = datetime(2020, 1, 1)
 
@@ -56,7 +56,7 @@ async def test_list_shape(db):
     a, b = await _acct(ana, "A"), await _acct(ana, "B")
     await _acct(ana, "Gone", archived=True)
     out = await list_profile_metrics(ana, weeks=4, userId="")
-    assert set(out) == {"start", "end", "weeks", "rows", "ratesSince"}
+    assert set(out) == {"start", "end", "weeks", "rows"}
     assert out["weeks"] == 4
     assert datetime.fromisoformat(out["end"]).date() - datetime.fromisoformat(out["start"]).date() == timedelta(days=27)
     assert {r["accountId"] for r in out["rows"]} == {str(a.id), str(b.id)}

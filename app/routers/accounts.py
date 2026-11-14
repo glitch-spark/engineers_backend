@@ -13,8 +13,8 @@ from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.profile_metrics import (
-    APPLIED_BY_SINCE, WEEK_CHOICES, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
-    profile_rounds, rounds_summary, since_date, source_rates, span, summarize, weekly_from_daily,
+    WEEK_CHOICES, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
+    profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
@@ -404,7 +404,7 @@ async def list_profile_metrics(
 ) -> dict:
     """Per-profile totals for the user's active profiles (admin: any/all) over the days [from, to], or since each
     profile was created (no from / to, or weeks=all), or the last completed `weeks` (older pages). Each row also has the
-    self and bidder interview-per-bid rates from APPLIED_BY_SINCE on, and the profile's first and last apply day."""
+    profile's first and last apply day."""
     in_range = bool(from_ or to)
     all_time = not in_range and str(weeks) == "all"
     if in_range:
@@ -434,24 +434,12 @@ async def list_profile_metrics(
         collected = await collect(accounts, weeks, today)
     rows = [summarize(aid, *vals) for aid, vals in collected.items()]
 
-    # Self / bidder rates only over days with "Applied by" (the period's days from APPLIED_BY_SINCE on).
-    rates_from = max(start, APPLIED_BY_SINCE)
-    window = await collect_range(accounts, rates_from, end) if rates_from <= end and accounts else {}
     dates = await apply_dates(accounts) if accounts else {}
     for row in rows:
-        vals = window.get(row["accountId"])
-        if vals is None:
-            row["selfRate"] = row["bidderRate"] = None
-        else:
-            daily = vals[2]
-            totals = {k: sum(c.get(k, 0) for c in daily.values()) for k in
-                      ("selfBids", "bidderBids", "selfAppliedInterviews", "bidderAppliedInterviews")}
-            row["selfRate"], row["bidderRate"] = source_rates(totals)
         first_apply, last_apply = dates.get(row["accountId"], (None, None))
         row["firstApply"] = first_apply.isoformat() if first_apply else None
         row["lastApply"] = last_apply.isoformat() if last_apply else None
-    out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": None if in_range else weeks, "rows": rows,
-           "ratesSince": rates_from.isoformat() if rates_from <= end else None}
+    out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": None if in_range else weeks, "rows": rows}
     if all_time:  # self bids exist per profile only from the launch day: the list says so
         since = await since_date()
         out["selfBidsSince"] = since.isoformat() if since and since > date.min else None

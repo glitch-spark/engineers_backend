@@ -1,5 +1,5 @@
-"""Profiles list: interviews split by who applied (self / bidder / not set), first and last apply dates, and the self
-and bidder rates from Nov 6 (in-memory MongoDB via mongomock-motor)."""
+"""Profiles list: interviews split by who applied (self / bidder / not set), first and last apply dates, and the list's
+date range (in-memory MongoDB via mongomock-motor)."""
 import os
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
@@ -120,7 +120,7 @@ async def _list(user, **kw):
     return await list_profile_metrics(user, **{"userId": "", **kw})
 
 
-async def test_list_date_range_and_rates_from_nov_6(db, today):
+async def test_list_date_range(db, today):
     ana, a = await _owner_profile()
     await _plan(ana, date(2026, 11, 5), {str(a.id): 5})
     await _plan(ana, date(2026, 11, 7), {str(a.id): 10})
@@ -132,29 +132,13 @@ async def test_list_date_range_and_rates_from_nov_6(db, today):
     await _iv(ana, a, applied=None, rounds=[at(11, 7)])
     out = await _list(ana, from_="2026-11-02", to="2026-11-08")
     row = out["rows"][0]
-    assert (out["start"], out["end"], out["ratesSince"]) == ("2026-11-02", "2026-11-08", "2026-11-06")
+    assert (out["start"], out["end"]) == ("2026-11-02", "2026-11-08")
+    assert "ratesSince" not in out and "selfRate" not in row and "bidderRate" not in row
     assert (row["interviews"], row["selfAppliedInterviews"], row["bidderAppliedInterviews"],
             row["unsetAppliedInterviews"]) == (4, 2, 1, 1)
-    assert row["selfRate"] == {"interviews": 1, "bids": 10, "rate": 0.1, "lowVolume": True}
-    assert row["bidderRate"] == {"interviews": 1, "bids": 20, "rate": 0.05, "lowVolume": True}
+    # One rate over the whole range: every interview / every bid (15 self + 20 bidder), no Nov 6 cutoff.
+    assert (row["bids"], row["interviewsPerBid"]) == (35, 0.1143)
     assert (row["firstApply"], row["lastApply"]) == ("2026-11-05", "2026-11-07")
-
-
-async def test_list_range_before_nov_6_has_no_rates(db, today):
-    ana, a = await _owner_profile()
-    out = await _list(ana, from_="2026-10-01", to="2026-10-31")
-    assert out["ratesSince"] is None
-    assert out["rows"][0]["selfRate"] is None and out["rows"][0]["bidderRate"] is None
-
-
-async def test_list_all_time_rates_since_nov_6(db, today):
-    ana, a = await _owner_profile()
-    await _plan(ana, date(2026, 11, 7), {str(a.id): 4})
-    await _iv(ana, a, applied={"kind": "self"}, rounds=[at(11, 7)])
-    out = await _list(ana, weeks="all")
-    assert out["ratesSince"] == "2026-11-06"
-    assert out["rows"][0]["selfRate"] == {"interviews": 1, "bids": 4, "rate": 0.25, "lowVolume": True}
-    assert out["rows"][0]["bidderRate"] == {"interviews": 0, "bids": 0, "rate": None, "lowVolume": True}
 
 
 async def test_list_bad_ranges(db, today):
