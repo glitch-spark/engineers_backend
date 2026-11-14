@@ -11,11 +11,18 @@ same fair way.
 """
 from __future__ import annotations
 
-from datetime import date
-from typing import Optional
+import asyncio
+import logging
+import time
+from datetime import date, timezone
+from typing import Awaitable, Callable, Optional
 
 from app import profile_metrics as pm
+from app.dashboard_stats import app_tz
 from app.interview_rates import rate
+from app.models import Account
+
+log = logging.getLogger(__name__)
 
 COMPARE_KEYS = (
     "profiles", "bids", "decided", "bidsPerWeek", "interviewsPerWeek", "tailoredResumesPerWeek", "interviewsPerBid",
@@ -84,3 +91,85 @@ def pool(stats: list[Optional[dict]], *, drop_idle: bool = True) -> Optional[dic
         "tailorScore": _score([v for s in kept for v in s["tailorScores"]]),
         "matchScore": _score([v for s in kept for v in s["matchScores"]]),
     }
+
+
+def empty_stats() -> dict:
+    """CompareStats with nobody to compare: zero counts, no rates or scores."""
+    return {"profiles": 0, "bids": 0, "decided": 0, "bidsPerWeek": None, "interviewsPerWeek": None,
+            "tailoredResumesPerWeek": None, "interviewsPerBid": None, "passRate": None,
+            "tailorScore": {"avg": None, "n": 0}, "matchScore": {"avg": None, "n": 0}}
+
+
+def created_day(account) -> date:
+    """The local day a profile was created."""
+    return account.createdAt.replace(tzinfo=timezone.utc).astimezone(app_tz()).date()
+
+
+async def benchmark(window: tuple[date, date]) -> dict:
+    """CompareStats of every owner's active profiles over the window ("All profiles" on the Metrics tab): no names
+    or ids, only the pooled numbers. Active = not archived (as the Profiles status filter)."""
+    accounts = await Account.find({"archived": {"$ne": True}}).project(pm.ProfileSpan).to_list()
+    if not accounts:
+        return empty_stats()
+    sources = await pm.load_sources(accounts, *window)
+    rounds = await pm.profile_rounds([a.id for a in accounts], *window)
+    stats = []
+    for a in accounts:
+        key = str(a.id)
+        daily, scores = pm.days_from(key, *window, sources)
+        stats.append(window_stats(created_day(a), window, daily, scores, rounds.get(key, [])))
+    return pool(stats) or empty_stats()
+
+
+class BenchmarkCache:
+    """Benchmarks by window, stale-while-revalidate: younger than `fresh_s` served as is; older (up to `keep_s`)
+    served at once while one background task recomputes it (a failed refresh keeps the old value and is logged; the
+    next request retries); missing or older than `keep_s` computed in the request, once per window however many
+    requests wait for it. Each process (Railway service) keeps its own."""
+
+    def __init__(self, compute: Callable[[tuple[date, date]], Awaitable[dict]], *, fresh_s: float = 900,
+                 keep_s: float = 86400, clock: Callable[[], float] = time.monotonic):
+        self._compute, self._fresh, self._keep, self._clock = compute, fresh_s, keep_s, clock
+        self._entries: dict[tuple[date, date], tuple[float, dict]] = {}
+        self._locks: dict[tuple[date, date], asyncio.Lock] = {}
+        self._refreshing: dict[tuple[date, date], asyncio.Task] = {}
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._locks.clear()
+        self._refreshing.clear()
+
+    def _usable(self, window) -> Optional[tuple[float, dict]]:
+        hit = self._entries.get(window)
+        return hit if hit and self._clock() - hit[0] <= self._keep else None
+
+    async def get(self, window: tuple[date, date]) -> dict:
+        hit = self._usable(window)
+        if hit:
+            if self._clock() - hit[0] > self._fresh and window not in self._refreshing:
+                self._refreshing[window] = asyncio.create_task(self._refresh(window))
+            return hit[1]
+        async with self._locks.setdefault(window, asyncio.Lock()):
+            hit = self._usable(window)  # another request computed it while this one waited
+            if hit:
+                return hit[1]
+            value = await self._compute(window)
+            now = self._clock()
+            self._entries = {k: v for k, v in self._entries.items() if now - v[0] <= self._keep}
+            self._entries[window] = (now, value)
+            return value
+
+    async def _refresh(self, window) -> None:
+        try:
+            self._entries[window] = (self._clock(), await self._compute(window))
+        except Exception:
+            log.exception("profile metrics benchmark refresh failed for %s", window)
+        finally:
+            self._refreshing.pop(window, None)
+
+    async def wait_refreshes(self) -> None:
+        """Wait for the background refreshes running now (tests)."""
+        await asyncio.gather(*list(self._refreshing.values()), return_exceptions=True)
+
+
+benchmark_cache = BenchmarkCache(benchmark)

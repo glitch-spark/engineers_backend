@@ -16,7 +16,7 @@ from app.profile_metrics import (
     WEEK_CHOICES, bids_by_bidder, ProfileSpan, apply_dates, collect, collect_range, days_from, lifetime,
     load_sources, peer_average, profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
-from app.profile_compare import compared_window, pool, window_stats
+from app.profile_compare import benchmark_cache, compared_window, created_day, empty_stats, pool, window_stats
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
@@ -451,6 +451,31 @@ async def list_profile_metrics(
     return out
 
 
+@router.get("/metrics/benchmark")
+async def get_metrics_benchmark(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: str = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month (default: today); custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+) -> dict:
+    """"All profiles" on the Metrics tab: every owner's active profiles, pooled over the period's compared window
+    (from the launch day; All time = launch day to today). Any signed-in user; no names or ids. Remembered per window
+    for 15 minutes (app.profile_compare.benchmark_cache)."""
+    _check_period(period)
+    if period == "all":
+        since = await since_date()
+        first = await Account.find({"archived": {"$ne": True}}).sort("createdAt").limit(1).project(ProfileSpan).to_list()
+        earliest = created_day(first[0]) if first else _today()
+        all_start = max(since, earliest) if since else earliest
+    else:
+        all_start = _today()
+    start, end, label = _period_range(period, date, to, all_start)
+    window = await compared_window(start, end) if start <= end else None
+    stats = await benchmark_cache.get(window) if window else empty_stats()
+    return {"start": start.isoformat(), "end": end.isoformat(), "label": label,
+            "comparedFrom": window[0].isoformat() if window else None, **stats}
+
+
 @router.get("/{account_id}/metrics")
 async def get_profile_metrics(
     account_id: str,
@@ -462,22 +487,11 @@ async def get_profile_metrics(
     """One profile's totals over a week, a month, a custom range or all time (the Statistics tabs' periods), its
     day-by-day and week-by-week counts and the owner's other active profiles' average totals over the same days.
     The current week or month runs to today."""
-    from app import interview_rates as ir
-    from app.routers.metrics import _stats_days
-
-    if period not in ("week", "month", "custom", "all"):
-        raise HTTPException(status_code=422, detail="period must be week, month, custom or all")
+    _check_period(period)
     acc = await Account.find_one({"_id": to_object_id(account_id)}).project(ProfileSpan)
     if acc is None or (user.role != "admin" and str(acc.createdBy) != str(user.id)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    today = _today()
-    if period == "all":
-        start, end, label = acc.createdAt.replace(tzinfo=timezone.utc).astimezone(app_tz()).date(), today, "All time"
-    else:
-        day, until = _stats_days(period, date, to)
-        start, end = ir.window(period, day, until)
-        label = ir.label(period, start, end)
-        end = min(end, today)
+    start, end, label = _period_range(period, date, to, created_day(acc))
     query: dict[str, Any] = archive_status_query("active")
     query["createdBy"] = acc.createdBy
     accounts = await Account.find(query).project(ProfileSpan).to_list()
@@ -506,13 +520,10 @@ async def get_profile_metrics(
     row["comparedFrom"] = window[0].isoformat() if window else None
     row["compare"] = {"this": None, "peers": None}
     if window:
-        tz = app_tz()
-
         def stats(a: ProfileSpan):
             key = str(a.id)
-            created = a.createdAt.replace(tzinfo=timezone.utc).astimezone(tz).date()
             _daily, window_scores = days_from(key, *window, sources)
-            return window_stats(created, window, collected[key][2], window_scores, rounds.get(key, []))
+            return window_stats(created_day(a), window, collected[key][2], window_scores, rounds.get(key, []))
 
         row["compare"] = {
             "this": pool([stats(acc)], drop_idle=False),
@@ -524,6 +535,25 @@ async def get_profile_metrics(
 def _today() -> date:
     """The app's local today: the current week or month runs to it."""
     return datetime.now(app_tz()).date()
+
+
+def _check_period(period: str) -> None:
+    if period not in ("week", "month", "custom", "all"):
+        raise HTTPException(status_code=422, detail="period must be week, month, custom or all")
+
+
+def _period_range(period: str, date_: str, to: str, all_start: date) -> tuple[date, date, str]:
+    """(first day, last day, label) of a Metrics tab period: all = `all_start` to today; the current week or month
+    runs to today."""
+    from app import interview_rates as ir
+    from app.routers.metrics import _stats_days
+
+    today = _today()
+    if period == "all":
+        return all_start, today, "All time"
+    day, until = _stats_days(period, date_, to)
+    start, end = ir.window(period, day, until)
+    return start, min(end, today), ir.label(period, start, end)
 
 
 @router.get("/{account_id}")
