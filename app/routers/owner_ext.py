@@ -8,10 +8,18 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+import asyncio
+from datetime import timedelta
+
+from app.bids.records import confirm_self_upload, record_self_screenshot
+from app.bids.storage import BidStorageError, get_bid_storage
+from app.bids.upload_keys import IMAGE_FORMATS, build_upload_key
+from app.config import get_settings
 from app.deps import ExtOwnerAuth, get_current_ext_owner
+from app.models.bid import Attachment
 from app.models import Account, UserExtra
 from app.routers.auth import _ci_eq, _password_ok
-from app.routers.bidder_ext import _keys, _reserve, _succeed
+from app.routers.bidder_ext import _JOB_TITLE_MAX, ConfirmIn, UploadUrlIn, _job_url, _keys, _reserve, _succeed
 from app.security import bidder_token_needs_renewal, create_ext_owner_token
 
 router = APIRouter(prefix="/ext/owner", tags=["owner-ext"])
@@ -78,3 +86,41 @@ def _renewal(auth: ExtOwnerAuth) -> dict:
 @router.get("/me")
 async def owner_me(auth: Annotated[ExtOwnerAuth, Depends(get_current_ext_owner)]) -> dict:
     return {**_me(auth.user, auth.account), **_renewal(auth)}
+
+
+@router.post("/upload-url")
+async def owner_upload_url(body: UploadUrlIn, auth: Annotated[ExtOwnerAuth, Depends(get_current_ext_owner)]) -> dict:
+    """As the bidder route: the server picks the object path (folder "self-<ownerId>", the signed-in profile) and
+    records the screenshot on the owner's self bid for that job."""
+    job_url = _job_url(body.jobUrl)
+    unavailable = HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Uploads are not configured")
+    bucket = get_settings().BID_STORAGE_BUCKET
+    storage = get_bid_storage()
+    if not bucket or not hasattr(storage, "presign_put"):
+        raise unavailable
+    try:
+        key = build_upload_key(f"self-{auth.user.id}", auth.account.name, body.job, body.step, body.trigger,
+                               body.capturedAt, datetime.now(timezone.utc), body.format)
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "capturedAt is not current")
+    bid = await record_self_screenshot(
+        auth.user.id, auth.account.id, key, body.step, body.trigger, body.capturedAt, job_url,
+        (body.jobTitle or "")[:_JOB_TITLE_MAX] or None, [Attachment(**a.model_dump()) for a in body.attachments],
+    )
+    try:
+        content_type = IMAGE_FORMATS[body.format][1]
+        url = await asyncio.to_thread(storage.presign_put, bucket, key, content_type)
+    except BidStorageError:
+        raise unavailable from None
+    return {
+        "url": url, "key": key, "bidId": str(bid.id),
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
+        "headers": {"Content-Type": content_type}, **_renewal(auth),
+    }
+
+
+@router.post("/uploads/confirm")
+async def owner_confirm(body: ConfirmIn, auth: Annotated[ExtOwnerAuth, Depends(get_current_ext_owner)]) -> dict:
+    if not await confirm_self_upload(auth.user.id, body.key):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found")
+    return {"ok": True, **_renewal(auth)}

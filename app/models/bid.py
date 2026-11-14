@@ -34,8 +34,14 @@ class Screenshot(BaseModel):
 class Bid(TimestampedDocument):
     """Unique per (bidderId, jobKey). Only approved bids count toward a day's bids and pay."""
 
-    bidderId: PydanticObjectId
-    ownerId: PydanticObjectId  # Bidder.createdBy at creation; decides review access
+    # "self": the owner's own apply recorded by the extension (spec 2026-11-15-self-bids-extension-design.md): no
+    # bidder, the signed-in profile in accountId, approved at once, never paid or reviewed. Bidder queries select by
+    # bidderId, so self bids stay out of them; the unique (bidderId, jobKey) index still holds (null + a per-owner
+    # "self-<ownerId>/..." job key).
+    kind: Literal["bidder", "self"] = "bidder"
+    bidderId: Optional[PydanticObjectId] = None
+    accountId: Optional[PydanticObjectId] = None
+    ownerId: PydanticObjectId  # Bidder.createdBy at creation (self bids: the owner); decides review access
     jobKey: str  # <folder>/<YYYY-MM-DD>/<profile>/<job>: the screenshot key without its file name
     jobUrl: Optional[str] = None
     jobTitle: Optional[str] = None
