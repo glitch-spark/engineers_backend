@@ -86,6 +86,15 @@ async def list_callers(user: Annotated[UserExtra, Depends(get_current_user)], ar
     return {"callers": await list_directory(include_archived=bool(archived)), "canManage": is_caller_manager(user)}
 
 
+@router.get("/overview")
+async def callers_overview(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Per caller id: upcoming and this-week rounds, pass rate (last 90 days) and all-time rounds. Callers with
+    nothing are left out (read as zeros). Declared before /{caller_id}."""
+    from app.caller_stats import caller_overview
+
+    return {"overview": await caller_overview(datetime.now(timezone.utc))}
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_caller(body: CallerIn, user: Annotated[UserExtra, Depends(require_caller_manager)]) -> dict:
     name = _clean_name(body.name)

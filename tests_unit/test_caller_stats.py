@@ -45,7 +45,7 @@ def client(db, monkeypatch):
     from httpx import ASGITransport, AsyncClient
 
     from app.deps import get_current_user
-    from app.routers import interviews, metrics
+    from app.routers import callers, interviews, metrics
 
     sync = AsyncMock()
     monkeypatch.setattr(interviews, "_sync_caller_posts", sync)
@@ -54,6 +54,7 @@ def client(db, monkeypatch):
         app = FastAPI()
         app.include_router(interviews.router)
         app.include_router(metrics.router)
+        app.include_router(callers.router)
         app.dependency_overrides[get_current_user] = lambda: user
         c = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
         c.sync = sync
@@ -217,3 +218,55 @@ def test_typed_caller_names_link_by_name_and_alias():
     doc = {"stageHistory": [r(" pietro "), r("Mohammad"), r("TBD"), r("David"), r("Muhammad", callerId="m1"),
                             {"caller": {"enabled": False, "callerName": "Pietro"}}]}
     assert [(i, c["name"]) for i, _, c in plan_links(doc, callers)] == [(0, "Pietro"), (1, "Muhammad")]
+
+
+async def test_rows_include_platform_callers(db):
+    """A round assigned to a platform user gets a row under the user's id, name and directory colour."""
+    from app.caller_directory import user_caller_color
+
+    ana = await UserExtra(name="Ana", email="ana@x.io", callerColor="rose").insert()
+    owner = await UserExtra(name="Owner", email="owner@x.io").insert()
+    us = await Account(name="Owner US", createdBy=owner.id, region="US").insert()
+    await _interview(owner, us, _round(at(10, 5), "passed", ana), company="Acme")
+
+    out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
+
+    row = next(c for c in out["callers"] if c["callerId"] == str(ana.id))
+    assert (row["name"], row["color"]) == ("Ana", user_caller_color(str(ana.id), "rose")) and row["color"] == "rose"
+    assert row["counts"]["passed"] == 1
+    assert not any(c["name"] == "Removed caller" for c in out["callers"])
+
+
+async def test_rows_include_archived_external_callers(db):
+    from datetime import datetime as dt
+
+    ex = await _caller("Gone", "rose")
+    ex.archivedAt = dt(2026, 9, 1)
+    await ex.save()
+    out = await cs.caller_stats("month", date(2026, 10, 1), "all", now=NOW)
+    assert [(c["name"], c["color"]) for c in out["callers"] if c["callerId"] == str(ex.id)] == [("Gone", "rose")]
+
+
+async def test_overview_counts(db):
+    """NOW is Fri 2026-10-30: one upcoming scheduled round, passed + rejected in the last 90 days, one passed 120
+    days ago; the rejected one is in this week (Oct 26 - Nov 1)."""
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    us = await Account(name="Ana US", createdBy=ana.id, region="US").insert()
+    mu = await _caller("Muhammad")
+    await _interview(ana, us, _round(at(11, 5), "scheduled", mu), company="Up")
+    await _interview(ana, us, _round(at(10, 20), "passed", mu), company="Pass")
+    await _interview(ana, us, _round(at(10, 28), "rejected", mu), company="Rej")
+    await _interview(ana, us, _round(datetime(2026, 7, 2, 15), "passed", mu), company="Old")
+    await _interview(ana, us, _round(at(10, 29), "passed", mu, stage="home_assessment"), company="HA")
+    await _interview(ana, us, _round(at(10, 29), "passed", enabled=False), company="SelfRound")
+
+    out = await cs.caller_overview(NOW)
+
+    assert out[str(mu.id)] == {"upcoming": 1, "thisWeek": 1, "passRate": 0.5, "rounds": 4}
+
+
+async def test_overview_endpoint(client):
+    staff = await UserExtra(name="Ana", email="ana@x.io").insert()
+    async with client(staff) as c:
+        r = await c.get("/callers/overview")
+    assert r.status_code == 200 and r.json() == {"overview": {}}
