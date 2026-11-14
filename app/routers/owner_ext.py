@@ -16,7 +16,10 @@ from app.bids.storage import BidStorageError, get_bid_storage
 from app.bids.upload_keys import IMAGE_FORMATS, build_upload_key
 from app.config import get_settings
 from app.deps import ExtOwnerAuth, get_current_ext_owner
+from app import self_bids
+from app.bids.windows import schedule_from_settings
 from app.models.bid import Attachment
+from app.profile_metrics import bid_report_day
 from app.models import Account, UserExtra
 from app.routers.auth import _ci_eq, _password_ok
 from app.routers.bidder_ext import _JOB_TITLE_MAX, ConfirmIn, UploadUrlIn, _job_url, _keys, _reserve, _succeed
@@ -107,6 +110,8 @@ async def owner_upload_url(body: UploadUrlIn, auth: Annotated[ExtOwnerAuth, Depe
         auth.user.id, auth.account.id, key, body.step, body.trigger, body.capturedAt, job_url,
         (body.jobTitle or "")[:_JOB_TITLE_MAX] or None, [Attachment(**a.model_dump()) for a in body.attachments],
     )
+    # After the switch the day's Daily Plan carries the tracked count (a no-op during the pilot).
+    await self_bids.write_through(auth.user.id, bid_report_day(bid.firstAt, schedule_from_settings()))
     try:
         content_type = IMAGE_FORMATS[body.format][1]
         url = await asyncio.to_thread(storage.presign_put, bucket, key, content_type)
