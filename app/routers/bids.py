@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.bids.evidence import duration_sec, evidence_for, job_domain
 from app.bids.live_counts import TtlCache
+from app.bids.insights import insights
 from app.bids.performance import performance
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
@@ -284,6 +285,30 @@ async def bids_performance(
     owner = to_object_id(ownerId) if ownerId else None
     bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
     return await performance(bidders, period, start, min(window_end, today), label(period, start, window_end), today)
+
+
+@router.get("/insights")
+async def bids_insights(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: str = Query("month"),
+    date: str = Query(""),
+    to: str = Query(""),
+    ownerId: Optional[str] = None,
+) -> dict:
+    """The Bidders page card: one owner's active bidders vs the platform over the Performance tab's period, and each
+    measure's best bidder vs the best on the platform. Staff: their own bidders; an admin: one owner's (`ownerId`),
+    else nothing to compare."""
+    if period not in ("week", "month", "custom"):
+        raise HTTPException(status_code=422, detail="period must be week, month or custom")
+    today = _now().astimezone(schedule_from_settings().tz).date()
+    day, until = _stats_days(period, date or today.isoformat(), to)
+    start, window_end = window(period, day, until)
+    end, text = min(window_end, today), label(period, start, window_end)
+    if user.role == "admin" and not ownerId:
+        return {"start": start.isoformat(), "end": end.isoformat(), "label": text, "mine": None, "platform": None,
+                "tops": None}
+    owner = to_object_id(ownerId) if ownerId else None
+    return await insights(await _visible_bidders(user, owner), period, start, end, text, today)
 
 
 @router.get("/{bid_id}")
