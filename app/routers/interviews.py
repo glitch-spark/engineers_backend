@@ -332,16 +332,32 @@ async def _sync_caller_posts(
     gone = set(deleted)
     if await sync_caller_thread(iv, before, added=added, deleted=gone) and not gone:
         await _save_interview(iv)
-    if not gone:  # a delete refreshes once the round is really gone (_refresh_day_post)
-        await _refresh_day_post()
+    if not gone:  # a delete refreshes once the round is really gone
+        _refresh_day_post(iv.id)
 
 
-async def _refresh_day_post() -> None:
-    """Edit today's day post to match the saved interviews. Slack trouble is logged, never raised."""
+_day_post_tasks: set[asyncio.Task] = set()
+
+
+def _refresh_day_post(iv_id: object, *, deleted: bool = False) -> None:
+    """Edit today's day post in the background (the response never waits on Slack). The refresh itself skips writes
+    that cannot change the post. Slack trouble is logged, never raised."""
+    task = asyncio.create_task(_run_day_post_refresh(str(iv_id), deleted))
+    _day_post_tasks.add(task)
+    task.add_done_callback(_day_post_tasks.discard)
+
+
+async def _run_day_post_refresh(iv_id: str, deleted: bool) -> None:
     try:
-        await refresh_today()
+        await refresh_today(interview_id=iv_id, deleted=deleted)
     except Exception as exc:
         log.warning("interviews: day post refresh failed: %s", exc)
+
+
+async def drain_day_post_refreshes() -> None:
+    """Wait for the scheduled day post refreshes (tests and shutdown)."""
+    while _day_post_tasks:
+        await asyncio.gather(*list(_day_post_tasks), return_exceptions=True)
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
@@ -1331,7 +1347,7 @@ async def delete_interview_stage(
     _sync_top_from_tip(iv)
     await _save_interview(iv)
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
-    await _refresh_day_post()
+    _refresh_day_post(iv.id, deleted=True)
     return await _interview_out(iv)
 
 
@@ -1354,7 +1370,7 @@ async def delete_interview(
     await _sync_caller_posts(iv, before, deleted=set(before))
     await iv.delete()
     await InterviewQuestion.find({"interviewId": iv.id}).delete()
-    await _refresh_day_post()
+    _refresh_day_post(iv.id, deleted=True)
     return {"ok": True}
 
 

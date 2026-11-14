@@ -14,7 +14,7 @@ from beanie import PydanticObjectId
 from app import slack_bot
 from app.config import get_settings
 from app.interview_day.blocks import day_messages, fallback_text
-from app.interview_day.rounds import DayRound, load_rounds
+from app.interview_day.rounds import DayRound, _is_round, load_rounds
 from app.models import Interview
 from app.models.interview_day_post import InterviewDayPost
 
@@ -29,27 +29,34 @@ def _now(now: Optional[datetime]) -> datetime:
 
 
 async def _thread_links(rounds: list[DayRound]) -> None:
-    """Fill `thread_link` of each caller round with the permalink of its #caller post (None when it has none)."""
+    """Fill `thread_link` of each caller round with the permalink of its #caller post (None when it has none).
+    An interview's rounds share one thread, so its permalink is fetched once per call."""
     wanted = [r for r in rounds if r.caller != "self"]
     if not wanted:
         return
     ids = {PydanticObjectId(r.interview_id) for r in wanted}
     interviews = {str(iv.id): iv for iv in await Interview.find({"_id": {"$in": list(ids)}}).to_list()}
+    links: dict[tuple, Optional[str]] = {}
     for r in wanted:
         iv = interviews.get(r.interview_id)
         entry = next((e for e in iv.stageHistory if e.id == r.round_id), None) if iv else None
-        if entry is not None and entry.caller is not None:
-            r.thread_link = await slack_bot._caller_daily_permalink(iv, entry)
+        if entry is None or entry.caller is None:
+            continue
+        # With an interview thread every round links to it; an older round has its own post.
+        key = (r.interview_id,) if getattr(iv, "slackThread", None) else (r.interview_id, r.round_id)
+        if key not in links:
+            links[key] = await slack_bot._caller_daily_permalink(iv, entry)
+        r.thread_link = links[key]
 
 
-async def _build(day: date, tz: ZoneInfo) -> tuple[list[list[dict]], str]:
-    """The day's messages (blocks) and the plain fallback text that goes with each."""
+async def _build(day: date, tz: ZoneInfo) -> tuple[list[list[dict]], str, list[str]]:
+    """The day's messages (blocks), the plain fallback text that goes with each, and the interviews listed."""
     start, end = slack_bot.caller_daily_bounds(day, tz)
     rounds = await load_rounds(start, end)
     await _thread_links(rounds)
     origin = get_settings().FRONTEND_ORIGIN.rstrip("/")
     messages = day_messages(day, rounds, managers=await slack_bot.interview_managers(), origin=origin)
-    return messages, fallback_text(day, len(rounds))
+    return messages, fallback_text(day, len(rounds)), sorted({r.interview_id for r in rounds})
 
 
 def _body(channel: str, text: str, blocks: list[dict]) -> dict:
@@ -85,11 +92,11 @@ async def run_day_post(now: datetime) -> str:
         if await InterviewDayPost.find_one(InterviewDayPost.day == day.isoformat()) is not None:
             keep = True  # the post is there, only its claim row was lost
             return "already_sent"
-        messages, text = await _build(day, tz)
+        messages, text, listed = await _build(day, tz)
         for blocks in messages:
             channel_id, ts = await _post_message(channel, text, blocks)
             channel, posted = channel_id, [*posted, ts]
-        await InterviewDayPost(day=day.isoformat(), channel=channel, ts=posted).insert()
+        await InterviewDayPost(day=day.isoformat(), channel=channel, ts=posted, interviewIds=listed).insert()
         keep = True
         return "posted"
     except Exception as exc:
@@ -123,21 +130,49 @@ async def today_parent_ts(now: datetime) -> Optional[str]:
     return stored.ts[0] if stored is not None and stored.ts else None
 
 
-async def refresh_today(now: Optional[datetime] = None) -> bool:
+async def _is_affected(stored: InterviewDayPost, interview_id: str, deleted: bool, day: date, tz: ZoneInfo) -> bool:
+    """Whether a write to this interview can change today's post: it is listed in it, or (unless it is gone) now has
+    an active round in today's window."""
+    if interview_id in stored.interviewIds:
+        return True
+    if deleted:
+        return False
+    try:
+        iv = await Interview.get(PydanticObjectId(interview_id))
+    except Exception:
+        return False
+    if iv is None:
+        return False
+    start, end = slack_bot.caller_daily_bounds(day, tz)
+    return any(_is_round(e, start, end) for e in iv.stageHistory)
+
+
+async def refresh_today(
+    now: Optional[datetime] = None, *, interview_id: Optional[str] = None, deleted: bool = False,
+) -> bool:
     """Edit today's post to match the database: update each stored message, post extra ones, delete surplus ones.
 
-    False when Slack is off or today has no post (the 05:00 run creates it). Raises when Slack fails; progress made
-    until then is kept."""
+    With `interview_id` (a write to that interview, `deleted` when it or one of its rounds was removed) it does
+    nothing unless the post lists that interview or the interview now has a round today.
+
+    False when Slack is off, today has no post (the 05:00 run creates it) or the write is not about today. Raises
+    when Slack fails; progress made until then is kept."""
     local = _local_today(now)
     if local is None:
         return False
     day, tz = local
+    stored = await InterviewDayPost.find_one(InterviewDayPost.day == day)
+    if stored is None:
+        return False
+    if interview_id is not None and not await _is_affected(stored, interview_id, deleted, date.fromisoformat(day), tz):
+        return False
     async with _refresh_lock:
         stored = await InterviewDayPost.find_one(InterviewDayPost.day == day)
         if stored is None:
             return False
-        messages, text = await _build(date.fromisoformat(day), tz)
+        messages, text, listed = await _build(date.fromisoformat(day), tz)
         channel, ts = stored.channel, list(stored.ts)
+        done = False
         try:
             for i, blocks in enumerate(messages):
                 if i < len(ts):
@@ -160,8 +195,11 @@ async def refresh_today(now: Optional[datetime] = None) -> bool:
                     if str(exc) not in slack_bot._MESSAGE_GONE:
                         log.warning("interview day post delete of %s failed: %s", gone, exc)
                 ts.pop()
+            done = True
         finally:
-            if ts != stored.ts:
-                stored.ts = ts
+            # If Slack failed the old messages may still show an interview that has left the list: keep it listed.
+            ids = listed if done else sorted(set(stored.interviewIds) | set(listed))
+            if ts != stored.ts or ids != stored.interviewIds:
+                stored.ts, stored.interviewIds = ts, ids
                 await stored.save()
         return True

@@ -174,7 +174,8 @@ async def test_confirm_refreshes_the_day_post(client):
     owner = await make_user()
     iv = await make_interview(owner, caller_id="ext1")
     await confirm(client, owner, iv)
-    interviews.refresh_today.assert_awaited_once()
+    await interviews.drain_day_post_refreshes()
+    interviews.refresh_today.assert_awaited_once_with(interview_id=str(iv.id), deleted=False)
 
 
 def test_is_assigned_caller_and_can_confirm():

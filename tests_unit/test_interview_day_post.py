@@ -228,6 +228,68 @@ async def test_today_parent_ts_is_the_first_message(slack):
     assert await post.today_parent_ts(chi(8, day=DAY + timedelta(days=1))) is None
 
 
+async def test_one_permalink_per_interview_for_all_its_rounds(slack):
+    iv = await add("Acme", 9)
+    iv.slackThread = SlackThread(channel="C_CALLER", ts="100.1")
+    iv.stageHistory.append(iv.stageHistory[0].model_copy(update={"id": "r2", "stage": "tech_round_1"}))
+    await iv.save()
+    other = await add("Beta", 11)
+    other.slackThread = SlackThread(channel="C_CALLER", ts="200.1")
+    await other.save()
+    slack.replies["chat.getPermalink"] = {"permalink": "https://slack.example/p1"}
+    await post.run_day_post(chi(5, 2))
+    assert sorted(b["message_ts"] for b in slack.of("chat.getPermalink")) == ["100.1", "200.1"]
+    slack.calls.clear()
+    await post.refresh_today(chi(8))
+    assert len(slack.of("chat.getPermalink")) == 2
+
+
+async def test_post_remembers_which_interviews_it_lists(slack):
+    a, b = await add("A", 9), await add("B", 10)
+    await add("Tomorrow", 9, day=DAY + timedelta(days=1))
+    await post.run_day_post(chi(5, 2))
+    assert (await stored_post()).interviewIds == sorted([str(a.id), str(b.id)])
+    b.stageHistory[0].status = "canceled"
+    await b.save()
+    await post.refresh_today(chi(8))
+    assert (await stored_post()).interviewIds == [str(a.id)]
+
+
+async def test_refresh_for_an_unrelated_interview_does_nothing(slack):
+    await add("A", 9)
+    other = await add("Tomorrow", 9, day=DAY + timedelta(days=1))
+    await post.run_day_post(chi(5, 2))
+    slack.calls.clear()
+    assert await post.refresh_today(chi(8), interview_id=str(other.id)) is False
+    assert await post.refresh_today(chi(8), interview_id=str(PydanticObjectId()), deleted=True) is False
+    assert slack.calls == []
+
+
+async def test_refresh_for_a_listed_or_newly_today_interview_edits_the_post(slack):
+    listed = await add("A", 9)
+    mover = await add("Mover", 9, day=DAY + timedelta(days=1))
+    await post.run_day_post(chi(5, 2))
+    slack.calls.clear()
+    assert await post.refresh_today(chi(8), interview_id=str(listed.id), deleted=True) is True  # was in the post
+    mover.stageHistory[0].scheduledAt = chi(14).astimezone(timezone.utc)
+    await mover.save()
+    assert await post.refresh_today(chi(8), interview_id=str(mover.id)) is True  # now has a round today
+    assert len(slack.of("chat.update")) == 2
+    assert (await stored_post()).interviewIds == sorted([str(listed.id), str(mover.id)])
+
+
+async def test_failed_refresh_keeps_an_interview_listed_that_may_still_show(slack):
+    await add("Keep", 9)
+    drop = await add("Drop", 10)
+    await post.run_day_post(chi(5, 2))
+    drop.stageHistory[0].status = "canceled"
+    await drop.save()
+    slack.errors["chat.update"] = ["ratelimited"]
+    with pytest.raises(RuntimeError):
+        await post.refresh_today(chi(8))
+    assert str(drop.id) in (await stored_post()).interviewIds
+
+
 async def test_caller_rounds_link_to_their_caller_thread(slack):
     iv = await add("Acme", 9)
     iv.slackThread = SlackThread(channel="C_CALLER", ts="100.1")
@@ -251,8 +313,6 @@ def api(db, monkeypatch):
     from app.routers import interviews
 
     monkeypatch.setattr(interviews, "sync_caller_thread", AsyncMock(return_value=False))
-    refresh = AsyncMock(return_value=True)
-    monkeypatch.setattr(interviews, "refresh_today", refresh)
 
     def make(user):
         app = FastAPI()
@@ -260,65 +320,156 @@ def api(db, monkeypatch):
         app.dependency_overrides[get_current_user] = lambda: user
         return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
-    make.refresh = refresh
     return make
 
 
-async def test_interview_write_refreshes_today(api, db):
+@pytest.fixture
+def stubbed_refresh(api, monkeypatch):
+    from app.routers import interviews
+
+    refresh = AsyncMock(return_value=True)
+    monkeypatch.setattr(interviews, "refresh_today", refresh)
+    return refresh
+
+
+@pytest.fixture
+async def admin(db):
     from app.models.interview_question import InterviewQuestion
 
-    await init_beanie(database=db, document_models=[Interview, UserExtra, Account, InterviewQuestion])
-    owner = await UserExtra(name="Pedro", email="p@x.io", role="admin").insert()
-    iv = await add("Acme", 9)
-    iv.createdBy = owner.id
+    await init_beanie(
+        database=db,
+        document_models=[Interview, UserExtra, Account, InterviewQuestion, SlackAlertLog, InterviewDayPost],
+    )
+    return await UserExtra(name="Pedro", email="p@x.io", role="admin").insert()
+
+
+async def owned(admin, company, hh, **kw):
+    iv = await add(company, hh, **kw)
+    iv.createdBy = admin.id
     await iv.save()
-    rnd = iv.stageHistory[0].id
-    async with api(owner) as client:
-        r = await client.patch(f"/interviews/{iv.id}/stages/{rnd}", json={"scheduledAt": "2026-10-09T15:00:00Z"})
+    return iv
+
+
+def move_to(day, hh=15):
+    return {"scheduledAt": chi(hh, day=day).astimezone(timezone.utc).isoformat()}
+
+
+async def patch_round(client, iv, body):
+    r = await client.patch(f"/interviews/{iv.id}/stages/{iv.stageHistory[0].id}", json=body)
     assert r.status_code == 200, r.text
-    api.refresh.assert_awaited_once()
 
 
-async def test_a_failing_refresh_never_fails_the_write(api, db):
-    from app.models.interview_question import InterviewQuestion
+async def test_interview_write_refreshes_today(api, stubbed_refresh, admin):
+    from app.routers import interviews
 
-    await init_beanie(database=db, document_models=[Interview, UserExtra, Account, InterviewQuestion])
-    owner = await UserExtra(name="Pedro", email="p@x.io", role="admin").insert()
-    iv = await add("Acme", 9)
-    iv.createdBy = owner.id
-    await iv.save()
-    api.refresh.side_effect = RuntimeError("slack down")
-    async with api(owner) as client:
-        r = await client.patch(
-            f"/interviews/{iv.id}/stages/{iv.stageHistory[0].id}", json={"scheduledAt": "2026-10-09T15:00:00Z"},
-        )
-    assert r.status_code == 200, r.text
+    iv = await owned(admin, "Acme", 9)
+    async with api(admin) as client:
+        await patch_round(client, iv, move_to(DAY + timedelta(days=2)))
+    await interviews.drain_day_post_refreshes()
+    stubbed_refresh.assert_awaited_once_with(interview_id=str(iv.id), deleted=False)
 
 
-async def test_deleting_a_round_refreshes_after_it_is_gone(api, db):
-    from app.models.interview_question import InterviewQuestion
+async def test_the_write_does_not_wait_for_slack(api, stubbed_refresh, admin):
+    import asyncio
 
-    await init_beanie(database=db, document_models=[Interview, UserExtra, Account, InterviewQuestion])
-    owner = await UserExtra(name="Pedro", email="p@x.io", role="admin").insert()
-    iv = await add("Acme", 9)
-    iv.createdBy = owner.id
-    second = iv.stageHistory[0].model_copy(update={"id": "r2", "stage": "tech_round_1"})
-    iv.stageHistory.append(second)
-    await iv.save()
+    from app.routers import interviews
 
-    first = iv.stageHistory[0].id
-    seen = []
+    release = asyncio.Event()
 
-    async def snapshot(*a, **k):
-        doc = await Interview.get(iv.id)
-        seen.append(None if doc is None else [e.id for e in doc.stageHistory])
+    async def slow(**kw):
+        await release.wait()
         return True
 
-    api.refresh.side_effect = snapshot
-    async with api(owner) as client:
+    stubbed_refresh.side_effect = slow
+    iv = await owned(admin, "Acme", 9)
+    async with api(admin) as client:
+        await patch_round(client, iv, move_to(DAY + timedelta(days=2)))  # answered while the refresh is stuck
+    release.set()
+    await interviews.drain_day_post_refreshes()
+    stubbed_refresh.assert_awaited_once()
+
+
+async def test_a_failing_refresh_never_fails_the_write(api, stubbed_refresh, admin):
+    from app.routers import interviews
+
+    stubbed_refresh.side_effect = RuntimeError("slack down")
+    iv = await owned(admin, "Acme", 9)
+    async with api(admin) as client:
+        await patch_round(client, iv, move_to(DAY + timedelta(days=2)))
+    await interviews.drain_day_post_refreshes()  # logs the error, raises nothing
+
+
+async def test_deleting_a_round_refreshes_after_it_is_gone(api, stubbed_refresh, admin):
+    from app.routers import interviews
+
+    iv = await owned(admin, "Acme", 9)
+    first = iv.stageHistory[0].id
+    iv.stageHistory.append(iv.stageHistory[0].model_copy(update={"id": "r2", "stage": "tech_round_1"}))
+    await iv.save()
+    seen = []
+
+    async def snapshot(**kw):
+        doc = await Interview.get(iv.id)
+        seen.append((kw, None if doc is None else [e.id for e in doc.stageHistory]))
+        return True
+
+    stubbed_refresh.side_effect = snapshot
+    kw = {"interview_id": str(iv.id), "deleted": True}
+    async with api(admin) as client:
         r = await client.delete(f"/interviews/{iv.id}/stages/r2")
         assert r.status_code == 200, r.text
-        assert seen == [[first]]  # refreshed once, and the round was already gone
+        await interviews.drain_day_post_refreshes()
+        assert seen == [(kw, [first])]  # the round was already gone
         r = await client.delete(f"/interviews/{iv.id}")
         assert r.status_code == 200, r.text
-    assert seen == [[first], None]
+        await interviews.drain_day_post_refreshes()
+    assert seen[1] == (kw, None)
+
+
+# Through the real refresh, with Slack faked: only writes that touch today reach Slack.
+
+
+@pytest.fixture
+def real_refresh(slack, monkeypatch):
+    monkeypatch.setattr(post, "_now", lambda now: now or chi(8))
+
+
+async def test_write_to_an_interview_with_only_other_days_makes_no_slack_calls(api, real_refresh, slack, admin):
+    from app.routers import interviews
+
+    await owned(admin, "Today", 9)
+    other = await owned(admin, "Later", 9, day=DAY + timedelta(days=1))
+    await post.run_day_post(chi(5, 2))
+    slack.calls.clear()
+    async with api(admin) as client:
+        await patch_round(client, other, move_to(DAY + timedelta(days=3)))
+    await interviews.drain_day_post_refreshes()
+    assert slack.calls == []
+
+
+async def test_moving_a_round_off_today_refreshes_the_post(api, real_refresh, slack, admin):
+    from app.routers import interviews
+
+    keep = await owned(admin, "Keep", 9)
+    move = await owned(admin, "Move", 10)
+    await post.run_day_post(chi(5, 2))
+    slack.calls.clear()
+    async with api(admin) as client:
+        await patch_round(client, move, move_to(DAY + timedelta(days=1)))
+    await interviews.drain_day_post_refreshes()
+    update = slack.of("chat.update")[0]
+    assert "Keep" in text_of(update["blocks"]) and "Move" not in text_of(update["blocks"])
+    assert (await stored_post()).interviewIds == [str(keep.id)]
+
+
+async def test_moving_a_round_onto_today_refreshes_the_post(api, real_refresh, slack, admin):
+    from app.routers import interviews
+
+    await owned(admin, "Today", 9)
+    later = await owned(admin, "Later", 9, day=DAY + timedelta(days=1))
+    await post.run_day_post(chi(5, 2))
+    slack.calls.clear()
+    async with api(admin) as client:
+        await patch_round(client, later, move_to(DAY, 16))
+    await interviews.drain_day_post_refreshes()
+    assert "Later" in text_of(slack.of("chat.update")[0]["blocks"])
