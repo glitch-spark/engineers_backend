@@ -25,6 +25,8 @@ ROW_KEYS = {
     "accountId", "spanWeeks", "bidsPerWeek", "selfBidsPerWeek", "bidderBidsPerWeek", "interviewsPerWeek",
     "selfInterviewsPerWeek", "callerInterviewsPerWeek", "interviewsPerBid", "lowVolume", "tailorScore", "matchScore",
     "bids", "selfBids", "bidderBids", "interviews", "selfInterviews", "callerInterviews", "tailoredResumes",
+    "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews",
+    "firstApply", "lastApply", "bidderBidsBy",
 }
 OLD = datetime(2020, 1, 1)
 

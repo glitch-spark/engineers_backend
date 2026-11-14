@@ -160,6 +160,8 @@ class InterviewAppliedBy(BaseModel):
     kind: Literal["self", "bidder"]
     bidderId: Optional[PydanticObjectId] = None  # bidder only
     bidderName: Optional[str] = None  # the bidder's name when saved, so it still reads after a rename or archive
+    # Set by scripts/backfill_interview_applied_by.py, not chosen by a person; choosing again clears it.
+    backfilled: bool = False
 
 
 class SlackThread(BaseModel):

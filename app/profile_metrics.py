@@ -80,7 +80,10 @@ def bid_report_day(first_at: datetime, sched: BidSchedule) -> date:
     return local.date() + timedelta(days=1 if local.time() >= sched.daily_at else 0)
 
 
-_COUNTS = ("selfBids", "bidderBids", "selfInterviews", "callerInterviews")
+_COUNTS = ("selfBids", "bidderBids", "selfInterviews", "callerInterviews",
+           # the same interviews by who applied for the job (Interview.appliedBy; unset = not recorded)
+           "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews")
+_APPLIED = {"self": 2, "bidder": 3}  # interview_rounds' slot per appliedBy kind; anything else is unset (4)
 
 
 def _monday(day: date) -> date:
@@ -123,10 +126,43 @@ async def bidder_bids(
     return dict(out)
 
 
+async def bids_by_bidder(
+    account_ids: list[PydanticObjectId], start: Optional[date], end: Optional[date],
+) -> dict[str, list[dict]]:
+    """account id -> [{bidderId, name, bids}], most bids first: each of the profile's bidders' approved and pending
+    bids (archived bidders too) on Bid Track days in [start, end], or ever when start is None. Counted as
+    `bidder_bids` / `_lifetime_bidder_bids` count them, so a profile's entries add up to its bidder bids; bidders with
+    none in the range are left out."""
+    bidders = {b.id: b async for b in Bidder.find({"profileId": {"$in": account_ids}})}
+    if not bidders:
+        return {}
+    match: dict = {"bidderId": {"$in": list(bidders)}, "status": {"$in": ["approved", "pending"]}}
+    coll = Bid.get_motor_collection()
+    counts: dict = defaultdict(int)
+    if start is None or end is None:
+        for g in await coll.aggregate([{"$match": match}, {"$group": {"_id": "$bidderId", "n": {"$sum": 1}}}]).to_list(None):
+            counts[g["_id"]] += g["n"]
+    else:
+        sched = schedule_from_settings()
+        # Report days don't align with UTC midnight: query a day wider on each side, then filter by report day.
+        match["firstAt"] = {"$gte": _midnight(start) - timedelta(days=1), "$lt": _midnight(end) + timedelta(days=2)}
+        async for b in coll.find(match, {"bidderId": 1, "firstAt": 1}):
+            if start <= bid_report_day(b["firstAt"], sched) <= end:
+                counts[b["bidderId"]] += 1
+    out: dict[str, list[dict]] = defaultdict(list)
+    for bidder_id, n in counts.items():
+        b = bidders[bidder_id]
+        out[str(b.profileId)].append({"bidderId": str(b.id), "name": b.name, "bids": n})
+    for entries in out.values():
+        entries.sort(key=lambda e: (-e["bids"], e["name"].lower()))
+    return dict(out)
+
+
 async def interview_rounds(
     account_ids: list[PydanticObjectId], start: date, end: date,
 ) -> dict[tuple[str, date], list[int]]:
-    """(account id, local day) -> [self rounds, caller rounds] held that day, by the interview's profile."""
+    """(account id, local day) -> [self rounds, caller rounds, self-applied, bidder-applied, unset-applied] held that
+    day, by the interview's profile: who took each round, and who applied for the job (Interview.appliedBy)."""
     tz = app_tz()
     first = local_day_start_utc(start, tz)
     last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
@@ -137,11 +173,68 @@ async def interview_rounds(
             {"stageHistory.scheduledAt": {"$gte": first, "$lte": last}},
         ],
     }).to_list()
-    out: dict = defaultdict(lambda: [0, 0])
+    out: dict = defaultdict(lambda: [0, 0, 0, 0, 0])
     for iv in ivs:
+        applied = _APPLIED.get(iv.appliedBy.kind if iv.appliedBy else "", 4)
         for day, _group, is_caller, _stage in split_rounds_by_day(iv, first, last, tz):
-            out[(str(iv.accountId), day)][int(is_caller)] += 1
+            counts = out[(str(iv.accountId), day)]
+            counts[int(is_caller)] += 1
+            counts[applied] += 1
     return dict(out)
+
+
+# Profile → Metrics "Rounds" card, in display order. Groups as on the Interviews board; home assessments are their own
+# type here (every other count leaves them out); AI interviews never count.
+ROUND_TYPES = ("intro", "tech", "hiring", "panel", "final", "home_assessment")
+
+
+async def profile_rounds(account_ids: list[PydanticObjectId], start: date, end: date) -> dict[str, list[dict]]:
+    """account id -> [{type, result}] for each round held on a local day in [start, end], by its interview's
+    profile. Rounds are merged as on Statistics (consecutive entries of one stage are one round); `result` is
+    app.caller_stats.round_result of its status, so canceled and still-scheduled rounds are kept but aren't done."""
+    from app.caller_stats import round_result
+    from app.interview_rounds import _breakdown_group, merged_rounds
+
+    tz = app_tz()
+    first = local_day_start_utc(start, tz)
+    last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
+    ivs = await Interview.find({
+        "accountId": {"$in": account_ids},
+        "$or": [
+            {"scheduledAt": {"$gte": first, "$lte": last}},
+            {"stageHistory.scheduledAt": {"$gte": first, "$lte": last}},
+        ],
+    }).to_list()
+    out: dict[str, list[dict]] = defaultdict(list)
+    for iv in ivs:
+        for rd in merged_rounds(iv):
+            kind = "home_assessment" if rd.stage == "home_assessment" else _breakdown_group(rd.stage)
+            if kind is None or rd.at is None:
+                continue
+            held = rd.at if rd.at.tzinfo else rd.at.replace(tzinfo=timezone.utc)
+            if start <= held.astimezone(tz).date() <= end:
+                out[str(iv.accountId)].append({"type": kind, "result": round_result(rd.status)})
+    return dict(out)
+
+
+def rounds_summary(rounds: list[dict]) -> dict:
+    """{byType: {type: {done, passed, rejected, passRate}}, awaiting, scheduled, passRate} of `profile_rounds`
+    records. done = passed + rejected + awaiting (held, no result yet); pass rate = passed / (passed + rejected), None
+    with none decided. The overall pass rate leaves home assessments out; awaiting and scheduled count every type."""
+    from app.interview_rates import rate
+
+    def stats(mine: list[dict]) -> dict:
+        n = {k: sum(1 for r in mine if r["result"] == k) for k in ("passed", "rejected", "awaiting")}
+        return {"done": n["passed"] + n["rejected"] + n["awaiting"], "passed": n["passed"], "rejected": n["rejected"],
+                "passRate": rate(n["passed"] + n["rejected"], n["passed"])}
+
+    rounds_only = stats([r for r in rounds if r["type"] != "home_assessment"])
+    return {
+        "byType": {t: stats([r for r in rounds if r["type"] == t]) for t in ROUND_TYPES},
+        "awaiting": sum(1 for r in rounds if r["result"] == "awaiting"),
+        "scheduled": sum(1 for r in rounds if r["result"] == "scheduled"),
+        "passRate": rounds_only["passRate"],
+    }
 
 
 async def _dated_scores(account_ids: list[str], start: date, end: date) -> list[tuple[str, date, str, Optional[int]]]:
@@ -261,6 +354,9 @@ def summarize(account_id: str, start: date, n_weeks: int, counts: dict, score_li
         "interviews": interviews,
         "selfInterviews": total["selfInterviews"],
         "callerInterviews": total["callerInterviews"],
+        "selfAppliedInterviews": total["selfAppliedInterviews"],
+        "bidderAppliedInterviews": total["bidderAppliedInterviews"],
+        "unsetAppliedInterviews": total["unsetAppliedInterviews"],
     }
 
 
@@ -355,9 +451,10 @@ def _days(key: str, first: date, last: date, sources: tuple[dict, dict, dict]) -
         for day, v in counts.get(key, {}).items():
             if day in daily:
                 daily[day][name] = v
-    for day, (mine, caller) in rounds.get(key, {}).items():
+    for day, held in rounds.get(key, {}).items():
         if day in daily:
-            daily[day]["selfInterviews"], daily[day]["callerInterviews"] = mine, caller
+            for name, n in zip(_COUNTS[2:], held):
+                daily[day][name] = n
     return daily, _score_lists(dated.get(key, ()), first, last)
 
 
@@ -392,6 +489,34 @@ async def _lifetime_bidder_bids(account_ids: list[PydanticObjectId]) -> dict[str
     return dict(out)
 
 
+async def apply_dates(accounts: list[Account | ProfileSpan]) -> dict[str, tuple[Optional[date], Optional[date]]]:
+    """accountId -> (first, last) day the profile applied, whatever the period, from two sources only: its bidders'
+    Bid Track bids (approved + pending, archived bidders too, on the Bid Track day) and the self bids typed for it in
+    logged daily plans. (None, None) with neither."""
+    days: dict = defaultdict(list)
+    ids = [a.id for a in accounts]
+    profile_of = {b.id: str(b.profileId) async for b in Bidder.find({"profileId": {"$in": ids}})}
+    if profile_of:
+        sched = schedule_from_settings()
+        pipeline = [
+            {"$match": {"bidderId": {"$in": list(profile_of)}, "status": {"$in": ["approved", "pending"]}}},
+            {"$group": {"_id": "$bidderId", "first": {"$min": "$firstAt"}, "last": {"$max": "$firstAt"}}},
+        ]
+        for g in await Bid.get_motor_collection().aggregate(pipeline).to_list(None):
+            days[profile_of[g["_id"]]] += [bid_report_day(g["first"], sched), bid_report_day(g["last"], sched)]
+    keys = {str(i) for i in ids}
+    cursor = DailyPlan.get_motor_collection().find(
+        {"userId": {"$in": list({a.createdBy for a in accounts})}, "loggedAt": {"$ne": None},
+         "done.bidsSelfByProfile": {"$exists": True}},
+        {"date": 1, "done.bidsSelfByProfile": 1},
+    )
+    async for d in cursor:
+        for account_id, n in ((d.get("done") or {}).get("bidsSelfByProfile") or {}).items():
+            if account_id in keys and n:
+                days[account_id].append(d["date"].date())
+    return {k: (min(days[k]), max(days[k])) if days.get(k) else (None, None) for k in keys}
+
+
 async def lifetime(accounts: list[Account | ProfileSpan], today: date) -> dict[str, tuple[date, int, dict, dict]]:
     """accountId -> (creation day, weeks since then, {today: totals}, score lists), shaped like `collect` so
     `summarize` reads it: every bid, interview round and scored application since each profile was created, through
@@ -412,7 +537,7 @@ async def lifetime(accounts: list[Account | ProfileSpan], today: date) -> dict[s
         held = [v for day, v in rounds.get(key, {}).items() if day >= day0]
         totals = {
             "selfBids": selfs.get(key, 0), "bidderBids": bidder.get(key, 0),
-            "selfInterviews": sum(v[0] for v in held), "callerInterviews": sum(v[1] for v in held),
+            **{name: sum(v[i] for v in held) for i, name in enumerate(_COUNTS[2:])},
         }
         out[key] = (day0, (today - day0).days // 7 + 1, {today: totals}, _score_lists(dated.get(key, ()), day0))
     return out
