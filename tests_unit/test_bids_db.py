@@ -260,11 +260,13 @@ async def test_archive_is_idempotent(api):
 async def test_another_users_bidder_is_not_found(api):
     me, other = await make_user("Pedro"), await make_user("Maria", role="admin")
     mine = await make_bidder(me, "Ana")
-    api.login(other)  # admins get no exemption either
+    api.login(other)  # admins get no exemption for changes; they may read any bidder's history
     assert (await api.put(f"/bidders/{mine.id}", json=body())).status_code == 404
     assert (await api.delete(f"/bidders/{mine.id}")).status_code == 404
-    assert (await api.get(f"/bidders/{mine.id}/reports")).status_code == 404
+    assert (await api.get(f"/bidders/{mine.id}/reports")).status_code == 200
     assert (await api.get("/bidders/not-an-id/reports")).status_code == 404
+    api.login(await make_user("Zed"))  # another staff user: still not found
+    assert (await api.get(f"/bidders/{mine.id}/reports")).status_code == 404
     assert (await Bidder.get(mine.id)).archivedAt is None
 
 

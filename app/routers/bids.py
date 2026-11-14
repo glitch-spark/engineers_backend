@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.bids.evidence import duration_sec, evidence_for, job_domain
 from app.bids.live_counts import TtlCache
+from app.bids.alerts import bid_alerts
 from app.bids.insights import insights
 from app.bids.performance import performance
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
@@ -309,6 +310,21 @@ async def bids_insights(
                 "tops": None}
     owner = to_object_id(ownerId) if ownerId else None
     return await insights(await _visible_bidders(user, owner), period, start, end, text, today)
+
+
+@router.get("/alerts")
+async def bids_alerts(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    ownerId: Optional[str] = None,
+) -> dict:
+    """The Bidders page banners: one owner's bidders that need action and archive suggestions, over fixed windows
+    ending today (report timezone). Staff: their own bidders; an admin: one owner's (`ownerId`), else none."""
+    now = _now()
+    today = now.astimezone(schedule_from_settings().tz).date()
+    if user.role == "admin" and not ownerId:
+        return {"asOf": today.isoformat(), "flags": None, "archive": None}
+    owner = to_object_id(ownerId) if ownerId else None
+    return await bid_alerts(await _visible_bidders(user, owner), today, now)
 
 
 @router.get("/{bid_id}")

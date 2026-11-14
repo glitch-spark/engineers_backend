@@ -193,7 +193,13 @@ async def bidder_reports(
     kind: Literal["daily", "weekly"] = "daily",
     limit: int = Query(30, ge=1, le=200),
 ) -> dict:
-    bidder = await _load_owned(bidder_id, user)
+    # Read-only history: an admin may read any bidder's (the admin owner filter opens other owners' bidders).
+    if user.role == "admin":
+        bidder = await Bidder.get(PydanticObjectId(bidder_id)) if PydanticObjectId.is_valid(bidder_id) else None
+        if bidder is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="bidder not found")
+    else:
+        bidder = await _load_owned(bidder_id, user)
     reports = (
         await BidReport.find(BidReport.bidderId == bidder.id, BidReport.kind == kind)
         .sort("-periodKey")
