@@ -45,6 +45,7 @@ from app.slack_bot import sync_caller_thread
 from app.caller_directory import resolve_caller
 from app.routers.callers import is_caller_manager, require_caller_manager
 from app.round_confirm import ConfirmError, confirm_round
+from app.caller_access import is_assigned_caller
 
 log = logging.getLogger(__name__)
 
@@ -333,8 +334,12 @@ async def _sync_caller_posts(
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
-    """Admin, interview manager, or owner."""
-    return user.role in ("admin", "interview_manager") or str(iv.createdBy) == str(user.id)
+    """Admin, interview manager, owner, or a round's assigned platform-user caller."""
+    return (
+        user.role in ("admin", "interview_manager")
+        or str(iv.createdBy) == str(user.id)
+        or is_assigned_caller(iv, user)
+    )
 
 
 _JOB_URL_MAX = 2000

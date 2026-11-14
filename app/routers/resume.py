@@ -8,13 +8,14 @@ from typing import Annotated, Any, List, Optional
 from urllib.parse import quote
 
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from app import ai_usage
 from app.config import get_settings
 from app.cover_letter import generate_cover_letter as write_cover_letter
 from app import resume_queue
+from app.caller_access import caller_interview
 from app.deps import get_current_user
 from app.interview_resume_link import linked_interview_names
 from app.job_apply.file_links import content_disposition
@@ -950,14 +951,21 @@ async def download_job(
     job_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
     format: str = "zip",
+    interview_id: Annotated[Optional[str], Query(alias="interviewId")] = None,
 ):
     """Default returns a ZIP containing `<profile>/<company>/Resume.pdf`.
     Pass `?format=pdf` for raw PDF bytes plus an `X-Folder: <profile>/<company>`
     header — used by the File System Access API path so the SPA can write
-    nested folders directly into the user-picked directory."""
+    nested folders directly into the user-picked directory.
+    The assigned caller of an interview (?interviewId=) may download that interview's linked resume, only."""
     job = await ResumeApplication.get(to_object_id(job_id))
     # Interview managers open everyone's interviews, so they can save the resume an interview came from.
-    if job is None or (user.role not in ("admin", "interview_manager") and str(job.userId) != str(user.id)):
+    allowed = job is not None and (user.role in ("admin", "interview_manager") or str(job.userId) == str(user.id))
+    if job is not None and not allowed:
+        iv = await caller_interview(interview_id, user)
+        link = iv.resumeLink if iv is not None else None
+        allowed = link is not None and link.resumeJobId is not None and str(link.resumeJobId) == job_id
+    if not allowed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
 
     pdf = await _fetch_pdf_bytes(job)
