@@ -26,7 +26,7 @@ ROW_KEYS = {
     "selfInterviewsPerWeek", "callerInterviewsPerWeek", "interviewsPerBid", "lowVolume", "tailorScore", "matchScore",
     "bids", "selfBids", "bidderBids", "interviews", "selfInterviews", "callerInterviews", "tailoredResumes",
     "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews",
-    "firstApply", "lastApply", "bidderBidsBy",
+    "firstApply", "lastApply", "bidderBidsBy", "callerInterviewsBy",
     "name", "rounds", "compare",  # the list's comparison with all profiles (test_profiles_list_compare.py)
 }
 OLD = datetime(2020, 1, 1)

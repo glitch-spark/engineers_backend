@@ -189,6 +189,44 @@ async def interview_rounds(
     return dict(out)
 
 
+async def interviews_by_caller(
+    account_ids: list[PydanticObjectId], start: date, end: date,
+) -> dict[str, list[dict]]:
+    """account id -> [{name, interviews}], most first: caller-taken rounds held on local days in [start, end], per
+    caller, counted as `interview_rounds` counts caller rounds so a profile's entries add up to its caller interviews.
+    A caller is told apart by its id (else its name); a round whose caller isn't picked yet is "Caller not assigned"."""
+    from app.interview_rounds import held_rounds
+
+    tz = app_tz()
+    first = local_day_start_utc(start, tz)
+    last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
+    ivs = await Interview.find({
+        "accountId": {"$in": account_ids},
+        "$or": [
+            {"scheduledAt": {"$gte": first, "$lte": last}},
+            {"stageHistory.scheduledAt": {"$gte": first, "$lte": last}},
+        ],
+    }).to_list()
+    counts: dict = defaultdict(lambda: defaultdict(int))
+    names: dict = {}
+    for iv in ivs:
+        for _day, _group, caller, _stage in held_rounds(iv, first, last, tz):
+            if caller is None:
+                continue
+            name = (caller.callerName or "").strip()
+            if not name or name.upper() == "TBD":
+                key, name = "", "Caller not assigned"
+            else:
+                key = caller.callerId or f"name:{name.lower()}"
+            names.setdefault(key, name)
+            counts[str(iv.accountId)][key] += 1
+    return {
+        aid: sorted(({"name": names[k], "interviews": n} for k, n in by.items()),
+                    key=lambda e: (-e["interviews"], e["name"] == "Caller not assigned", e["name"].lower()))
+        for aid, by in counts.items()
+    }
+
+
 # Profile → Metrics "Rounds" card, in display order. Groups as on the Interviews board; home assessments are their own
 # type here (every other count leaves them out); AI interviews never count.
 ROUND_TYPES = ("intro", "tech", "hiring", "panel", "final", "home_assessment")
