@@ -17,7 +17,7 @@ from app.profile_metrics import (
     load_sources, peer_average, profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
 from app.profile_compare import (
-    all_time_start, benchmark_cache, compared_window, created_day, empty_stats, pass_counts, pool, window_stats,
+    all_time_start, benchmark_cache, compared_window, region_tops, created_day, empty_stats, pass_counts, pool, window_stats,
 )
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
@@ -497,6 +497,7 @@ async def _add_compare(out: dict, accounts: list[ProfileSpan], start: date, end:
     out["comparedFrom"] = window[0].isoformat() if window else None
     out["comparedTo"] = window[1].isoformat() if window else None
     out["mine"] = None
+    out["regionTops"] = None
     if not compared:
         return
     sources = range_sources if range_sources is not None else await load_sources(accounts, *window)
@@ -509,6 +510,7 @@ async def _add_compare(out: dict, accounts: list[ProfileSpan], start: date, end:
     for row in out["rows"]:
         row["compare"] = pool([stats.get(row["accountId"])], drop_idle=False)
     out["mine"] = pool(list(stats.values()))
+    out["regionTops"] = region_tops([(a, stats[str(a.id)]) for a in accounts])
 
 
 @router.get("/metrics/benchmark")

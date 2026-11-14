@@ -128,12 +128,46 @@ def pass_counts(rounds: list[dict]) -> dict:
     return {"decided": decided, "passed": passed, "passRate": rate(decided, passed)}
 
 
+# The hiring regions the Profiles list ranks top profiles in (Account.region values); others and none are left out.
+REGIONS = ("US", "EU", "Latam")
+MIN_BIDS = 30  # a rate needs this many bids to rank (as the card's other "best rate")
+
+
+def region_tops(pairs: list[tuple["pm.ProfileSpan", Optional[dict]]]) -> dict[str, dict]:
+    """Per shown region with at least one of these profiles: the one with the most interviews (at least 1; ties: better
+    rate, then name) and the one with the best interview rate (30+ bids; ties: more bids, then name), over the
+    `window_stats` each pair carries (None: created after the window)."""
+    out: dict[str, dict] = {}
+    for region in REGIONS:
+        here = [(a, s) for a, s in pairs if a.region == region]
+        if not here:
+            continue
+        entries = [(a, s["interviews"], s["bids"], s["interviews"] / s["bids"] if s["bids"] else 0.0)
+                   for a, s in here if s]
+        most = [e for e in entries if e[1] >= 1]
+        most.sort(key=lambda e: (-e[1], -e[3], e[0].name.lower()))
+        rated = [e for e in entries if e[2] >= MIN_BIDS]
+        rated.sort(key=lambda e: (-e[3], -e[2], e[0].name.lower()))
+        out[region] = {
+            "mostInterviews": {"accountId": str(most[0][0].id), "name": most[0][0].name, "interviews": most[0][1]}
+            if most else None,
+            "bestRate": {"accountId": str(rated[0][0].id), "name": rated[0][0].name,
+                         "interviewsPerBid": round(rated[0][3], 4), "bids": rated[0][2]} if rated else None,
+        }
+    return out
+
+
+def _numbers_only(tops: dict[str, dict]) -> dict[str, dict]:
+    return {r: {"mostInterviews": t["mostInterviews"]["interviews"] if t["mostInterviews"] else None,
+                "bestRate": t["bestRate"]["interviewsPerBid"] if t["bestRate"] else None} for r, t in tops.items()}
+
+
 async def benchmark(window: tuple[date, date]) -> dict:
-    """CompareStats of every owner's active profiles over the window ("All profiles" on the Metrics tab): no names
-    or ids, only the pooled numbers. Active = not archived (as the Profiles status filter)."""
+    """CompareStats of every owner's active profiles over the window ("All profiles" on the Metrics tab), plus each
+    region's best single-profile numbers (`regionTops`): no names or ids, only numbers. Active = not archived (as the Profiles status filter)."""
     accounts = await Account.find({"archived": {"$ne": True}}).project(pm.ProfileSpan).to_list()
     if not accounts:
-        return empty_stats()
+        return {**empty_stats(), "regionTops": {}}
     sources = await pm.load_sources(accounts, *window)
     rounds = await pm.profile_rounds([a.id for a in accounts], *window)
     stats = []
@@ -141,7 +175,9 @@ async def benchmark(window: tuple[date, date]) -> dict:
         key = str(a.id)
         daily, scores = pm.days_from(key, *window, sources)
         stats.append(window_stats(created_day(a), window, daily, scores, rounds.get(key, [])))
-    return pool(stats) or empty_stats()
+    # Each region's best single profile, any owner: numbers only, never names or ids.
+    tops = _numbers_only(region_tops(list(zip(accounts, stats))))
+    return {**(pool(stats) or empty_stats()), "regionTops": tops}
 
 
 class BenchmarkCache:

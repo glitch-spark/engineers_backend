@@ -97,7 +97,7 @@ async def test_benchmark_pools_every_owner(db, today):
     out = await _bench(ana)
     assert (out["profiles"], out["bids"], out["interviewsPerBid"]) == (2, 100, 0.03)
     assert (out["decided"], out["passRate"]) == (3, 0.6667)
-    assert set(out) == {"start", "end", "label", "comparedFrom", *pc.COMPARE_KEYS}
+    assert set(out) == {"start", "end", "label", "comparedFrom", *pc.COMPARE_KEYS, "regionTops"}
     assert (out["start"], out["end"], out["comparedFrom"]) == ("2026-11-01", "2026-11-13", "2026-11-01")
 
 
