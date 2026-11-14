@@ -13,9 +13,10 @@ from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.profile_metrics import (
-    WEEK_CHOICES, bids_by_bidder, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
-    profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
+    WEEK_CHOICES, bids_by_bidder, ProfileSpan, apply_dates, collect, collect_range, days_from, lifetime,
+    load_sources, peer_average, profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
+from app.profile_compare import compared_window, pool, window_stats
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
@@ -482,7 +483,8 @@ async def get_profile_metrics(
     accounts = await Account.find(query).project(ProfileSpan).to_list()
     if all(a.id != acc.id for a in accounts):
         accounts.append(acc)
-    collected = await collect_range(accounts, start, end)
+    sources = await load_sources(accounts, start, end) if start <= end else None
+    collected = await collect_range(accounts, start, end, sources)
     me = str(acc.id)
     row = summarize(me, *collected[me])
     _, _, daily, _ = collected[me]
@@ -498,6 +500,24 @@ async def get_profile_metrics(
     row["passRate"] = row["rounds"]["passRate"]
     if row["peers"] is not None:
         row["peers"]["passRate"] = rounds_summary([r for aid, rs in rounds.items() if aid != me for r in rs])["passRate"]
+    # This profile and the owner's other profiles over the compared window (from the launch day, each from its own
+    # creation, idle profiles out of the average, rates and scores pooled): app.profile_compare.
+    window = await compared_window(start, end) if sources is not None else None
+    row["comparedFrom"] = window[0].isoformat() if window else None
+    row["compare"] = {"this": None, "peers": None}
+    if window:
+        tz = app_tz()
+
+        def stats(a: ProfileSpan):
+            key = str(a.id)
+            created = a.createdAt.replace(tzinfo=timezone.utc).astimezone(tz).date()
+            _daily, window_scores = days_from(key, *window, sources)
+            return window_stats(created, window, collected[key][2], window_scores, rounds.get(key, []))
+
+        row["compare"] = {
+            "this": pool([stats(acc)], drop_idle=False),
+            "peers": pool([stats(a) for a in accounts if str(a.id) != me]),
+        }
     return row
 
 

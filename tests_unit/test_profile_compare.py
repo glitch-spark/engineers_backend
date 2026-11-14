@@ -104,3 +104,107 @@ async def test_compared_window_clamps_to_launch(monkeypatch):
     assert await pc.compared_window(date(2026, 10, 1), date(2026, 11, 13)) == (date(2026, 11, 5), date(2026, 11, 13))
     assert await pc.compared_window(date(2026, 10, 1), date(2026, 10, 20)) is None
     assert await pc.compared_window(date(2026, 11, 6), date(2026, 11, 9)) == (date(2026, 11, 6), date(2026, 11, 9))
+
+
+# ---- GET /accounts/{id}/metrics: the compare block ----------------------------------------------------------------
+
+import itertools  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+from beanie import init_beanie  # noqa: E402
+from mongomock_motor import AsyncMongoMockClient  # noqa: E402
+
+from app.models import (  # noqa: E402
+    Account, Bid, Bidder, DailyPlan, Interview, InterviewQuestion, JobApplicationLog, ResumeApplication, UserExtra,
+)
+
+_job = itertools.count()
+
+
+@pytest.fixture
+async def db():
+    await init_beanie(database=AsyncMongoMockClient()["profile-compare-unit"], document_models=[
+        UserExtra, Account, DailyPlan, Interview, InterviewQuestion, Bid, Bidder, JobApplicationLog, ResumeApplication])
+
+
+@pytest.fixture
+def today(monkeypatch):
+    from app.routers import accounts
+
+    monkeypatch.setattr(accounts, "_today", lambda: date(2026, 11, 13))
+
+
+async def _profile(owner, name, created=datetime(2026, 1, 5, 15)):
+    return await Account(name=name, region="US", createdBy=owner.id, createdAt=created).insert()
+
+
+async def _bids(owner, acc, month, day, n):
+    """n bidder bids at 10:00 Chicago (before the 18:30 cutoff, so they count on that day)."""
+    b = await Bidder(createdBy=owner.id, name=f"B{next(_job)}", profileId=acc.id, rate=1,
+                     screenshotFolderUrl="s3://b/").insert()
+    first = datetime(2026, month, day, 10, tzinfo=ZoneInfo("America/Chicago")).astimezone(timezone.utc).replace(tzinfo=None)
+    for _ in range(n):
+        await Bid(bidderId=b.id, ownerId=owner.id, jobKey=f"k{next(_job)}", firstAt=first, status="approved",
+                  screenshots=[]).insert()
+
+
+async def _round(owner, acc, month, day, stage="intro", status="passed"):
+    when = datetime(2026, month, day, 15)
+    await Interview(accountId=acc.id, createdBy=owner.id, scheduledAt=when, companyName="Acme",
+                    stageHistory=[{"stage": stage, "at": when, "scheduledAt": when, "status": status}]).insert()
+
+
+async def _metrics(acc, owner, period="month", day="2026-11-13", to=""):
+    from app.routers.accounts import get_profile_metrics
+
+    return await get_profile_metrics(str(acc.id), owner, period=period, date=day, to=to)
+
+
+async def test_compare_starts_at_launch_day(db, today, monkeypatch):
+    launch(monkeypatch, "2026-11-05")
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    a = await _profile(ana, "A")
+    await _round(ana, a, 10, 20)
+    await _round(ana, a, 11, 6)
+    await _bids(ana, a, 11, 6, 40)
+    out = await _metrics(a, ana, period="all", day="")
+    assert out["comparedFrom"] == "2026-11-05"
+    assert out["compare"]["this"]["interviewsPerBid"] == 0.025   # 1 / 40: the Oct 20 round isn't compared
+    assert out["compare"]["this"]["decided"] == 1
+    assert out["interviews"] == 2                                 # totals keep the full range
+    assert tuple(out["compare"]["this"]) == pc.COMPARE_KEYS
+
+
+async def test_compare_peers_leave_out_idle_and_unborn_profiles(db, today):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    a, b, c = await _profile(ana, "A"), await _profile(ana, "B"), await _profile(ana, "C")
+    await _profile(ana, "D", created=datetime(2026, 11, 20, 15))  # after the window (it ends today, Nov 13)
+    await _bids(ana, a, 11, 3, 10)
+    await _bids(ana, b, 11, 3, 30)
+    await _round(ana, b, 11, 4)
+    out = await _metrics(a, ana)
+    peers = out["compare"]["peers"]
+    assert (peers["profiles"], peers["bids"], peers["interviewsPerBid"]) == (1, 30, 0.0333)
+    assert out["compare"]["this"]["bids"] == 10
+    assert out["peers"] is not None and "bids" in out["peers"]    # the old block is still there for older frontends
+    del c
+
+
+async def test_single_profile_owner_has_no_peers(db, today):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    a = await _profile(ana, "A")
+    out = await _metrics(a, ana)
+    assert out["compare"]["peers"] is None
+    assert out["compare"]["this"]["bids"] == 0 and out["compare"]["this"]["interviewsPerBid"] is None
+
+
+async def test_range_before_launch_has_no_comparison(db, today, monkeypatch):
+    launch(monkeypatch, "2026-11-05")
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    a = await _profile(ana, "A")
+    await _bids(ana, a, 10, 10, 5)
+    out = await _metrics(a, ana, period="custom", day="2026-10-01", to="2026-10-20")
+    assert out["comparedFrom"] is None
+    assert out["compare"] == {"this": None, "peers": None}
+    assert out["bids"] == 5

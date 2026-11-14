@@ -419,27 +419,29 @@ async def collect(
     if not live:
         return out
     start, end = min(spans[str(a.id)][0] for a in live), max(spans[str(a.id)][1] for a in live)
-    sources = await _load(live, start, end)
+    sources = await load_sources(live, start, end)
     for a in live:
         first, last, n = spans[str(a.id)]
-        out[str(a.id)] = (first, n, *_days(str(a.id), first, last, sources))
+        out[str(a.id)] = (first, n, *days_from(str(a.id), first, last, sources))
     return out
 
 
 async def collect_range(
-    accounts: list[Account | ProfileSpan], start: date, end: date,
+    accounts: list[Account | ProfileSpan], start: date, end: date, sources: Optional[tuple[dict, dict, dict]] = None,
 ) -> dict[str, tuple[date, int, dict, dict]]:
     """accountId -> (start, weeks the range touches, daily counts, score lists) over the days [start, end], every
     day present (zeros too). Unlike `collect` nothing is clamped: each source counts on its own days (self bids exist
-    only once they are typed per profile)."""
+    only once they are typed per profile). `sources`: `load_sources` over the same profiles and days, when the caller
+    already loaded them."""
     days = (end - start).days + 1
     if days <= 0 or not accounts:
         return {str(a.id): (start, 0, {}, _score_lists((), start)) for a in accounts}
-    sources = await _load(accounts, start, end)
-    return {str(a.id): (start, -(-days // 7), *_days(str(a.id), start, end, sources)) for a in accounts}
+    if sources is None:
+        sources = await load_sources(accounts, start, end)
+    return {str(a.id): (start, -(-days // 7), *days_from(str(a.id), start, end, sources)) for a in accounts}
 
 
-async def _load(accounts: list[Account | ProfileSpan], start: date, end: date) -> tuple[dict, dict, dict]:
+async def load_sources(accounts: list[Account | ProfileSpan], start: date, end: date) -> tuple[dict, dict, dict]:
     """Every source over [start, end] for these profiles, one query each, grouped by profile: (bids by kind,
     interview rounds, dated scores)."""
     keys, ids = {str(a.id) for a in accounts}, [a.id for a in accounts]
@@ -454,7 +456,7 @@ async def _load(accounts: list[Account | ProfileSpan], start: date, end: date) -
     return bids, rounds, dated
 
 
-def _days(key: str, first: date, last: date, sources: tuple[dict, dict, dict]) -> tuple[dict, dict]:
+def days_from(key: str, first: date, last: date, sources: tuple[dict, dict, dict]) -> tuple[dict, dict]:
     """One profile's (daily counts for every day of [first, last], score lists) out of the loaded sources."""
     bids, rounds, dated = sources
     daily = {first + timedelta(days=i): dict.fromkeys(_COUNTS, 0) for i in range((last - first).days + 1)}
