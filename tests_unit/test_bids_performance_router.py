@@ -23,7 +23,7 @@ pytestmark = [
     pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
 ]
 
-KEYS = {"period", "start", "end", "label", "recordsStart", "weeks", "bidders", "totals", "top"}
+KEYS = {"period", "start", "end", "label", "recordsStart", "weeks", "bidders", "totals", "top", "payWeek"}
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ async def test_current_month_ends_today(db):
     r = await call(staff)  # no date: the month holding today (Wed Nov 4)
     assert (r["start"], r["end"]) == ("2026-11-01", "2026-11-04")
     r = await call(staff, period="week")
-    assert (r["start"], r["end"]) == ("2026-11-02", "2026-11-04")
+    assert (r["start"], r["end"]) == ("2026-11-01", "2026-11-04")  # the pay week runs Sun Nov 1 .. Sat Nov 7
     r = await call(staff, date="2026-10-15")  # a past month is whole
     assert r["end"] == "2026-10-31"
 

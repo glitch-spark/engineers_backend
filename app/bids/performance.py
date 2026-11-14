@@ -7,6 +7,8 @@ bids; weekends neither count nor break a streak.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
@@ -33,6 +35,25 @@ def week_columns(start: date, end: date) -> list[dict]:
         e = min(mon + timedelta(days=6), end)
         out.append({"start": s.isoformat(), "end": e.isoformat(), "partial": s != mon or e != mon + timedelta(days=6)})
         s = e + timedelta(days=1)
+    return out
+
+
+def day_columns(days: list[date]) -> list[dict]:
+    """One column per report day (a pay week's)."""
+    return [{"start": d.isoformat(), "end": d.isoformat(), "partial": False} for d in days]
+
+
+def pay_week_columns(start: date, end: date, sched: BidSchedule) -> list[dict]:
+    """Every pay week touching [start, end] (its report days), clipped to it; `partial` when the range cuts it."""
+    from app.bids.week import pay_week
+
+    out, d = [], start
+    while d <= end:
+        days = [date.fromisoformat(w.key) for w in pay_week(sched, datetime.now(timezone.utc), d).days]
+        first, last = days[0], days[-1]
+        s, e = max(first, start), min(last, end)
+        out.append({"start": s.isoformat(), "end": e.isoformat(), "partial": s != first or e != last})
+        d = last + timedelta(days=1)
     return out
 
 
@@ -176,12 +197,13 @@ def _ratio(n, d, digits):
 
 async def performance(
     bidders: list[Bidder], period: str, start: date, end: date, label: str, today: date,
+    columns: Optional[list[dict]] = None,
 ) -> dict:
     """The /bids/performance response (spec section 3): per-bidder bids by week, streaks, interviews and the top cards."""
     sched = schedule_from_settings()
     prev_start, prev_end = previous_range(period, start, end)
     counts = await day_counts(bidders, min(prev_start, start), end, sched)
-    weeks = week_columns(start, end)
+    weeks = columns if columns is not None else week_columns(start, end)
     week_of = {date.fromisoformat(w["start"]) + timedelta(days=i): n
                for n, w in enumerate(weeks) for i in range((date.fromisoformat(w["end"]) - date.fromisoformat(w["start"])).days + 1)}
 
@@ -204,7 +226,8 @@ async def performance(
         cur = [(d, c) for (bid, d), c in counts.items() if bid == k and start <= d <= end]
         weekly = [0] * len(weeks)
         for d, c in cur:
-            weekly[week_of[d]] += c[0] + c[1]
+            if d in week_of:  # stats-only callers pass no columns
+                weekly[week_of[d]] += c[0] + c[1]
         approved, pending, rejected = (sum(c[i] for _d, c in cur) for i in range(3))
         total = approved + pending
         prev_total = sum(n for d, n in mine.items() if prev_start <= d <= prev_end)
