@@ -331,6 +331,19 @@ async def lookup_accounts(
     }
 
 
+def _setup_units(acc: Account) -> dict:
+    """The profile's tailoring units as the Profile tab reads them (`prompts_view`: an older profile's single prompt
+    and template as one unit, a unit saved before units had templates on the profile's template), without their HTML
+    and prompt text: the Profiles list's Setup column."""
+    units, default_id = prompts_view(acc)
+    filled = lambda s: bool((s or "").strip())  # noqa: E731
+    return {
+        "setupUnits": [{"id": u.id, "name": u.name, "roles": list(u.roles), "hasTemplate": filled(u.templateHtml),
+                        "hasPrompt": filled(u.body)} for u in units],
+        "setupDefaultId": default_id,
+    }
+
+
 @router.get("")
 async def list_accounts(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -356,10 +369,11 @@ async def list_accounts(
     skip = (page - 1) * limit
     total = await Account.find(query).count()
     rows = await Account.find(query).skip(skip).limit(limit).to_list()
+    setup = {str(acc.id): _setup_units(acc) for acc in rows}
     accounts_out = await populate_owner(rows, field="createdBy")
     # Strip the markdown blob from list responses to prevent multi-MB payloads.
     # Full resume content ships only from GET /accounts/{id} (used by Edit modal).
-    accounts_out = [_strip_markdown_from_account(a) for a in accounts_out]
+    accounts_out = [{**_strip_markdown_from_account(a), **setup.get(str(a.get("_id")), {})} for a in accounts_out]
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {

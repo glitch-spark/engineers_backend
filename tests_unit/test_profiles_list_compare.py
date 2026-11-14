@@ -150,3 +150,37 @@ async def test_admin_viewing_everyone_gets_no_compare(db, today):
     assert all("rounds" in r and "name" in r for r in out["rows"])
     picked = await _list(admin, userId=str(ana.id), **NOV)
     assert picked["mine"]["bids"] == 40
+
+
+# ---- setup units on the profiles list ---------------------------------------------------------------------------------
+
+async def _accounts(user):
+    from app.routers.accounts import list_accounts
+
+    return await list_accounts(user, page=1, limit=10, search="", userId="", status_="active", region="")
+
+
+async def test_list_setup_units_follow_the_profile_tab(db, today):
+    from app.models.account import ResumePrompt
+
+    ana = await _user("ana")
+    await _profile(ana, "P", defaultPromptId="u1", resumePrompts=[
+        ResumePrompt(id="u1", name="Backend", roles=["backend"], body="Rewrite", templateHtml="<p>x</p>"),
+        ResumePrompt(id="u2", name="QA", roles=["qa"], body="  ", templateHtml=""),
+    ])
+    p = (await _accounts(ana))["accounts"][0]
+    assert [(u["id"], u["hasTemplate"], u["hasPrompt"]) for u in p["setupUnits"]] == [("u1", True, True), ("u2", False, False)]
+    assert p["setupUnits"][0]["roles"] == ["backend"] and p["setupDefaultId"] == "u1"
+    assert all("body" not in u and "templateHtml" not in u for u in p["setupUnits"])
+
+
+async def test_list_setup_units_for_older_profiles(db, today):
+    from app.models.account import ResumePrompt
+
+    ana = await _user("ana")
+    await _profile(ana, "L", resumePromptBody="# Backend\nRewrite", styleTemplate="<p/>")
+    await _profile(ana, "M", styleTemplate="<p/>", resumePrompts=[
+        ResumePrompt(id="m1", name="Backend", roles=["backend"], body="Rewrite", templateHtml=None)])
+    by = {a["name"]: a for a in (await _accounts(ana))["accounts"]}
+    assert [(u["hasTemplate"], u["hasPrompt"]) for u in by["L"]["setupUnits"]] == [(True, True)]
+    assert by["M"]["setupUnits"][0]["hasTemplate"] is True
