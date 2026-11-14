@@ -8,6 +8,7 @@ from app.models.bidder import Bidder
 from app.models.caller import Caller
 from app.models.interview import Interview
 from app.models.interview_chat_log import InterviewChatLog
+from app.models.interview_day_post import InterviewDayPost
 from app.models.interview_question import InterviewQuestion
 from app.models.job_apply import (
     JobApplicationLog, JobApplyRow, JobApplyRun, JobApproval, JobExtractionCache, JobInfo, JobInvalidRole,
@@ -38,6 +39,7 @@ __all__ = [
     "GlobalPrompt",
     "Interview",
     "InterviewChatLog",
+    "InterviewDayPost",
     "InterviewQuestion",
     "JobApplicationLog",
     "JobApplyRow",

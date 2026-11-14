@@ -18,10 +18,6 @@ class ConfirmError(Exception):
         self.message = message
 
 
-async def refresh_today(now=None) -> bool:  # replaced by app.interview_day.post.refresh_today in Task 8
-    return False
-
-
 async def confirm_round(iv_id: str, round_id: str, user: UserExtra, confirmed: bool) -> Interview:
     # The router module imports this one, so its helpers are imported at call time.
     from fastapi import HTTPException
@@ -54,6 +50,5 @@ async def confirm_round(iv_id: str, round_id: str, user: UserExtra, confirmed: b
     iv.stageHistory[idx] = entry
     ivr._sync_top_from_tip(iv)
     await ivr._save_interview(iv)
-    await ivr._sync_caller_posts(iv, before)
-    await refresh_today()
+    await ivr._sync_caller_posts(iv, before)  # also refreshes today's day post
     return iv

@@ -38,7 +38,7 @@ def slack(monkeypatch):
 
     sync = AsyncMock(return_value=False)
     monkeypatch.setattr(interviews, "sync_caller_thread", sync)
-    monkeypatch.setattr(round_confirm, "refresh_today", AsyncMock(return_value=False))
+    monkeypatch.setattr(interviews, "refresh_today", AsyncMock(return_value=False))
     return sync
 
 
@@ -169,10 +169,12 @@ async def test_confirm_posts_thread_event(client, slack):
 
 
 async def test_confirm_refreshes_the_day_post(client):
+    from app.routers import interviews
+
     owner = await make_user()
     iv = await make_interview(owner, caller_id="ext1")
     await confirm(client, owner, iv)
-    round_confirm.refresh_today.assert_awaited_once()
+    interviews.refresh_today.assert_awaited_once()
 
 
 def test_is_assigned_caller_and_can_confirm():

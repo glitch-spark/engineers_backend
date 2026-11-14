@@ -17,6 +17,7 @@ from app import ai_usage
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
+from app.interview_day.post import refresh_today
 from app.interview_resume_link import ResumeLinkIn, build_link, resolve_link, search_matches
 from app.llm_router import is_reasoning_model
 from app.models import (
@@ -331,6 +332,16 @@ async def _sync_caller_posts(
     gone = set(deleted)
     if await sync_caller_thread(iv, before, added=added, deleted=gone) and not gone:
         await _save_interview(iv)
+    if not gone:  # a delete refreshes once the round is really gone (_refresh_day_post)
+        await _refresh_day_post()
+
+
+async def _refresh_day_post() -> None:
+    """Edit today's day post to match the saved interviews. Slack trouble is logged, never raised."""
+    try:
+        await refresh_today()
+    except Exception as exc:
+        log.warning("interviews: day post refresh failed: %s", exc)
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
@@ -1320,6 +1331,7 @@ async def delete_interview_stage(
     _sync_top_from_tip(iv)
     await _save_interview(iv)
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
+    await _refresh_day_post()
     return await _interview_out(iv)
 
 
@@ -1342,6 +1354,7 @@ async def delete_interview(
     await _sync_caller_posts(iv, before, deleted=set(before))
     await iv.delete()
     await InterviewQuestion.find({"interviewId": iv.id}).delete()
+    await _refresh_day_post()
     return {"ok": True}
 
 
