@@ -21,7 +21,7 @@ from typing import Awaitable, Callable, Optional
 from app import profile_metrics as pm
 from app.dashboard_stats import app_tz
 from app.interview_rates import rate
-from app.models import Account
+from app.models import Account, UserExtra
 
 log = logging.getLogger(__name__)
 
@@ -157,14 +157,25 @@ def region_tops(pairs: list[tuple["pm.ProfileSpan", Optional[dict]]]) -> dict[st
     return out
 
 
-def _numbers_only(tops: dict[str, dict]) -> dict[str, dict]:
-    return {r: {"mostInterviews": t["mostInterviews"]["interviews"] if t["mostInterviews"] else None,
-                "bestRate": t["bestRate"]["interviewsPerBid"] if t["bestRate"] else None} for r, t in tops.items()}
+async def _named(tops: dict[str, dict], accounts: list["pm.ProfileSpan"]) -> dict[str, dict]:
+    """All users' region tops as the Profiles list shows them: each number with its profile's name and its owner's
+    name, so a user can look the profile up; no ids."""
+    owner_of = {str(a.id): a.createdBy for a in accounts}
+    picked = [e["accountId"] for t in tops.values() for e in t.values() if e]
+    owner_ids = list({owner_of[i] for i in picked})
+    names = {u.id: u.name for u in await UserExtra.find({"_id": {"$in": owner_ids}}).to_list()} if owner_ids else {}
+
+    def strip(e: Optional[dict]) -> Optional[dict]:
+        if not e:
+            return None
+        return {**{k: v for k, v in e.items() if k != "accountId"}, "ownerName": names.get(owner_of[e["accountId"]], "")}
+
+    return {r: {"mostInterviews": strip(t["mostInterviews"]), "bestRate": strip(t["bestRate"])} for r, t in tops.items()}
 
 
 async def benchmark(window: tuple[date, date]) -> dict:
     """CompareStats of every owner's active profiles over the window ("All profiles" on the Metrics tab), plus each
-    region's best single-profile numbers (`regionTops`): no names or ids, only numbers. Active = not archived (as the Profiles status filter)."""
+    region's best single profile (`regionTops`: number, profile name, owner name; no ids). Active = not archived (as the Profiles status filter)."""
     accounts = await Account.find({"archived": {"$ne": True}}).project(pm.ProfileSpan).to_list()
     if not accounts:
         return {**empty_stats(), "regionTops": {}}
@@ -175,8 +186,8 @@ async def benchmark(window: tuple[date, date]) -> dict:
         key = str(a.id)
         daily, scores = pm.days_from(key, *window, sources)
         stats.append(window_stats(created_day(a), window, daily, scores, rounds.get(key, [])))
-    # Each region's best single profile, any owner: numbers only, never names or ids.
-    tops = _numbers_only(region_tops(list(zip(accounts, stats))))
+    # Each region's best single profile, any owner: its number, profile name and owner name (no ids).
+    tops = await _named(region_tops(list(zip(accounts, stats))), accounts)
     return {**(pool(stats) or empty_stats()), "regionTops": tops}
 
 

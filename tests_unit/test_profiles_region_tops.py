@@ -115,14 +115,17 @@ async def test_region_top_ties(db, today):
     assert us["bestRate"]["name"] == "Y"            # 0.05 like X, more bids
 
 
-async def test_benchmark_region_tops_are_numbers_only(db, today):
+async def test_benchmark_region_tops_name_the_profile_and_its_user(db, today):
     bo, cy = await _user("bo"), await _user("cy")
     await _p(bo, "P1", 300, 9)
-    await _p(cy, "P2", 100, 3)
+    await _p(cy, "P2", 100, 3)                       # same 0.03 rate, fewer bids
     await _p(cy, "Q", 20, 0, region="EU")
     bench = await pc.benchmark((date(2026, 11, 1), date(2026, 11, 13)))
-    assert bench["regionTops"] == {"US": {"mostInterviews": 9, "bestRate": 0.03},
-                                   "EU": {"mostInterviews": None, "bestRate": None}}
+    assert bench["regionTops"] == {
+        "US": {"mostInterviews": {"interviews": 9, "name": "P1", "ownerName": "bo"},
+               "bestRate": {"interviewsPerBid": 0.03, "bids": 300, "name": "P1", "ownerName": "bo"}},
+        "EU": {"mostInterviews": None, "bestRate": None}}
+    assert "accountId" not in str(bench["regionTops"])   # names to look them up by, no ids
 
 
 async def test_admin_viewing_everyone_gets_no_region_tops(db, today):
