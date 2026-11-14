@@ -44,6 +44,7 @@ from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object
 from app.slack_bot import sync_caller_thread
 from app.caller_directory import resolve_caller
 from app.routers.callers import is_caller_manager, require_caller_manager
+from app.round_confirm import ConfirmError, confirm_round
 
 log = logging.getLogger(__name__)
 
@@ -1247,6 +1248,25 @@ async def update_interview_stage(
             await InterviewQuestion.find({"interviewId": iv.id, "stageId": entry.id}).delete()
     await _sync_caller_posts(iv, before)
     await _after_save(iv, extract_stage_ids=extract_ids)
+    return await _interview_out(iv)
+
+
+class ConfirmIn(BaseModel):
+    confirmed: bool
+
+
+@router.post("/{iv_id}/stages/{stage_id}/confirm")
+async def confirm_interview_round(
+    iv_id: str,
+    stage_id: str,
+    body: ConfirmIn,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """The round's assigned caller, an interview manager, admin or the owner confirms (or unconfirms) it."""
+    try:
+        iv = await confirm_round(iv_id, stage_id, user, body.confirmed)
+    except ConfirmError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message)
     return await _interview_out(iv)
 
 
