@@ -109,7 +109,7 @@ def round_blocks(
     elif r.caller in ("user", "external") and not r.confirmed:
         elements.append(_button("Confirm", style="primary", action_id=CONFIRM_ACTION_ID, value=ref))
     return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": _cap("\n".join(lines))}},
         {"type": "actions", "elements": elements},
     ]
 

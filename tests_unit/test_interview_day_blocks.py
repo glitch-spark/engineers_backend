@@ -246,3 +246,17 @@ async def test_self_round_shows_no_stale_method_or_link(db):
     assert r.caller == "self" and r.method == "" and r.link == ""
     text = text_of(blocks(r))
     assert "Video" not in text and "old.example" not in text
+
+
+@pytest.mark.parametrize("kind", ["self", "tbd", "external", "user"])
+def test_round_blocks_cap_escape_heavy_text_in_every_typed_part(kind):
+    amp = "&" * 5000
+    person = SimpleNamespace(name=amp, email=None, slackUserId=None, isActive=True)
+    managers = [SimpleNamespace(name=f"{amp}{i}", email=None, slackUserId=None, isActive=True) for i in range(5)]
+    r = rnd(company=amp, position=amp, profile=amp, caller=kind, caller_name=amp, caller_user=person, owner=person,
+            link="Call " + amp, thread_link="https://slack.example/p1")
+    text = text_of(blocks(r, managers=managers, starting_in=30))
+    assert len(text) <= 3000
+    last = text.rstrip("…")
+    assert last.rfind("<") <= last.rfind(">") and last.rfind("&") <= last.rfind(";")
+    assert text.startswith("⏰ *Starting in 30 min*")
