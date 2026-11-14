@@ -31,6 +31,8 @@ async def _user_from_token(token: str) -> UserExtra:
         payload = decode_token(token)
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+    if payload.get("typ") in ("bidder", "ext-owner"):  # extension tokens never act as app users
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
     sub = payload.get("sub")
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token payload")

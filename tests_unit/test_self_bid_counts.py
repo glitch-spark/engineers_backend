@@ -137,3 +137,56 @@ async def test_days_before_the_profiles_first_tracked_day_stay_typed(db):
     plan = await DailyPlan.find_one({"date": datetime(2026, 11, 16)})
     assert plan.done.bidsSelfByProfile == {str(alpha.id): 9}
     assert (await get(pedro, before))["trackedProfiles"] == []
+
+
+async def test_other_applies_come_back_on_the_day(db):
+    phase2(db)
+    pedro, alpha, _beta = await setup()
+    await self_bid(pedro, alpha)
+    await put(pedro, DAY, {alpha.id: 3})
+    assert (await get(pedro, DAY))["selfOtherByProfile"] == {str(alpha.id): 3}
+
+
+async def test_write_through_keeps_the_rest_of_the_plan(db):
+    phase2(db)
+    pedro, alpha, _beta = await setup()
+    await put(pedro, DAY, {alpha.id: 1})
+    plan = await DailyPlan.find_one()
+    await plan.set({DailyPlan.notes: "kept", DailyPlan.slackTs: "123.45", DailyPlan.slackChannel: "C1"})
+    stale = await DailyPlan.find_one()                       # what a concurrent writer might still hold
+    await self_bid(pedro, alpha)
+    await self_bids.write_through(pedro.id, DAY)
+    fresh = await DailyPlan.find_one()
+    assert (fresh.notes, fresh.slackTs, fresh.slackChannel) == ("kept", "123.45", "C1")
+    assert fresh.done.bidsSelfByProfile[str(alpha.id)] == 1 and stale is not None   # tracked replaces pre-switch typed
+
+
+async def test_an_upload_never_fails_because_of_the_write_through(db, monkeypatch):
+    phase2(db)
+    pedro, alpha, _beta = await setup()
+
+    async def boom(*a, **kw):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(self_bids, "_write", boom)
+    await self_bid(pedro, alpha)
+    await self_bids.safe_write_through(pedro, DAY)           # logged, not raised
+
+
+async def test_the_slack_post_follows_the_tracked_count(db, monkeypatch):
+    from app.routers import daily_plans
+
+    phase2(db)
+    pedro, alpha, _beta = await setup()
+    await put(pedro, DAY, {alpha.id: 1})
+    await (await DailyPlan.find_one()).set({DailyPlan.slackTs: "123.45", DailyPlan.slackChannel: "C1"})
+    posted = []
+
+    async def fake_sync(plan, owner, done, rounds):
+        posted.append(done.bidsSelf)
+
+    monkeypatch.setattr(daily_plans, "_sync_slack", fake_sync)
+    await self_bid(pedro, alpha)
+    await self_bid(pedro, alpha)
+    await self_bids.safe_write_through(pedro, DAY)
+    assert posted == [2]

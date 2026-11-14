@@ -105,3 +105,16 @@ async def test_archiving_the_profile_ends_its_sign_in(api):
     a.archived = True
     await a.save()
     assert (await api.get("/ext/owner/me", headers=bearer(token))).status_code == 401
+
+
+async def test_the_ai_review_stream_refuses_extension_tokens(api):
+    from fastapi import HTTPException
+
+    from app.routers.ai_review import _user_from_token
+
+    pedro = await owner("Pedro")
+    a = await Account(name="Alpha", createdBy=pedro.id).insert()
+    token = (await login(api, "Pedro", str(a.id))).json()["token"]
+    with pytest.raises(HTTPException) as e:
+        await _user_from_token(token)
+    assert e.value.status_code == 401

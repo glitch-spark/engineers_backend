@@ -111,7 +111,7 @@ async def owner_upload_url(body: UploadUrlIn, auth: Annotated[ExtOwnerAuth, Depe
         (body.jobTitle or "")[:_JOB_TITLE_MAX] or None, [Attachment(**a.model_dump()) for a in body.attachments],
     )
     # After the switch the day's Daily Plan carries the tracked count (a no-op during the pilot).
-    await self_bids.write_through(auth.user.id, bid_report_day(bid.firstAt, schedule_from_settings()))
+    await self_bids.safe_write_through(auth.user, bid_report_day(bid.firstAt, schedule_from_settings()))
     try:
         content_type = IMAGE_FORMATS[body.format][1]
         url = await asyncio.to_thread(storage.presign_put, bucket, key, content_type)
