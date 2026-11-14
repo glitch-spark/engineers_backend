@@ -97,9 +97,9 @@ async def test_everyone_reads_the_list_only_managers_change_it(client):
     staff, puma = await make_user("Sam"), await make_user("Puma", role="interview_manager")
     async with client(staff) as c:
         got = (await c.get("/callers")).json()
-        assert [x["name"] for x in got["callers"]] == ["Pietro"] and got["canManage"] is False
+        assert [x["name"] for x in got["callers"] if x["kind"] == "external"] == ["Pietro"] and got["canManage"] is False
         assert (await c.post("/callers", json={"name": "Zed"})).status_code == 403
-        pid = got["callers"][0]["_id"]
+        pid = next(x["_id"] for x in got["callers"] if x["kind"] == "external")
         assert (await c.put(f"/callers/{pid}", json={"name": "P"})).status_code == 403
         assert (await c.delete(f"/callers/{pid}")).status_code == 403
     async with client(puma) as c:
@@ -117,7 +117,7 @@ async def test_bad_or_duplicate_names_are_refused(client, name, code):
         assert (await c.post("/callers", json={"name": name})).status_code == code
 
 
-async def test_rename_follows_assigned_rounds_and_delete_keeps_the_name(client):
+async def test_rename_follows_assigned_rounds_and_archive_keeps_the_name(client):
     pietro = await make_caller("Pietro")
     owner, admin = await make_user(), await make_user("Admin", role="admin")
     iv = await make_interview(owner, caller_name="Pietro", caller_id=str(pietro.id))
@@ -128,9 +128,113 @@ async def test_rename_follows_assigned_rounds_and_delete_keeps_the_name(client):
         assert (await c.put(f"/callers/{pietro.id}", json={"color": "black"})).status_code == 400
         assert (await fresh(iv)).callerName == "Pietro R."
         assert (await fresh(other)).callerName == "David"
-        assert (await c.delete(f"/callers/{pietro.id}")).status_code == 204
+        assert (await c.put(f"/callers/{pietro.id}", json={"archived": True})).status_code == 200
     kept = await fresh(iv)
     assert (kept.callerName, kept.callerId) == ("Pietro R.", str(pietro.id))
+
+
+# ---- directory: users, archive, delete, colour ----
+
+async def test_list_includes_platform_users(client):
+    await make_caller("Pietro")
+    staff, ana = await make_user("Sam"), await make_user("Ana", role="admin")
+    async with client(staff) as c:
+        got = (await c.get("/callers")).json()
+    assert [x["kind"] for x in got["callers"]] == ["user", "user", "external"]
+    assert [x["name"] for x in got["callers"]] == ["Ana", "Sam", "Pietro"]
+    assert got["canManage"] is False
+    assert all(x["archived"] is False for x in got["callers"])
+
+
+async def test_archive_hides_from_list_and_unarchive_restores(client):
+    pietro = await make_caller("Pietro")
+    puma = await make_user("Puma", role="interview_manager")
+    async with client(puma) as c:
+        res = await c.put(f"/callers/{pietro.id}", json={"archived": True})
+        assert res.status_code == 200 and res.json()["archived"] is True
+        assert (await Caller.get(pietro.id)).archivedAt is not None
+        assert "Pietro" not in [x["name"] for x in (await c.get("/callers")).json()["callers"]]
+        withall = {x["name"]: x for x in (await c.get("/callers", params={"archived": 1})).json()["callers"]}
+        assert withall["Pietro"]["archived"] is True
+        res = await c.put(f"/callers/{pietro.id}", json={"archived": False})
+        assert res.status_code == 200 and res.json()["archived"] is False
+        assert (await Caller.get(pietro.id)).archivedAt is None
+        assert "Pietro" in [x["name"] for x in (await c.get("/callers")).json()["callers"]]
+
+
+async def test_delete_with_rounds_is_409(client):
+    busy, idle = await make_caller("Busy"), await make_caller("Idle")
+    owner, admin = await make_user(), await make_user("Admin", role="admin")
+    await make_interview(owner, caller_name="Busy", caller_id=str(busy.id))
+    async with client(admin) as c:
+        res = await c.delete(f"/callers/{busy.id}")
+        assert res.status_code == 409
+        assert res.json()["detail"] == "This caller has rounds — archive them instead."
+        assert await Caller.get(busy.id) is not None
+        assert (await c.delete(f"/callers/{idle.id}")).status_code == 204
+        assert await Caller.get(idle.id) is None
+        assert (await c.delete(f"/callers/{owner.id}")).status_code == 400
+
+
+async def test_user_caller_only_takes_colour(client):
+    ana, puma = await make_user("Ana"), await make_user("Puma", role="interview_manager")
+    async with client(puma) as c:
+        res = await c.put(f"/callers/{ana.id}", json={"color": "teal"})
+        assert res.status_code == 200, res.text
+        assert res.json()["kind"] == "user" and res.json()["color"] == "teal"
+        assert (await UserExtra.get(ana.id)).callerColor == "teal"
+        assert (await c.put(f"/callers/{ana.id}", json={"name": "X"})).status_code == 400
+        assert (await c.put(f"/callers/{ana.id}", json={"archived": True})).status_code == 400
+        assert (await c.put(f"/callers/{ana.id}", json={"color": "black"})).status_code == 400
+    assert (await UserExtra.get(ana.id)).name == "Ana"
+
+
+async def test_user_rename_follows_onto_rounds(db):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.deps import get_current_user
+    from app.routers import profile
+
+    ana = await make_user("Ana")
+    owner = await make_user("Owner")
+    entry = InterviewStageEvent(
+        stage="intro", at=START, scheduledAt=START, status="scheduled",
+        caller=InterviewCaller(enabled=True, callerName="Ana", callerId=str(ana.id), callerKind="user", startsAt=START),
+    )
+    iv = await Interview(accountId=PydanticObjectId(), createdBy=owner.id, scheduledAt=START, companyName="Acme",
+                         stageHistory=[entry.model_dump()]).insert()
+    app = FastAPI()
+    app.include_router(profile.router)
+    app.dependency_overrides[get_current_user] = lambda: ana
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.put("/profile", json={"username": "Ana B", "email": ana.email})
+        assert res.status_code == 200, res.text
+    assert (await fresh(iv)).callerName == "Ana B"
+
+
+async def test_admin_user_edit_rename_follows_onto_rounds(db):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.deps import require_admin
+    from app.routers import users
+
+    ana, admin = await make_user("Ana"), await make_user("Admin", role="admin")
+    entry = InterviewStageEvent(
+        stage="intro", at=START, scheduledAt=START, status="scheduled",
+        caller=InterviewCaller(enabled=True, callerName="Ana", callerId=str(ana.id), callerKind="user", startsAt=START),
+    )
+    iv = await Interview(accountId=PydanticObjectId(), createdBy=admin.id, scheduledAt=START, companyName="Acme",
+                         stageHistory=[entry.model_dump()]).insert()
+    app = FastAPI()
+    app.include_router(users.router)
+    app.dependency_overrides[require_admin] = lambda: admin
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        assert (await c.put(f"/users/{ana.id}", json={"phone": "1"})).status_code == 200
+        assert (await fresh(iv)).callerName == "Ana"
+        assert (await c.put(f"/users/{ana.id}", json={"name": "Ana C"})).status_code == 200
+    assert (await fresh(iv)).callerName == "Ana C"
 
 
 # ---- rounds ----

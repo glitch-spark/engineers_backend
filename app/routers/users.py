@@ -4,10 +4,12 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
+from app.caller_directory import user_display_name
 from app.deps import get_current_user, require_admin
 from app.models import UserExtra
 from app.models.user_extra import UserRole
 from app.routers._util import ci_regex, doc_to_dict, to_object_id
+from app.routers.callers import rename_on_rounds
 from app.slack_bot import normalize_slack_id
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -140,6 +142,7 @@ async def update_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    old_caller_name = user_display_name(user)
     if body.name is not None:
         user.name = body.name
     if body.role is not None:
@@ -163,6 +166,8 @@ async def update_user(
         user.slackUserId = slack_id
 
     await user.save()
+    if user_display_name(user) != old_caller_name:
+        await rename_on_rounds(str(user.id), user_display_name(user))
     return doc_to_dict(user)
 
 

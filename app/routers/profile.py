@@ -5,10 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.bids.schemas import password_problem
+from app.caller_directory import user_display_name
 from app.deps import get_current_user
 from app.config import get_settings
 from app.models import UserExtra
 from app.resume_prompts import max_body
+from app.routers.callers import rename_on_rounds
 from app.security import hash_password, verify_password
 from app.slack_bot import (
     normalize_slack_timezone,
@@ -94,6 +96,7 @@ async def update_profile(
         if existing and str(existing.id) != str(user.id):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already taken")
 
+    old_caller_name = user_display_name(user)
     user.name = body.username.strip()
     user.email = new_email
     user.image = body.image or ""
@@ -112,6 +115,8 @@ async def update_profile(
     if body.coverLetterPromptBody is not None:
         user.coverLetterPromptBody = body.coverLetterPromptBody[:30000] or None
     await user.save()
+    if user_display_name(user) != old_caller_name:
+        await rename_on_rounds(str(user.id), user_display_name(user))
 
     return {
         "message": "Profile updated successfully",
