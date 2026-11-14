@@ -13,7 +13,7 @@ from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
 from app.profile_metrics import (
-    WEEK_CHOICES, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
+    WEEK_CHOICES, bids_by_bidder, ProfileSpan, apply_dates, collect, collect_range, lifetime, peer_average,
     profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
 from app.models.account import PromptRole, Resume, ResumePrompt
@@ -404,7 +404,7 @@ async def list_profile_metrics(
 ) -> dict:
     """Per-profile totals for the user's active profiles (admin: any/all) over the days [from, to], or since each
     profile was created (no from / to, or weeks=all), or the last completed `weeks` (older pages). Each row also has the
-    profile's first and last apply day."""
+    profile's first and last apply day, and its bidder bids per bidder (`bidderBidsBy`)."""
     in_range = bool(from_ or to)
     all_time = not in_range and str(weeks) == "all"
     if in_range:
@@ -435,7 +435,11 @@ async def list_profile_metrics(
     rows = [summarize(aid, *vals) for aid, vals in collected.items()]
 
     dates = await apply_dates(accounts) if accounts else {}
+    # All time counts every bid ever, as the lifetime totals do; the other periods count their own days.
+    by_bidder = await bids_by_bidder([a.id for a in accounts], None if all_time else start,
+                                     None if all_time else end) if accounts else {}
     for row in rows:
+        row["bidderBidsBy"] = by_bidder.get(row["accountId"], [])
         first_apply, last_apply = dates.get(row["accountId"], (None, None))
         row["firstApply"] = first_apply.isoformat() if first_apply else None
         row["lastApply"] = last_apply.isoformat() if last_apply else None

@@ -126,6 +126,38 @@ async def bidder_bids(
     return dict(out)
 
 
+async def bids_by_bidder(
+    account_ids: list[PydanticObjectId], start: Optional[date], end: Optional[date],
+) -> dict[str, list[dict]]:
+    """account id -> [{bidderId, name, bids}], most bids first: each of the profile's bidders' approved and pending
+    bids (archived bidders too) on Bid Track days in [start, end], or ever when start is None. Counted as
+    `bidder_bids` / `_lifetime_bidder_bids` count them, so a profile's entries add up to its bidder bids; bidders with
+    none in the range are left out."""
+    bidders = {b.id: b async for b in Bidder.find({"profileId": {"$in": account_ids}})}
+    if not bidders:
+        return {}
+    match: dict = {"bidderId": {"$in": list(bidders)}, "status": {"$in": ["approved", "pending"]}}
+    coll = Bid.get_motor_collection()
+    counts: dict = defaultdict(int)
+    if start is None or end is None:
+        for g in await coll.aggregate([{"$match": match}, {"$group": {"_id": "$bidderId", "n": {"$sum": 1}}}]).to_list(None):
+            counts[g["_id"]] += g["n"]
+    else:
+        sched = schedule_from_settings()
+        # Report days don't align with UTC midnight: query a day wider on each side, then filter by report day.
+        match["firstAt"] = {"$gte": _midnight(start) - timedelta(days=1), "$lt": _midnight(end) + timedelta(days=2)}
+        async for b in coll.find(match, {"bidderId": 1, "firstAt": 1}):
+            if start <= bid_report_day(b["firstAt"], sched) <= end:
+                counts[b["bidderId"]] += 1
+    out: dict[str, list[dict]] = defaultdict(list)
+    for bidder_id, n in counts.items():
+        b = bidders[bidder_id]
+        out[str(b.profileId)].append({"bidderId": str(b.id), "name": b.name, "bids": n})
+    for entries in out.values():
+        entries.sort(key=lambda e: (-e["bids"], e["name"].lower()))
+    return dict(out)
+
+
 async def interview_rounds(
     account_ids: list[PydanticObjectId], start: date, end: date,
 ) -> dict[tuple[str, date], list[int]]:
