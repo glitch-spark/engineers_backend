@@ -109,6 +109,25 @@ def created_day(account) -> date:
     return account.createdAt.replace(tzinfo=timezone.utc).astimezone(app_tz()).date()
 
 
+async def all_time_start(today: date) -> date:
+    """All time's first compared day, the same for the Profiles list and the benchmark (so both ask the cache for one
+    window): the launch day or the earliest active profile's creation day (any owner), whichever is later; `today`
+    with no active profile."""
+    first = await Account.find({"archived": {"$ne": True}}).sort("createdAt").limit(1).project(pm.ProfileSpan).to_list()
+    earliest = created_day(first[0]) if first else today
+    since = await pm.since_date()
+    return max(since, earliest) if since else earliest
+
+
+def pass_counts(rounds: list[dict]) -> dict:
+    """{decided, passed, passRate} of `profile_rounds` records; home assessments never count (as the Metrics tab's
+    pass rate)."""
+    mine = [r for r in rounds if r["type"] != "home_assessment"]
+    passed = sum(1 for r in mine if r["result"] == "passed")
+    decided = passed + sum(1 for r in mine if r["result"] == "rejected")
+    return {"decided": decided, "passed": passed, "passRate": rate(decided, passed)}
+
+
 async def benchmark(window: tuple[date, date]) -> dict:
     """CompareStats of every owner's active profiles over the window ("All profiles" on the Metrics tab): no names
     or ids, only the pooled numbers. Active = not archived (as the Profiles status filter)."""

@@ -30,6 +30,7 @@ class ProfileSpan(BaseModel):
     id: PydanticObjectId = Field(alias="_id")
     createdBy: PydanticObjectId
     createdAt: datetime = Field(default_factory=datetime.utcnow)  # as on Account (TimestampedDocument)
+    name: str = ""  # the Profiles list names its strongest / weakest profile
 
 
 # Where the deployed backend records the day self bids start being typed per profile (one document, never updated).

@@ -27,6 +27,7 @@ ROW_KEYS = {
     "bids", "selfBids", "bidderBids", "interviews", "selfInterviews", "callerInterviews", "tailoredResumes",
     "selfAppliedInterviews", "bidderAppliedInterviews", "unsetAppliedInterviews",
     "firstApply", "lastApply", "bidderBidsBy",
+    "name", "rounds", "compare",  # the list's comparison with all profiles (test_profiles_list_compare.py)
 }
 OLD = datetime(2020, 1, 1)
 
@@ -56,7 +57,7 @@ async def test_list_shape(db):
     a, b = await _acct(ana, "A"), await _acct(ana, "B")
     await _acct(ana, "Gone", archived=True)
     out = await list_profile_metrics(ana, weeks=4, userId="")
-    assert set(out) == {"start", "end", "weeks", "rows"}
+    assert set(out) == {"start", "end", "weeks", "rows", "comparedFrom", "comparedTo", "mine"}
     assert out["weeks"] == 4
     assert datetime.fromisoformat(out["end"]).date() - datetime.fromisoformat(out["start"]).date() == timedelta(days=27)
     assert {r["accountId"] for r in out["rows"]} == {str(a.id), str(b.id)}

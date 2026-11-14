@@ -16,7 +16,9 @@ from app.profile_metrics import (
     WEEK_CHOICES, bids_by_bidder, ProfileSpan, apply_dates, collect, collect_range, days_from, lifetime,
     load_sources, peer_average, profile_rounds, rounds_summary, since_date, span, summarize, weekly_from_daily,
 )
-from app.profile_compare import benchmark_cache, compared_window, created_day, empty_stats, pool, window_stats
+from app.profile_compare import (
+    all_time_start, benchmark_cache, compared_window, created_day, empty_stats, pass_counts, pool, window_stats,
+)
 from app.models.account import PromptRole, Resume, ResumePrompt
 from app.resume_prompts import PromptError, apply_prompts, prompts_view, sync_default_body, sync_default_template
 from app.routers._util import ci_regex, doc_to_dict, populate_owner, to_object_id
@@ -423,9 +425,11 @@ async def list_profile_metrics(
         query["createdBy"] = user.id
     accounts = await Account.find(query).project(ProfileSpan).to_list()
     today = _today()
+    range_sources = None
     if in_range:
         start, end = range_start, range_end
-        collected = await collect_range(accounts, start, end)
+        range_sources = await load_sources(accounts, start, end) if accounts else None
+        collected = await collect_range(accounts, start, end, range_sources)
     elif all_time:
         collected = await lifetime(accounts, today)
         first = min((vals[0] for vals in collected.values()), default=today)
@@ -445,10 +449,51 @@ async def list_profile_metrics(
         row["firstApply"] = first_apply.isoformat() if first_apply else None
         row["lastApply"] = last_apply.isoformat() if last_apply else None
     out = {"start": start.isoformat(), "end": end.isoformat(), "weeks": None if in_range else weeks, "rows": rows}
+    await _add_compare(out, accounts, start, end, today, all_time=all_time,
+                       one_owner=user.role != "admin" or bool(userId), range_sources=range_sources)
     if all_time:  # self bids exist per profile only from the launch day: the list says so
         since = await since_date()
         out["selfBidsSince"] = since.isoformat() if since and since > date.min else None
     return out
+
+
+async def _add_compare(out: dict, accounts: list[ProfileSpan], start: date, end: date, today: date, *,
+                       all_time: bool, one_owner: bool, range_sources) -> None:
+    """The Profiles list's comparison with all profiles: each row's `name` and pass counts over its own range
+    (`rounds`), and, for one owner's profiles, each profile (`compare`) and all of them together (`mine`) over the
+    compared window, measured as on the Metrics tab (app.profile_compare). The window ends at today (the list's
+    presets send whole periods) and starts where the benchmark's would, so both ask the cache for the same one. An
+    admin viewing every owner gets no `compare` / `mine`: that is the benchmark's work, uncached, on every load."""
+    ids = [a.id for a in accounts]
+    if accounts and start <= end:
+        held = await profile_rounds(ids, start, end)
+    else:
+        held = {}
+    by_id = {str(a.id): a for a in accounts}
+    for row in out["rows"]:
+        row["name"] = by_id[row["accountId"]].name if row["accountId"] in by_id else ""
+        row["rounds"] = pass_counts(held.get(row["accountId"], []))
+        row["compare"] = None
+    out["comparedFrom"] = out["comparedTo"] = None
+    out["mine"] = None
+    first = await all_time_start(today) if all_time else start
+    last = min(end, today)
+    window = await compared_window(first, last) if first <= last else None
+    if not window:
+        return
+    out["comparedFrom"], out["comparedTo"] = window[0].isoformat(), window[1].isoformat()
+    if not one_owner or not accounts:
+        return
+    sources = range_sources if range_sources is not None else await load_sources(accounts, *window)
+    rounds = await profile_rounds(ids, *window)
+    stats = {}
+    for a in accounts:
+        key = str(a.id)
+        daily, scores = days_from(key, *window, sources)
+        stats[key] = window_stats(created_day(a), window, daily, scores, rounds.get(key, []))
+    for row in out["rows"]:
+        row["compare"] = pool([stats.get(row["accountId"])], drop_idle=False)
+    out["mine"] = pool(list(stats.values()))
 
 
 @router.get("/metrics/benchmark")
@@ -462,13 +507,7 @@ async def get_metrics_benchmark(
     (from the launch day; All time = launch day to today). Any signed-in user; no names or ids. Remembered per window
     for 15 minutes (app.profile_compare.benchmark_cache)."""
     _check_period(period)
-    if period == "all":
-        since = await since_date()
-        first = await Account.find({"archived": {"$ne": True}}).sort("createdAt").limit(1).project(ProfileSpan).to_list()
-        earliest = created_day(first[0]) if first else _today()
-        all_start = max(since, earliest) if since else earliest
-    else:
-        all_start = _today()
+    all_start = await all_time_start(_today()) if period == "all" else _today()
     start, end, label = _period_range(period, date, to, all_start)
     window = await compared_window(start, end) if start <= end else None
     stats = await benchmark_cache.get(window) if window else empty_stats()
