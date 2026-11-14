@@ -207,3 +207,42 @@ async def test_load_rounds_external_caller_and_confirmed(db):
     (r,) = await load_rounds(START - timedelta(hours=1), START + timedelta(hours=1))
     assert r.caller == "external" and r.caller_name == "Pietro" and r.caller_user is None and r.confirmed is True
     assert r.profile == ""
+
+
+# --- limits and link text -------------------------------------------------------------------------
+
+
+def test_section_text_stays_under_slack_limit_with_huge_typed_fields():
+    r = rnd(link="Join here: " + "x" * 5000, company="C" * 4000, position="P&" * 3000, profile="Q" * 4000,
+            caller="external", caller_name="N" * 4000, thread_link="https://slack.example/p1")
+    text = text_of(blocks(r))
+    assert len(text) <= 3000
+    assert "…" in text and "Round 1" in text
+    assert text.count("<") == text.count(">")  # no token cut in half
+    url = rnd(link="https://meet.example/" + "a" * 5000)
+    assert len(text_of(blocks(url))) <= 3000 and "<https://meet.example" not in text_of(blocks(url))
+
+
+def test_cap_never_ends_inside_a_token():
+    from app.interview_day.blocks import _cap
+
+    cut = _cap("a" * 2990 + " <https://x.example|link> tail")
+    assert len(cut) <= 3000 and "<https" not in cut
+    assert len(_cap("&amp;" * 700)) <= 3000 and not _cap("&amp;" * 700).replace("…", "").endswith(("&", "&a", "&am", "&amp"))
+
+
+def test_unlinkable_http_link_is_shown_as_escaped_text():
+    text = text_of(blocks(rnd(link="https://meet.example/a b<c>|d")))
+    assert "(https://meet.example/a b&lt;c&gt;|d)" in text and "(link)" not in text
+
+
+async def test_self_round_shows_no_stale_method_or_link(db):
+    owner = await UserExtra(name="Pedro", email="p@x.io").insert()
+    await Interview(
+        accountId=PydanticObjectId(), createdBy=owner.id, scheduledAt=START, companyName="Acme",
+        stageHistory=[ev(caller=InterviewCaller(enabled=False, method="video", methodValue="https://old.example/x"))],
+    ).insert()
+    (r,) = await load_rounds(START - timedelta(hours=1), START + timedelta(hours=1))
+    assert r.caller == "self" and r.method == "" and r.link == ""
+    text = text_of(blocks(r))
+    assert "Video" not in text and "old.example" not in text

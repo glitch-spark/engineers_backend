@@ -99,8 +99,9 @@ async def load_rounds(start: datetime, end: datetime) -> list[DayRound]:
             profile=_profile_label(accounts.get(str(iv.accountId))),
             position=(iv.appliedPosition or "").strip(),
             round_no=no,
-            method=(caller.method or "") if caller else "",
-            link=(caller.methodValue or "").strip() if caller else "",
+            # A self round is not a caller call: a method kept from an earlier caller is not shown.
+            method=(caller.method or "") if state != "self" else "",
+            link=(caller.methodValue or "").strip() if state != "self" else "",
             caller=state,
             caller_name=name,
             caller_user=user,
