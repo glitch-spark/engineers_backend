@@ -50,7 +50,7 @@ def test_alert_tick_runs_day_post_after_reminders():
     reminders = AsyncMock(side_effect=lambda now: order.append("reminders") or {"sent": 0, "failed": 0})
     day_post = AsyncMock(side_effect=lambda now: order.append("day_post") or "posted")
     with (
-        patch.object(slack_bot, "run_caller_reminders", reminders),
+        patch("app.interview_day.reminders.run_round_reminders", reminders),
         patch("app.interview_day.post.run_day_post", day_post),
         patch.object(slack_bot, "slack_bot_configured", lambda: False),
     ):
@@ -61,7 +61,7 @@ def test_alert_tick_runs_day_post_after_reminders():
 def test_alert_tick_sends_no_dms():
     send = AsyncMock(return_value=True)
     with (
-        patch.object(slack_bot, "run_caller_reminders", AsyncMock(return_value={"sent": 2, "failed": 0})),
+        patch("app.interview_day.reminders.run_round_reminders", AsyncMock(return_value={"sent": 2, "failed": 0})),
         patch("app.interview_day.post.run_day_post", AsyncMock(return_value="posted")),
         patch.object(slack_bot, "slack_bot_configured", lambda: True),
         patch.object(slack_bot, "send_dm", send),
@@ -73,7 +73,7 @@ def test_alert_tick_sends_no_dms():
 
 def test_alert_tick_survives_day_post_crash():
     with (
-        patch.object(slack_bot, "run_caller_reminders", AsyncMock(return_value={"sent": 0, "failed": 0})),
+        patch("app.interview_day.reminders.run_round_reminders", AsyncMock(return_value={"sent": 0, "failed": 0})),
         patch("app.interview_day.post.run_day_post", AsyncMock(side_effect=RuntimeError("boom"))),
         patch.object(slack_bot, "slack_bot_configured", lambda: False),
     ):
@@ -83,7 +83,7 @@ def test_alert_tick_survives_day_post_crash():
 def test_alert_tick_survives_reminder_crash():
     day_post = AsyncMock(return_value="posted")
     with (
-        patch.object(slack_bot, "run_caller_reminders", AsyncMock(side_effect=RuntimeError("boom"))),
+        patch("app.interview_day.reminders.run_round_reminders", AsyncMock(side_effect=RuntimeError("boom"))),
         patch("app.interview_day.post.run_day_post", day_post),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
