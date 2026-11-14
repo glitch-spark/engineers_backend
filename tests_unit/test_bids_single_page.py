@@ -86,6 +86,7 @@ async def test_week_totals_match_the_board_and_say_today(db):
     r, b = await perf(pedro), await board(pedro)
     t = r["totals"]
     assert (t["toReview"], t["pay"], t["days"]) == (b["totals"]["toReview"], b["totals"]["pay"], b["totals"]["days"])
+    assert (t["approved"], t["pending"], t["rejected"]) == (b["totals"]["approved"], b["totals"]["pending"], b["totals"]["rejected"])
     assert t["today"] == {"day": "2026-11-18", "approved": 0, "pending": 0}
     past = await perf(pedro, date="2026-11-04")
     assert past["totals"]["today"] is None

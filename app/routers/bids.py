@@ -337,7 +337,7 @@ async def bids_performance(
             if row["id"] in cells:
                 row["dayCells"], row["week"] = cells[row["id"]]["days"], cells[row["id"]]["week"]
         t = board["totals"]
-        out["totals"].update({"toReview": t["toReview"], "pay": t["pay"], "days": t["days"]})
+        out["totals"].update({k: t[k] for k in ("approved", "pending", "rejected", "toReview", "pay", "days")})
         today = next((d for d in out["payWeek"]["days"] if d["isToday"]), None)
         cell = next((d for d in t["days"] if today and d["day"] == today["day"]), None)
         out["totals"]["today"] = {"day": cell["day"], "approved": cell["approved"], "pending": cell["pending"]} if cell else None
