@@ -20,6 +20,7 @@ from app.routers import (
     ai_usage,
     auth as auth_router,
     bidder_ext,
+    owner_ext,
     bidders,
     bids,
     callers,
@@ -135,6 +136,7 @@ def create_app() -> FastAPI:
     app.include_router(slack_bot.cron_router)
     app.include_router(bidders.router)
     app.include_router(bidder_ext.router)
+    app.include_router(owner_ext.router)
     app.include_router(bidders.cron_router)
     app.include_router(bids.router)
 
