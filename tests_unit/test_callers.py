@@ -410,6 +410,66 @@ async def test_patch_changing_caller_clears_confirmed_same_caller_keeps_it(clien
     assert (await fresh(iv)).callerKind == "user"
 
 
+async def test_resending_an_archived_external_caller_keeps_it(client):
+    pietro, jamil = await make_caller("Pietro"), await make_caller("Jamil's group")
+    admin = await make_user("Admin", role="admin")
+    iv = await make_interview(await make_user("Owner"), caller_name="Pietro", caller_id=str(pietro.id))
+    await _confirm(iv)
+    for c_ in (pietro, jamil):
+        found = await Caller.get(c_.id)
+        found.archivedAt = datetime.now(timezone.utc)
+        await found.save()
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}"
+    async with client(admin) as c:
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(pietro.id), "method": "phone_hushed"}})
+        assert res.status_code == 200, res.text
+        # A new assignment of an archived caller is still refused (PATCH and PUT).
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(jamil.id)}})
+        assert res.status_code == 400 and res.json()["detail"] == "That caller is no longer on the list."
+        res = await c.put(url + "/caller", json={"callerId": str(jamil.id)})
+        assert res.status_code == 400
+        # The assign endpoint also accepts the round's current caller.
+        assert (await c.put(url + "/caller", json={"callerId": str(pietro.id)})).status_code == 200
+    caller = await fresh(iv)
+    assert (caller.callerId, caller.callerName, caller.callerKind, caller.method) == (
+        str(pietro.id), "Pietro", "external", "phone_hushed")
+    assert await _confirmed(iv) is True
+
+
+async def test_resending_a_deactivated_user_caller_keeps_it(client):
+    ana = await make_user("Ana")
+    admin = await make_user("Admin", role="admin")
+    iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
+    fresh_iv = await Interview.get(iv.id)
+    fresh_iv.stageHistory[-1].caller.callerKind = "user"
+    await fresh_iv.save()
+    await _confirm(iv)
+    ana.isActive = False
+    await ana.save()
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}"
+    async with client(admin) as c:
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(ana.id), "method": "phone_hushed"}})
+        assert res.status_code == 200, res.text
+    caller = await fresh(iv)
+    assert (caller.callerId, caller.callerName, caller.callerKind, caller.method) == (
+        str(ana.id), "Ana", "user", "phone_hushed")
+    assert await _confirmed(iv) is True
+
+
+async def test_patch_ignores_confirmed_when_the_caller_changes_in_the_same_request(client):
+    ana, bob = await make_user("Ana"), await make_user("Bob")
+    admin = await make_user("Admin", role="admin")
+    iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}"
+    async with client(admin) as c:
+        res = await c.patch(url, json={"confirmed": True, "caller": {"enabled": True, "callerId": str(bob.id)}})
+        assert res.status_code == 200, res.text
+        assert await _confirmed(iv) is False
+        # Without a caller change, confirmed is honoured.
+        assert (await c.patch(url, json={"confirmed": True})).status_code == 200
+        assert await _confirmed(iv) is True
+
+
 async def test_creator_picks_a_platform_user_when_adding_a_round(client):
     ana, owner = await make_user("Ana"), await make_user("Owner")
     iv = await make_interview(owner, caller=False)
