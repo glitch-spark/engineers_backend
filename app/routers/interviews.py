@@ -42,7 +42,8 @@ from app.interview_caller import (
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
-from app.routers.callers import get_caller, is_caller_manager, require_caller_manager
+from app.caller_directory import resolve_caller
+from app.routers.callers import is_caller_manager, require_caller_manager
 
 log = logging.getLogger(__name__)
 
@@ -223,16 +224,22 @@ def _round_caller(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
-async def _resolve_caller(body: Optional[CallerIn]) -> Optional[CallerIn]:
-    """A caller picked from the caller list gets the list's name; "" means not assigned yet."""
+async def _resolve_caller(body: Optional[CallerIn], *, owner_id: str) -> Optional[CallerIn]:
+    """A caller picked from the directory (active user or external caller) gets the directory's name and kind;
+    "" means not assigned yet. Nobody takes their own interview as the caller."""
     if body is None or body.callerId is None:
         return body
     if not body.callerId:
-        return body.model_copy(update={"callerName": "TBD"})
-    caller = await get_caller(body.callerId)
-    if caller is None:
+        return body.model_copy(update={"callerName": "TBD", "callerKind": "external"})
+    if body.callerId == owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You take your own interview as Self — pick someone else as the caller.",
+        )
+    entry = await resolve_caller(body.callerId)
+    if entry is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That caller is no longer on the list.")
-    return body.model_copy(update={"callerId": str(caller.id), "callerName": caller.name})
+    return body.model_copy(update={"callerId": entry["_id"], "callerName": entry["name"], "callerKind": entry["kind"]})
 
 
 def _assignment(caller: Optional[InterviewCaller]) -> tuple:
@@ -944,7 +951,7 @@ async def create_interview(
         )
     applied_by = await _applied_by(body.appliedBy, account_oid) if body.appliedBy else None
     first = body.round or _legacy_round(body)
-    first.caller = await _resolve_caller(first.caller)
+    first.caller = await _resolve_caller(first.caller, owner_id=str(user.id))
     entry = _build_round(first, user=user, source="create")
 
     # History is appended after construction: the model's read-time resolver
@@ -1084,7 +1091,7 @@ async def add_interview_stage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="rejected is a status; set status on the current round",
         )
-    body.caller = await _resolve_caller(body.caller)
+    body.caller = await _resolve_caller(body.caller, owner_id=str(iv.createdBy))
     entry = _build_round(body, user=user, source="stage")
     prev_tip = _tip(iv)
     if prev_tip is not None and _normalize_stage(prev_tip.stage) == entry.stage:
@@ -1125,8 +1132,13 @@ async def assign_round_caller(
     entry = iv.stageHistory[idx]
     if entry.caller is None or not entry.caller.enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This round has no caller request.")
-    picked = await _resolve_caller(CallerIn(enabled=True, callerId=body.callerId))
-    entry.caller = entry.caller.model_copy(update={"callerId": picked.callerId or None, "callerName": picked.callerName})
+    picked = await _resolve_caller(CallerIn(enabled=True, callerId=body.callerId), owner_id=str(iv.createdBy))
+    previous = entry.caller
+    entry.caller = previous.model_copy(
+        update={"callerId": picked.callerId or None, "callerName": picked.callerName, "callerKind": picked.callerKind},
+    )
+    if _assignment(entry.caller) != _assignment(previous):
+        entry.confirmed = False  # the new caller has not agreed yet
     iv.stageHistory[idx] = entry
     _sync_top_from_tip(iv)
     await _save_interview(iv)
@@ -1189,13 +1201,16 @@ async def update_interview_stage(
         entry.note = body.note
     if body.caller is not None:
         previous = entry.caller
-        entry.caller = _round_caller(await _resolve_caller(body.caller), starts_at=entry.scheduledAt, previous=previous)
+        resolved = await _resolve_caller(body.caller, owner_id=str(iv.createdBy))
+        entry.caller = _round_caller(resolved, starts_at=entry.scheduledAt, previous=previous)
         # The creator picks a caller when adding a round; after that the caller managers assign it.
         if not is_caller_manager(user) and _assignment(entry.caller) != _assignment(previous):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only Admin or an interview manager can change the caller.",
             )
+        if _assignment(entry.caller) != _assignment(previous):
+            entry.confirmed = False  # the new caller has not agreed yet
     ended = _status_value(entry.status) in ENDED_STATUSES
     if entry.caller is None or not entry.caller.enabled or ended:
         entry.confirmed = False  # a caller is only lined up for an active caller round

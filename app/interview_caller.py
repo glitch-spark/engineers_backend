@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.interview_normalize import normalize_stage, normalize_status
 from app.models.interview import InterviewCaller
 
+CALLER_KINDS = ("external", "user")
 CALLER_METHODS = ("video", "phone_hushed", "phone_slynumber")
 # Statuses that call a round off: its #caller post is marked canceled.
 ENDED_STATUSES = ("canceled", "rejected")
@@ -23,6 +24,8 @@ class CallerIn(BaseModel):
     # From the caller list; "" = not assigned. The router resolves it and sets callerName. When both are left
     # out, the round keeps the caller it has.
     callerId: Optional[str] = None
+    # "external" | "user". The router sets it from the directory; a client's value is not trusted.
+    callerKind: Optional[str] = None
     method: Optional[str] = None
     methodValue: Optional[str] = None
 
@@ -55,13 +58,19 @@ def build_round_caller(
         raise CallerError("invalid caller method")
 
     if body.callerId is None and body.callerName is None and previous is not None:
-        caller_id, name = previous.callerId, previous.callerName
+        caller_id, name, kind = previous.callerId, previous.callerName, previous.callerKind
     else:
         caller_id, name = (body.callerId or None), (body.callerName or "").strip() or "TBD"
+        kind = body.callerKind
+        if kind is None and caller_id is not None and previous is not None and caller_id == previous.callerId:
+            kind = previous.callerKind  # same caller sent back without a kind
+        if kind not in CALLER_KINDS or caller_id is None:
+            kind = "external"
     return InterviewCaller(
         enabled=True,
         callerName=name,
         callerId=caller_id,
+        callerKind=kind,
         startsAt=_as_utc(starts_at),
         method=method,
         methodValue=(body.methodValue or "").strip(),

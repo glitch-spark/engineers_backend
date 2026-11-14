@@ -303,6 +303,125 @@ async def test_managers_assign_callers_on_anyones_round(client):
     assert (caller.callerId, caller.callerName) == (None, "TBD")
 
 
+async def test_assign_platform_user_sets_kind_user(client):
+    ana, puma = await make_user("Ana"), await make_user("Puma", role="interview_manager")
+    owner = await make_user("Owner")
+    iv = await make_interview(owner)
+    async with client(puma) as c:
+        res = await c.put(f"/interviews/{iv.id}/stages/{rid(iv)}/caller", json={"callerId": str(ana.id)})
+        assert res.status_code == 200, res.text
+        caller = res.json()["stageHistory"][-1]["caller"]
+        assert (caller["callerId"], caller["callerName"], caller["callerKind"]) == (str(ana.id), "Ana", "user")
+    stored = await fresh(iv)
+    assert stored.callerKind == "user" and stored.callerName == "Ana"
+
+
+async def test_assign_external_and_unassign_set_kind_external(client):
+    pietro, puma = await make_caller("Pietro"), await make_user("Puma", role="interview_manager")
+    ana, owner = await make_user("Ana"), await make_user("Owner")
+    iv = await make_interview(owner, caller_name="Ana", caller_id=str(ana.id))
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}/caller"
+    async with client(puma) as c:
+        assert (await c.put(url, json={"callerId": str(pietro.id)})).status_code == 200
+        assert (await fresh(iv)).callerKind == "external"
+        assert (await c.put(url, json={"callerId": ""})).status_code == 200
+    caller = await fresh(iv)
+    assert (caller.callerId, caller.callerName, caller.callerKind) == (None, "TBD", "external")
+
+
+async def test_owner_cannot_be_own_caller(client):
+    owner, puma = await make_user("Owner"), await make_user("Puma", role="interview_manager")
+    iv = await make_interview(owner)
+    copy = "You take your own interview as Self — pick someone else as the caller."
+    async with client(puma) as c:
+        res = await c.put(f"/interviews/{iv.id}/stages/{rid(iv)}/caller", json={"callerId": str(owner.id)})
+        assert res.status_code == 400 and res.json()["detail"] == copy
+    async with client(owner) as c:
+        body = {"stage": "tech_round_1", "scheduledAt": "2026-10-09T15:00:00Z",
+                "caller": {"enabled": True, "callerId": str(owner.id)}}
+        res = await c.post(f"/interviews/{iv.id}/stages", json=body)
+        assert res.status_code == 400 and res.json()["detail"] == copy
+        res = await c.patch(f"/interviews/{iv.id}/stages/{rid(iv)}",
+                            json={"caller": {"enabled": True, "callerId": str(owner.id)}})
+        assert res.status_code == 400 and res.json()["detail"] == copy
+        account = await Account(name="Erric", createdBy=owner.id).insert()
+        create = {"companyName": "Acme", "accountId": str(account.id),
+                  "resumeLink": None, "round": {"stage": "intro", "scheduledAt": "2026-10-09T15:00:00Z",
+                                                "caller": {"enabled": True, "callerId": str(owner.id)}}}
+        res = await c.post("/interviews", json=create)
+        assert res.status_code == 400 and res.json()["detail"] == copy
+        ana = await make_user("Ana")
+        create["round"]["caller"]["callerId"] = str(ana.id)
+        res = await c.post("/interviews", json=create)
+        assert res.status_code == 201, res.text
+        caller = res.json()["stageHistory"][-1]["caller"]
+        assert (caller["callerName"], caller["callerKind"]) == ("Ana", "user")
+
+
+async def test_inactive_user_is_no_longer_on_the_list(client):
+    gone, puma = await make_user("Gone"), await make_user("Puma", role="interview_manager")
+    gone.isActive = False
+    await gone.save()
+    iv = await make_interview(await make_user("Owner"))
+    async with client(puma) as c:
+        res = await c.put(f"/interviews/{iv.id}/stages/{rid(iv)}/caller", json={"callerId": str(gone.id)})
+        assert res.status_code == 400 and res.json()["detail"] == "That caller is no longer on the list."
+
+
+async def _confirm(iv):
+    fresh_iv = await Interview.get(iv.id)
+    fresh_iv.stageHistory[-1].confirmed = True
+    await fresh_iv.save()
+
+
+async def _confirmed(iv) -> bool:
+    return (await Interview.get(iv.id)).stageHistory[-1].confirmed
+
+
+async def test_changing_caller_clears_confirmed(client):
+    ana, bob = await make_user("Ana"), await make_user("Bob")
+    pietro, puma = await make_caller("Pietro"), await make_user("Puma", role="interview_manager")
+    iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
+    await _confirm(iv)
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}/caller"
+    async with client(puma) as c:
+        assert (await c.put(url, json={"callerId": str(ana.id)})).status_code == 200  # same caller
+        assert await _confirmed(iv) is True
+        assert (await c.put(url, json={"callerId": str(bob.id)})).status_code == 200
+        assert await _confirmed(iv) is False
+        await _confirm(iv)
+        assert (await c.put(url, json={"callerId": str(pietro.id)})).status_code == 200
+        assert await _confirmed(iv) is False
+
+
+async def test_patch_changing_caller_clears_confirmed_same_caller_keeps_it(client):
+    ana, bob = await make_user("Ana"), await make_user("Bob")
+    admin = await make_user("Admin", role="admin")
+    iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
+    await _confirm(iv)
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}"
+    async with client(admin) as c:
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(ana.id)}})
+        assert res.status_code == 200, res.text
+        assert await _confirmed(iv) is True
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(bob.id)}})
+        assert res.status_code == 200, res.text
+        assert await _confirmed(iv) is False
+    assert (await fresh(iv)).callerKind == "user"
+
+
+async def test_creator_picks_a_platform_user_when_adding_a_round(client):
+    ana, owner = await make_user("Ana"), await make_user("Owner")
+    iv = await make_interview(owner, caller=False)
+    body = {"stage": "tech_round_1", "scheduledAt": "2026-10-09T15:00:00Z",
+            "caller": {"enabled": True, "callerId": str(ana.id), "callerKind": "external"}}  # client kind is ignored
+    async with client(owner) as c:
+        res = await c.post(f"/interviews/{iv.id}/stages", json=body)
+        assert res.status_code == 201, res.text
+        caller = res.json()["stageHistory"][-1]["caller"]
+        assert (caller["callerId"], caller["callerName"], caller["callerKind"]) == (str(ana.id), "Ana", "user")
+
+
 # ---- calendar feed ----
 
 def _feed_iv(*rounds):
