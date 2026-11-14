@@ -278,6 +278,48 @@ def bid_period(period: str, day: str, to: str, now: datetime) -> BidPeriod:
                      columns=pay_week_columns(start, end, sched) if start <= end else [])
 
 
+async def _self_rows(user, owner, bidders: list[Bidder], p: BidPeriod) -> list[dict]:
+    """The owners' own applies recorded by the extension (self bids), one row per owner in view: the signed-in owner,
+    the picked owner, or every owner with bidders for an admin viewing all. Kept out of the bidders' totals."""
+    from app.models import Account
+    from app.profile_metrics import interview_rounds
+    from app.self_bids import tracked_counts
+
+    if owner is not None:
+        owners = [owner]
+    elif user.role != "admin":
+        owners = [user.id]
+    else:
+        owners = list({b.createdBy for b in bidders})
+    if not owners or p.start > p.end:
+        return []
+    names = {u.id: u.name or u.email or "" for u in await UserExtra.find({"_id": {"$in": owners}}).to_list()}
+    col_of = {}
+    for i, c in enumerate(p.columns):
+        d = date.fromisoformat(c["start"])
+        while d <= date.fromisoformat(c["end"]):
+            col_of[d] = i
+            d += timedelta(days=1)
+    out = []
+    for o in owners:
+        counts = await tracked_counts(o, p.start, p.end)
+        if not counts:
+            continue
+        weekly = [0] * len(p.columns)
+        for (_pid, d), n in counts.items():
+            if d in col_of:
+                weekly[col_of[d]] += n
+        accounts = [a.id for a in await Account.find({"createdBy": o}).to_list()]
+        rounds = await interview_rounds(accounts, p.start, p.end) if accounts else {}
+        last = await Bid.find({"kind": "self", "ownerId": o}).sort("-firstAt").limit(1).to_list()
+        out.append({
+            "ownerId": str(o), "ownerName": names.get(o, ""), "total": sum(counts.values()), "weekly": weekly,
+            "interviews": sum(v[2] for v in rounds.values()),  # rounds of interviews tagged "Applied by: Self"
+            "lastBidAt": _iso_utc(last[0].firstAt) if last else None,
+        })
+    return out
+
+
 def _pay_week_out(pw: PayWeek, now: datetime) -> dict:
     sched = schedule_from_settings()
     return {"start": _iso_utc(pw.start), "end": _iso_utc(pw.end), "label": week_label(pw), "timezone": sched.tz.key,
@@ -328,6 +370,7 @@ async def bids_performance(
     bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
     out = await performance(bidders, period, p.start, p.end, p.label, p.today, columns=p.columns)
     out["payWeek"] = _pay_week_out(p.pay_week, now.astimezone(timezone.utc)) if p.pay_week else None
+    out["selfRows"] = await _self_rows(user, owner, bidders, p)
     if p.pay_week:
         # Money and "to review" come from the pay week board (the pay-week window, folder counts before records start),
         # so they match /bids/week, the weekly report and actual pay; the performance measures stay on report days.

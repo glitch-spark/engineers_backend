@@ -23,7 +23,7 @@ pytestmark = [
     pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
 ]
 
-KEYS = {"period", "start", "end", "label", "recordsStart", "weeks", "bidders", "totals", "top", "payWeek"}
+KEYS = {"period", "start", "end", "label", "recordsStart", "weeks", "bidders", "totals", "top", "payWeek", "selfRows"}
 
 
 @pytest.fixture

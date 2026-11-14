@@ -107,3 +107,18 @@ async def test_card_tops_add_streak_and_interviews(db):
     tops = (await bids_router.bids_insights(pedro, period="week", date="", to="", ownerId=None))["tops"]
     assert {"streak", "interviews"} <= set(tops)
     assert all("id" not in (t["platform"] or {}) for t in tops.values())
+
+
+async def test_the_owners_self_bids_get_their_own_row_outside_the_totals(db):
+    pedro, _ana, _bo = await setup()
+    alpha = await Account(name="Alpha", createdBy=pedro.id).insert()
+    for day, n in ((16, 3), (17, 2)):
+        first = datetime(2026, 11, day, 10, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+        for _ in range(n):
+            await Bid(kind="self", bidderId=None, ownerId=pedro.id, accountId=alpha.id, jobKey=f"self-{pedro.id}/x/j{next(_n)}",
+                      firstAt=first, status="approved", screenshots=[]).insert()
+    r = await perf(pedro)
+    assert r["selfRows"] == [{"ownerId": str(pedro.id), "ownerName": "Pedro", "total": 5,
+                              "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0, "lastBidAt": r["selfRows"][0]["lastBidAt"]}]
+    assert r["selfRows"][0]["lastBidAt"] is not None
+    assert r["totals"]["total"] == 14 and r["totals"]["approved"] == 10   # Ana's bidder bids only
