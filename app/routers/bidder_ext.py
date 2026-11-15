@@ -116,6 +116,14 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
     return result.matched_count == 1
 
 
+@router.get("/latest")
+async def latest() -> dict:
+    """The newest Bid Track version and its download link (Railway settings), so an older extension can show
+    "Update available". No sign-in needed; both null while unset."""
+    s = get_settings()
+    return {"version": s.EXT_LATEST_VERSION or None, "url": s.EXT_DOWNLOAD_URL or None}
+
+
 @router.post("/register")
 async def register(body: RegisterIn, request: Request) -> dict:
     keys = _keys(body.username, request)

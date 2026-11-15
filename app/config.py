@@ -149,6 +149,9 @@ class Settings(BaseSettings):
     # to typed, nothing changes); an ISO day = each owner's profile switches to tracked counts from its first tracked
     # day on or after it.
     SELF_BIDS_TRACKED_FROM: Optional[str] = None
+    # Bid Track update notice: the newest extension version and where to download it (unset = no notice).
+    EXT_LATEST_VERSION: Optional[str] = None
+    EXT_DOWNLOAD_URL: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
     # Profile metrics start here (YYYY-MM-DD): earlier weeks are not shown. Unset = the day after this release first
