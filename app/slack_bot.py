@@ -1,14 +1,16 @@
-"""Slack interview bot: #caller threads, reminders and the daily caller list.
+"""Slack interview bot: #caller threads, the interview day post and its 30-minute reminders.
 
 Uses the workspace Bot Token (chat.postMessage). Users type their Slack member id in Profile; it is
 stored on UserExtra and used to @-mention them (and for the Profile test DM). Channel posts: one "Caller needed" thread per
-interview in the private SLACK_CALLER_CHANNEL_ID, the daily caller list in SLACK_CALLER_DAILY_CHANNEL_ID, and
+interview in the private SLACK_CALLER_CHANNEL_ID, the interview day post in SLACK_CALLER_DAILY_CHANNEL_ID, and
 each daily plan in SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
-A round with a caller gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner and
-the interview managers. Each morning the day's caller interviews are listed in SLACK_CALLER_DAILY_CHANNEL_ID,
-tagging each owner and cc'ing the managers; there are no per-user digest DMs. Transactions live in
-app/slack_transactions.py.
+Each morning (SLACK_CALLER_DAILY_TIME) one day post lists every round of the local day, whoever is on the call, with
+Confirm / Assign caller / Download brief buttons; it is edited in place whenever an interview changes. About 30
+minutes before a round starts it gets a reminder reply in the day post's thread, built like its block in the post.
+Dedup rows (SlackAlertLog) use the keys "interview-day:<YYYY-MM-DD>" and "round-reminder:<roundId>:<startEpoch>";
+there are no per-user digest DMs. The day post and reminders live in app/interview_day/, button clicks in
+app/interview_day/actions.py, transactions in app/slack_transactions.py.
 """
 
 from __future__ import annotations
@@ -690,18 +692,25 @@ def _caller_daily_configured() -> Optional[tuple[str, time, ZoneInfo]]:
 
 
 async def run_alert_tick() -> dict[str, Any]:
-    """Cron entrypoint: the 30-minute round reminders, then the day post. Sends no DMs."""
-    from app.interview_day.post import run_day_post  # post imports this module
+    """Cron entrypoint: the day post first (a round starting at 05:00-05:30 is reminded in the same tick and
+    threads under it), then the 30-minute round reminders, then a refresh of today's post so changes no interview
+    write reports (renames, deactivations, Slack ID changes, archives, a refresh that failed) reach it. Each step
+    is isolated from the others. Sends no DMs."""
+    from app.interview_day.post import refresh_today, run_day_post  # post imports this module
     from app.interview_day.reminders import run_round_reminders
 
-    try:
-        reminders = await run_round_reminders(datetime.now(timezone.utc))
-    except Exception as exc:  # never block the day post
-        log.exception("slack_bot round reminders crashed: %s", exc)
-        reminders = {"sent": 0, "failed": 0}
     try:
         caller_daily = await run_day_post(datetime.now(timezone.utc))
     except Exception as exc:
         log.exception("slack_bot interview day post crashed: %s", exc)
         caller_daily = "failed"
+    try:
+        reminders = await run_round_reminders(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot round reminders crashed: %s", exc)
+        reminders = {"sent": 0, "failed": 0}
+    try:
+        await refresh_today()  # no interview id: the unconditional refresh
+    except Exception as exc:
+        log.warning("slack_bot day post refresh failed: %s", exc)
     return {"caller_reminders": reminders["sent"], "caller_daily": caller_daily}

@@ -16,6 +16,14 @@ CALLER_METHODS = ("video", "phone_hushed", "phone_slynumber")
 ENDED_STATUSES = ("canceled", "rejected")
 
 
+def caller_unassigned(caller: Any) -> bool:
+    """A caller round nobody is on yet: no caller id and no typed name (or the "TBD" placeholder). A name typed
+    before the caller list existed counts as a named, external caller."""
+    if caller is None or getattr(caller, "callerId", None):
+        return False
+    return (getattr(caller, "callerName", "") or "").strip().upper() in ("", "TBD")
+
+
 class CallerIn(BaseModel):
     # Older clients also send `timezone`; it is ignored (Slack shows each
     # reader their own time).

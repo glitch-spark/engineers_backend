@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from app.caller_access import can_confirm
-from app.interview_caller import ENDED_STATUSES
+from app.interview_caller import ENDED_STATUSES, caller_unassigned
 from app.models import Interview, UserExtra
 
 NOT_ALLOWED = "Only the caller or an interview manager can confirm."
@@ -44,7 +44,7 @@ async def confirm_round(iv_id: str, round_id: str, user: UserExtra, confirmed: b
             raise ConfirmError(400, "Only caller rounds are confirmed")
         if ivr._status_value(entry.status) in ENDED_STATUSES:
             raise ConfirmError(400, "A canceled or rejected round can't be confirmed")
-        if not entry.caller.callerId:
+        if caller_unassigned(entry.caller):
             raise ConfirmError(400, "Assign a caller first")
     entry.confirmed = confirmed
     iv.stageHistory[idx] = entry

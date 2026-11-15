@@ -56,11 +56,11 @@ async def make_user(name="Pedro", role="staff") -> UserExtra:
     return await UserExtra(name=name, email=f"{name.lower()}@x.io", role=role).insert()
 
 
-async def make_interview(owner, *, caller=True, confirmed=False) -> Interview:
+async def make_interview(owner, *, caller=True, confirmed=False, name="Sam") -> Interview:
     entry = InterviewStageEvent(
         stage="intro", at=START, scheduledAt=START, endsAt=START.replace(hour=16), status="scheduled",
         confirmed=confirmed,
-        caller=InterviewCaller(enabled=caller, callerName="Sam", startsAt=START, method="video"),
+        caller=InterviewCaller(enabled=caller, callerName=name, startsAt=START, method="video"),
     )
     return await Interview(
         accountId=PydanticObjectId(), createdBy=owner.id, scheduledAt=START, companyName="Acme",
@@ -86,6 +86,15 @@ async def test_owner_confirms_caller_round(client):
     assert body["stageHistory"][-1]["confirmed"] is True and body["confirmed"] is True
     saved = await Interview.get(iv.id)
     assert saved.stageHistory[-1].confirmed is True and saved.confirmed is True
+
+
+@pytest.mark.parametrize("name", ["TBD", "tbd", ""])
+async def test_confirm_tbd_round_is_400(client, name):
+    owner = await make_user()
+    iv = await make_interview(owner, name=name)
+    r = await patch(client, owner, iv, {"confirmed": True})
+    assert (r.status_code, r.json()["detail"]) == (400, "Assign a caller first")
+    assert (await Interview.get(iv.id)).stageHistory[-1].confirmed is False
 
 
 async def test_admin_can_unconfirm(client):

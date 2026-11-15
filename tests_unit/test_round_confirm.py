@@ -132,6 +132,21 @@ async def test_tbd_round_cannot_be_confirmed(client):
     assert (r.status_code, r.json()["detail"]) == (400, "Assign a caller first")
 
 
+async def test_blank_name_without_a_caller_is_unassigned(client):
+    owner, manager = await make_user(), await make_user("Mia", "admin")
+    iv = await make_interview(owner, caller_id=None, name="")
+    r = await confirm(client, manager, iv)
+    assert (r.status_code, r.json()["detail"]) == (400, "Assign a caller first")
+
+
+async def test_typed_name_without_a_caller_id_can_be_confirmed(client):
+    # Rounds from before the caller list have a name and no id; the app shows them as assigned.
+    owner, manager = await make_user(), await make_user("Mia", "admin")
+    iv = await make_interview(owner, caller_id=None, name="Sam")
+    r = await confirm(client, manager, iv)
+    assert r.status_code == 200 and (await Interview.get(iv.id)).stageHistory[-1].confirmed is True
+
+
 async def test_non_caller_round_is_400(client):
     owner = await make_user()
     iv = await make_interview(owner, enabled=False)

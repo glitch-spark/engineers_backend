@@ -45,17 +45,44 @@ def test_bounds_on_dst_day_are_25_hours():
 # --- cron order -------------------------------------------------------------------------------
 
 
-def test_alert_tick_runs_day_post_after_reminders():
+def test_alert_tick_posts_the_day_before_the_reminders_and_then_refreshes_it():
+    # A 05:00-05:30 round is reminded in the same tick: its reminder must thread under the new post.
     order = []
     reminders = AsyncMock(side_effect=lambda now: order.append("reminders") or {"sent": 0, "failed": 0})
     day_post = AsyncMock(side_effect=lambda now: order.append("day_post") or "posted")
+    refresh = AsyncMock(side_effect=lambda *a, **k: order.append("refresh") or True)
     with (
         patch("app.interview_day.reminders.run_round_reminders", reminders),
         patch("app.interview_day.post.run_day_post", day_post),
+        patch("app.interview_day.post.refresh_today", refresh),
         patch.object(slack_bot, "slack_bot_configured", lambda: False),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert order == ["reminders", "day_post"] and out["caller_daily"] == "posted"
+    assert order == ["day_post", "reminders", "refresh"] and out["caller_daily"] == "posted"
+
+
+def test_alert_tick_refreshes_the_post_unconditionally_once():
+    # No interview id: renames, deactivations and archives (which no interview write reports) reach the post too.
+    refresh = AsyncMock(return_value=True)
+    with (
+        patch("app.interview_day.reminders.run_round_reminders", AsyncMock(return_value={"sent": 0, "failed": 0})),
+        patch("app.interview_day.post.run_day_post", AsyncMock(return_value="already_sent")),
+        patch("app.interview_day.post.refresh_today", refresh),
+    ):
+        asyncio.run(slack_bot.run_alert_tick())
+    refresh.assert_awaited_once()
+    assert refresh.await_args.kwargs.get("interview_id") is None and not refresh.await_args.args[1:]
+
+
+def test_alert_tick_survives_a_failing_refresh():
+    reminders = AsyncMock(return_value={"sent": 3, "failed": 0})
+    with (
+        patch("app.interview_day.reminders.run_round_reminders", reminders),
+        patch("app.interview_day.post.run_day_post", AsyncMock(return_value="already_sent")),
+        patch("app.interview_day.post.refresh_today", AsyncMock(side_effect=RuntimeError("slack down"))),
+    ):
+        out = asyncio.run(slack_bot.run_alert_tick())
+    assert out == {"caller_reminders": 3, "caller_daily": "already_sent"}
 
 
 def test_alert_tick_sends_no_dms():

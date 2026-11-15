@@ -39,6 +39,7 @@ from app.interview_caller import (
     CallerError,
     CallerIn,
     build_round_caller,
+    caller_unassigned,
     round_caller_snapshot,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
@@ -1265,6 +1266,8 @@ async def update_interview_stage(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="A canceled or rejected round can't be confirmed",
             )
+        if body.confirmed and caller_unassigned(entry.caller):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Assign a caller first")
         entry.confirmed = body.confirmed
     iv.stageHistory[idx] = entry
 

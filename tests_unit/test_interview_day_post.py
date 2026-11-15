@@ -228,6 +228,12 @@ async def test_today_parent_ts_is_the_first_message(slack):
     assert await post.today_parent_ts(chi(8, day=DAY + timedelta(days=1))) is None
 
 
+async def test_parent_ts_for_day_is_that_days_first_message(slack):
+    await post.run_day_post(chi(5, 2))
+    assert await post.parent_ts_for_day(DAY) == "1"
+    assert await post.parent_ts_for_day(DAY + timedelta(days=1)) is None
+
+
 async def test_one_permalink_per_interview_for_all_its_rounds(slack):
     iv = await add("Acme", 9)
     iv.slackThread = SlackThread(channel="C_CALLER", ts="100.1")

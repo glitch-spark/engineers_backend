@@ -209,6 +209,21 @@ async def test_load_rounds_external_caller_and_confirmed(db):
     assert r.profile == ""
 
 
+async def test_typed_name_without_a_caller_id_is_a_named_external_caller_not_tbd(db):
+    owner = await UserExtra(name="Pedro", email="p@x.io").insert()
+    names = ["Sam", "TBD", "tbd", " ", ""]
+    await Interview(
+        accountId=PydanticObjectId(), createdBy=owner.id, scheduledAt=START, companyName="Acme",
+        stageHistory=[ev(at=START + timedelta(minutes=i), caller=InterviewCaller(enabled=True, callerName=n))
+                      for i, n in enumerate(names)],
+    ).insert()
+    got = await load_rounds(START - timedelta(hours=1), START + timedelta(hours=1))
+    assert [(r.caller, r.caller_name) for r in got] == [
+        ("external", "Sam"), ("tbd", "TBD"), ("tbd", "tbd"), ("tbd", " "), ("tbd", ""),
+    ]
+    assert "Confirm" in buttons(blocks(got[0])) and "Assign caller" not in buttons(blocks(got[0]))
+
+
 # --- limits and link text -------------------------------------------------------------------------
 
 

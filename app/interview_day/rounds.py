@@ -8,7 +8,7 @@ from typing import Any, Literal, Optional
 
 from beanie import PydanticObjectId
 
-from app.interview_caller import ENDED_STATUSES
+from app.interview_caller import ENDED_STATUSES, caller_unassigned
 from app.interview_normalize import interview_status_value, normalize_stage
 from app.models import Account, Interview, UserExtra
 from app.models.interview import InterviewStage
@@ -57,7 +57,7 @@ def _object_id(raw: Any) -> Optional[PydanticObjectId]:
 def _caller_state(caller: Any) -> CallerState:
     if caller is None or not caller.enabled:
         return "self"
-    if not caller.callerId:
+    if caller_unassigned(caller):
         return "tbd"
     return "user" if caller.callerKind == "user" else "external"
 

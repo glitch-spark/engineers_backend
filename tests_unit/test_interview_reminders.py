@@ -170,3 +170,32 @@ async def test_lost_day_post_falls_back_to_top_level(slack):
     assert await reminders.run_round_reminders(chi(9)) == {"sent": 1, "failed": 0}
     first, second = slack.posts()
     assert first["thread_ts"] == "77.1" and "thread_ts" not in second
+
+
+async def test_round_just_after_midnight_threads_under_its_own_days_post(slack):
+    # Reminded at 23:40 for a 00:10 round: today's post is the wrong thread, tomorrow's is the right one.
+    await day_post()
+    tomorrow = DAY + timedelta(days=1)
+    await InterviewDayPost(day=tomorrow.isoformat(), channel="C_DAILY", ts=["88.1"], interviewIds=[]).insert()
+    await add("Night", chi(0, 10).replace(day=tomorrow.day))
+    assert await reminders.run_round_reminders(chi(23, 40)) == {"sent": 1, "failed": 0}
+    assert slack.posts()[0]["thread_ts"] == "88.1"
+
+
+async def test_round_after_midnight_without_its_post_yet_is_posted_top_level(slack):
+    await day_post()  # only today's post exists; the next one is made at 05:00
+    await add("Night", chi(0, 10).replace(day=DAY.day + 1))
+    assert await reminders.run_round_reminders(chi(23, 40)) == {"sent": 1, "failed": 0}
+    assert "thread_ts" not in slack.posts()[0]
+
+
+async def test_a_failing_release_does_not_skip_the_rest_of_the_tick(slack, monkeypatch):
+    async def broken_release(key):
+        raise RuntimeError("mongo down")
+
+    monkeypatch.setattr(slack_bot, "_reminder_release", broken_release)
+    await add("First", chi(9, 20))
+    await add("Second", chi(9, 25))
+    slack.errors["chat.postMessage"] = ["ratelimited", None]
+    assert await reminders.run_round_reminders(chi(9)) == {"sent": 1, "failed": 1}
+    assert "Second" in slack.posts()[1]["text"]

@@ -121,13 +121,16 @@ def _local_today(now: Optional[datetime]) -> Optional[tuple[str, ZoneInfo]]:
     return _now(now).astimezone(tz).date().isoformat(), tz
 
 
-async def today_parent_ts(now: datetime) -> Optional[str]:
-    """The first message of today's post (what #caller reminders thread under), None when it is not posted."""
-    local = _local_today(now)
-    if local is None:
-        return None
-    stored = await InterviewDayPost.find_one(InterviewDayPost.day == local[0])
+async def parent_ts_for_day(day: date) -> Optional[str]:
+    """The first message of that local day's post (what its reminders thread under), None when it is not posted."""
+    stored = await InterviewDayPost.find_one(InterviewDayPost.day == day.isoformat())
     return stored.ts[0] if stored is not None and stored.ts else None
+
+
+async def today_parent_ts(now: datetime) -> Optional[str]:
+    """The first message of today's post, None when it is not posted or Slack is off."""
+    local = _local_today(now)
+    return await parent_ts_for_day(date.fromisoformat(local[0])) if local is not None else None
 
 
 async def _is_affected(stored: InterviewDayPost, interview_id: str, deleted: bool, day: date, tz: ZoneInfo) -> bool:

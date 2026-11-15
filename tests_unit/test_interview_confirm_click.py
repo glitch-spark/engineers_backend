@@ -6,7 +6,7 @@ import hmac
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlencode
@@ -21,6 +21,7 @@ from mongomock_motor import AsyncMongoMockClient  # noqa: E402
 from app.interview_day import actions  # noqa: E402
 from app.models import Account, UserExtra  # noqa: E402
 from app.models.interview import Interview, InterviewCaller, InterviewStageEvent  # noqa: E402
+from app.models.interview_day_post import InterviewDayPost  # noqa: E402
 from app.models.interview_question import InterviewQuestion  # noqa: E402
 from app.routers import slack_bot as slack_router  # noqa: E402
 
@@ -31,6 +32,7 @@ pytestmark = [
 
 START = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
 RESPONSE_URL = "https://hooks.slack.com/actions/T1/1/abc"
+REMINDER_TS = "55.5"
 REFUSAL = "Only the caller or an interview manager can confirm."
 SECRET = "test-signing-secret"
 PATH = "/integrations/slack/interactions"
@@ -39,7 +41,7 @@ PATH = "/integrations/slack/interactions"
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["confirm-click-unit"]
-    await init_beanie(database=database, document_models=[Interview, UserExtra, Account, InterviewQuestion])
+    await init_beanie(database=database, document_models=[Interview, UserExtra, Account, InterviewQuestion, InterviewDayPost])
     return database
 
 
@@ -92,6 +94,78 @@ async def test_caller_click_confirms(slack):
     await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL)
     assert await confirmed(iv) is True
     assert slack == []
+
+
+def _button_labels(blocks) -> list[str]:
+    return [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+
+
+def _text(blocks) -> str:
+    return " ".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+
+
+async def test_reminder_click_replaces_the_reminder_with_the_confirmed_round(slack):
+    owner = await make_user()
+    caller = await make_user("Cal", slack_id="U0CALLER01")
+    iv = await make_interview(owner, caller_id=str(caller.id))
+    with patch.object(actions, "_now", lambda: START - timedelta(minutes=20)):
+        await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL, REMINDER_TS)
+    assert await confirmed(iv) is True
+    ((url, payload),) = slack
+    assert url == RESPONSE_URL and payload["replace_original"] is True
+    assert payload["response_type"] == "in_channel"
+    text = _text(payload["blocks"])
+    assert "✅ confirmed" in text and "not confirmed" not in text and "Starting in 20 min" in text
+    assert "Confirm" not in _button_labels(payload["blocks"])
+    assert "Download brief" in _button_labels(payload["blocks"]) and payload["text"]
+
+
+async def test_reminder_click_after_the_start_drops_the_countdown(slack):
+    owner = await make_user()
+    caller = await make_user("Cal", slack_id="U0CALLER01")
+    iv = await make_interview(owner, caller_id=str(caller.id))
+    with patch.object(actions, "_now", lambda: START + timedelta(minutes=2)):
+        await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL, REMINDER_TS)
+    ((_, payload),) = slack
+    assert payload["replace_original"] is True and "Starting in" not in _text(payload["blocks"])
+
+
+async def test_day_post_click_leaves_the_post_to_the_refresh(slack):
+    # The day post lists many rounds: replacing it with one round would wipe the rest.
+    owner = await make_user()
+    caller = await make_user("Cal", slack_id="U0CALLER01")
+    iv = await make_interview(owner, caller_id=str(caller.id))
+    await InterviewDayPost(day="2026-10-07", channel="C", ts=["44.1", "44.2"], interviewIds=[str(iv.id)]).insert()
+    await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL, "44.2")
+    assert await confirmed(iv) is True and slack == []
+
+
+async def test_failed_rebuild_falls_back_to_a_confirmation_note(slack):
+    owner = await make_user()
+    caller = await make_user("Cal", slack_id="U0CALLER01")
+    iv = await make_interview(owner, caller_id=str(caller.id))
+    with patch.object(actions, "rebuild_reminder", AsyncMock(side_effect=RuntimeError("boom"))):
+        await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL, REMINDER_TS)
+    assert await confirmed(iv) is True
+    assert slack == [(RESPONSE_URL, {"response_type": "ephemeral", "replace_original": False,
+                                     "text": "Confirmed — thanks."})]
+
+
+async def test_round_missing_after_confirm_falls_back_to_a_confirmation_note(slack):
+    owner = await make_user()
+    caller = await make_user("Cal", slack_id="U0CALLER01")
+    iv = await make_interview(owner, caller_id=str(caller.id))
+    with patch.object(actions, "rebuild_reminder", AsyncMock(side_effect=LookupError("gone"))):
+        await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL, REMINDER_TS)
+    assert [p["text"] for _, p in slack] == ["Confirmed — thanks."]
+
+
+async def test_refusal_does_not_touch_the_reminder(slack):
+    owner = await make_user()
+    iv = await make_interview(owner, caller_id="ext1", kind="external")
+    await make_user("Other", slack_id="U0OTHER001")
+    await actions.process_confirm_click(value(iv), "U0OTHER001", RESPONSE_URL, REMINDER_TS)
+    assert [(p["replace_original"], p["text"]) for _, p in slack] == [(False, REFUSAL)]
 
 
 async def test_clicking_again_keeps_it_confirmed(slack):
@@ -192,6 +266,7 @@ def _signed(body: bytes) -> dict:
 def _confirm_body() -> bytes:
     payload = {
         "type": "block_actions", "user": {"id": "U0CALLER01"}, "response_url": RESPONSE_URL,
+        "message": {"ts": REMINDER_TS},
         "actions": [{"action_id": "interview_confirm", "value": "iv1:r1", "type": "button"}],
     }
     return urlencode({"payload": json.dumps(payload)}).encode()
@@ -216,7 +291,7 @@ async def test_router_dispatches_confirm_action(db):
     body = _confirm_body()
     r = await _post(body, _signed(body), seen)
     assert r.status_code == 200
-    seen.assert_awaited_once_with("iv1:r1", "U0CALLER01", RESPONSE_URL)
+    seen.assert_awaited_once_with("iv1:r1", "U0CALLER01", RESPONSE_URL, "55.5")
 
 
 async def test_router_confirm_needs_a_valid_signature(db):

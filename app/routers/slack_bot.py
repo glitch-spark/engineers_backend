@@ -150,8 +150,9 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> d
     value = str(action.get("value") or "")
     slack_user_id = str(user.get("id") or "")
     response_url = str(payload.get("response_url") or "")
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
     if action_id == CONFIRM_ACTION_ID:
-        background.add_task(process_confirm_click, value, slack_user_id, response_url)
+        background.add_task(process_confirm_click, value, slack_user_id, response_url, str(message.get("ts") or ""))
     elif is_transaction_action(action_id):
         background.add_task(process_transaction_click, action_id, value, slack_user_id, response_url)
     return {"ok": True}
