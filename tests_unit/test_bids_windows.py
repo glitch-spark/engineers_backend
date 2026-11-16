@@ -175,7 +175,7 @@ def test_env_examples_have_no_inline_comments_in_bid_values():
     example = _bid_env_values((root / ".env.example").read_text(encoding="utf-8"))
     doc = (root / "docs" / "bids.md").read_text(encoding="utf-8")
     doc_env = _bid_env_values(doc.split("```env", 1)[1].split("```", 1)[0])
-    assert len(example) == 12 and set(doc_env) == set(example)
+    assert len(example) == 16 and set(doc_env) == set(example)
     for values in (example, doc_env):
         assert all("#" not in (v or "") for v in values.values()), values
 
