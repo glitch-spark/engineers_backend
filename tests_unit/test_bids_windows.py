@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import ValidationError
 
-from app.bids.windows import BidSchedule, latest_cutoff, open_window, period_key, schedule_from_settings, window_for
+from app.bids.windows import BidSchedule, Rules, latest_cutoff, open_window, period_key, schedule_from_settings, window_for
 from app.config import Settings
 
 CT = ZoneInfo("America/Chicago")
@@ -88,6 +88,61 @@ def test_storage_endpoint_url_is_optional_and_trimmed(value, expected):
 def test_invalid_schedule_settings_fail_validation(field, value):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a" * 32, **{field: value})
+
+
+_SWITCH = dict(BID_SCHEDULE_SWITCH_AT="2026-11-22T20:00", BID_NEXT_DAILY_REPORT_TIME="18:00",
+               BID_NEXT_WEEKLY_REPORT_DAY="sunday", BID_NEXT_WEEKLY_REPORT_TIME="20:00")
+
+
+def _settings(**over):
+    return Settings(_env_file=None, MONGODB_URI="m", AUTH_SECRET="a" * 32, **over)
+
+
+def test_switch_settings_build_a_two_rule_schedule():
+    sched = schedule_from_settings(_settings(**_SWITCH))
+    assert sched.switch_at == datetime(2026, 11, 22, 20, 0, tzinfo=CT)
+    assert sched.next_rules == Rules(time(18, 0), 6, time(20, 0))
+    assert (sched.tz, sched.daily_at, sched.weekly_day, sched.weekly_at) == (CT, time(18, 30), 5, time(16, 0))
+
+
+def test_switch_off_by_default():
+    sched = schedule_from_settings(_settings())
+    assert sched.switch_at is None and sched.next_rules is None
+
+
+def test_blank_switch_values_mean_off():
+    sched = schedule_from_settings(_settings(BID_SCHEDULE_SWITCH_AT=" ", BID_NEXT_DAILY_REPORT_TIME="",
+                                             BID_NEXT_WEEKLY_REPORT_DAY="", BID_NEXT_WEEKLY_REPORT_TIME=""))
+    assert sched.switch_at is None and sched.next_rules is None
+
+
+@pytest.mark.parametrize("missing", ["BID_NEXT_DAILY_REPORT_TIME", "BID_NEXT_WEEKLY_REPORT_DAY",
+                                     "BID_NEXT_WEEKLY_REPORT_TIME"])
+def test_switch_needs_all_next_values(missing):
+    values = {k: v for k, v in _SWITCH.items() if k != missing}
+    with pytest.raises(ValidationError):
+        _settings(**values)
+
+
+@pytest.mark.parametrize("override", [
+    {"BID_SCHEDULE_SWITCH_AT": "2026-11-22T19:00"},  # right day, wrong time
+    {"BID_SCHEDULE_SWITCH_AT": "2026-11-21T20:00"},  # a Saturday
+    {"BID_NEXT_WEEKLY_REPORT_DAY": "saturday"},
+    {"BID_NEXT_WEEKLY_REPORT_TIME": "19:00"},
+])
+def test_switch_must_sit_on_the_next_weekly_cutoff(override):
+    with pytest.raises(ValidationError):
+        _settings(**{**_SWITCH, **override})
+
+
+@pytest.mark.parametrize("override", [
+    {"BID_SCHEDULE_SWITCH_AT": "2026-11-22 20:00"}, {"BID_SCHEDULE_SWITCH_AT": "2026-11-22"},
+    {"BID_SCHEDULE_SWITCH_AT": "2026-02-30T20:00"}, {"BID_NEXT_DAILY_REPORT_TIME": "25:00"},
+    {"BID_NEXT_WEEKLY_REPORT_DAY": "funday"},
+])
+def test_invalid_switch_values_fail_validation(override):
+    with pytest.raises(ValidationError):
+        _settings(**{**_SWITCH, **override})
 
 
 def _bid_env_values(text: str) -> dict:

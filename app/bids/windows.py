@@ -16,11 +16,21 @@ Kind = Literal["daily", "weekly"]
 
 
 @dataclass(frozen=True)
+class Rules:
+    daily_at: time
+    weekly_day: int  # Monday=0
+    weekly_at: time
+
+
+@dataclass(frozen=True)
 class BidSchedule:
+    # daily_at / weekly_day / weekly_at are the rules before switch_at (or the only rules when there is no switch).
     tz: ZoneInfo
     daily_at: time
     weekly_day: int  # Monday=0
     weekly_at: time
+    switch_at: Optional[datetime] = None  # aware in tz; next_rules apply from here on
+    next_rules: Optional[Rules] = None
 
 
 def _parse_hhmm(s: str) -> time:
@@ -30,11 +40,23 @@ def _parse_hhmm(s: str) -> time:
 
 def schedule_from_settings(s: Optional[Settings] = None) -> BidSchedule:
     s = s or get_settings()
+    tz = ZoneInfo(s.BID_REPORT_TIMEZONE)
+    switch_at: Optional[datetime] = None
+    next_rules: Optional[Rules] = None
+    if s.BID_SCHEDULE_SWITCH_AT:  # Settings guarantees the three NEXT values are set with it
+        switch_at = datetime.fromisoformat(s.BID_SCHEDULE_SWITCH_AT).replace(tzinfo=tz)
+        next_rules = Rules(
+            daily_at=_parse_hhmm(s.BID_NEXT_DAILY_REPORT_TIME),
+            weekly_day=WEEKDAYS.index(s.BID_NEXT_WEEKLY_REPORT_DAY),
+            weekly_at=_parse_hhmm(s.BID_NEXT_WEEKLY_REPORT_TIME),
+        )
     return BidSchedule(
-        tz=ZoneInfo(s.BID_REPORT_TIMEZONE),
+        tz=tz,
         daily_at=_parse_hhmm(s.BID_DAILY_REPORT_TIME),
         weekly_day=WEEKDAYS.index(s.BID_WEEKLY_REPORT_DAY),
         weekly_at=_parse_hhmm(s.BID_WEEKLY_REPORT_TIME),
+        switch_at=switch_at,
+        next_rules=next_rules,
     )
 
 
