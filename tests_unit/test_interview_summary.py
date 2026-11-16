@@ -1,6 +1,7 @@
 """Any signed-in user can open any interview and gets a read-only summary; owner/admin/manager/caller keep the full view.
 Real routes over mongomock-motor."""
 
+import json
 import os
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
@@ -181,7 +182,6 @@ async def test_feeds_trim_others_rows_and_keep_own(client, feed):
     assert theirs["createdBy"]["name"] == other_owner.name and theirs["ownerName"] == other_owner.name
     assert theirs["stageHistory"][0]["caller"]["callerName"] == "Cal"
     assert not PRIVATE_KEYS & keys_anywhere(theirs)
-    import json
     assert not any(w in json.dumps(theirs) for w in SECRET_WORDS)
     if rounds:  # the calendar / caller schedule still get what they draw
         by_company = {(r["companyName"], r["stage"]): r for r in rounds}
@@ -214,3 +214,21 @@ async def test_feeds_keep_assigned_callers_row_unchanged(client, feed):
     assert "summaryOnly" not in ivs["Theirs"] and ivs["Theirs"]["jobUrl"]
     if rounds:
         assert rounds[0]["statusNote"] == "TOPSECRET-STATUS"
+
+
+@pytest.mark.parametrize("feed", ["rounds", "caller"])
+async def test_hidden_round_rows_carry_no_email(client, feed):
+    """A round row of an interview the viewer can't fully see names the owner and profile, never an email: an owner
+    with no display name leaves ownerName empty rather than falling back to the address."""
+    me = await make_user("Mia")
+    nameless = await UserExtra(name="", email="nameless@x.io", role="staff").insert()
+    await make_interview(owner=nameless, company="Theirs")
+    await make_interview(owner=me, company="Mine")
+    async with client(me) as c:
+        body = (await c.get(URLS[feed])).json()
+    by_company = {(r["companyName"], r["stage"]): r for r in body["rounds"]}
+    theirs = by_company[("Theirs", "intro")]
+    assert theirs["ownerName"] is None and theirs["profileLabel"] == "Alex"
+    assert "@" not in json.dumps(theirs)
+    assert theirs["callerId"] is None and theirs["hasCaller"] is True  # the Caller filter still has its fields
+    assert by_company[("Mine", "intro")]["ownerName"] == "Mia"

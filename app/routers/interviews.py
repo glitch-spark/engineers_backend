@@ -603,11 +603,17 @@ def trim_for_viewer(items: list[dict], user: UserExtra) -> list[dict]:
 
 def trim_feed(items: list[dict], rounds: list[dict], user: UserExtra) -> list[dict]:
     """Round feeds (calendar, caller schedule): the interviews behind the rows are trimmed as in the list, and a round of
-    an interview the user can't fully see loses its status reason (the rest of a row is what the calendar draws)."""
-    hidden = {str(it.get("_id")) for it in items if not _sees_full(it, user)}
+    an interview the user can't fully see loses its status reason and any email fallback in its names (the rest of a row is what the calendar draws)."""
+    hidden = {str(it.get("_id")): it for it in items if not _sees_full(it, user)}
     for r in rounds:
-        if r["interviewId"] in hidden:
-            r["statusNote"] = None
+        iv = hidden.get(r["interviewId"])
+        if iv is None:
+            continue
+        # Names only: the row builder falls back to an email when a name is missing.
+        account, owner = iv.get("accountId"), iv.get("createdBy")
+        r["statusNote"] = None
+        r["profileLabel"] = ((account.get("name") or "").strip() or None) if isinstance(account, dict) else None
+        r["ownerName"] = ((owner.get("name") or "").strip() or None) if isinstance(owner, dict) else None
     return trim_for_viewer(items, user)
 
 

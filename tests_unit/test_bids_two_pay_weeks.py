@@ -200,3 +200,34 @@ async def test_one_pay_week_money_is_unchanged(db, monkeypatch):
     r = await perf(pedro, weeks=1)
     assert r["totals"]["approved"] == 11 and r["totals"]["pay"] == 5.5
     assert r["bidders"][0]["week"]["approved"] == 11 and len(r["bidders"][0]["dayCells"]) == 7
+
+
+def _board(weeks, pay, to_review, error=None):
+    """A `week_board` result for one bidder ("a") and the team, with the money fields given."""
+    block = {"approved": None if pay is None else pay * 2, "pending": to_review, "rejected": 0 if pay is not None else None,
+             "pay": pay, "toReview": to_review, "source": "records" if error is None else "folders", "error": error}
+    totals = {"approved": block["approved"], "pending": to_review, "rejected": block["rejected"], "pay": pay,
+              "toReview": to_review, "days": []}
+    return {"bidders": [{"id": "a", "week": block}], "totals": totals}
+
+
+def test_combine_boards_with_an_unknown_week_is_unknown_not_a_partial_sum():
+    from app.bids.week import combine_boards
+
+    known = _board(1, 5.0, 3)
+    unknown = _board(2, None, None, error="Couldn't list the bid screenshots")
+    for boards in ([known, unknown], [unknown, known]):
+        out = combine_boards(boards)
+        row = out["blocks"]["a"]
+        assert row["pay"] is None and row["approved"] is None and row["toReview"] is None and row["rejected"] is None
+        assert row["error"] == "Couldn't list the bid screenshots" and row["source"] == "folders"
+        assert out["totals"]["pay"] is None and out["totals"]["toReview"] is None
+        assert out["totals"]["error"] == "Couldn't list the bid screenshots"
+
+
+def test_combine_boards_of_two_known_weeks_sums_and_has_no_error():
+    from app.bids.week import combine_boards
+
+    out = combine_boards([_board(1, 5.0, 3), _board(2, 2.5, 1)])
+    assert out["blocks"]["a"]["pay"] == 7.5 and out["blocks"]["a"]["toReview"] == 4 and out["blocks"]["a"]["error"] is None
+    assert out["totals"]["pay"] == 7.5 and out["totals"]["error"] is None

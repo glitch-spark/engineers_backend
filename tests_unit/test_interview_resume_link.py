@@ -230,7 +230,7 @@ async def test_lists_leave_out_the_job_description(db):
     ), owner)
 
     listed = await interviews.list_interviews(owner, page=1, limit=10, from_="", to="", accountId="", stage="",
-                                              status_="", creatorId="", callType="", sort="latest", dir="desc")
+                                              status_="", q="", creatorId="", callType="", sort="latest", dir="desc")
 
     link = listed["interviews"][0]["resumeLink"]
     assert link["kind"] == "tailored" and "jobDescription" not in link
