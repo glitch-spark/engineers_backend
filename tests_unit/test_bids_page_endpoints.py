@@ -202,3 +202,21 @@ async def test_pending_bad_dates_are_400(db, switch_on, monkeypatch):
         with pytest.raises(HTTPException) as e:
             await pending(s["pedro"], **kw)
         assert e.value.status_code == 400, kw
+
+
+async def test_pending_same_first_at_is_ordered_by_id(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    same = datetime(2026, 11, 24, 15)
+    made = [await bid(s["raj"], "pending", same) for _ in range(3)]
+    expected = sorted(str(b.id) for b in made)
+    for _ in range(2):  # a refresh returns the same order
+        r = await pending(s["pedro"], period="day", date="2026-11-24", bidderId=str(s["raj"].id))
+        assert [b["id"] for b in r["bids"]] == expected
+
+
+async def test_pending_includes_an_archived_bidders_bids(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    lee = await bid(s["lee"], "pending", datetime(2026, 11, 24, 9))
+    r = await pending(s["pedro"], period="day", date="2026-11-24")
+    assert str(lee.id) in {b["id"] for b in r["bids"]}
+    assert str(lee.id) in {b["id"] for b in (await pending(s["pedro"]))["bids"]}

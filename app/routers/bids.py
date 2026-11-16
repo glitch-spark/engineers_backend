@@ -615,7 +615,7 @@ async def pending_bids(
     if window_ is not None:
         query["firstAt"] = {"$gte": _naive_utc(window_[0]), "$lt": _naive_utc(window_[1])}
     query["$or"] = [{"status": "pending"}] + ([{"reviewedAt": {"$gte": since_at}}] if since_at else [])
-    bids = await Bid.find(query).sort("firstAt").to_list()
+    bids = await Bid.find(query).sort([("firstAt", 1), ("_id", 1)]).to_list()
     names = {b.id: b.name for b in candidates}
     evidence = await evidence_for(bids, {str(b.id): b for b in candidates})
     thumbs = await _thumb_urls(bids)
