@@ -3,21 +3,34 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
 
-from app.bids.windows import BidSchedule, Rules, latest_cutoff, open_window, period_key, schedule_from_settings, window_for
+from app.bids.windows import (BidSchedule, Rules, daily_cutoff_on, latest_cutoff, next_cutoff, open_window, period_key,
+                              report_day, schedule_from_settings, window_for)
 from app.config import Settings
 
 CT = ZoneInfo("America/Chicago")
 SCHED = BidSchedule(tz=CT, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0))
 
+# Today's rules (daily 18:30, weekly Saturday 16:00) with no switch, and the same rules switching at
+# Sun 2026-11-22 20:00 to daily 18:00, weekly Sunday 20:00.
+CHI = ZoneInfo("America/Chicago")
+sched_off = BidSchedule(tz=CHI, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0))
+sched_on = BidSchedule(tz=CHI, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0),
+                       switch_at=datetime(2026, 11, 22, 20, 0, tzinfo=CHI),
+                       next_rules=Rules(time(18, 0), 6, time(20, 0)))
+
 
 def utc(*a):
     return datetime(*a, tzinfo=timezone.utc)
+
+
+def chi(*a, fold=0):
+    return datetime(*a, tzinfo=CHI, fold=fold)
 
 
 def test_daily_cutoff_before_and_after_the_time():
@@ -165,3 +178,91 @@ def test_env_examples_have_no_inline_comments_in_bid_values():
     assert len(example) == 12 and set(doc_env) == set(example)
     for values in (example, doc_env):
         assert all("#" not in (v or "") for v in values.values()), values
+
+
+# --- the schedule switch (all times America/Chicago) ---
+
+
+def test_weekly_cutoffs_around_the_switch():
+    # Old Saturday cutoffs stop at switch - 7 days, so Sat 11-21 is not a cutoff: the week before the switch is long.
+    assert latest_cutoff("weekly", chi(2026, 11, 21, 17, 0), sched_on) == chi(2026, 11, 14, 16, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 22, 19, 59), sched_on) == chi(2026, 11, 14, 16, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 22, 20, 0), sched_on) == chi(2026, 11, 22, 20, 0)
+    assert latest_cutoff("weekly", chi(2026, 12, 2, 9, 0), sched_on) == chi(2026, 11, 29, 20, 0)
+
+
+def test_weekly_windows_around_the_switch():
+    assert window_for("weekly", chi(2026, 11, 22, 20, 0), sched_on) == (
+        utc(2026, 11, 14, 22, 0), utc(2026, 11, 23, 2, 0))
+    assert window_for("weekly", chi(2026, 11, 29, 20, 0), sched_on) == (
+        utc(2026, 11, 23, 2, 0), utc(2026, 11, 30, 2, 0))
+
+
+def test_daily_cutoffs_around_the_switch():
+    assert latest_cutoff("daily", chi(2026, 11, 22, 19, 0), sched_on) == chi(2026, 11, 22, 18, 30)
+    assert latest_cutoff("daily", chi(2026, 11, 23, 12, 0), sched_on) == chi(2026, 11, 22, 18, 30)
+    assert latest_cutoff("daily", chi(2026, 11, 23, 18, 0), sched_on) == chi(2026, 11, 23, 18, 0)
+    # [Sun 11-22 18:30 CST, Mon 11-23 18:00 CST)
+    assert window_for("daily", chi(2026, 11, 23, 18, 0), sched_on) == (
+        utc(2026, 11, 23, 0, 30), utc(2026, 11, 24, 0, 0))
+
+
+def test_the_past_is_unchanged():
+    t, stop = chi(2026, 10, 1).astimezone(timezone.utc), chi(2026, 11, 15).astimezone(timezone.utc)
+    while t < stop:  # every hour, in UTC so both 01:00s of the Nov 1 fall-back are covered
+        for kind in ("daily", "weekly"):
+            cutoff = latest_cutoff(kind, t, sched_off)
+            assert latest_cutoff(kind, t, sched_on).isoformat() == cutoff.isoformat(), (kind, t)
+            on, off = window_for(kind, cutoff, sched_on), window_for(kind, cutoff, sched_off)
+            assert [d.isoformat() for d in on] == [d.isoformat() for d in off], (kind, t)
+        t += timedelta(hours=1)
+
+
+def test_weekly_window_over_dst_end_after_the_switch_is_169_hours():
+    # DST ends at 02:00 on Sun 2027-11-07: the week runs from Sun 10-31 20:00 CDT to Sun 11-07 20:00 CST.
+    start, end = window_for("weekly", chi(2027, 11, 7, 20, 0), sched_on)
+    assert (start, end) == (utc(2027, 11, 1, 1, 0), utc(2027, 11, 8, 2, 0))
+    assert end - start == timedelta(hours=169)
+    for fold in (0, 1):  # both 01:30s of that morning (06:30Z and 07:30Z)
+        assert latest_cutoff("weekly", chi(2027, 11, 7, 1, 30, fold=fold), sched_on) == chi(2027, 10, 31, 20, 0)
+        assert latest_cutoff("daily", chi(2027, 11, 7, 1, 30, fold=fold), sched_on) == chi(2027, 11, 6, 18, 0)
+
+
+def test_next_cutoff():
+    assert next_cutoff("weekly", chi(2026, 11, 14, 16, 0), sched_on) == chi(2026, 11, 22, 20, 0)
+    assert next_cutoff("daily", chi(2026, 11, 22, 18, 30), sched_on) == chi(2026, 11, 23, 18, 0)
+    assert next_cutoff("daily", chi(2026, 11, 22, 18, 30), sched_on).tzinfo is CHI
+    assert next_cutoff("weekly", chi(2026, 11, 14, 16, 0), sched_off) == chi(2026, 11, 21, 16, 0)
+
+
+def test_daily_cutoff_on():
+    assert daily_cutoff_on(date(2026, 11, 10), sched_on) == chi(2026, 11, 10, 18, 30)
+    assert daily_cutoff_on(date(2026, 11, 22), sched_on) == chi(2026, 11, 22, 18, 30)
+    assert daily_cutoff_on(date(2026, 11, 23), sched_on) == chi(2026, 11, 23, 18, 0)
+    assert daily_cutoff_on(date(2026, 11, 23), sched_off) == chi(2026, 11, 23, 18, 30)
+
+
+def test_report_day():
+    assert report_day(chi(2026, 11, 22, 18, 15), sched_on) == date(2026, 11, 22)
+    assert report_day(chi(2026, 11, 22, 18, 30), sched_on) == date(2026, 11, 23)  # on the cutoff = next day
+    assert report_day(chi(2026, 11, 23, 18, 0), sched_on) == date(2026, 11, 24)
+    assert report_day(chi(2026, 11, 29, 18, 30), sched_on) == date(2026, 11, 30)
+    assert report_day(datetime(2026, 11, 23, 0, 15), sched_on) == date(2026, 11, 22)  # naive = UTC: Sun 18:15 CST
+
+
+def test_a_moment_on_a_cutoff_belongs_to_the_next_period():
+    assert report_day(chi(2026, 11, 22, 18, 30), sched_on) == date(2026, 11, 23)
+    assert report_day(chi(2026, 11, 23, 18, 0), sched_on) == date(2026, 11, 24)
+    assert latest_cutoff("weekly", chi(2026, 11, 22, 20, 0), sched_on) == chi(2026, 11, 22, 20, 0)
+    assert next_cutoff("weekly", chi(2026, 11, 22, 20, 0), sched_on) == chi(2026, 11, 29, 20, 0)
+
+
+def test_naive_times_are_refused_except_by_report_day():
+    # Only report_day reads a naive time (as UTC); elsewhere it would silently become the server's local time.
+    for sched in (sched_off, sched_on):
+        with pytest.raises(TypeError):
+            latest_cutoff("daily", datetime(2026, 11, 23, 0, 15), sched)
+        with pytest.raises(TypeError):
+            next_cutoff("daily", datetime(2026, 11, 23, 0, 15), sched)
+        with pytest.raises(TypeError):
+            window_for("daily", datetime(2026, 11, 23, 18, 0), sched)
