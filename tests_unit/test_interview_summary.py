@@ -10,7 +10,7 @@ os.environ["RESUME_QUEUE_DISABLED"] = "1"
 from datetime import datetime, timezone
 
 import pytest
-from beanie import init_beanie
+from beanie import PydanticObjectId, init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
 from app.models import Account, ResumeApplication, UserExtra
@@ -23,7 +23,7 @@ pytestmark = [
 ]
 
 START = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
-SECRET_WORDS = ("TOPSECRET-NOTE", "TOPSECRET-TRANSCRIPT", "TOPSECRET-LINK", "TOPSECRET-URL", "TOPSECRET-INTERVIEWER")
+SECRET_WORDS = ("TOPSECRET-STATUS", "TOPSECRET-NOTE", "TOPSECRET-TRANSCRIPT", "TOPSECRET-LINK", "TOPSECRET-URL", "TOPSECRET-INTERVIEWER")
 
 
 @pytest.fixture
@@ -57,15 +57,17 @@ async def make_user(name, role="staff", **kw) -> UserExtra:
     return await UserExtra(name=name, email=f"{name.lower()}@x.io", role=role, **kw).insert()
 
 
-async def make_interview():
-    owner = await make_user("Owen")
+async def make_interview(owner=None, company="Acme", caller_user=None):
+    owner = owner or await make_user(f"Owen{PydanticObjectId()}")
     acc = await Account(name="Alex", region="EU", country="PT", createdBy=owner.id).insert()
     rounds = [
         InterviewStageEvent(
             stage="intro", at=START, scheduledAt=START, endsAt=START.replace(hour=16), status="passed",
+            statusNote="TOPSECRET-STATUS",
             note="TOPSECRET-NOTE", transcript="TOPSECRET-TRANSCRIPT", interviewerName="TOPSECRET-INTERVIEWER",
             caller=InterviewCaller(
-                enabled=True, callerName="Cal", callerKind="external", startsAt=START, method="video",
+                enabled=True, callerName="Cal", callerKind="user" if caller_user else "external",
+                callerId=str(caller_user.id) if caller_user else None, startsAt=START, method="video",
                 methodValue="TOPSECRET-LINK",
             ),
         ),
@@ -75,7 +77,7 @@ async def make_interview():
         ),
     ]
     iv = await Interview(
-        accountId=acc.id, createdBy=owner.id, scheduledAt=START, companyName="Acme", appliedPosition="Dev",
+        accountId=acc.id, createdBy=owner.id, scheduledAt=START, companyName=company, appliedPosition="Dev",
         jobUrl="https://TOPSECRET-URL.example/job", note="TOPSECRET-NOTE",
         stageHistory=[r.model_dump() for r in rounds], stage="tech_round_1", status="scheduled",
     ).insert()
@@ -106,7 +108,7 @@ async def test_staff_gets_summary_for_others_interview(client):
     assert body["companyName"] == "Acme" and body["appliedPosition"] == "Dev"
     assert body["accountId"]["name"] == "Alex" and body["accountId"]["region"] == "EU"
     assert body["accountId"]["country"] == "PT"
-    assert body["createdBy"]["name"] == "Owen"
+    assert body["createdBy"]["name"] == owner.name
     assert body["stage"] == "tech_round_1" and body["status"] == "scheduled"
     assert body["scheduledAt"]
     assert not {"note", "transcript", "resumeLink", "jobUrl", "interviewerName", "appliedBy", "method",
@@ -141,3 +143,74 @@ async def test_questions_still_forbidden_for_others(client):
     stranger = await make_user("Eve")
     async with client(stranger) as c:
         assert (await c.get(f"/interviews/{iv.id}/questions")).status_code == 403
+
+
+# ---- the list, calendar and caller feeds hide what the summary hides --------------------------------------------
+
+RANGE = "from=2026-10-01T00:00:00Z&to=2026-10-20T00:00:00Z"
+PRIVATE_KEYS = {"note", "transcript", "resumeLink", "jobUrl", "interviewerName", "appliedBy", "method", "methodValue",
+                "statusNote", "questions"}
+
+
+def feed_rows(kind, body):
+    """(interview dict by company, the feed's round rows) for the three feeds."""
+    if kind == "list":
+        return {i["companyName"]: i for i in body["interviews"]}, []
+    return {i["companyName"]: i for i in body["interviews"].values()}, body["rounds"]
+
+
+URLS = {
+    "list": "/interviews",
+    "rounds": f"/interviews/rounds?{RANGE}",
+    "caller": "/interviews/caller-rounds",
+}
+
+
+@pytest.mark.parametrize("feed", ["list", "rounds", "caller"])
+async def test_feeds_trim_others_rows_and_keep_own(client, feed):
+    me = await make_user("Mia")
+    await make_interview(owner=me, company="Mine")
+    other_owner, _, other = await make_interview(company="Theirs")
+    async with client(me) as c:
+        body = (await c.get(URLS[feed])).json()
+    ivs, rounds = feed_rows("list" if feed == "list" else feed, body)
+    mine, theirs = ivs["Mine"], ivs["Theirs"]
+    assert "summaryOnly" not in mine and mine["jobUrl"] and mine["stageHistory"][0]["note"] == "TOPSECRET-NOTE"
+    assert theirs["summaryOnly"] is True and theirs["_id"] == str(other.id)
+    assert theirs["companyName"] == "Theirs" and theirs["accountId"]["name"] == "Alex"
+    assert theirs["createdBy"]["name"] == other_owner.name and theirs["ownerName"] == other_owner.name
+    assert theirs["stageHistory"][0]["caller"]["callerName"] == "Cal"
+    assert not PRIVATE_KEYS & keys_anywhere(theirs)
+    import json
+    assert not any(w in json.dumps(theirs) for w in SECRET_WORDS)
+    if rounds:  # the calendar / caller schedule still get what they draw
+        by_company = {(r["companyName"], r["stage"]): r for r in rounds}
+        t = by_company[("Theirs", "intro")]
+        assert t["roundId"] and t["stage"] == "intro" and t["status"] == "passed" and t["scheduledAt"]
+        assert t["callerName"] == "Cal" and t["statusNote"] is None
+        assert by_company[("Mine", "intro")]["statusNote"] == "TOPSECRET-STATUS"
+
+
+@pytest.mark.parametrize("feed", ["list", "rounds", "caller"])
+async def test_feeds_stay_full_for_admin_and_manager(client, feed):
+    await make_interview(company="Theirs")
+    for role in ("admin", "interview_manager"):
+        user = await make_user(f"V{role}", role=role)
+        async with client(user) as c:
+            body = (await c.get(URLS[feed])).json()
+        ivs, rounds = feed_rows("list" if feed == "list" else feed, body)
+        assert "summaryOnly" not in ivs["Theirs"] and ivs["Theirs"]["jobUrl"]
+        if rounds:
+            assert rounds[0]["statusNote"] == "TOPSECRET-STATUS"
+
+
+@pytest.mark.parametrize("feed", ["list", "rounds", "caller"])
+async def test_feeds_keep_assigned_callers_row_unchanged(client, feed):
+    caller = await make_user("Cal")
+    await make_interview(company="Theirs", caller_user=caller)
+    async with client(caller) as c:
+        body = (await c.get(URLS[feed])).json()
+    ivs, rounds = feed_rows("list" if feed == "list" else feed, body)
+    assert "summaryOnly" not in ivs["Theirs"] and ivs["Theirs"]["jobUrl"]
+    if rounds:
+        assert rounds[0]["statusNote"] == "TOPSECRET-STATUS"

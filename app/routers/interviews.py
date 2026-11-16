@@ -521,42 +521,84 @@ async def _interview_out(iv: Interview) -> dict:
     return out[0]
 
 
-async def summary_out(iv: Interview) -> dict:
-    """The read-only view of an interview for a signed-in user who is not its owner, an admin, an interview manager or an
-    assigned caller: who and where (company, position, profile, owner) and the rounds timeline. Never notes, transcripts,
-    interviewer names, links, the applying bidder, caller method/link or questions."""
-    owner = await UserExtra.get(iv.createdBy) if iv.createdBy else None
-    account = await Account.get(iv.accountId) if iv.accountId else None
+def _summary_fields(item: dict) -> dict:
+    """The read-only view of one populated interview dict (as `_interview_out` / the list feeds build it): who and where
+    (company, position, profile, owner) and the rounds timeline. A whitelist, so notes, transcripts, interviewer names,
+    links, the applying bidder, caller method/link and questions can never ride along."""
+    account = item.get("accountId")
+    owner = item.get("createdBy")
     rounds = []
-    for e in iv.stageHistory:
-        caller = e.caller
+    for e in item.get("stageHistory") or []:
+        caller = e.get("caller") or {}
+        on = bool(caller.get("enabled"))
         rounds.append({
-            "id": e.id,
-            "stage": _stage_value(e.stage),
-            "status": _status_value(e.status),
-            "scheduledAt": _iso_utc(e.scheduledAt),
-            "endsAt": _iso_utc(e.endsAt),
+            "id": e.get("id"),
+            "stage": _stage_value(e.get("stage")),
+            "status": _status_value(e.get("status")),
+            "scheduledAt": _iso_utc(e.get("scheduledAt")),
+            "endsAt": _iso_utc(e.get("endsAt")),
             "caller": {
-                "enabled": bool(caller and caller.enabled),
-                "callerName": caller.callerName if caller and caller.enabled else None,
-                "callerKind": caller.callerKind if caller and caller.enabled else None,
+                "enabled": on,
+                "callerName": caller.get("callerName") if on else None,
+                "callerKind": caller.get("callerKind") if on else None,
             },
         })
+    owner_ok = isinstance(owner, dict)
     return {
-        "_id": str(iv.id),
-        "companyName": iv.companyName,
-        "appliedPosition": iv.appliedPosition,
+        "_id": str(item.get("_id")),
+        "companyName": item.get("companyName"),
+        "appliedPosition": item.get("appliedPosition"),
         "accountId": (
-            {"_id": str(account.id), "name": account.name, "region": account.region, "country": account.country}
-            if account is not None else None
+            {k: account.get(k) for k in ("_id", "name", "region", "country")} if isinstance(account, dict) else None
         ),
-        "createdBy": {"_id": str(owner.id), "name": owner.name} if owner is not None else None,
-        "stage": _stage_value(iv.stage),
-        "status": _status_value(iv.status),
-        "scheduledAt": _iso_utc(iv.scheduledAt),
+        "createdBy": {"_id": owner.get("_id"), "name": owner.get("name")} if owner_ok else None,
+        "ownerName": owner.get("name") if owner_ok else None,
+        "stage": _stage_value(item.get("stage")),
+        "status": _status_value(item.get("status")),
+        "scheduledAt": _iso_utc(item.get("scheduledAt")),
         "summaryOnly": True,
         "stageHistory": rounds,
     }
+
+
+async def summary_out(iv: Interview) -> dict:
+    """What a signed-in user who is not the interview's owner, an admin, an interview manager or an assigned caller
+    sees of it (`GET /interviews/{id}`)."""
+    return _summary_fields(await _interview_out(iv))
+
+
+def _sees_full(item: dict, user: UserExtra) -> bool:
+    """`_can_view` for a populated interview dict: admin, interview manager, owner, or a round's assigned platform-user
+    caller (an inactive user is not one)."""
+    if user.role in ("admin", "interview_manager"):
+        return True
+    owner = item.get("createdBy")
+    owner_id = owner.get("_id") if isinstance(owner, dict) else owner
+    uid = str(user.id)
+    if str(owner_id) == uid:
+        return True
+    if getattr(user, "isActive", True) is False:
+        return False
+    return any(
+        (c := e.get("caller") or {}).get("enabled") and c.get("callerKind") == "user" and c.get("callerId") == uid
+        for e in item.get("stageHistory") or []
+    )
+
+
+def trim_for_viewer(items: list[dict], user: UserExtra) -> list[dict]:
+    """List and calendar feeds: interviews the user can't fully see shrink to the read-only summary fields (with
+    `summaryOnly`); the ones they can see stay as they are."""
+    return [it if _sees_full(it, user) else _summary_fields(it) for it in items]
+
+
+def trim_feed(items: list[dict], rounds: list[dict], user: UserExtra) -> list[dict]:
+    """Round feeds (calendar, caller schedule): the interviews behind the rows are trimmed as in the list, and a round of
+    an interview the user can't fully see loses its status reason (the rest of a row is what the calendar draws)."""
+    hidden = {str(it.get("_id")) for it in items if not _sees_full(it, user)}
+    for r in rounds:
+        if r["interviewId"] in hidden:
+            r["statusNote"] = None
+    return trim_for_viewer(items, user)
 
 
 def _list_view(items: list) -> list:
@@ -766,7 +808,7 @@ async def list_interviews(
         [(field, direction), ("_id", direction)]
     ).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
-    rows_out = _list_view(await _populate_account(rows_with_owner))
+    rows_out = trim_for_viewer(_list_view(await _populate_account(rows_with_owner)), user)
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -820,6 +862,7 @@ async def list_interview_rounds(
         out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_, caller_only=callerOnly, caller_id=callerId,
         call_type=callType,
     )
+    out = trim_feed(out, rounds, user)
     # The interviews behind the rounds, so a click can open the side panel
     # (GET /{id} is limited to owner/admin/interview manager; this feed is not).
     shown = {r["interviewId"] for r in rounds}
@@ -862,6 +905,7 @@ async def list_caller_rounds(
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
+    out = trim_feed(out, rounds, user)
     if dir != "asc":
         rounds.reverse()  # flatten_rounds sorts oldest first
     total = len(rounds)
