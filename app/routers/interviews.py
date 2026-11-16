@@ -521,28 +521,35 @@ async def _interview_out(iv: Interview) -> dict:
     return out[0]
 
 
+def _caller_summary(caller: Optional[dict]) -> dict:
+    """Who takes a round, and nothing about how (no id, method or link)."""
+    caller = caller or {}
+    on = bool(caller.get("enabled"))
+    return {
+        "enabled": on,
+        "callerName": caller.get("callerName") if on else None,
+        "callerKind": caller.get("callerKind") if on else None,
+    }
+
+
 def _summary_fields(item: dict) -> dict:
     """The read-only view of one populated interview dict (as `_interview_out` / the list feeds build it): who and where
     (company, position, profile, owner) and the rounds timeline. A whitelist, so notes, transcripts, interviewer names,
     links, the applying bidder, caller method/link and questions can never ride along."""
     account = item.get("accountId")
     owner = item.get("createdBy")
-    rounds = []
-    for e in item.get("stageHistory") or []:
-        caller = e.get("caller") or {}
-        on = bool(caller.get("enabled"))
-        rounds.append({
+    rounds = [
+        {
             "id": e.get("id"),
             "stage": _stage_value(e.get("stage")),
             "status": _status_value(e.get("status")),
             "scheduledAt": _iso_utc(e.get("scheduledAt")),
             "endsAt": _iso_utc(e.get("endsAt")),
-            "caller": {
-                "enabled": on,
-                "callerName": caller.get("callerName") if on else None,
-                "callerKind": caller.get("callerKind") if on else None,
-            },
-        })
+            "confirmed": bool(e.get("confirmed")),
+            "caller": _caller_summary(e.get("caller")),
+        }
+        for e in item.get("stageHistory") or []
+    ]
     owner_ok = isinstance(owner, dict)
     return {
         "_id": str(item.get("_id")),
@@ -556,6 +563,9 @@ def _summary_fields(item: dict) -> dict:
         "stage": _stage_value(item.get("stage")),
         "status": _status_value(item.get("status")),
         "scheduledAt": _iso_utc(item.get("scheduledAt")),
+        # The latest round's caller and confirmed flag, which the Interviews list shows in a column.
+        "caller": _caller_summary(item.get("caller")),
+        "confirmed": bool(item.get("confirmed")),
         "summaryOnly": True,
         "stageHistory": rounds,
     }
