@@ -127,6 +127,16 @@ def test_pay_week_across_dst():
     assert all(d.end - d.start == timedelta(hours=24) for d in pw.days[1:])
 
 
+def test_old_era_week_over_dst_start_is_pinned():
+    from app.bids.week import pay_week
+
+    pw = pay_week(sched_off, datetime(2026, 3, 11, 9, tzinfo=CHI))  # Wed; clocks go forward Sun 2026-03-08
+    assert pw.cutoff == datetime(2026, 3, 14, 16, tzinfo=CHI)
+    assert pw.end == z("2026-03-14T21:00:00Z")
+    assert pw.end - pw.start == timedelta(hours=167)
+    assert [d.key for d in pw.days] == [f"2026-03-{n:02d}" for n in range(8, 15)]
+
+
 # --- pay_week across the schedule switch (Sun 2026-11-22 20:00: daily 18:30 -> 18:00, weekly Sat 16:00 -> Sun 20:00)
 
 

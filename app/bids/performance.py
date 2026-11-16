@@ -16,7 +16,7 @@ from app.bids.records import records_start_utc
 from app.bids.schemas import _iso_utc
 from app.bids.week import DayWindow, _day_counts
 from app.bids.schemas import bidder_status
-from app.bids.windows import BidSchedule, period_key, schedule_from_settings, window_for
+from app.bids.windows import BidSchedule, daily_cutoff_on, period_key, schedule_from_settings, window_for
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import split_rounds_by_day
 from app.models import Account, Interview, UserExtra
@@ -58,12 +58,21 @@ def pay_week_columns(start: date, end: date, sched: BidSchedule) -> list[dict]:
     return out
 
 
-def previous_range(period: str, start: date, end: date) -> tuple[date, date]:
-    """The period to compare with: the week before; the month before, cut to the same number of days (clipped to its
-    last day); a custom range's length of days just before it."""
+def previous_range(period: str, start: date, end: date, sched: Optional[BidSchedule] = None) -> tuple[date, date]:
+    """The period to compare with: the pay week before (`start` is a pay week's first report day; a week so far, its
+    end clipped to today, compares with as many days of it); the month before, cut to the same number of days
+    (clipped to its last day); a custom range's length of days just before it."""
     days = (end - start).days + 1
     if period == "week":
-        return start - timedelta(days=7), end - timedelta(days=7)
+        from app.bids.week import pay_week
+
+        sched = sched or schedule_from_settings()
+        now = datetime.now(timezone.utc)
+        this_last = date.fromisoformat(pay_week(sched, now, start).days[-1].key)
+        prev = [date.fromisoformat(d.key) for d in pay_week(sched, now, start - timedelta(days=1)).days]
+        if end >= this_last:
+            return prev[0], prev[-1]
+        return prev[0], min(prev[0] + timedelta(days=days - 1), prev[-1])
     if period == "month":
         first = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
         return first, min(first + timedelta(days=days - 1), date(first.year, first.month, monthrange(first.year, first.month)[1]))
@@ -132,7 +141,7 @@ def day_windows(start: date, end: date, sched: BidSchedule) -> list[DayWindow]:
     """One window per local date of [start, end]: the daily window ending at that date's cutoff."""
     out = []
     for i in range((end - start).days + 1):
-        cutoff = datetime.combine(start + timedelta(days=i), sched.daily_at, tzinfo=sched.tz)
+        cutoff = daily_cutoff_on(start + timedelta(days=i), sched)
         s, e = window_for("daily", cutoff, sched)
         out.append(DayWindow(period_key(cutoff), s, e))
     return out
@@ -202,7 +211,7 @@ async def performance(
 ) -> dict:
     """The /bids/performance response (spec section 3): per-bidder bids by week, streaks, interviews and the top cards."""
     sched = schedule_from_settings()
-    prev_start, prev_end = previous_range(period, start, end)
+    prev_start, prev_end = previous_range(period, start, end, sched)
     counts = await day_counts(bidders, min(prev_start, start), end, sched)
     weeks = columns if columns is not None else week_columns(start, end)
     week_of = {date.fromisoformat(w["start"]) + timedelta(days=i): n

@@ -12,7 +12,7 @@ from typing import Optional
 from beanie import PydanticObjectId
 from pydantic import BaseModel, Field
 
-from app.bids.windows import BidSchedule, schedule_from_settings
+from app.bids.windows import BidSchedule, report_day, schedule_from_settings
 from app.config import get_settings
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rates import MIN_BIDS
@@ -77,9 +77,9 @@ def span(weeks: int, today: date, since: date, created: date) -> tuple[date, dat
 
 
 def bid_report_day(first_at: datetime, sched: BidSchedule) -> date:
-    """The local date of the Bid Track daily window a naive-UTC time falls in (a bid at the cutoff is the next day's)."""
-    local = first_at.replace(tzinfo=timezone.utc).astimezone(sched.tz)
-    return local.date() + timedelta(days=1 if local.time() >= sched.daily_at else 0)
+    """The local date of the Bid Track daily window a naive-UTC time falls in (a bid at the cutoff is the next day's):
+    windows.report_day, under the name its callers use."""
+    return report_day(first_at, sched)
 
 
 _COUNTS = ("selfBids", "bidderBids", "selfInterviews", "callerInterviews",

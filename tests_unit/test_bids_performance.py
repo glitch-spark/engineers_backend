@@ -10,7 +10,7 @@ import pytest
 from beanie import init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
-from app.bids.performance import day_counts, performance, previous_range, rank, streaks, week_columns
+from app.bids.performance import day_counts, day_windows, performance, previous_range, rank, streaks, week_columns
 from app.bids.windows import schedule_from_settings
 from app.models import Account, UserExtra
 from app.models.bid import Bid
@@ -18,6 +18,7 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
+from tests_unit.test_bids_windows import sched_off, sched_on
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -65,12 +66,28 @@ def test_streaks_empty_range():
 
 
 def test_previous_range():
-    assert previous_range("week", D(10, 19), D(10, 25)) == (D(10, 12), D(10, 18))
+    assert previous_range("week", D(10, 18), D(10, 24), sched_off) == (D(10, 11), D(10, 17))
     assert previous_range("month", D(10, 1), D(10, 31)) == (D(9, 1), D(9, 30))
     assert previous_range("month", D(11, 1), D(11, 4)) == (D(10, 1), D(10, 4))
     assert previous_range("month", D(3, 1), D(3, 31)) == (D(2, 1), D(2, 28))
     assert previous_range("custom", D(9, 1), D(10, 31)) == (D(7, 2), D(8, 31))
 
+
+
+def test_previous_range_of_a_pay_week_across_the_switch():
+    assert previous_range("week", D(11, 23), D(11, 29), sched_on) == (D(11, 15), D(11, 22))  # first Sunday week
+    assert previous_range("week", D(11, 15), D(11, 22), sched_on) == (D(11, 8), D(11, 14))   # the long week
+    # a week so far (end clipped to today) compares with as many days of the week before
+    assert previous_range("week", D(11, 23), D(11, 25), sched_on) == (D(11, 15), D(11, 17))
+    assert previous_range("week", D(11, 15), D(11, 18), sched_off) == (D(11, 8), D(11, 11))
+
+
+def test_day_windows_follow_the_switch():
+    windows = day_windows(D(11, 22), D(11, 24), sched_on)
+    assert [w.key for w in windows] == ["2026-11-22", "2026-11-23", "2026-11-24"]
+    chi = lambda d, h, m=0: datetime(2026, 11, d, h, m, tzinfo=CHI)
+    assert [(w.start, w.end) for w in windows] == [
+        (chi(21, 18, 30), chi(22, 18, 30)), (chi(22, 18, 30), chi(23, 18)), (chi(23, 18), chi(24, 18))]
 
 def row(id, name, total=0, approved=0, streak=0, rate=0.0, interviews=0, per100=None):
     return {"id": id, "name": name, "total": total, "approved": approved, "longestStreak": streak, "hitRate": rate,

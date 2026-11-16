@@ -266,3 +266,16 @@ def test_naive_times_are_refused_except_by_report_day():
             next_cutoff("daily", datetime(2026, 11, 23, 0, 15), sched)
         with pytest.raises(TypeError):
             window_for("daily", datetime(2026, 11, 23, 18, 0), sched)
+
+
+def test_no_direct_schedule_reads():
+    # Outside app/bids/windows.py the schedule's rules are read only through its switch-aware helpers.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "app"
+    windows = root / "bids" / "windows.py"
+    pattern = re.compile(r"\.(daily_at|weekly_day|weekly_at)\b")
+    offenders = [f"{p.relative_to(root.parent).as_posix()}:{n}" for p in sorted(root.rglob("*.py")) if p != windows
+                 for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1) if pattern.search(line)]
+    assert offenders == []
