@@ -58,12 +58,12 @@ def pay_week_columns(start: date, end: date, sched: BidSchedule) -> list[dict]:
     return out
 
 
-def previous_range(period: str, start: date, end: date) -> tuple[date, date]:
-    """The period to compare with: the week before; the month before, cut to the same number of days (clipped to its
-    last day); a custom range's length of days just before it."""
+def previous_range(period: str, start: date, end: date, span: int = 1) -> tuple[date, date]:
+    """The period to compare with: the week before (`span` weeks before for a two-week period); the month before, cut
+    to the same number of days (clipped to its last day); a custom range's length of days just before it."""
     days = (end - start).days + 1
     if period == "week":
-        return start - timedelta(days=7), end - timedelta(days=7)
+        return start - timedelta(days=7 * span), end - timedelta(days=7 * span)
     if period == "month":
         first = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
         return first, min(first + timedelta(days=days - 1), date(first.year, first.month, monthrange(first.year, first.month)[1]))
@@ -198,11 +198,11 @@ def _ratio(n, d, digits):
 
 async def performance(
     bidders: list[Bidder], period: str, start: date, end: date, label: str, today: date,
-    columns: Optional[list[dict]] = None,
+    columns: Optional[list[dict]] = None, span: int = 1,
 ) -> dict:
     """The /bids/performance response (spec section 3): per-bidder bids by week, streaks, interviews and the top cards."""
     sched = schedule_from_settings()
-    prev_start, prev_end = previous_range(period, start, end)
+    prev_start, prev_end = previous_range(period, start, end, span)
     counts = await day_counts(bidders, min(prev_start, start), end, sched)
     weeks = columns if columns is not None else week_columns(start, end)
     week_of = {date.fromisoformat(w["start"]) + timedelta(days=i): n

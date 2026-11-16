@@ -65,9 +65,9 @@ def bidder_tops(rows: list[dict]) -> dict:
 
 
 async def _platform(key: tuple) -> dict:
-    period, start, end, today = key
+    period, start, end, today, span = key
     everyone = await Bidder.find({"archivedAt": None}).to_list()
-    perf = await performance(everyone, period, start, end, "", today, columns=[])  # stats only: no columns needed
+    perf = await performance(everyone, period, start, end, "", today, columns=[], span=span)  # stats only: no columns needed
     return {"stats": bidder_stats(perf), "tops": bidder_tops(perf["bidders"])}
 
 
@@ -76,11 +76,11 @@ platform_cache = BenchmarkCache(_platform)
 
 
 async def insights(bidders: list[Bidder], period: str, start: date, end: date, label: str, today: date,
-                   columns: Optional[list[dict]] = None) -> dict:
+                   columns: Optional[list[dict]] = None, span: int = 1) -> dict:
     """The /bids/insights response for one owner's bidders (archived ones never count)."""
     active = [b for b in bidders if b.archivedAt is None]
-    mine_perf = await performance(active, period, start, end, label, today, columns=[])
-    plat = await platform_cache.get((period, start, end, today))
+    mine_perf = await performance(active, period, start, end, label, today, columns=[], span=span)
+    plat = await platform_cache.get((period, start, end, today, span))
     mine_tops = bidder_tops(mine_perf["bidders"])
 
     def own(t):

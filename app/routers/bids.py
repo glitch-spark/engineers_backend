@@ -252,12 +252,14 @@ class BidPeriod(BaseModel):
     today: date
     columns: list[dict]
     pay_week: Optional[PayWeek] = None
+    span: int = 1  # pay weeks in a `week` period: 1, or 2 (the anchored pay week and the one before; no pay_week board)
 
 
-def bid_period(period: str, day: str, to: str, now: datetime) -> BidPeriod:
+def bid_period(period: str, day: str, to: str, now: datetime, weeks: int = 1) -> BidPeriod:
     """The period the Bidders page asked for: a pay week (the one holding `day`, default now) with a column per report
-    day, or a calendar month / custom range of report days with a column per pay week. Raises 422 / 400 like the
-    statistics periods."""
+    day, or a calendar month / custom range of report days with a column per pay week. `weeks=2` (week only) is that
+    pay week and the one before, with a column per pay week like a custom range. Raises 422 / 400 like the statistics
+    periods."""
     if period not in ("week", "month", "custom"):
         raise HTTPException(status_code=422, detail="period must be week, month or custom")
     sched = schedule_from_settings()
@@ -269,6 +271,11 @@ def bid_period(period: str, day: str, to: str, now: datetime) -> BidPeriod:
             raise HTTPException(status_code=400, detail="invalid date") from None
         pw = pay_week(sched, now, anchor)
         days = [date.fromisoformat(d.key) for d in pw.days]
+        if weeks == 2:
+            first = date.fromisoformat(pay_week(sched, now, days[0] - timedelta(days=1)).days[0].key)
+            end = min(days[-1], today)
+            return BidPeriod(period=period, start=first, end=end, label=label("custom", first, days[-1]), today=today,
+                             columns=pay_week_columns(first, end, sched) if first <= end else [], span=2)
         return BidPeriod(period=period, start=days[0], end=min(days[-1], today), label=week_label(pw), today=today,
                          columns=day_columns(days), pay_week=pw)
     first, until = _stats_days(period, day or today.isoformat(), to)
@@ -317,16 +324,18 @@ async def bids_performance(
     period: str = Query("month"),
     date: str = Query(""),
     to: str = Query(""),
+    weeks: Annotated[int, Query(ge=1, le=2)] = 1,
     includeArchived: bool = False,
     ownerId: Optional[str] = None,
 ) -> dict:
-    """Bidder performance for a pay week, month or custom range: bids, hit days, streaks, interviews and rankings.
-    The current period runs to today's open report day. `ownerId` limits it to one user's bidders."""
+    """Bidder performance for a pay week (`weeks=2`: that and the one before), month or custom range: bids, hit days,
+    streaks, interviews and rankings. The current period runs to today's open report day. `ownerId` limits it to one
+    user's bidders."""
     now = _now()
-    p = bid_period(period, date, to, now)
+    p = bid_period(period, date, to, now, weeks)
     owner = to_object_id(ownerId) if ownerId else None
     bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
-    out = await performance(bidders, period, p.start, p.end, p.label, p.today, columns=p.columns)
+    out = await performance(bidders, period, p.start, p.end, p.label, p.today, columns=p.columns, span=p.span)
     out["payWeek"] = _pay_week_out(p.pay_week, now.astimezone(timezone.utc)) if p.pay_week else None
     if p.pay_week:
         # Money and "to review" come from the pay week board (the pay-week window, folder counts before records start),
@@ -350,18 +359,19 @@ async def bids_insights(
     period: str = Query("month"),
     date: str = Query(""),
     to: str = Query(""),
+    weeks: Annotated[int, Query(ge=1, le=2)] = 1,
     ownerId: Optional[str] = None,
 ) -> dict:
     """The Bidders page card: one owner's active bidders vs the platform over the Performance tab's period, and each
     measure's best bidder vs the best on the platform. Staff: their own bidders; an admin: one owner's (`ownerId`),
     else nothing to compare."""
-    p = bid_period(period, date, to, _now())
+    p = bid_period(period, date, to, _now(), weeks)
     start, end, text, today = p.start, p.end, p.label, p.today
     if user.role == "admin" and not ownerId:
         return {"start": start.isoformat(), "end": end.isoformat(), "label": text, "mine": None, "platform": None,
                 "tops": None}
     owner = to_object_id(ownerId) if ownerId else None
-    return await insights(await _visible_bidders(user, owner), period, start, end, text, today, columns=p.columns)
+    return await insights(await _visible_bidders(user, owner), period, start, end, text, today, columns=p.columns, span=p.span)
 
 
 @router.get("/alerts")
