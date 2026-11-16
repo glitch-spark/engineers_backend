@@ -39,6 +39,9 @@ class DoneCounts(Counts):
     """A day's Done: self bids typed per profile (accountId hex -> count) are kept beside the totals."""
 
     bidsSelfByProfile: Dict[str, Count] = {}
+    # Profiles on tracked self bids (the extension): what was typed is "other applies" (not captured), kept here and
+    # added to the tracked count in bidsSelfByProfile.
+    bidsSelfOtherByProfile: Dict[str, Count] = {}
 
 
 def bids_of(c: Bids) -> dict[str, int]:

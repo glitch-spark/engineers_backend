@@ -19,6 +19,7 @@ from app.dashboard_stats import app_tz
 from app.models.plan_common import monday_of
 from app.plan_auto import day_goal, effective_daily_done, empty_day, interview_counts, weekly_plans_for
 from app.plan_profiles import derive_self_bids, owner_profiles, profile_regions
+from app import self_bids
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
@@ -116,10 +117,21 @@ async def get_day(
     when = parse_ymd(day, "date")
     uid = await read_subject(user, userId)
     interviews = await _interviews(uid, when, when)
-    return _day_out(
+    out = _day_out(
         uid, when, await _find(uid, when), interviews.get(when, empty_day()), await _weekly(uid, when),
         await owner_profiles(uid),
     )
+    return await _with_tracked(out, uid, when)
+
+
+async def _with_tracked(out: dict, uid, when: date) -> dict:
+    """The extension's self bids for the day (shown next to typed in the pilot) and the profiles already on tracked
+    counts (their typed number is "other applies")."""
+    out["trackedSelfByProfile"] = await self_bids.tracked_for_day(uid, when)
+    out["trackedProfiles"] = sorted(await self_bids.switched_profiles(uid, when))
+    plan_done = out.get("done") or {}
+    out["selfOtherByProfile"] = (plan_done.get("bidsSelfOtherByProfile") if isinstance(plan_done, dict) else None) or {}
+    return out
 
 
 @router.put("/{day}")
@@ -144,13 +156,18 @@ async def put_day(
     plan.goal = Counts(**bids_of(goal))
     plan.goalItems = body.goalItems
     profiles = await owner_profiles(user.id)  # one read: validation and the response
-    by = {pid: n for pid, n in body.done.bidsSelfByProfile.items() if n}
+    typed = {pid: n for pid, n in body.done.bidsSelfByProfile.items() if n}
+    # Profiles on tracked self bids: the typed number is "other applies", added to the tracked count.
+    switched = await self_bids.switched_profiles(user.id, when)
+    other = {pid: n for pid, n in typed.items() if pid in switched}
+    by = await self_bids.day_self_bids(user.id, when, typed, other) if switched else typed
     if by:
         regions = await profile_regions(profiles, by)
         by = {pid: by[pid] for pid in regions}
-        plan.done = DoneCounts(**{**bids_of(body.done), **derive_self_bids(by, regions)}, bidsSelfByProfile=by)
+        plan.done = DoneCounts(**{**bids_of(body.done), **derive_self_bids(by, regions)}, bidsSelfByProfile=by,
+                               bidsSelfOtherByProfile=other)
     else:
-        plan.done = DoneCounts(**bids_of(body.done))
+        plan.done = DoneCounts(**bids_of(body.done), bidsSelfOtherByProfile=other)
     plan.notes = body.notes
     if plan.loggedAt is None:
         plan.loggedAt = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -161,7 +178,7 @@ async def put_day(
 
     auto_day = (await _interviews(user.id, when, when)).get(when, empty_day())
     await _sync_slack(plan, user, effective_daily_done(plan, auto_day), auto_day["rounds"])
-    return _day_out(user.id, when, plan, auto_day, weekly, profiles)
+    return await _with_tracked(_day_out(user.id, when, plan, auto_day, weekly, profiles), user.id, when)
 
 
 @router.delete("/{day}")

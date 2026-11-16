@@ -1,12 +1,16 @@
 """Routes the Bid Track extension calls: register with an invite code, log in, who am I."""
 
 import asyncio
+import json
+import zipfile
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 from urllib.parse import urlsplit
 
 from beanie.exceptions import RevisionIdWasChanged
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import FileResponse
 from pydantic import AwareDatetime, BaseModel, Field, StringConstraints, ValidationInfo, field_validator
 from pymongo.errors import DuplicateKeyError
 
@@ -114,6 +118,43 @@ async def register_bidder_row(bidder: Bidder, username: str, password_hash: str)
         },
     )
     return result.matched_count == 1
+
+
+# The Bid Track package shipped with the server (replaced with each new extension version): /ext/download serves it and
+# /ext/latest names its version, so older extensions show "Update available" with a download link here.
+EXT_PACKAGE = Path(__file__).resolve().parent.parent / "static" / "bid-track.zip"
+
+
+def _package_version() -> Optional[str]:
+    """The version in the shipped package's manifest.json; None without a readable package."""
+    try:
+        with zipfile.ZipFile(EXT_PACKAGE) as z:
+            return json.loads(z.read("manifest.json")).get("version") or None
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+@router.get("/latest")
+async def latest(request: Request) -> dict:
+    """The newest Bid Track version and its download link, so an older extension can show "Update available": the
+    shipped package and /ext/download, unless EXT_LATEST_VERSION / EXT_DOWNLOAD_URL say otherwise. No sign-in needed;
+    both null when there is nothing to offer."""
+    s = get_settings()
+    shipped = _package_version()
+    url = s.EXT_DOWNLOAD_URL or None
+    if url is None and shipped:
+        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme  # Railway terminates HTTPS
+        url = f"{scheme}://{request.url.netloc}/ext/download"
+    return {"version": s.EXT_LATEST_VERSION or shipped, "url": url}
+
+
+@router.get("/download")
+async def download() -> FileResponse:
+    """The shipped Bid Track package, named with its version (bid-track-3.5.1.zip)."""
+    version = _package_version()
+    if version is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No Bid Track package on this server")
+    return FileResponse(EXT_PACKAGE, media_type="application/zip", filename=f"bid-track-{version}.zip")
 
 
 @router.post("/register")

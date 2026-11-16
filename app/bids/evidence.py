@@ -35,7 +35,12 @@ async def evidence_for(bids: list[Bid], bidders: dict[str, Bidder]) -> dict[str,
 
     The tailored resume is the newest completed ResumeApplication of the bidder's profile for exactly the bid's jobUrl.
     Only names are read: an Account holds its resumes' markdown and a ResumeApplication its PDF."""
-    profile_of = {str(b.id): (bidders[str(b.bidderId)].profileId if str(b.bidderId) in bidders else None) for b in bids}
+    # A self bid (the owner's own apply) carries the profile it was recorded for.
+    profile_of = {
+        str(b.id): (b.accountId if getattr(b, "kind", "bidder") == "self"
+                    else bidders[str(b.bidderId)].profileId if str(b.bidderId) in bidders else None)
+        for b in bids
+    }
     profile_ids = list({p for p in profile_of.values() if p})
 
     profiles: dict = {}

@@ -42,6 +42,18 @@ def create_bidder_token(bidder_id: str, version: int) -> str:
     return jwt.encode(payload, get_settings().AUTH_SECRET, algorithm=ALGORITHM)
 
 
+EXT_OWNER_TOKEN_DAYS = 14  # an owner's extension sign-in ends after two weeks unused (renewed while in use)
+
+
+def create_ext_owner_token(owner_id: str, profile_id: str) -> str:
+    """An owner's extension token, bound to one profile (pid): typ="ext-owner" keeps it apart from app and bidder
+    tokens; iat lets /ext/owner renew it like a bidder's."""
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {"sub": owner_id, "pid": profile_id, "typ": "ext-owner", "iat": now,
+                               "exp": now + timedelta(days=EXT_OWNER_TOKEN_DAYS)}
+    return jwt.encode(payload, get_settings().AUTH_SECRET, algorithm=ALGORITHM)
+
+
 def bidder_token_needs_renewal(claims: dict[str, Any], now: datetime) -> bool:
     """Older than BIDDER_TOKEN_RENEW_AFTER, or issued before tokens carried iat."""
     iat = claims.get("iat")

@@ -145,6 +145,13 @@ class Settings(BaseSettings):
     # cut-over day (YYYY-MM-DD, in BID_REPORT_TIMEZONE): a window starting before that day's local
     # midnight (or straddling it) keeps the old screenshot-folder count. Unset = records everywhere.
     BID_RECORDS_START: Optional[str] = None
+    # Self bids from the extension (spec 2026-11-15-self-bids-extension-design.md): unset = pilot (tracked shown next
+    # to typed, nothing changes); an ISO day = each owner's profile switches to tracked counts from its first tracked
+    # day on or after it.
+    SELF_BIDS_TRACKED_FROM: Optional[str] = None
+    # Bid Track update notice: the newest extension version and where to download it (unset = no notice).
+    EXT_LATEST_VERSION: Optional[str] = None
+    EXT_DOWNLOAD_URL: Optional[str] = None
     # Slack channel the bid reports post to. Unset = reports are saved but not posted.
     SLACK_BIDS_CHANNEL_ID: Optional[str] = None
     # Profile metrics start here (YYYY-MM-DD): earlier weeks are not shown. Unset = the day after this release first
@@ -180,7 +187,7 @@ class Settings(BaseSettings):
             return None
         return str(v).strip() or None
 
-    @field_validator("BID_RECORDS_START", "PROFILE_METRICS_SINCE", mode="before")
+    @field_validator("BID_RECORDS_START", "PROFILE_METRICS_SINCE", "SELF_BIDS_TRACKED_FROM", mode="before")
     @classmethod
     def _validate_records_start(cls, v: object) -> Optional[str]:
         if v is None:
