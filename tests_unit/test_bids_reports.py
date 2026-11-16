@@ -38,6 +38,9 @@ def bidder(name, folder, rate=0.5):
                            rate=rate, screenshotFolderUrl=folder)
 
 
+def _aware(dt): return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 class FakeStore:
     def __init__(self, bidders):
         self.bidders, self.rows, self.done, self.posts = bidders, [], set(), {}
@@ -50,6 +53,12 @@ class FakeStore:
     async def release(self, key): self.done.discard(key)
     async def load_rows(self, kind, pk): return [r for r in self.rows if (r.kind, r.periodKey) == (kind, pk)]
     async def save_rows(self, rows): self.rows += rows; return rows
+    async def overlapping_weekly(self, start, end, exclude_key):
+        for r in self.rows:
+            if (r.kind == "weekly" and r.periodKey != exclude_key and _aware(r.periodStart) < end
+                    and _aware(r.periodEnd) > start):
+                return r.periodKey
+        return None
     async def active_bidders(self): return self.bidders
     async def profile_names(self, ids): return {}
     async def owners(self, ids): return {str(OWNER): Owner("Pedro", "Pedro")}
@@ -432,3 +441,61 @@ async def test_switch_read_from_settings(monkeypatch):
     now = datetime(2026, 11, 22, 20, 5, tzinfo=CT).astimezone(timezone.utc)
     got = await run_bid_reports_tick(now, store=store, storage=FakeStorage({"s3://b/ana/": 3}), post=post)
     assert got["weekly"] == "posted" and "bids-weekly:2026-11-22" in store.done
+
+
+# --- the double-report guard: a weekly window may not overlap a stored weekly report of another period ---
+
+def stored_weekly(store, key, start, end):
+    store.rows.append(BidReport.model_construct(
+        kind="weekly", periodKey=key, periodStart=start, periodEnd=end, bidderId=PydanticObjectId(),
+        ownerId=OWNER, bidderName="Ana", rate=0.5, count=1, amount=0.5))
+
+
+async def test_switch_weekly_overlapping_a_stored_report_is_refused(caplog):
+    # old code posted weekly 2026-11-21 (11-14 -> 11-21); the long week 11-14 -> 11-22 would pay those days twice
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    stored_weekly(store, "2026-11-21", datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 21, 22, 0, tzinfo=timezone.utc))
+    with caplog.at_level("ERROR", logger="bids.reports"):
+        got, store, post = await switch_tick(datetime(2026, 11, 22, 20, 5), store)
+    assert got["weekly"] == "overlap:2026-11-21"
+    assert not any("Weekly" in t for t in post.sent)
+    assert {r.periodKey for r in weekly_rows(store)} == {"2026-11-21"}
+    assert "bids-weekly:2026-11-22" in store.done  # the claim stays: later ticks do not retry
+    assert any("2026-11-22" in m and "2026-11-21" in m for m in caplog.messages)
+    again = await run_bid_reports_tick(datetime(2026, 11, 22, 20, 10, tzinfo=CT).astimezone(timezone.utc),
+                                       store=store, storage=FakeStorage({}), post=post, sched=SWITCH_SCHED)
+    assert again["weekly"] == "done" and not any("Weekly" in t for t in post.sent)
+
+
+async def test_switch_weekly_after_a_normal_previous_week_is_not_refused():
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    stored_weekly(store, "2026-11-14", datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc))
+    got, store, post = await switch_tick(datetime(2026, 11, 22, 20, 5), store)
+    assert got["weekly"] == "posted"
+
+
+async def test_overlap_guard_does_not_apply_to_daily_reports():
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    stored_weekly(store, "2026-11-21", datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 21, 22, 0, tzinfo=timezone.utc))
+    got, _, _ = await switch_tick(datetime(2026, 11, 22, 18, 35), store)
+    assert got["daily"] == "posted"
+
+
+async def test_real_store_finds_an_overlapping_weekly_report(db):
+    start, end = datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc), datetime(2026, 11, 23, 2, 0, tzinfo=timezone.utc)
+    store = reports.BeanieReportStore()
+    for kind, key, s_, e_ in [
+        ("weekly", "2026-11-14", datetime(2026, 11, 7, 22, 0), datetime(2026, 11, 14, 22, 0)),   # adjacent
+        ("daily", "2026-11-20", datetime(2026, 11, 19, 23, 30), datetime(2026, 11, 20, 23, 30)),  # not weekly
+    ]:
+        await BidReport(kind=kind, periodKey=key, periodStart=s_, periodEnd=e_, bidderId=PydanticObjectId(),
+                        ownerId=OWNER, bidderName="Ana", rate=0.5, count=1, amount=0.5).insert()
+    assert await store.overlapping_weekly(start, end, "2026-11-22") is None
+    await BidReport(kind="weekly", periodKey="2026-11-21", periodStart=datetime(2026, 11, 14, 22, 0),
+                    periodEnd=datetime(2026, 11, 21, 22, 0), bidderId=PydanticObjectId(), ownerId=OWNER,
+                    bidderName="Ana", rate=0.5, count=1, amount=0.5).insert()
+    assert await store.overlapping_weekly(start, end, "2026-11-22") == "2026-11-21"
+    assert await store.overlapping_weekly(start, end, "2026-11-21") is None
