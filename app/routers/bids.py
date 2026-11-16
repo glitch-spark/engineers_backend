@@ -21,7 +21,7 @@ from app.bids.storage import BidStorageError, count_folders, get_bid_storage
 from app.bids.week import PayWeek, combine_boards, pay_week, week_board, week_label
 from app.profile_metrics import bid_report_day
 from app.bids.windows import (daily_cutoff_on, latest_cutoff, next_cutoff, open_window, period_key,
-                              schedule_from_settings, window_for)
+                              report_day, schedule_from_settings, window_for)
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_rates import label, window
@@ -521,6 +521,23 @@ async def bids_alerts(
         return {"asOf": today.isoformat(), "flags": None, "archive": None}
     owner = to_object_id(ownerId) if ownerId else None
     return await bid_alerts(await _visible_bidders(user, owner), today, now)
+
+
+@router.get("/clock")
+async def bids_clock(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """"Now" as the report schedule sees it, so the client never hard-codes the schedule: the open report day, the
+    first and last report days of the pay week holding now (7 days, 8 across the switch) and the first report day of
+    the pay week before it. Any signed-in user."""
+    sched, now = schedule_from_settings(), _now()
+    week = pay_week(sched, now)
+    previous = pay_week(sched, week.start - timedelta(microseconds=1))
+    return {
+        "today": report_day(now, sched).isoformat(),
+        "payWeekStart": week.days[0].key,
+        "payWeekEnd": week.days[-1].key,
+        "previousPayWeekStart": previous.days[0].key,
+        "timezone": sched.tz.key,
+    }
 
 
 @router.get("/{bid_id}")
