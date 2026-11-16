@@ -60,8 +60,14 @@ BID_WEEKLY_REPORT_TIME=16:00
 # When set, reports follow the schedule above until that moment and the NEXT values take over at it.
 # Format YYYY-MM-DDTHH:MM, local time in BID_REPORT_TIMEZONE.
 # All three NEXT values are required with it, and the switch moment must be the NEXT weekly day at the NEXT
-# weekly time, or the app refuses to start. The week ending at the switch is one long week (Sat 16:00 -> Sun 20:00).
-# Set all four on the API service and on the report cron service. Values for the Sunday switch:
+# weekly time, or the app refuses to start. The week ending at the switch is one long week
+# (Sat 2026-11-14 16:00 -> Sun 2026-11-22 20:00, about 8 days).
+# Deploy order: deploying this code first is safe, nothing changes until BID_SCHEDULE_SWITCH_AT is set.
+# Deadline: set all four BEFORE the last old weekly cutoff the switch removes (the Saturday cutoff before the
+# switch), otherwise the old rules close and post that week. For the switch below that is Sat 2026-11-21
+# 16:00 Chicago. If the switch moves to a later Sunday, the deadline moves to the Saturday before it.
+# Set all four on both Railway services: engineers_backend (API) and keen-spirit (report cron).
+# Values for the Sunday switch:
 #   BID_SCHEDULE_SWITCH_AT=2026-11-22T20:00  BID_NEXT_DAILY_REPORT_TIME=18:00
 #   BID_NEXT_WEEKLY_REPORT_DAY=sunday        BID_NEXT_WEEKLY_REPORT_TIME=20:00
 BID_SCHEDULE_SWITCH_AT=
