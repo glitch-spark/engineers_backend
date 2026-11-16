@@ -770,6 +770,23 @@ def _call_type_match(call_type: str) -> Any:
     return True if call_type == "caller" else {"$ne": True}
 
 
+def _search_match(q: str) -> dict:
+    """Mongo match for the feeds' `q`: the company or the position contains it, case-insensitive and literal
+    (regex characters in what the user typed mean themselves). Empty / blank q matches everything ({})."""
+    text = (q or "").strip()
+    if not text:
+        return {}
+    rx = {"$regex": re.escape(text), "$options": "i"}
+    return {"$or": [{"companyName": rx}, {"appliedPosition": rx}]}
+
+
+def _and_search(query: dict, q: str) -> None:
+    """Add the `q` match to `query` without clobbering an `$or` already there (the date range uses one)."""
+    cond = _search_match(q)
+    if cond:
+        query.setdefault("$and", []).append(cond)
+
+
 _SORT_FIELDS = {"latest": "scheduledAt", "company": "companyName", "stage": "stage", "status": "status"}
 
 
@@ -787,6 +804,7 @@ async def list_interviews(
     callType: str = Query("", description="self | caller: who takes the latest round"),
     sort: str = Query("latest"),
     dir: str = Query("desc"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
 ) -> dict:
     # Every authenticated user can list/filter all interviews. Pass creatorId
     # to narrow to one owner; omit it to see everyone.
@@ -805,6 +823,7 @@ async def list_interviews(
         query["createdBy"] = to_object_id(creatorId)
     if callType:
         query["caller.enabled"] = _call_type_match(callType)
+    _and_search(query, q)
 
     # Legacy clients send sort=asc|desc (by date).
     if sort in ("asc", "desc"):
@@ -846,6 +865,7 @@ async def list_interview_rounds(
     callerOnly: bool = Query(False),
     callerId: str = Query(""),
     callType: str = Query("", description="self | caller: who takes the round"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
 ) -> dict:
     """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list.
     callerOnly / callerId narrow it to caller rounds (the Callers calendar); callType to self or caller rounds."""
@@ -866,6 +886,7 @@ async def list_interview_rounds(
         query["accountId"] = to_object_id(accountId)
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
+    _and_search(query, q)
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(
@@ -891,6 +912,7 @@ async def list_caller_rounds(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=200),
     dir: str = Query("desc"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
 ) -> dict:
     """Callers list: every user's caller rounds (or `creatorId`'s), one row per round, by start time (desc by
     default), paginated. `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
@@ -912,6 +934,7 @@ async def list_caller_rounds(
     query: dict[str, Any] = {"stageHistory": {"$elemMatch": in_range}}
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
+    _and_search(query, q)
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
