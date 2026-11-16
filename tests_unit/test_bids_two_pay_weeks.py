@@ -143,3 +143,60 @@ async def test_weeks_must_be_one_or_two(db, monkeypatch):
             for path in ("/bids/performance", "/bids/insights") for w in (1, 2, 3, 0)
         }
     assert codes == {(p, w): 200 if w in (1, 2) else 422 for p in ("/bids/performance", "/bids/insights") for w in (1, 2, 3, 0)}
+
+
+async def bid_as(b, status, *chicago, n=1):
+    first = datetime(*chicago, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+    for _ in range(n):
+        await Bid(bidderId=b.id, ownerId=b.createdBy, jobKey=f"ana/x/j{next(_n)}", jobUrl="https://j.example/x",
+                  jobTitle="x", firstAt=first, status=status, screenshots=[]).insert()
+
+
+async def test_two_pay_weeks_money_is_the_sum_of_the_two_pay_weeks(db, monkeypatch):
+    at(monkeypatch, 2026, 11, 18, 9)
+    pedro, ana = await setup()
+    ben = await Bidder(createdBy=pedro.id, name="Ben", rate=0.25, folder="ben", screenshotFolderUrl="s3://shots/ben/",
+                       createdAt=datetime(2026, 1, 1)).insert()
+    await bid_as(ana, "approved", 2026, 11, 7, 17, n=2)        # Sat Nov 7 16:00..18:30: the earlier pay week's money,
+    await bid_as(ana, "pending", 2026, 11, 7, 18, n=1)         # but report day Nov 7, outside the two periods' days
+    await bid_as(ana, "approved", 2026, 11, 10, 10, n=3)       # pay week of Nov 8..14
+    await bid_as(ana, "pending", 2026, 11, 12, 10, n=2)
+    await bid_as(ana, "approved", 2026, 11, 14, 15, n=4)       # closing Saturday, before 16:00: still that pay week
+    await bid_as(ana, "approved", 2026, 11, 14, 17, n=5)       # closing Saturday 16:00..18:30: the NEXT pay week's money
+    await bid_as(ana, "pending", 2026, 11, 14, 18, n=1)        # ... and its review queue
+    await bid_as(ana, "approved", 2026, 11, 16, 10, n=6)       # current pay week
+    await bid_as(ben, "approved", 2026, 11, 3, 10, n=7)        # before the two pay weeks: not counted
+    await bid_as(ben, "approved", 2026, 11, 9, 10, n=8)
+    await bid_as(ben, "pending", 2026, 11, 17, 10, n=2)
+
+    both = await perf(pedro)                                    # weeks=2 (the helper's default)
+    current = await perf(pedro, weeks=1)
+    earlier = await perf(pedro, weeks=1, date="2026-11-14")     # the pay week before, as Last pay week asks for it
+    assert earlier["payWeek"]["days"][0]["day"] == "2026-11-08" and both["start"] == "2026-11-08"
+    # the closing-Saturday 17:00 bids sit in the report-day sums of the earlier week, but are the next pay week's money
+
+    for key in ("pay", "approved", "toReview", "pending", "rejected"):
+        assert both["totals"][key] == pytest.approx(current["totals"][key] + earlier["totals"][key]), key
+    assert both["totals"]["pay"] > 0 and both["totals"]["toReview"] > 0
+    cur = {r["id"]: r for r in current["bidders"]}
+    old = {r["id"]: r for r in earlier["bidders"]}
+    assert len(both["bidders"]) == 2
+    for row in both["bidders"]:
+        for key in ("pay", "approved", "pending", "rejected", "toReview"):
+            want = cur[row["id"]]["week"][key] + old[row["id"]]["week"][key]
+            assert row["week"][key] == pytest.approx(want), (row["name"], key)
+        assert row["week"]["source"] == "records" and row["dayCells"] is None
+    ana_row = next(r for r in both["bidders"] if r["name"] == "Ana")
+    # Ana: 2+3+4 approved earlier (the Nov 14 17:00 ones are the next week's), 5+6 current; 1+2 pending earlier, 1 current
+    assert (ana_row["week"]["approved"], ana_row["week"]["toReview"], ana_row["week"]["pay"]) == (20, 4, 10.0)
+    assert both["totals"]["today"] is None and both["payWeek"] is None
+
+
+async def test_one_pay_week_money_is_unchanged(db, monkeypatch):
+    at(monkeypatch, 2026, 11, 18, 9)
+    pedro, ana = await setup()
+    await bid_as(ana, "approved", 2026, 11, 14, 17, n=5)
+    await bid_as(ana, "approved", 2026, 11, 16, 10, n=6)
+    r = await perf(pedro, weeks=1)
+    assert r["totals"]["approved"] == 11 and r["totals"]["pay"] == 5.5
+    assert r["bidders"][0]["week"]["approved"] == 11 and len(r["bidders"][0]["dayCells"]) == 7

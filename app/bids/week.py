@@ -52,6 +52,31 @@ def pay_week(sched: BidSchedule, now: datetime, week: Optional[date] = None) -> 
     return PayWeek(start, end, cutoff, days)
 
 
+def _known_sum(values) -> Optional[float]:
+    """Sum of the known values; None when none is known (a folder day or a failed listing)."""
+    known = [v for v in values if v is not None]
+    return sum(known) if known else None
+
+
+def combine_boards(boards: list[dict]) -> dict:
+    """Pay-week money of several consecutive pay weeks: each bidder's `week` block (approved, pending, rejected, pay,
+    toReview) and the team totals, as the sum of what `week_board` reports for each pay week, so a period of two pay
+    weeks pays exactly what its two pay weeks pay. Unknown values are left out of a sum (None if all are unknown)."""
+    blocks: dict[str, dict] = {}
+    for rows in zip(*(b["bidders"] for b in boards)):
+        weeks = [r["week"] for r in rows]
+        block = {k: _known_sum(w[k] for w in weeks) for k in ("approved", "pending", "rejected", "toReview")}
+        pay = _known_sum(w["pay"] for w in weeks)
+        block["pay"] = None if pay is None else round(pay, 2)
+        block["source"] = "records" if all(w["source"] == "records" for w in weeks) else "folders"
+        block["error"] = next((w["error"] for w in weeks if w["error"]), None)
+        blocks[rows[0]["id"]] = block
+    totals = {k: _known_sum(b["totals"][k] for b in boards) for k in ("approved", "pending", "rejected", "toReview")}
+    pay = _known_sum(b["totals"]["pay"] for b in boards)
+    totals["pay"] = None if pay is None else round(pay, 2)
+    return {"blocks": blocks, "totals": totals}
+
+
 def week_label(pw: PayWeek) -> str:
     d = pw.cutoff.date()
     return f"Week ending {d:%a} {d:%b} {d.day}"

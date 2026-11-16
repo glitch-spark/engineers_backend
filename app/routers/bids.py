@@ -17,7 +17,7 @@ from app.bids.performance import day_columns, pay_week_columns, performance
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
-from app.bids.week import PayWeek, pay_week, week_board, week_label
+from app.bids.week import PayWeek, combine_boards, pay_week, week_board, week_label
 from app.profile_metrics import bid_report_day
 from app.bids.windows import latest_cutoff, open_window, period_key, schedule_from_settings, window_for
 from app.config import get_settings
@@ -252,6 +252,7 @@ class BidPeriod(BaseModel):
     today: date
     columns: list[dict]
     pay_week: Optional[PayWeek] = None
+    pay_weeks: list[PayWeek] = []  # span 2: the two pay weeks, earlier first (their money comes from the week boards)
     span: int = 1  # pay weeks in a `week` period: 1, or 2 (the anchored pay week and the one before; no pay_week board)
 
 
@@ -272,10 +273,12 @@ def bid_period(period: str, day: str, to: str, now: datetime, weeks: int = 1) ->
         pw = pay_week(sched, now, anchor)
         days = [date.fromisoformat(d.key) for d in pw.days]
         if weeks == 2:
-            first = date.fromisoformat(pay_week(sched, now, days[0] - timedelta(days=1)).days[0].key)
+            earlier = pay_week(sched, now, days[0] - timedelta(days=1))
+            first = date.fromisoformat(earlier.days[0].key)
             end = min(days[-1], today)
             return BidPeriod(period=period, start=first, end=end, label=label("custom", first, days[-1]), today=today,
-                             columns=pay_week_columns(first, end, sched) if first <= end else [], span=2)
+                             columns=pay_week_columns(first, end, sched) if first <= end else [], span=2,
+                             pay_weeks=[earlier, pw])
         return BidPeriod(period=period, start=days[0], end=min(days[-1], today), label=week_label(pw), today=today,
                          columns=day_columns(days), pay_week=pw)
     first, until = _stats_days(period, day or today.isoformat(), to)
@@ -350,6 +353,17 @@ async def bids_performance(
         today = next((d for d in out["payWeek"]["days"] if d["isToday"]), None)
         cell = next((d for d in t["days"] if today and d["day"] == today["day"]), None)
         out["totals"]["today"] = {"day": cell["day"], "approved": cell["approved"], "pending": cell["pending"]} if cell else None
+    elif p.pay_weeks:
+        # Two pay weeks: money and "to review" are the sum of the two pay weeks' boards, exactly what each one reports
+        # (pay-week windows, folder counts before records start), not the report-day sums, which run past the Saturday
+        # 16:00 close and miss folder-counted days. The performance measures stay on report days.
+        sched, storage = schedule_from_settings(), get_bid_storage()
+        boards = [await week_board(bidders, pw, now, sched, storage, FOLDER_CACHE) for pw in p.pay_weeks]
+        money = combine_boards(boards)
+        for row in out["bidders"]:
+            if row["id"] in money["blocks"]:
+                row["week"] = money["blocks"][row["id"]]
+        out["totals"].update(money["totals"])
     return out
 
 
