@@ -26,6 +26,7 @@ class ProfileUpdate(BaseModel):
     email: str
     image: Optional[str] = None
     birthday: Optional[str] = None
+    phone: Optional[str] = None
     leaderboardOptIn: Optional[bool] = None
     leaderboardName: Optional[str] = None
     leaderboardAnon: Optional[bool] = None
@@ -70,6 +71,8 @@ async def get_profile(user: Annotated[UserExtra, Depends(get_current_user)]) -> 
             "email": user.email or "",
             "image": user.image or "",
             "birthday": user.birthday,
+            "phone": user.phone or "",
+            "isActive": user.isActive,
             "leaderboardOptIn": user.leaderboardOptIn,
             "leaderboardName": user.leaderboardName or "",
             "leaderboardAnon": user.leaderboardAnon,
@@ -104,6 +107,8 @@ async def update_profile(
         parsed = _parse_dt(body.birthday)
         if parsed is not None:
             user.birthday = parsed
+    if body.phone is not None:
+        user.phone = body.phone.strip() or None
     if body.leaderboardName is not None:
         user.leaderboardName = body.leaderboardName.strip() or None
     if body.leaderboardAnon is not None:
@@ -125,6 +130,7 @@ async def update_profile(
             "email": user.email,
             "image": user.image,
             "birthday": user.birthday,
+            "phone": user.phone or "",
             "leaderboardOptIn": user.leaderboardOptIn,
             "leaderboardName": user.leaderboardName or "",
             "leaderboardAnon": user.leaderboardAnon,
