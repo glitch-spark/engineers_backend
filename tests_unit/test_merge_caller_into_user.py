@@ -143,6 +143,42 @@ async def test_owner_is_never_made_the_caller_of_their_own_interview(db):
     assert (await Interview.get(theirs.id)).stageHistory[0].caller.callerKind == "user"
 
 
+async def test_own_to_self_turns_the_users_own_interviews_into_self_rounds(db):
+    nick, owner = await make_user("Nicholas"), await make_user("Pedro")
+    ext = await make_caller("Nicholas")
+    cid = str(ext.id)
+    mine = await make_interview(nick, "Mine Inc", [_round(cid, "Nicholas", confirmed=True)])
+    theirs = await make_interview(owner, "Acme", [_round(cid, "Nicholas")])
+
+    plan = await mc.plan_merge(cid, str(nick.id))
+    assert plan.self_rounds == 1 and plan.skipped_companies == ["Mine Inc"]
+    assert await mc.merge_caller_into_user(cid, str(nick.id), apply=True, own_to_self=True) == 1
+    own = (await Interview.get(mine.id)).stageHistory[0]
+    assert own.caller.enabled is False and own.caller.callerId is None and own.caller.callerName == "TBD"
+    assert own.confirmed is True                                   # nothing else on the round changes
+    moved = (await Interview.get(theirs.id)).stageHistory[0].caller
+    assert (moved.enabled, moved.callerKind, moved.callerId) == (True, "user", str(nick.id))
+    # Without the option the user's own rounds stay on the external caller (the default behaviour).
+    other = await make_interview(nick, "Other Inc", [_round(cid, "Nicholas")])
+    await mc.merge_caller_into_user(cid, str(nick.id), apply=True)
+    assert (await Interview.get(other.id)).stageHistory[0].caller.callerId == cid
+
+
+async def test_cli_own_to_self_reports_and_applies(db, capsys):
+    nick, owner = await make_user("Nicholas"), await make_user("Pedro")
+    ext = await make_caller("Nicholas")
+    mine = await make_interview(nick, "Mine Inc", [_round(str(ext.id), "Nicholas")])
+    await make_interview(owner, "Acme", [_round(str(ext.id), "Nicholas")])
+
+    assert await mc.run(_args(caller_name="Nicholas", user_name="Nicholas", own_to_self=True)) == 0
+    out = capsys.readouterr().out
+    assert "Switch to Self (the user owns these interviews): Mine Inc" in out and "DRY RUN" in out
+    assert (await Interview.get(mine.id)).stageHistory[0].caller.enabled is True   # dry run wrote nothing
+    assert await mc.run(_args(caller_name="Nicholas", user_name="Nicholas", own_to_self=True, apply=True)) == 0
+    assert "and switched 1 round(s) to Self" in capsys.readouterr().out
+    assert (await Interview.get(mine.id)).stageHistory[0].caller.enabled is False
+
+
 async def test_unknown_ids_raise(db):
     nick, ext = await make_user(), await make_caller()
     with pytest.raises(ValueError):
@@ -154,7 +190,7 @@ async def test_unknown_ids_raise(db):
 
 
 def _args(**kw):
-    base = dict(caller_name=None, user_name=None, caller_id=None, user_id=None, apply=False)
+    base = dict(caller_name=None, user_name=None, caller_id=None, user_id=None, apply=False, own_to_self=False)
     base.update(kw)
     return argparse.Namespace(**base)
 

@@ -6,7 +6,8 @@ Then the external caller is archived (kept on the list for history, no longer of
 are written, with positional ($set stageHistory.<i>.caller.*) updates; nothing else on an interview changes (confirmed included).
 
 An interview's owner is never the caller of their own interview's rounds, so the user's own interviews are left
-on the external caller and listed in the output.
+on the external caller and listed in the output. With --own-to-self those rounds become Self rounds instead (the
+owner took the call): caller.enabled = False, callerId = None, callerName = "TBD", callerKind = "external".
 
 --caller-name matches Caller.nameKey case-insensitively; --user-name matches UserExtra.name exactly, else
 case-insensitively. If either matches 0 or more than 1 record the matches are printed and nothing changes (exit 1).
@@ -18,6 +19,7 @@ Run:
     cd engineers_backend
     .venv/Scripts/python -m scripts.merge_caller_into_user --caller-name Nicholas --user-name Nicholas           # dry run
     .venv/Scripts/python -m scripts.merge_caller_into_user --caller-name Nicholas --user-name Nicholas --apply   # write
+    add --own-to-self to also make the user's own interviews' rounds with this caller Self rounds
 
 Connects with MONGODB_URI and registers the models only: no startup migrations or seeds, no index creation.
 """
@@ -44,6 +46,8 @@ class MergePlan:
     skipped_companies: list[str] = field(default_factory=list)  # the user's own interviews: left alone
     # (interview _id, indexes of its matching stageHistory rounds, whether its legacy top-level caller matches)
     targets: list = field(default_factory=list)
+    self_rounds: int = 0  # rounds on the user's own interviews (made Self with own_to_self)
+    self_targets: list = field(default_factory=list)  # same shape as targets
 
 
 def _oid(value: str, what: str) -> PydanticObjectId:
@@ -69,11 +73,13 @@ async def plan_merge(caller_id: str, user_id: str) -> MergePlan:
     )
     async for doc in cursor:
         label = (doc.get("companyName") or "").strip() or f"(no company, {doc['_id']})"
-        if str(doc.get("createdBy")) == str(user.id):
-            plan.skipped_companies.append(label)
-            continue
         idx = [i for i, r in enumerate(doc.get("stageHistory") or []) if (r.get("caller") or {}).get("callerId") == caller_id]
         top = (doc.get("caller") or {}).get("callerId") == caller_id
+        if str(doc.get("createdBy")) == str(user.id):
+            plan.skipped_companies.append(label)
+            plan.self_rounds += len(idx) or int(top)
+            plan.self_targets.append((doc["_id"], idx, top))
+            continue
         # Interview.caller mirrors the latest round, so it is a round of its own only when no stageHistory round matches
         # (a legacy document that predates stageHistory); it is moved either way.
         plan.rounds += len(idx) or int(top)
@@ -82,8 +88,9 @@ async def plan_merge(caller_id: str, user_id: str) -> MergePlan:
     return plan
 
 
-async def merge_caller_into_user(caller_id: str, user_id: str, *, apply: bool) -> int:
-    """Rounds (stageHistory + top-level caller) assigned to the external caller; with apply, move them to the user."""
+async def merge_caller_into_user(caller_id: str, user_id: str, *, apply: bool, own_to_self: bool = False) -> int:
+    """Rounds (stageHistory + top-level caller) assigned to the external caller; with apply, move them to the user.
+    With own_to_self, the same caller's rounds on the user's own interviews become Self rounds."""
     plan = await plan_merge(caller_id, user_id)
     if not apply:
         return plan.rounds
@@ -108,6 +115,18 @@ async def merge_caller_into_user(caller_id: str, user_id: str, *, apply: bool) -
             sets.update({"caller.callerId": uid, "caller.callerKind": "user", "caller.callerName": uname})
         if sets:
             await coll.update_one(guard, {"$set": sets})
+    if own_to_self:
+        self_fields = {"enabled": False, "callerId": None, "callerName": "TBD", "callerKind": "external"}
+        for iid, idx, top in plan.self_targets:
+            sets, guard = {}, {"_id": iid}
+            for i in idx:
+                guard[f"stageHistory.{i}.caller.callerId"] = caller_id
+                sets.update({f"stageHistory.{i}.caller.{k}": v for k, v in self_fields.items()})
+            if top:
+                guard["caller.callerId"] = caller_id
+                sets.update({f"caller.{k}": v for k, v in self_fields.items()})
+            if sets:
+                await coll.update_one(guard, {"$set": sets})
     if plan.caller.archivedAt is None:
         await type(plan.caller).get_motor_collection().update_one(
             {"_id": plan.caller.id, "archivedAt": None}, {"$set": {"archivedAt": datetime.now(timezone.utc)}}
@@ -172,11 +191,14 @@ async def run(args: argparse.Namespace) -> int:
     print(f"Rounds to move: {plan.rounds} in {len(plan.companies)} interview(s)")
     for company in plan.companies:
         print(f"   - {company}")
+    own_to_self = bool(getattr(args, "own_to_self", False))
     if plan.skipped_companies:
-        print(f"Left on the external caller (the user owns these interviews): {', '.join(plan.skipped_companies)}")
+        what = "Switch to Self" if own_to_self else "Left on the external caller"
+        print(f"{what} (the user owns these interviews): {', '.join(plan.skipped_companies)}")
     if args.apply:
-        moved = await merge_caller_into_user(str(caller.id), str(user.id), apply=True)
-        print(f"APPLIED: moved {moved} round(s) to {user_display_name(user)} and archived caller {caller.name}")
+        moved = await merge_caller_into_user(str(caller.id), str(user.id), apply=True, own_to_self=own_to_self)
+        selfed = f" and switched {plan.self_rounds} round(s) to Self" if own_to_self else ""
+        print(f"APPLIED: moved {moved} round(s) to {user_display_name(user)}{selfed} and archived caller {caller.name}")
     else:
         print("DRY RUN: nothing written. Re-run with --apply to merge.")
     return 0
@@ -206,6 +228,8 @@ async def _main() -> int:
     parser.add_argument("--caller-id", help="external caller id (overrides --caller-name)")
     parser.add_argument("--user-id", help="user id (overrides --user-name)")
     parser.add_argument("--apply", action="store_true", help="write the merge (default: dry run)")
+    parser.add_argument("--own-to-self", action="store_true",
+                        help="also make the user's own interviews' rounds with this caller Self rounds")
     args = parser.parse_args()
     client = await _connect()
     try:
