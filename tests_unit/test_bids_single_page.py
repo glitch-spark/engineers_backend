@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from beanie import init_beanie
+from fastapi import HTTPException
 from mongomock_motor import AsyncMongoMockClient
 
 from app.bids import insights as ins
@@ -119,6 +120,47 @@ async def test_the_owners_self_bids_get_their_own_row_outside_the_totals(db):
                       firstAt=first, status="approved", screenshots=[]).insert()
     r = await perf(pedro)
     assert r["selfRows"] == [{"ownerId": str(pedro.id), "ownerName": "Pedro", "total": 5,
-                              "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0, "lastBidAt": r["selfRows"][0]["lastBidAt"]}]
+                              "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0, "lastBidAt": r["selfRows"][0]["lastBidAt"],
+                              "profiles": [{"accountId": str(alpha.id), "name": "Alpha", "total": 5,
+                                            "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0}]}]
     assert r["selfRows"][0]["lastBidAt"] is not None
     assert r["totals"]["total"] == 14 and r["totals"]["approved"] == 10   # Ana's bidder bids only
+
+
+async def _self_bids(owner, account, day: int, n: int):
+    first = datetime(2026, 11, day, 10, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+    for _ in range(n):
+        await Bid(kind="self", bidderId=None, ownerId=owner.id, accountId=account.id, jobKey=f"self-{owner.id}/x/j{next(_n)}",
+                  firstAt=first, status="approved", screenshots=[]).insert()
+
+
+async def test_a_self_row_splits_by_profile_and_the_profiles_add_up_to_it(db):
+    pedro, _ana, _bo = await setup()
+    zeta = await Account(name="Zeta", createdBy=pedro.id).insert()
+    alpha = await Account(name="Alpha", createdBy=pedro.id).insert()
+    await Account(name="Idle", createdBy=pedro.id).insert()            # no self bids: no sub-row
+    await _self_bids(pedro, zeta, 16, 2)
+    await _self_bids(pedro, alpha, 16, 1)
+    await _self_bids(pedro, alpha, 17, 4)
+    row = (await perf(pedro))["selfRows"][0]
+    assert [(p["name"], p["total"], p["weekly"]) for p in row["profiles"]] == [
+        ("Alpha", 5, [0, 1, 4, 0, 0, 0, 0]),
+        ("Zeta", 2, [0, 2, 0, 0, 0, 0, 0]),
+    ]
+    assert row["total"] == sum(p["total"] for p in row["profiles"]) == 7
+    assert row["weekly"] == [sum(col) for col in zip(*(p["weekly"] for p in row["profiles"]))]
+
+
+async def test_the_self_listing_narrows_to_one_profile(db):
+    pedro, _ana, _bo = await setup()
+    alpha = await Account(name="Alpha", createdBy=pedro.id).insert()
+    zeta = await Account(name="Zeta", createdBy=pedro.id).insert()
+    await _self_bids(pedro, alpha, 16, 2)
+    await _self_bids(pedro, zeta, 16, 3)
+    every = await bids_router.list_bids(pedro, day="2026-11-16", self_=True)
+    only = await bids_router.list_bids(pedro, day="2026-11-16", self_=True, accountId=str(alpha.id))
+    assert len(every["bids"]) == 5 and len(only["bids"]) == 2
+    assert {b["profileName"] for b in only["bids"]} == {"Alpha"}
+    with pytest.raises(HTTPException) as bad:
+        await bids_router.list_bids(pedro, day="2026-11-16", self_=True, accountId="not-an-id")
+    assert bad.value.status_code == 400

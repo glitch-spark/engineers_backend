@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 
@@ -178,6 +179,7 @@ async def list_bids(
     week: Optional[str] = None,
     self_: bool = Query(False, alias="self"),
     ownerId: Optional[str] = None,
+    accountId: Optional[str] = None,
 ) -> dict:
     sched, now = schedule_from_settings(), _now()
     if day is not None and week is not None:
@@ -199,7 +201,7 @@ async def list_bids(
             raise HTTPException(status_code=400, detail="Invalid day") from None
     start, end = (pw.start, pw.end) if pw is not None else window_for("daily", cutoff, sched)
     if self_:
-        return await _self_listing(user, ownerId, status, start, end, cutoff, pw, sched)
+        return await _self_listing(user, ownerId, status, start, end, cutoff, pw, sched, accountId)
 
     candidates = await _visible_bidders(user)
     if bidderId is not None:
@@ -236,9 +238,10 @@ async def list_bids(
     }
 
 
-async def _self_listing(user, owner_id: Optional[str], status, start, end, cutoff, pw, sched) -> dict:
+async def _self_listing(user, owner_id: Optional[str], status, start, end, cutoff, pw, sched,
+                        account_id: Optional[str] = None) -> dict:
     """The owners' own applies (self bids) of a day or pay week: staff see their own; an admin one owner's (ownerId)
-    or everyone's. Same shape as the bidders' listing; never reviewable."""
+    or everyone's. `accountId` narrows to one profile's. Same shape as the bidders' listing; never reviewable."""
     if user.role == "admin":
         owners = [to_object_id(owner_id)] if owner_id else None
     else:
@@ -246,6 +249,8 @@ async def _self_listing(user, owner_id: Optional[str], status, start, end, cutof
     query: dict = {"kind": "self", "firstAt": {"$gte": _naive_utc(start), "$lt": _naive_utc(end)}}
     if owners is not None:
         query["ownerId"] = {"$in": owners}
+    if account_id:
+        query["accountId"] = to_object_id(account_id)
     if status:
         query["status"] = status
     bids = await Bid.find(query).sort("-firstAt").to_list() if owners != [] else []
@@ -370,17 +375,33 @@ async def _self_rows(user, owner, bidders: list[Bidder], p: BidPeriod) -> list[d
         counts = await tracked_counts(o, p.start, p.end)
         if not counts:
             continue
-        weekly = [0] * len(p.columns)
-        for (_pid, d), n in counts.items():
+        # One sub-row per profile the owner applied with in the period; the row is their sum.
+        by_profile: dict[str, list[int]] = {}
+        for (pid, d), n in counts.items():
             if d in col_of:
-                weekly[col_of[d]] += n
+                by_profile.setdefault(pid, [0] * len(p.columns))[col_of[d]] += n
+        weekly = [sum(col) for col in zip(*by_profile.values())] if by_profile else [0] * len(p.columns)
         accounts = [a.id for a in await Account.find({"createdBy": o}).to_list()]
         rounds = await interview_rounds(accounts, p.start, p.end) if accounts else {}
+        # Rounds of interviews tagged "Applied by: Self" (index 2), per profile.
+        self_rounds: dict[str, int] = defaultdict(int)
+        for (acc, _day), v in rounds.items():
+            self_rounds[acc] += v[2]
+        profile_names = {
+            str(a.id): a.name or "Unnamed profile"
+            for a in await Account.find({"_id": {"$in": [to_object_id(pid) for pid in by_profile]}}).to_list()
+        }
+        profiles = sorted(
+            ({"accountId": pid, "name": profile_names.get(pid, "Unknown profile"), "total": sum(cells),
+              "weekly": cells, "interviews": self_rounds.get(pid, 0)} for pid, cells in by_profile.items()),
+            key=lambda r: (r["name"].lower(), r["accountId"]),
+        )
         last = await Bid.find({"kind": "self", "ownerId": o}).sort("-firstAt").limit(1).to_list()
         out.append({
             "ownerId": str(o), "ownerName": names.get(o, ""), "total": sum(counts.values()), "weekly": weekly,
-            "interviews": sum(v[2] for v in rounds.values()),  # rounds of interviews tagged "Applied by: Self"
+            "interviews": sum(self_rounds.values()),
             "lastBidAt": _iso_utc(last[0].firstAt) if last else None,
+            "profiles": profiles,
         })
     return out
 
