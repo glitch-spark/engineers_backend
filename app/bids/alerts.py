@@ -7,8 +7,10 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 
+from beanie import PydanticObjectId
+
 from app.bids.performance import _local_day, day_counts, interview_credit, last_bid_at
-from app.bids.windows import schedule_from_settings
+from app.bids.windows import BidSchedule, schedule_from_settings
 from app.models import Account
 from app.models.bid import Bid
 from app.models.bidder import Bidder
@@ -28,6 +30,18 @@ def _weekdays_before(today: date, n: int) -> list[date]:
         d -= timedelta(days=1)
         if d.weekday() < 5:
             out.append(d)
+    return out
+
+
+async def pending_days(bidder_ids: list[PydanticObjectId], sched: BidSchedule) -> dict[str, list[date]]:
+    """Every pending bid's report day (any age) per bidder id (as a string); bidders with none are absent."""
+    out: dict[str, list[date]] = defaultdict(list)
+    if not bidder_ids:
+        return out
+    async for d in Bid.get_motor_collection().find(
+        {"bidderId": {"$in": bidder_ids}, "status": "pending"}, {"bidderId": 1, "firstAt": 1},
+    ):
+        out[str(d["bidderId"])].append(bid_report_day(d["firstAt"], sched))
     return out
 
 
@@ -61,13 +75,9 @@ async def bid_alerts(bidders: list[Bidder], today: date, now: datetime) -> dict:
     ):
         if first <= bid_report_day(d["firstAt"], sched) <= today and d.get("rejectReason"):
             reasons[str(d["bidderId"])][d["rejectReason"]] += 1
-    backlog: dict = defaultdict(list)
-    async for d in Bid.get_motor_collection().find(
-        {"bidderId": {"$in": ids}, "status": "pending"}, {"bidderId": 1, "firstAt": 1},
-    ):
-        day = bid_report_day(d["firstAt"], sched)
-        if day <= today - timedelta(days=BACKLOG_DAYS):
-            backlog[str(d["bidderId"])].append(day)
+    backlog = {k: [d for d in days if d <= today - timedelta(days=BACKLOG_DAYS)]
+               for k, days in (await pending_days(ids, sched)).items()}
+    backlog = defaultdict(list, backlog)
 
     naive_now = now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo else now
     for b in sorted(active, key=lambda x: x.name.lower()):

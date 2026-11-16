@@ -220,3 +220,46 @@ async def test_pending_includes_an_archived_bidders_bids(db, switch_on, monkeypa
     r = await pending(s["pedro"], period="day", date="2026-11-24")
     assert str(lee.id) in {b["id"] for b in r["bids"]}
     assert str(lee.id) in {b["id"] for b in (await pending(s["pedro"]))["bids"]}
+
+
+# ---- /bids/backlog ---------------------------------------------------------------------------------------------
+
+
+async def backlog(user, **kw):
+    return await bids_router.bids_backlog(user, **{"ownerId": None, **kw})
+
+
+async def seed_backlog(monkeypatch) -> dict:
+    """Wed 2026-11-25 09:00 CST. Ana pending Oct 1, Nov 17 and Nov 25 08:00; Raj pending Nov 10; Lee (archived)
+    pending Nov 20; Ana approved Nov 24; Mia pending Nov 24."""
+    s = await seed()
+    at(monkeypatch, datetime(2026, 11, 25, 9))
+    for d in (datetime(2026, 10, 1, 10), datetime(2026, 11, 17, 10), datetime(2026, 11, 25, 8)):
+        await bid(s["ana"], "pending", d)
+    await bid(s["raj"], "pending", datetime(2026, 11, 10, 10))
+    await bid(s["lee"], "pending", datetime(2026, 11, 20, 10))
+    await bid(s["ana"], "approved", datetime(2026, 11, 24, 10))
+    await bid(s["mia"], "pending", datetime(2026, 11, 24, 10))
+    return s
+
+
+async def test_backlog_counts_every_pending_bid_of_any_age(db, switch_on, monkeypatch):
+    s = await seed_backlog(monkeypatch)
+    r = await backlog(s["pedro"])
+    assert (r["today"], r["total"], r["todayCount"], r["oldestDay"]) == ("2026-11-25", 5, 1, "2026-10-01")
+    assert [(b["name"], b["pending"], b["oldestDay"]) for b in r["bidders"]] == [
+        ("Ana", 3, "2026-10-01"), ("Lee", 1, "2026-11-20"), ("Raj", 1, "2026-11-10")]
+    assert set(r["bidders"][0]) == {"bidderId", "name", "ownerName", "pending", "oldestDay"}
+    assert r["bidders"][0]["ownerName"] == "Pedro"
+
+
+async def test_backlog_staff_see_only_their_own(db, switch_on, monkeypatch):
+    s = await seed_backlog(monkeypatch)
+    r = await backlog(s["pedro"], ownerId=str(s["maria"].id))
+    assert (r["total"], r["bidders"], r["oldestDay"], r["todayCount"]) == (0, [], None, 0)
+
+
+async def test_backlog_admin_any_owner_or_all(db, switch_on, monkeypatch):
+    s = await seed_backlog(monkeypatch)
+    assert (await backlog(s["boss"], ownerId=str(s["maria"].id)))["total"] == 1
+    assert (await backlog(s["boss"]))["total"] == 6

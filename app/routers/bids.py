@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.bids.evidence import duration_sec, evidence_for, job_domain
 from app.bids.live_counts import TtlCache
-from app.bids.alerts import bid_alerts
+from app.bids.alerts import bid_alerts, pending_days
 from app.bids.insights import insights
 from app.bids.performance import day_columns, pay_week_columns, performance
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
@@ -620,6 +620,29 @@ async def pending_bids(
     evidence = await evidence_for(bids, {str(b.id): b for b in candidates})
     thumbs = await _thumb_urls(bids)
     return {**out, "bids": [_bid_out(b, names[b.bidderId], evidence[str(b.id)], thumbs[str(b.id)]) for b in bids]}
+
+
+@router.get("/backlog")
+async def bids_backlog(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    ownerId: Optional[str] = None,
+) -> dict:
+    """The To review counts: every pending bid of any age, per bidder (archived bidders included, the set
+    /bids/pending walks). Staff: their own bidders; an admin: one owner's (`ownerId`) or everyone's. Bidders with
+    nothing pending are left out; most pending first, then by name."""
+    sched, now = schedule_from_settings(), _now()
+    today = report_day(now, sched)
+    owner = to_object_id(ownerId) if ownerId else None
+    bidders = await _visible_bidders(user, owner)
+    days = await pending_days([b.id for b in bidders], sched)
+    owners = {b.createdBy for b in bidders if str(b.id) in days}
+    names = {u.id: u.name or u.email or "" for u in await UserExtra.find({"_id": {"$in": list(owners)}}).to_list()} if owners else {}
+    rows = [{"bidderId": str(b.id), "name": b.name, "ownerName": names.get(b.createdBy), "pending": len(days[str(b.id)]),
+             "oldestDay": min(days[str(b.id)]).isoformat()} for b in bidders if days.get(str(b.id))]
+    rows.sort(key=lambda r: (-r["pending"], r["name"].lower()))
+    return {"today": today.isoformat(), "total": sum(r["pending"] for r in rows),
+            "todayCount": sum(d == today for v in days.values() for d in v),
+            "oldestDay": min((r["oldestDay"] for r in rows), default=None), "bidders": rows}
 
 
 @router.get("/{bid_id}")
