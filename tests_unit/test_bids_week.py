@@ -6,7 +6,6 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import pytest
 from beanie import init_beanie
@@ -18,14 +17,12 @@ from app.models import Account, ResumeApplication, UserExtra
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
+from tests_unit.test_bids_windows import CHI, sched_off, sched_on
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
     pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
 ]
-
-CHI = ZoneInfo("America/Chicago")
-
 
 def chi(month, day, hh, mm=0) -> datetime:
     return datetime(2026, month, day, hh, mm, tzinfo=CHI)
@@ -128,6 +125,70 @@ def test_pay_week_across_dst():
     assert (first.start, first.end) == (z("2026-10-31T23:30:00Z"), z("2026-11-02T00:30:00Z"))
     assert first.end - first.start == timedelta(hours=25)
     assert all(d.end - d.start == timedelta(hours=24) for d in pw.days[1:])
+
+
+# --- pay_week across the schedule switch (Sun 2026-11-22 20:00: daily 18:30 -> 18:00, weekly Sat 16:00 -> Sun 20:00)
+
+
+def test_the_long_week_at_the_switch():
+    from app.bids.week import pay_week, week_label
+
+    pw = pay_week(sched_on, chi(11, 18, 9))
+    assert (pw.start, pw.end) == (z("2026-11-14T22:00:00Z"), z("2026-11-23T02:00:00Z"))
+    assert pw.cutoff == chi(11, 22, 20)
+    assert [d.key for d in pw.days] == [f"2026-11-{n:02d}" for n in range(15, 23)]
+    assert week_label(pw) == "Week ending Sun Nov 22"
+    last = pw.days[-1]
+    assert (last.start, last.end) == (chi(11, 21, 18, 30), chi(11, 22, 18, 30))
+
+
+def test_the_first_sunday_week():
+    from app.bids.week import pay_week, week_label
+
+    pw = pay_week(sched_on, chi(11, 25, 9))
+    assert (pw.start, pw.end) == (chi(11, 22, 20), chi(11, 29, 20))
+    assert [d.key for d in pw.days] == [f"2026-11-{n:02d}" for n in range(23, 30)]
+    assert week_label(pw) == "Week ending Sun Nov 29"
+    first = pw.days[0]
+    assert (first.start, first.end) == (chi(11, 22, 18, 30), chi(11, 23, 18))
+    assert all((d.start, d.end) == (chi(11, n - 1, 18), chi(11, n, 18)) for d, n in zip(pw.days[1:], range(24, 30)))
+
+
+def test_week_param_picks_the_right_week():
+    from app.bids.week import pay_week
+
+    now = chi(11, 25, 9)
+    for day in (date(2026, 11, 21), date(2026, 11, 22)):
+        pw = pay_week(sched_on, now, day)
+        assert (pw.start, pw.end) == (z("2026-11-14T22:00:00Z"), z("2026-11-23T02:00:00Z")), day
+    pw = pay_week(sched_on, now, date(2026, 11, 23))
+    assert pw.cutoff == chi(11, 29, 20)
+    assert pw.days[0].key == "2026-11-23"
+
+
+def test_old_weeks_are_unchanged():
+    from app.bids.week import pay_week
+
+    now = chi(11, 25, 9)
+    anchors = [date(2026, 10, 3) + timedelta(days=7 * i) for i in range(7)]  # Saturdays Oct 3 .. Nov 14
+    assert anchors[-1] == date(2026, 11, 14)
+    for anchor in anchors:
+        on, off = pay_week(sched_on, now, anchor), pay_week(sched_off, now, anchor)
+        assert (on.start, on.end, on.cutoff) == (off.start, off.end, off.cutoff), anchor
+        assert on.cutoff.tzinfo is off.cutoff.tzinfo
+        assert [(d.key, d.start, d.end) for d in on.days] == [(d.key, d.start, d.end) for d in off.days], anchor
+        assert len(on.days) == 7
+
+
+def test_dst_week_after_the_switch():
+    from app.bids.week import pay_week
+
+    pw = pay_week(sched_on, datetime(2027, 3, 10, 9, tzinfo=CHI))
+    assert pw.cutoff == datetime(2027, 3, 14, 20, tzinfo=CHI)
+    assert (pw.cutoff.hour, pw.cutoff.minute) == (20, 0)
+    assert pw.end == z("2027-03-15T01:00:00Z")
+    assert [d.key for d in pw.days] == [f"2027-03-{n:02d}" for n in range(8, 15)]
+    assert pw.end - pw.start == timedelta(hours=167)
 
 
 # --- week_board ---------------------------------------------------------------------------------------
