@@ -40,6 +40,7 @@ class ReportStore(Protocol):
     async def release(self, key: str) -> None: ...
     async def load_rows(self, kind: Kind, period_key: str) -> list[BidReportRow]: ...
     async def save_rows(self, rows: list[BidReportRow]) -> list[BidReportRow]: ...
+    async def overlapping_weekly(self, start: datetime, end: datetime, exclude_key: str) -> Optional[str]: ...
     async def active_bidders(self) -> list: ...
     async def profile_names(self, ids: list[PydanticObjectId]) -> dict[str, str]: ...
     async def owners(self, ids: list[PydanticObjectId]) -> dict[str, Owner]: ...
@@ -86,6 +87,14 @@ class BeanieReportStore:
                 raise
         # Another run inserted this period first; use its rows.
         return await self.load_rows(rows[0].kind, rows[0].periodKey)
+
+    async def overlapping_weekly(self, start: datetime, end: datetime, exclude_key: str) -> Optional[str]:
+        """periodKey of a stored weekly report, other than `exclude_key`, whose [periodStart, periodEnd) overlaps [start, end)."""
+        row = await BidReport.find_one(
+            BidReport.kind == "weekly", BidReport.periodKey != exclude_key,
+            BidReport.periodStart < end, BidReport.periodEnd > start,
+        )
+        return row.periodKey if row else None
 
     async def active_bidders(self) -> list:
         return await Bidder.find(Bidder.archivedAt == None).to_list()  # noqa: E711
@@ -254,6 +263,13 @@ async def _run_kind(
         return "done"
     try:
         start, end = window_for(kind, cutoff, sched)
+        if kind == "weekly":
+            # A switch deployed late (old code posted the Saturday week) would pay those days twice. Refuse, and keep
+            # the claim: later ticks skip this period until someone intervenes (e.g. moves BID_SCHEDULE_SWITCH_AT).
+            other = await store.overlapping_weekly(start, end, pk)
+            if other:
+                log.error("bid weekly report %s not posted: its window overlaps the stored weekly report %s", pk, other)
+                return f"overlap:{other}"
         rows = await store.load_rows(kind, pk)
         if not rows:
             bidders = await store.active_bidders()

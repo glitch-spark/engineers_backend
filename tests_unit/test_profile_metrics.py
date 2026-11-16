@@ -375,3 +375,14 @@ async def test_period_rows_carry_totals(db):
     await _plan(user, date(2026, 10, 20), {str(acc.id): 5})
     row = pm.summarize(str(acc.id), *(await pm.collect([acc], 4, date(2026, 11, 3)))[str(acc.id)])
     assert (row["bids"], row["selfBids"], row["bidsPerWeek"]) == (5, 5, 1.2)
+
+
+def test_report_day_alias():
+    from datetime import timezone
+
+    from tests_unit.test_bids_windows import CHI, sched_on
+
+    at = datetime(2026, 11, 22, 18, 30, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+    assert bid_report_day(at, sched_on) == date(2026, 11, 23)
+    after = datetime(2026, 11, 23, 18, 10, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+    assert bid_report_day(after, sched_on) == date(2026, 11, 24)  # past Monday's new 18:00 cutoff

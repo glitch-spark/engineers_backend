@@ -56,6 +56,29 @@ BID_DAILY_REPORT_TIME=18:30
 # monday ... sunday
 BID_WEEKLY_REPORT_DAY=saturday
 BID_WEEKLY_REPORT_TIME=16:00
+# Optional schedule switch. Leave BID_SCHEDULE_SWITCH_AT unset (blank) to keep the schedule above forever.
+# When set, reports follow the schedule above until that moment and the NEXT values take over at it.
+# Format YYYY-MM-DDTHH:MM, local time in BID_REPORT_TIMEZONE.
+# All three NEXT values are required with it, and the switch moment must be the NEXT weekly day at the NEXT
+# weekly time, or the app refuses to start. The week ending at the switch is one long week
+# (Sat 2026-11-14 16:00 -> Sun 2026-11-22 20:00, about 8 days).
+# Deploy order: deploying this code first is safe, nothing changes until BID_SCHEDULE_SWITCH_AT is set.
+# Deadline: BOTH Railway services, engineers_backend (API) and keen-spirit (report cron), must be RUNNING THIS
+# CODE, not only have the variables set, before the last old weekly cutoff the switch removes (the Saturday
+# cutoff before the switch). For the switch below that is Sat 2026-11-21 16:00 Chicago. Old code ignores the new
+# variables, posts the Saturday weekly report, and the long week would then pay those days again. The
+# double-report guard now refuses that long-week report (nothing saved or posted, an error logged naming both
+# periods, status overlap:<period>) and stays blocked until someone intervenes. If that Saturday is missed, move
+# BID_SCHEDULE_SWITCH_AT to a later Sunday instead; the deadline moves to the Saturday before it.
+# Set all four on both services.
+# Week-over-week change is skewed for the long week and the first Sunday week; this is a one-off.
+# Values for the Sunday switch:
+#   BID_SCHEDULE_SWITCH_AT=2026-11-22T20:00  BID_NEXT_DAILY_REPORT_TIME=18:00
+#   BID_NEXT_WEEKLY_REPORT_DAY=sunday        BID_NEXT_WEEKLY_REPORT_TIME=20:00
+BID_SCHEDULE_SWITCH_AT=
+BID_NEXT_DAILY_REPORT_TIME=
+BID_NEXT_WEEKLY_REPORT_DAY=
+BID_NEXT_WEEKLY_REPORT_TIME=
 # Optional cut-over day, YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows starting before that day's
 # local midnight (or straddling it) keep counting screenshot folders. Blank = approved bid records
 # everywhere (section 6). Set it on the API service and on the report cron service.
