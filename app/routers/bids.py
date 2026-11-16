@@ -540,6 +540,88 @@ async def bids_clock(user: Annotated[UserExtra, Depends(get_current_user)]) -> d
     }
 
 
+def _parse_day(value: str, what: str = "date") -> date:
+    """A YYYY-MM-DD day; 400 for anything else (a missing day, 2026-02-31, a basic-format date)."""
+    try:
+        if not _DAY.fullmatch(value):
+            raise ValueError(value)
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"invalid {what}") from None
+
+
+def _parse_since(value: str) -> datetime:
+    """An ISO moment (aware, `Z`, or naive = UTC) as naive UTC, the way reviewedAt is stored; 400 when malformed."""
+    try:
+        return _naive_utc(datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace("z", "+00:00")))
+    except (ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="invalid since") from None
+
+
+def _pending_window(period: str, day: str, to: str, weeks: int, now: datetime, sched) -> tuple[str, Optional[tuple[datetime, datetime]]]:
+    """(label, (start, end) of the firstAt window) of a review scope; the window is None for no time limit and
+    start == end for a period that has not begun (nothing to list)."""
+    if period == "all":
+        return "All pending", None
+    try:
+        if period == "day":
+            d = _parse_day(day) if day else report_day(now, sched)
+            return f"{d:%a} {d:%b} {d.day}", window_for("daily", daily_cutoff_on(d, sched), sched)
+        for value, what in ((day, "date"), (to, "to")):
+            if value:
+                _parse_day(value, what)
+        p = bid_period(period, day, to, now, weeks)
+        if p.period == "week":
+            ws = p.pay_weeks or [p.pay_week]
+            return p.label, (ws[0].start, ws[-1].end)
+        if p.start > p.end:  # a month that has not begun
+            return p.label, (now, now)
+        first, _ = window_for("daily", daily_cutoff_on(p.start, sched), sched)
+        _, last = window_for("daily", daily_cutoff_on(p.end, sched), sched)
+        return p.label, (first, last)
+    except (ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="invalid date") from None
+
+
+@router.get("/pending")
+async def pending_bids(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["all", "day", "week", "month", "custom"] = "all",
+    date: str = "",
+    to: str = "",
+    weeks: Annotated[int, Query(ge=1, le=2)] = 1,
+    ownerId: Optional[str] = None,
+    bidderId: Optional[str] = None,
+    since: Optional[str] = None,
+) -> dict:
+    """The bids one review scope lists, oldest first: `all` pending bids of any age, a report `day`, a pay `week`
+    (`weeks=2`: that and the one before), a `month` or a `custom` range of report days (period rules as
+    /bids/performance). `since` (ISO) also keeps any bid decided at or after it, so a bid reviewed while the overlay
+    is open stays listed. Staff: their own bidders; an admin: one owner's (`ownerId`) or everyone's. Archived
+    bidders are included; `bidderId` narrows to one bidder (404 outside the visible ones)."""
+    sched, now = schedule_from_settings(), _now()
+    since_at = _parse_since(since) if since else None
+    text, window_ = _pending_window(period, date, to, weeks, now, sched)
+    owner = to_object_id(ownerId) if ownerId else None
+    candidates = await _visible_bidders(user, owner)
+    if bidderId is not None:
+        candidates = [b for b in candidates if str(b.id) == bidderId]
+        if not candidates:
+            raise HTTPException(status_code=404, detail="bidder not found")
+    out = {"label": text, "timezone": sched.tz.key, "bidderName": candidates[0].name if bidderId is not None else None}
+    if not candidates or (window_ is not None and window_[0] >= window_[1]):
+        return {**out, "bids": []}
+    query: dict = {"bidderId": {"$in": [b.id for b in candidates]}}
+    if window_ is not None:
+        query["firstAt"] = {"$gte": _naive_utc(window_[0]), "$lt": _naive_utc(window_[1])}
+    query["$or"] = [{"status": "pending"}] + ([{"reviewedAt": {"$gte": since_at}}] if since_at else [])
+    bids = await Bid.find(query).sort("firstAt").to_list()
+    names = {b.id: b.name for b in candidates}
+    evidence = await evidence_for(bids, {str(b.id): b for b in candidates})
+    thumbs = await _thumb_urls(bids)
+    return {**out, "bids": [_bid_out(b, names[b.bidderId], evidence[str(b.id)], thumbs[str(b.id)]) for b in bids]}
+
+
 @router.get("/{bid_id}")
 async def get_bid(bid_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     bid, bidder = await _load_viewable(bid_id, user)

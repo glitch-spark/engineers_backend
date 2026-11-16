@@ -12,6 +12,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi import HTTPException
 from beanie import init_beanie
 from mongomock_motor import AsyncMongoMockClient
 
@@ -113,3 +114,91 @@ async def test_clock_without_the_switch(db, monkeypatch):
     assert (r["payWeekStart"], r["payWeekEnd"], r["previousPayWeekStart"]) == ("2026-11-22", "2026-11-28", "2026-11-15")
     at(monkeypatch, datetime(2026, 11, 21, 18, 30))
     assert (await bids_router.bids_clock(s["pedro"]))["today"] == "2026-11-22"
+
+
+# ---- /bids/pending ---------------------------------------------------------------------------------------------
+
+
+async def pending(user, **kw):
+    return await bids_router.pending_bids(user, **{
+        "period": "all", "date": "", "to": "", "weeks": 1, "ownerId": None, "bidderId": None, "since": None, **kw})
+
+
+async def seed_pending(monkeypatch) -> dict:
+    """Wed 2026-11-25 09:00 CST. Ana: pending Oct 1, Nov 17, Nov 24; two approved Nov 24 (one decided 14:59:30Z, one
+    14:00Z the same day); Mia: pending Nov 24."""
+    s = await seed()
+    at(monkeypatch, datetime(2026, 11, 25, 9))
+    ana, mia = s["ana"], s["mia"]
+    for d in (datetime(2026, 10, 1, 10), datetime(2026, 11, 17, 10), datetime(2026, 11, 24, 10)):
+        await bid(ana, "pending", d)
+    z = lambda h, m, sec=0: datetime(2026, 11, 25, h, m, sec, tzinfo=timezone.utc).astimezone(CHI).replace(tzinfo=None)
+    await bid(ana, "approved", datetime(2026, 11, 24, 11), reviewed_at=z(14, 59, 30))
+    await bid(ana, "approved", datetime(2026, 11, 24, 12), reviewed_at=z(14, 0))
+    await bid(mia, "pending", datetime(2026, 11, 24, 10))
+    return s
+
+
+async def test_pending_lists_every_pending_bid_of_any_age(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    r = await pending(s["pedro"], period="all")
+    assert [b["firstAt"][:10] for b in r["bids"]] == ["2026-10-01", "2026-11-17", "2026-11-24"]
+    assert {b["status"] for b in r["bids"]} == {"pending"}
+    assert r["label"] == "All pending" and r["bidderName"] is None and r["timezone"] == "America/Chicago"
+
+
+async def test_pending_for_a_day_and_a_week(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    p = s["pedro"]
+    r = await pending(p, period="day", date="2026-11-24")
+    assert (len(r["bids"]), r["label"]) == (1, "Tue Nov 24")
+    r = await pending(p, period="day")
+    assert (len(r["bids"]), r["label"]) == (0, "Wed Nov 25")
+    r = await pending(p, period="week")
+    assert (len(r["bids"]), r["label"]) == (1, "Week ending Sun Nov 29")
+    r = await pending(p, period="week", date="2026-11-22")
+    assert (len(r["bids"]), r["label"], r["bids"][0]["firstAt"][:10]) == (1, "Week ending Sun Nov 22", "2026-11-17")
+    r = await pending(p, period="week", date="2026-11-22", weeks=2)
+    assert (len(r["bids"]), r["label"]) == (1, "Nov 8\u201322, 2026")
+    r = await pending(p, period="month", date="2026-11-01")
+    assert (len(r["bids"]), r["label"]) == (2, "Nov 2026")
+
+
+async def test_pending_since_keeps_bids_decided_while_open(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    r = await pending(s["pedro"], period="week", since="2026-11-25T14:59:00Z")
+    assert [b["status"] for b in r["bids"]] == ["pending", "approved"]  # the 14:00 decision is not listed
+    r = await pending(s["pedro"], period="week", since="2026-11-25T14:59:00+00:00")
+    assert len(r["bids"]) == 2
+
+
+async def test_pending_one_bidder(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    r = await pending(s["pedro"], bidderId=str(s["ana"].id))
+    assert r["bidderName"] == "Ana" and len(r["bids"]) == 3
+    with pytest.raises(HTTPException) as e:
+        await pending(s["pedro"], bidderId=str(s["mia"].id))
+    assert (e.value.status_code, e.value.detail) == (404, "bidder not found")
+
+
+async def test_pending_staff_see_only_their_own(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    r = await pending(s["pedro"])
+    assert "Mia" not in {b["bidderName"] for b in r["bids"]}
+    assert (await pending(s["pedro"], ownerId=str(s["maria"].id)))["bids"] == []
+
+
+async def test_pending_admin_any_owner_or_all(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    r = await pending(s["boss"], ownerId=str(s["maria"].id))
+    assert {b["bidderName"] for b in r["bids"]} == {"Mia"} and len(r["bids"]) == 1
+    assert len((await pending(s["boss"]))["bids"]) == 4
+
+
+async def test_pending_bad_dates_are_400(db, switch_on, monkeypatch):
+    s = await seed_pending(monkeypatch)
+    for kw in ({"period": "day", "date": "2026-02-31"}, {"period": "day", "date": "tomorrow"},
+               {"period": "week", "date": "2026-02-31"}, {"since": "yesterday"}):
+        with pytest.raises(HTTPException) as e:
+            await pending(s["pedro"], **kw)
+        assert e.value.status_code == 400, kw
