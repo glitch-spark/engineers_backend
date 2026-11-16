@@ -60,3 +60,26 @@ async def test_run_cron_ticks_reports_bid_failure_after_other_steps():
         assert await run_cron_ticks() == 1
     slack.assert_awaited_once()
     alerts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_weekly_plan_notification_links_to_plans():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    from app import alerts_service
+
+    user = SimpleNamespace(id="u1", slackTimezone=None)
+    put = AsyncMock(return_value=True)
+    with (
+        patch.object(alerts_service, "_put_notification", put),
+        patch.object(alerts_service, "resolve_user_tz", lambda _u: ZoneInfo("UTC")),
+        patch.object(alerts_service.WeeklyPlan, "find_one", AsyncMock(return_value=None)),
+    ):
+        # Monday 2026-11-16, 03:00 UTC, zone pinned to UTC: inside the Monday-morning window.
+        created = await alerts_service._tick_weekly_plans(
+            [user], now=datetime(2026, 11, 16, 3, 0, tzinfo=timezone.utc)
+        )
+    assert created == 1
+    assert put.await_args.kwargs["href"] == "/plans"

@@ -69,7 +69,7 @@ def test_daily_plan_text_follow_up():
         "```",
     ]
     assert lines[-1].startswith(":link: <")
-    assert lines[-1].endswith("/report?week=2026-09-28|Open Report>")
+    assert lines[-1].endswith("/plans?week=2026-09-28|Open Plans>")
 
 
 def test_daily_plan_heading():
