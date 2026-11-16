@@ -35,16 +35,35 @@ async def record_screenshot(
     job_url: Optional[str], job_title: Optional[str], attachments: Sequence[Attachment] = (),
 ) -> Bid:
     """Upsert the bid of this bidder and job folder and attach the screenshot (a retried key is not added twice)."""
-    coll = Bid.get_motor_collection()
-    jk, at, now = job_key(key), _naive_utc(captured_at), datetime.utcnow()
+    jk = job_key(key)
+    return await _record({"bidderId": bidder.id, "jobKey": jk},
+                         {"ownerId": bidder.createdBy, "jobKey": jk, "status": "pending"},
+                         key, step, trigger, captured_at, job_url, job_title, attachments)
 
+
+async def record_self_screenshot(
+    owner_id: PydanticObjectId, account_id: PydanticObjectId, key: str, step: int, trigger: str,
+    captured_at: datetime, job_url: Optional[str], job_title: Optional[str], attachments: Sequence[Attachment] = (),
+) -> Bid:
+    """An owner's own apply (self bid): one per job folder of that owner, for the signed-in profile, approved at once
+    (never reviewed or paid)."""
+    jk = job_key(key)
+    return await _record({"kind": "self", "ownerId": owner_id, "jobKey": jk},
+                         {"bidderId": None, "accountId": account_id, "status": "approved"},
+                         key, step, trigger, captured_at, job_url, job_title, attachments)
+
+
+async def _record(
+    match: dict, on_insert: dict, key: str, step: int, trigger: str, captured_at: datetime,
+    job_url: Optional[str], job_title: Optional[str], attachments: Sequence[Attachment],
+) -> Bid:
+    coll = Bid.get_motor_collection()
+    at, now = _naive_utc(captured_at), datetime.utcnow()
+    insert = {k: v for k, v in on_insert.items() if k not in match}
     upsert = (
-        {"bidderId": bidder.id, "jobKey": jk},
+        match,
         {
-            "$setOnInsert": {
-                "ownerId": bidder.createdBy, "jobKey": jk, "status": "pending", "createdAt": now,
-                "screenshots": [], "changedSinceReview": False,
-            },
+            "$setOnInsert": {**insert, "createdAt": now, "screenshots": [], "changedSinceReview": False},
             "$min": {"firstAt": at},
             "$set": {"updatedAt": now},
         },
@@ -72,6 +91,15 @@ async def record_screenshot(
         await coll.update_one({"_id": bid_id, "submittedAt": None}, {"$set": {"submittedAt": at}})
 
     return await Bid.get(bid_id)
+
+
+async def confirm_self_upload(owner_id: PydanticObjectId, key: str) -> bool:
+    """As confirm_upload, for one of this owner's self bids."""
+    result = await Bid.get_motor_collection().update_one(
+        {"kind": "self", "ownerId": owner_id, "screenshots.key": key},
+        {"$set": {"screenshots.$.uploadedAt": datetime.utcnow()}},
+    )
+    return result.matched_count > 0
 
 
 async def confirm_upload(bidder_id: PydanticObjectId, key: str) -> bool:

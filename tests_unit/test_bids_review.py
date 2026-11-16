@@ -161,7 +161,7 @@ async def test_owner_lists_their_bids_for_the_day(make_client, owner, storage):
     assert str(stranger.id) not in body["summary"]
     two = next(b for b in body["bids"] if b["id"] == str(older.id))
     assert two == {
-        "id": str(older.id), "bidderId": str(ana.id), "bidderName": "Ana", "jobUrl": "https://jobs.example/two",
+        "id": str(older.id), "kind": "bidder", "bidderId": str(ana.id), "bidderName": "Ana", "jobUrl": "https://jobs.example/two",
         "jobTitle": "Two", "firstAt": iso(start + timedelta(hours=2)),
         "submittedAt": None, "screenshotCount": 2, "missingUploads": 2, "status": "pending",
         "reviewedByName": None, "reviewedAt": None, "note": None, "changedSinceReview": False,

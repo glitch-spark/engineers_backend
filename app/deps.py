@@ -5,7 +5,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
-from app.models import UserExtra
+from app.models import Account, UserExtra
 from app.models.bidder import Bidder
 from app.security import decode_token
 
@@ -22,7 +22,7 @@ async def get_current_user(
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
 
-    if payload.get("typ") == "bidder":  # extension tokens never act as app users
+    if payload.get("typ") in ("bidder", "ext-owner"):  # extension tokens never act as app users
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
     sub = payload.get("sub")
     if not sub:
@@ -44,6 +44,38 @@ async def require_admin(
     if user.role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
     return user
+
+
+class ExtOwnerAuth(NamedTuple):
+    user: UserExtra
+    account: Account  # the profile this sign-in records for
+    claims: dict[str, Any]
+
+
+async def get_current_ext_owner(
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(_bearer)],
+) -> ExtOwnerAuth:
+    """An owner's extension sign-in: still active, not an admin, and the profile still theirs and not archived. One
+    message for every failure."""
+    invalid = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise invalid
+    try:
+        payload = decode_token(credentials.credentials)
+    except JWTError:
+        raise invalid
+    if payload.get("typ") != "ext-owner":
+        raise invalid
+    try:
+        user_id, profile_id = PydanticObjectId(payload.get("sub")), PydanticObjectId(payload.get("pid"))
+    except Exception:
+        raise invalid
+    user = await UserExtra.get(user_id)
+    account = await Account.get(profile_id)
+    if (user is None or not user.isActive or user.role == "admin" or account is None or account.archived
+            or account.createdBy != user.id):
+        raise invalid
+    return ExtOwnerAuth(user, account, payload)
 
 
 class BidderAuth(NamedTuple):

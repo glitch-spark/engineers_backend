@@ -88,7 +88,8 @@ def _bid_out(bid: Bid, bidder_name: str, evidence: dict, thumb_url: Optional[str
     """evidence is the bid's entry from evidence_for: profileName, resumeNames, tailoredResumeName."""
     return {
         "id": str(bid.id),
-        "bidderId": str(bid.bidderId),
+        "kind": bid.kind,
+        "bidderId": str(bid.bidderId) if bid.bidderId else "self",
         "bidderName": bidder_name,
         "jobUrl": bid.jobUrl,
         "jobTitle": bid.jobTitle,
@@ -109,9 +110,32 @@ def _bid_out(bid: Bid, bidder_name: str, evidence: dict, thumb_url: Optional[str
     }
 
 
-async def _single_bid_out(bid: Bid, bidder: Bidder) -> dict:
-    evidence = (await evidence_for([bid], {str(bidder.id): bidder}))[str(bid.id)]
-    return _bid_out(bid, bidder.name, evidence, (await _thumb_urls([bid]))[str(bid.id)])
+async def _single_bid_out(bid: Bid, bidder: Optional[Bidder], self_name: str = "Self") -> dict:
+    evidence = (await evidence_for([bid], {str(bidder.id): bidder} if bidder else {}))[str(bid.id)]
+    return _bid_out(bid, bidder.name if bidder else self_name, evidence, (await _thumb_urls([bid]))[str(bid.id)])
+
+
+async def _self_name(owner_id, user) -> str:
+    """How a self bid is labelled: "Self" for the viewer's own, "Self · <owner>" for an admin looking at another's."""
+    if owner_id == user.id:
+        return "Self"
+    owner = await UserExtra.get(owner_id)
+    return f"Self · {(owner.name or owner.email) if owner else 'owner'}"
+
+
+async def _load_viewable(bid_id: str, user) -> tuple[Bid, Optional[Bidder]]:
+    """A bid to look at: a bidder's bid as for review; a self bid (no bidder) for its owner and admins (read-only:
+    the review routes keep refusing it)."""
+    if not PydanticObjectId.is_valid(bid_id):
+        raise _not_found()
+    bid = await Bid.get(PydanticObjectId(bid_id))
+    if bid is None:
+        raise _not_found()
+    if bid.kind == "self":
+        if bid.ownerId != user.id and user.role != "admin":
+            raise _not_found()
+        return bid, None
+    return bid, _reviewable(await Bidder.get(bid.bidderId), user)
 
 
 def _now() -> datetime:
@@ -152,6 +176,8 @@ async def list_bids(
     bidderId: Optional[str] = None,
     status: Optional[Status] = None,
     week: Optional[str] = None,
+    self_: bool = Query(False, alias="self"),
+    ownerId: Optional[str] = None,
 ) -> dict:
     sched, now = schedule_from_settings(), _now()
     if day is not None and week is not None:
@@ -172,6 +198,8 @@ async def list_bids(
         except (ValueError, OverflowError):
             raise HTTPException(status_code=400, detail="Invalid day") from None
     start, end = (pw.start, pw.end) if pw is not None else window_for("daily", cutoff, sched)
+    if self_:
+        return await _self_listing(user, ownerId, status, start, end, cutoff, pw, sched)
 
     candidates = await _visible_bidders(user)
     if bidderId is not None:
@@ -205,6 +233,33 @@ async def list_bids(
             )
             for b in shown
         },
+    }
+
+
+async def _self_listing(user, owner_id: Optional[str], status, start, end, cutoff, pw, sched) -> dict:
+    """The owners' own applies (self bids) of a day or pay week: staff see their own; an admin one owner's (ownerId)
+    or everyone's. Same shape as the bidders' listing; never reviewable."""
+    if user.role == "admin":
+        owners = [to_object_id(owner_id)] if owner_id else None
+    else:
+        owners = [] if owner_id and owner_id != str(user.id) else [user.id]
+    query: dict = {"kind": "self", "firstAt": {"$gte": _naive_utc(start), "$lt": _naive_utc(end)}}
+    if owners is not None:
+        query["ownerId"] = {"$in": owners}
+    if status:
+        query["status"] = status
+    bids = await Bid.find(query).sort("-firstAt").to_list() if owners != [] else []
+    evidence = await evidence_for(bids, {})
+    thumbs = await _thumb_urls(bids)
+    names = {o: await _self_name(o, user) for o in {b.ownerId for b in bids}}
+    return {
+        "day": None if pw is not None else period_key(cutoff),
+        "week": period_key(pw.cutoff) if pw is not None else None,
+        "start": _iso_utc(start),
+        "end": _iso_utc(end),
+        "timezone": sched.tz.key,
+        "bids": [_bid_out(b, names[b.ownerId], evidence[str(b.id)], thumbs[str(b.id)]) for b in bids],
+        "summary": {},
     }
 
 
@@ -288,6 +343,48 @@ def bid_period(period: str, day: str, to: str, now: datetime, weeks: int = 1) ->
                      columns=pay_week_columns(start, end, sched) if start <= end else [])
 
 
+async def _self_rows(user, owner, bidders: list[Bidder], p: BidPeriod) -> list[dict]:
+    """The owners' own applies recorded by the extension (self bids), one row per owner in view: the signed-in owner,
+    the picked owner, or every owner with bidders for an admin viewing all. Kept out of the bidders' totals."""
+    from app.models import Account
+    from app.profile_metrics import interview_rounds
+    from app.self_bids import tracked_counts
+
+    if owner is not None:
+        owners = [owner]
+    elif user.role != "admin":
+        owners = [user.id]
+    else:
+        owners = list({b.createdBy for b in bidders})
+    if not owners or p.start > p.end:
+        return []
+    names = {u.id: u.name or u.email or "" for u in await UserExtra.find({"_id": {"$in": owners}}).to_list()}
+    col_of = {}
+    for i, c in enumerate(p.columns):
+        d = date.fromisoformat(c["start"])
+        while d <= date.fromisoformat(c["end"]):
+            col_of[d] = i
+            d += timedelta(days=1)
+    out = []
+    for o in owners:
+        counts = await tracked_counts(o, p.start, p.end)
+        if not counts:
+            continue
+        weekly = [0] * len(p.columns)
+        for (_pid, d), n in counts.items():
+            if d in col_of:
+                weekly[col_of[d]] += n
+        accounts = [a.id for a in await Account.find({"createdBy": o}).to_list()]
+        rounds = await interview_rounds(accounts, p.start, p.end) if accounts else {}
+        last = await Bid.find({"kind": "self", "ownerId": o}).sort("-firstAt").limit(1).to_list()
+        out.append({
+            "ownerId": str(o), "ownerName": names.get(o, ""), "total": sum(counts.values()), "weekly": weekly,
+            "interviews": sum(v[2] for v in rounds.values()),  # rounds of interviews tagged "Applied by: Self"
+            "lastBidAt": _iso_utc(last[0].firstAt) if last else None,
+        })
+    return out
+
+
 def _pay_week_out(pw: PayWeek, now: datetime) -> dict:
     sched = schedule_from_settings()
     return {"start": _iso_utc(pw.start), "end": _iso_utc(pw.end), "label": week_label(pw), "timezone": sched.tz.key,
@@ -340,6 +437,7 @@ async def bids_performance(
     bidders = [b for b in await _visible_bidders(user, owner) if includeArchived or b.archivedAt is None]
     out = await performance(bidders, period, p.start, p.end, p.label, p.today, columns=p.columns, span=p.span)
     out["payWeek"] = _pay_week_out(p.pay_week, now.astimezone(timezone.utc)) if p.pay_week else None
+    out["selfRows"] = await _self_rows(user, owner, bidders, p)
     if p.pay_week:
         # Money and "to review" come from the pay week board (the pay-week window, folder counts before records start),
         # so they match /bids/week, the weekly report and actual pay; the performance measures stay on report days.
@@ -405,13 +503,13 @@ async def bids_alerts(
 
 @router.get("/{bid_id}")
 async def get_bid(bid_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    bid, bidder = await _load_reviewable(bid_id, user)
-    return await _single_bid_out(bid, bidder)
+    bid, bidder = await _load_viewable(bid_id, user)
+    return await _single_bid_out(bid, bidder, await _self_name(bid.ownerId, user) if bidder is None else "Self")
 
 
 @router.get("/{bid_id}/screenshots")
 async def bid_screenshots(bid_id: str, user: Annotated[UserExtra, Depends(get_current_user)]) -> list[dict]:
-    bid, _ = await _load_reviewable(bid_id, user)
+    bid, _ = await _load_viewable(bid_id, user)
     shots = sorted(bid.screenshots, key=lambda s: (s.step, s.capturedAt))
     uploaded = [s for s in shots if s.uploadedAt is not None]
     urls: dict[str, str] = {}

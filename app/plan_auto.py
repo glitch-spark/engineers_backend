@@ -71,6 +71,7 @@ def effective_daily_done(plan: Optional[Any], auto_day: dict) -> DoneCounts:
     return DoneCounts(
         **(bids_of(plan.done) if plan else {}),
         bidsSelfByProfile=plan.done.bidsSelfByProfile if plan else {},
+        bidsSelfOtherByProfile=(getattr(plan.done, "bidsSelfOtherByProfile", None) or {}) if plan else {},
         interviewsSelf=auto_day["self"],
         interviewsCaller=auto_day["caller"],
     )
