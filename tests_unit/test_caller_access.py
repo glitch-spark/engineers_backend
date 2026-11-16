@@ -97,21 +97,32 @@ async def test_assigned_caller_can_get_interview(client):
     _, _, _, iv = await make_brief(caller=caller)
     async with client(caller) as c:
         assert (await c.get(f"/interviews/{iv.id}")).status_code == 200
-    async with client(other) as c:
-        assert (await c.get(f"/interviews/{iv.id}")).status_code == 403
+    async with client(other) as c:  # anyone else signed in gets only the read-only summary
+        r = await c.get(f"/interviews/{iv.id}")
+        assert r.status_code == 200 and r.json()["summaryOnly"] is True
 
 
-async def test_external_or_self_or_inactive_caller_gets_no_access(client):
+async def summary_only(c, iv_id) -> bool:
+    """The interview opens as the read-only summary and its questions stay closed."""
+    r = await c.get(f"/interviews/{iv_id}")
+    return (
+        r.status_code == 200
+        and r.json().get("summaryOnly") is True
+        and (await c.get(f"/interviews/{iv_id}/questions")).status_code == 403
+    )
+
+
+async def test_external_or_self_or_inactive_caller_gets_summary_only(client):
     caller = await make_user("Cal")
     _, _, _, iv = await make_brief(caller=caller, kind="external")  # id matches but it's an external caller
     _, _, _, iv_off = await make_brief(caller=caller, enabled=False)  # round is Self
     async with client(caller) as c:
-        assert (await c.get(f"/interviews/{iv.id}")).status_code == 403
-        assert (await c.get(f"/interviews/{iv_off.id}")).status_code == 403
+        assert await summary_only(c, iv.id)
+        assert await summary_only(c, iv_off.id)
     gone = await make_user("Gus", isActive=False)
     _, _, _, iv_gone = await make_brief(caller=gone)
     async with client(gone) as c:
-        assert (await c.get(f"/interviews/{iv_gone.id}")).status_code == 403
+        assert await summary_only(c, iv_gone.id)
 
 
 async def test_caller_downloads_linked_resume_only_with_interview_context(client):

@@ -521,6 +521,44 @@ async def _interview_out(iv: Interview) -> dict:
     return out[0]
 
 
+async def summary_out(iv: Interview) -> dict:
+    """The read-only view of an interview for a signed-in user who is not its owner, an admin, an interview manager or an
+    assigned caller: who and where (company, position, profile, owner) and the rounds timeline. Never notes, transcripts,
+    interviewer names, links, the applying bidder, caller method/link or questions."""
+    owner = await UserExtra.get(iv.createdBy) if iv.createdBy else None
+    account = await Account.get(iv.accountId) if iv.accountId else None
+    rounds = []
+    for e in iv.stageHistory:
+        caller = e.caller
+        rounds.append({
+            "id": e.id,
+            "stage": _stage_value(e.stage),
+            "status": _status_value(e.status),
+            "scheduledAt": _iso_utc(e.scheduledAt),
+            "endsAt": _iso_utc(e.endsAt),
+            "caller": {
+                "enabled": bool(caller and caller.enabled),
+                "callerName": caller.callerName if caller and caller.enabled else None,
+                "callerKind": caller.callerKind if caller and caller.enabled else None,
+            },
+        })
+    return {
+        "_id": str(iv.id),
+        "companyName": iv.companyName,
+        "appliedPosition": iv.appliedPosition,
+        "accountId": (
+            {"_id": str(account.id), "name": account.name, "region": account.region, "country": account.country}
+            if account is not None else None
+        ),
+        "createdBy": {"_id": str(owner.id), "name": owner.name} if owner is not None else None,
+        "stage": _stage_value(iv.stage),
+        "status": _status_value(iv.status),
+        "scheduledAt": _iso_utc(iv.scheduledAt),
+        "summaryOnly": True,
+        "stageHistory": rounds,
+    }
+
+
 def _list_view(items: list) -> list:
     """List and calendar feeds leave out the linked job description (one interview's GET has it)."""
     for item in items:
@@ -885,7 +923,9 @@ async def get_interview(
     if iv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if not _can_view(iv, user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+        # Anyone else signed in sees a read-only summary (no notes, resume, brief or questions).
+        migrate_legacy_stage_fields(iv)  # in memory only; the owner's next read saves it
+        return await summary_out(iv)
     if migrate_legacy_stage_fields(iv):
         await _save_interview(iv)
         tip = _tip(iv)
