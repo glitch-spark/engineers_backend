@@ -164,3 +164,44 @@ async def test_the_self_listing_narrows_to_one_profile(db):
     with pytest.raises(HTTPException) as bad:
         await bids_router.list_bids(pedro, day="2026-11-16", self_=True, accountId="not-an-id")
     assert bad.value.status_code == 400
+
+
+@pytest.fixture
+def switch_on(monkeypatch):
+    """The schedule switch (Sun 2026-11-22 20:00: daily 18:00, weekly Sunday 20:00) in the settings
+    schedule_from_settings reads, and no folder listing."""
+    from app.bids import windows
+    from app.config import get_settings
+
+    settings = get_settings().model_copy(update={
+        "BID_SCHEDULE_SWITCH_AT": "2026-11-22T20:00", "BID_NEXT_DAILY_REPORT_TIME": "18:00",
+        "BID_NEXT_WEEKLY_REPORT_DAY": "sunday", "BID_NEXT_WEEKLY_REPORT_TIME": "20:00"})
+    monkeypatch.setattr(windows, "get_settings", lambda: settings)
+
+    async def no_folders(bidders, *_a):
+        return {str(b.id): None for b in bidders}
+    monkeypatch.setattr(bids_router, "_folders_without_record", no_folders)
+
+
+async def listing(u, **kw):
+    return await bids_router.list_bids(u, **{"day": None, "bidderId": None, "status": None, "week": None,
+                                             "self_": False, "ownerId": None, **kw})
+
+
+async def test_listing_a_day_after_the_switch(db, switch_on, monkeypatch):
+    pedro, ana, _bo = await setup()
+    inside, outside = [], []
+    for at, into in ((datetime(2026, 11, 22, 18, 40), inside), (datetime(2026, 11, 23, 17, 50), inside),
+                     (datetime(2026, 11, 23, 18, 0), outside)):
+        first = at.replace(tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+        into.append(await Bid(bidderId=ana.id, ownerId=pedro.id, jobKey=f"ana/x/j{next(_n)}",
+                              jobUrl="https://j.example/x", jobTitle="x", firstAt=first, status="pending",
+                              screenshots=[]).insert())
+    r = await listing(pedro, day="2026-11-23")
+    assert sorted(b["id"] for b in r["bids"]) == sorted(str(b.id) for b in inside)
+    assert (r["day"], r["start"], r["end"]) == ("2026-11-23", "2026-11-23T00:30:00Z", "2026-11-24T00:00:00Z")
+
+    # The open window on Mon 11-23 is the same day: it ends at Monday's 18:00 cutoff.
+    monkeypatch.setattr(bids_router, "_now", lambda: datetime(2026, 11, 23, 12, tzinfo=CHI).astimezone(timezone.utc))
+    r = await listing(pedro)
+    assert (r["day"], r["start"], r["end"]) == ("2026-11-23", "2026-11-23T00:30:00Z", "2026-11-24T00:00:00Z")

@@ -20,7 +20,8 @@ from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
 from app.bids.week import PayWeek, combine_boards, pay_week, week_board, week_label
 from app.profile_metrics import bid_report_day
-from app.bids.windows import latest_cutoff, open_window, period_key, schedule_from_settings, window_for
+from app.bids.windows import (daily_cutoff_on, latest_cutoff, next_cutoff, open_window, period_key,
+                              schedule_from_settings, window_for)
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_rates import label, window
@@ -190,12 +191,12 @@ async def list_bids(
     elif day is None:
         # The open window: the one that ends at the next daily cutoff, so bids filed after the report are listed.
         opened, _ = open_window("daily", now, sched)
-        cutoff = datetime.combine(opened.astimezone(sched.tz).date() + timedelta(days=1), sched.daily_at, tzinfo=sched.tz)
+        cutoff = next_cutoff("daily", opened, sched)
     else:
         try:
             if not _DAY.fullmatch(day):
                 raise ValueError(day)
-            cutoff = datetime.combine(date.fromisoformat(day), sched.daily_at, tzinfo=sched.tz)
+            cutoff = daily_cutoff_on(date.fromisoformat(day), sched)
             window_for("daily", cutoff, sched)  # overflows at the edges of the calendar
         except (ValueError, OverflowError):
             raise HTTPException(status_code=400, detail="Invalid day") from None
@@ -303,7 +304,7 @@ def _pay_week_param(week: Optional[str], sched, now: datetime) -> PayWeek:
 
 class BidPeriod(BaseModel):
     """A Bidders page period in report days: `start`..`end` (end clipped to today), its label and columns; `pay_week`
-    for a week (Sat 16:00 -> Sat 16:00); `today` = the open report day (after the daily cutoff, tomorrow's)."""
+    for a week (weekly cutoff to weekly cutoff); `today` = the open report day (after the daily cutoff, tomorrow's)."""
     model_config = {"arbitrary_types_allowed": True}
     period: str
     start: date
@@ -612,7 +613,7 @@ async def review_bids(body: BulkReviewIn, user: Annotated[UserExtra, Depends(get
         updated = result.matched_count
         # One recount per bidder, daily window and weekly window, after all the writes (same race as the single
         # review). refresh_report_rows takes both rows from one bid's firstAt; the weekly cutoff falls inside a
-        # daily window (Saturday's), so bids of one day can belong to two weekly rows.
+        # daily window (Saturday's; Monday's after the switch), so bids of one day can belong to two weekly rows.
         sched = schedule_from_settings()
         per_period: dict[tuple, Bid] = {}
         for b in allowed:

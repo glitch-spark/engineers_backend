@@ -1,15 +1,16 @@
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _YMD = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_YMD_HM = re.compile(r"^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d$")
 AUTH_SECRET_MIN_LEN = 32
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
@@ -141,6 +142,14 @@ class Settings(BaseSettings):
     BID_DAILY_REPORT_TIME: str = "18:30"
     BID_WEEKLY_REPORT_DAY: str = "saturday"
     BID_WEEKLY_REPORT_TIME: str = "16:00"
+    # Optional schedule switch (spec 2026-11-16-pay-week-sunday-switch): from BID_SCHEDULE_SWITCH_AT (local wall clock
+    # in BID_REPORT_TIMEZONE, "YYYY-MM-DDTHH:MM") the NEXT rules apply; earlier periods keep the rules above. All three
+    # NEXT values are then required, and the switch moment must fall on the NEXT weekly day at the NEXT weekly time.
+    # Unset = no switch.
+    BID_SCHEDULE_SWITCH_AT: Optional[str] = None
+    BID_NEXT_DAILY_REPORT_TIME: Optional[str] = None
+    BID_NEXT_WEEKLY_REPORT_DAY: Optional[str] = None
+    BID_NEXT_WEEKLY_REPORT_TIME: Optional[str] = None
     # Reports, live counts and the Bidders page count approved bid records (the database). Optional
     # cut-over day (YYYY-MM-DD, in BID_REPORT_TIMEZONE): a window starting before that day's local
     # midnight (or straddling it) keeps the old screenshot-folder count. Unset = records everywhere.
@@ -203,17 +212,43 @@ class Settings(BaseSettings):
             raise ValueError("not a calendar date, use YYYY-MM-DD") from e
         return s
 
-    @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME")
+    @field_validator("BID_SCHEDULE_SWITCH_AT", "BID_NEXT_DAILY_REPORT_TIME", "BID_NEXT_WEEKLY_REPORT_DAY",
+                     "BID_NEXT_WEEKLY_REPORT_TIME", mode="before")
     @classmethod
-    def _validate_report_time(cls, v: str) -> str:
+    def _blank_switch_value_is_unset(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        return str(v).strip() or None
+
+    @field_validator("BID_SCHEDULE_SWITCH_AT")
+    @classmethod
+    def _validate_switch_at(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not _YMD_HM.match(v):
+            raise ValueError("must be YYYY-MM-DDTHH:MM local time, e.g. 2026-11-22T20:00")
+        try:
+            datetime.fromisoformat(v)
+        except ValueError as e:
+            raise ValueError("not a calendar date and time, use YYYY-MM-DDTHH:MM") from e
+        return v
+
+    @field_validator("BID_DAILY_REPORT_TIME", "BID_WEEKLY_REPORT_TIME",
+                     "BID_NEXT_DAILY_REPORT_TIME", "BID_NEXT_WEEKLY_REPORT_TIME")
+    @classmethod
+    def _validate_report_time(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
         s = str(v).strip()
         if not _HHMM.match(s):
             raise ValueError("must be 24h HH:MM, e.g. 18:30")
         return s
 
-    @field_validator("BID_WEEKLY_REPORT_DAY")
+    @field_validator("BID_WEEKLY_REPORT_DAY", "BID_NEXT_WEEKLY_REPORT_DAY")
     @classmethod
-    def _validate_report_day(cls, v: str) -> str:
+    def _validate_report_day(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
         s = str(v).strip().lower()
         if s not in WEEKDAYS:
             raise ValueError("must be one of " + ", ".join(WEEKDAYS))
@@ -228,6 +263,29 @@ class Settings(BaseSettings):
         except Exception as e:  # ZoneInfoNotFoundError, ValueError for malformed keys
             raise ValueError(f"unknown timezone {s!r}") from e
         return s
+
+    @model_validator(mode="after")
+    def _validate_schedule_switch(self) -> "Settings":
+        if self.BID_SCHEDULE_SWITCH_AT is None:
+            return self
+        missing = [
+            name for name in ("BID_NEXT_DAILY_REPORT_TIME", "BID_NEXT_WEEKLY_REPORT_DAY", "BID_NEXT_WEEKLY_REPORT_TIME")
+            if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError("BID_SCHEDULE_SWITCH_AT needs " + ", ".join(missing))
+        tz = ZoneInfo(self.BID_REPORT_TIMEZONE)
+        naive = datetime.fromisoformat(self.BID_SCHEDULE_SWITCH_AT)
+        switch = naive.replace(tzinfo=tz)
+        if switch.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None) != naive:
+            raise ValueError("BID_SCHEDULE_SWITCH_AT does not exist in " + self.BID_REPORT_TIMEZONE + " (clock gap)")
+        want_day = WEEKDAYS.index(self.BID_NEXT_WEEKLY_REPORT_DAY)
+        if switch.weekday() != want_day or switch.strftime("%H:%M") != self.BID_NEXT_WEEKLY_REPORT_TIME:
+            raise ValueError(
+                "BID_SCHEDULE_SWITCH_AT must fall on BID_NEXT_WEEKLY_REPORT_DAY at BID_NEXT_WEEKLY_REPORT_TIME "
+                f"({self.BID_NEXT_WEEKLY_REPORT_DAY} {self.BID_NEXT_WEEKLY_REPORT_TIME})"
+            )
+        return self
 
 
 @lru_cache

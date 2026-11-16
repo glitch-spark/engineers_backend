@@ -1,8 +1,13 @@
 """Pay weeks for the Bidders page: the weekly report window, its seven daily windows, and per-bidder counts.
 
-A pay week is the weekly report window. Its days are the daily windows that start inside it, so the last day
-(Saturday with the defaults) ends after the weekly cutoff: day counts show that whole day, while the week's totals
+A pay week is the weekly report window [previous weekly cutoff, weekly cutoff). Its days are the daily windows whose
+midpoint lies inside it. A day can stick out of the week at either end (with the old Saturday 16:00 / daily 18:30
+rules, Saturday's day ends at 18:30, after the weekly cutoff): day counts show that whole day, while the week's totals
 and pay use the pay-week window itself and match the weekly Slack report.
+
+With a schedule switch (see app.bids.windows) the week ending at the switch is longer (Sat 2026-11-14 16:00 to
+Sun 2026-11-22 20:00, eight days) and the day straddling the switch counts in the week after it. Before the switch the
+midpoint rule picks the same days as the old "starts inside" rule, so old weeks are unchanged.
 """
 
 from dataclasses import dataclass
@@ -13,7 +18,7 @@ from app.bids.live_counts import TtlCache
 from app.bids.records import _naive_utc, count_by_status, uses_records
 from app.bids.schemas import _iso_utc, bidder_status
 from app.bids.storage import BidStorage, count_folder_windows
-from app.bids.windows import BidSchedule, latest_cutoff, period_key, window_for
+from app.bids.windows import BidSchedule, latest_cutoff, next_cutoff, period_key, window_for
 from app.models import Account, UserExtra
 from app.models.bid import Bid
 from app.models.bidder import Bidder
@@ -40,15 +45,18 @@ def pay_week(sched: BidSchedule, now: datetime, week: Optional[date] = None) -> 
     """The pay week holding `week` (taken at local noon) or, by default, `now`: the first weekly cutoff strictly
     after that moment ends it. Raises ValueError/OverflowError at the edges of the calendar."""
     anchor = now if week is None else datetime.combine(week, time(12), tzinfo=sched.tz)
-    last = latest_cutoff("weekly", anchor, sched)
-    cutoff = datetime.combine(last.date() + timedelta(days=7), sched.weekly_at, tzinfo=sched.tz)
+    cutoff = next_cutoff("weekly", latest_cutoff("weekly", anchor, sched), sched)
     start, end = window_for("weekly", cutoff, sched)
     days = []
-    for offset in range(8):  # local dates the week touches; keep the daily windows that start inside it
-        day_cutoff = datetime.combine(last.date() + timedelta(days=offset + 1), sched.daily_at, tzinfo=sched.tz)
+    day_cutoff = next_cutoff("daily", start - timedelta(days=1), sched)
+    while True:  # daily windows in order; keep those whose midpoint (in UTC) is inside [start, end)
         d_start, d_end = window_for("daily", day_cutoff, sched)
-        if start <= d_start < end:
+        mid = d_start + (d_end - d_start) / 2
+        if mid >= end:
+            break
+        if mid >= start:
             days.append(DayWindow(period_key(day_cutoff), d_start, d_end))
+        day_cutoff = next_cutoff("daily", day_cutoff, sched)
     return PayWeek(start, end, cutoff, days)
 
 
