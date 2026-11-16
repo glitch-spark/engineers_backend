@@ -15,7 +15,7 @@ from app.bids import records, reports
 from app.bids.reports import run_bid_reports_tick
 from app.bids.slack_format import Owner
 from app.bids.storage import BidStorageError
-from app.bids.windows import BidSchedule
+from app.bids.windows import BidSchedule, Rules
 from app.config import get_settings
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
@@ -351,3 +351,84 @@ async def test_update_report_edits_each_message_and_fits_a_new_length(monkeypatc
     calls.clear()
     assert await reports.update_report("C1", ["1.0"], "t", [[{"b": 1}], [{"b": 2}]]) == ["1.0", "9.0"]
     assert calls == [("chat.update", "1.0", None), ("chat.postMessage", None, "1.0")]
+
+
+# --- the schedule switch: Sun 2026-11-22 20:00 CST, daily 18:30 -> 18:00, weekly Sat 16:00 -> Sun 20:00 ---
+
+SWITCH_SCHED = BidSchedule(tz=CT, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0),
+                           switch_at=datetime(2026, 11, 22, 20, 0, tzinfo=CT),
+                           next_rules=Rules(time(18, 0), 6, time(20, 0)))
+
+
+async def switch_tick(local, store=None):
+    store = store or FakeStore([bidder("Ana", "s3://b/ana/")])
+    post = Poster()
+    got = await run_bid_reports_tick(local.replace(tzinfo=CT).astimezone(timezone.utc), store=store,
+                                     storage=FakeStorage({"s3://b/ana/": 3}), post=post, sched=SWITCH_SCHED)
+    return got, store, post
+
+
+def weekly_rows(store):
+    return [r for r in store.rows if r.kind == "weekly"]
+
+
+async def test_switch_no_weekly_report_on_the_saturday_before():
+    # Sat 11-21 16:05: the old Saturday cutoff no longer exists, the long week is still open
+    got, store, post = await switch_tick(datetime(2026, 11, 21, 16, 5))
+    assert got["weekly"] == "not-due" and weekly_rows(store) == []
+    assert not any("Weekly" in t for t in post.sent)
+    assert "bids-weekly:2026-11-21" not in store.done and "bids-weekly:2026-11-14" not in store.done
+
+
+async def test_switch_weekly_report_posts_at_the_sunday_cutoff():
+    got, store, post = await switch_tick(datetime(2026, 11, 22, 20, 5))
+    assert got["weekly"] == "posted" and "bids-weekly:2026-11-22" in store.done
+    rows = weekly_rows(store)
+    assert rows and {r.periodKey for r in rows} == {"2026-11-22"}
+    assert all(r.periodStart.replace(tzinfo=timezone.utc) == datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc) and
+               r.periodEnd.replace(tzinfo=timezone.utc) == datetime(2026, 11, 23, 2, 0, tzinfo=timezone.utc)
+               for r in rows)
+    weekly = [t for t in post.sent if "Weekly bids & pay" in t]
+    assert len(weekly) == 1 and "week ending Sun Nov 22" in weekly[0]
+
+
+async def test_switch_day_report_posts_at_the_old_cutoff_on_the_switch_day():
+    got, store, post = await switch_tick(datetime(2026, 11, 22, 18, 35))
+    assert got["daily"] == "posted" and "bids-daily:2026-11-22" in store.done
+    assert got["weekly"] == "not-due" and weekly_rows(store) == []
+    daily = [r for r in store.rows if r.kind == "daily"]
+    assert {r.periodKey for r in daily} == {"2026-11-22"}
+    # the day ending at the old Sun 18:30 cutoff: Sat 18:30 -> Sun 18:30 CST
+    assert {(r.periodStart.replace(tzinfo=timezone.utc), r.periodEnd.replace(tzinfo=timezone.utc)) for r in daily} == {
+        (datetime(2026, 11, 22, 0, 30, tzinfo=timezone.utc), datetime(2026, 11, 23, 0, 30, tzinfo=timezone.utc))}
+
+
+async def test_switch_daily_report_moves_to_the_new_time_after_the_switch():
+    got, store, post = await switch_tick(datetime(2026, 11, 23, 18, 5))
+    assert got["daily"] == "posted" and "bids-daily:2026-11-23" in store.done
+    daily = [r for r in store.rows if r.kind == "daily"]
+    assert {r.periodKey for r in daily} == {"2026-11-23"}
+    start = {r.periodStart.replace(tzinfo=timezone.utc) for r in daily}
+    end = {r.periodEnd.replace(tzinfo=timezone.utc) for r in daily}
+    # Sun 18:30 -> Mon 18:00 CST
+    assert start == {datetime(2026, 11, 23, 0, 30, tzinfo=timezone.utc)}
+    assert end == {datetime(2026, 11, 24, 0, 0, tzinfo=timezone.utc)}
+
+
+async def test_switch_nothing_new_before_the_first_new_daily_cutoff():
+    # Mon 11-23 17:59: the old 18:30 cutoff would not be until later, the new 18:00 not yet; the latest
+    # cutoff is still Sun 11-22 18:30, long past its catch-up window, and nothing is posted or saved.
+    got, store, post = await switch_tick(datetime(2026, 11, 23, 17, 59))
+    assert got["daily"] == "not-due" and got["weekly"] == "not-due"
+    assert store.rows == [] and post.sent == []
+
+
+async def test_switch_read_from_settings(monkeypatch):
+    s = get_settings().model_copy(update={
+        "BID_SCHEDULE_SWITCH_AT": "2026-11-22T20:00", "BID_NEXT_DAILY_REPORT_TIME": "18:00",
+        "BID_NEXT_WEEKLY_REPORT_DAY": "sunday", "BID_NEXT_WEEKLY_REPORT_TIME": "20:00"})
+    monkeypatch.setattr("app.bids.windows.get_settings", lambda: s)
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    now = datetime(2026, 11, 22, 20, 5, tzinfo=CT).astimezone(timezone.utc)
+    got = await run_bid_reports_tick(now, store=store, storage=FakeStorage({"s3://b/ana/": 3}), post=post)
+    assert got["weekly"] == "posted" and "bids-weekly:2026-11-22" in store.done
