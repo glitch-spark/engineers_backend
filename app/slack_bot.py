@@ -570,7 +570,7 @@ def daily_plan_text(
         *body,
         _PLAN_DIVIDER,
         "```",
-        f":link: <{_frontend_link(f'/plans?week={monday}')}|Open Plans>",
+        f":link: <{_frontend_link(f'/plans?week={monday}')}|Open Daily plan>",
     ])
 
 
