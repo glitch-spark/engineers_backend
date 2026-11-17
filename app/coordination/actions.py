@@ -7,8 +7,15 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
+from fastapi import HTTPException
+
 from app import slack_bot
-from app.models import UserExtra
+from app.coordination.blocks import COORD_CHOOSE_CALLER, COORD_CONFIRM
+from app.models import Interview, UserExtra
+from app.models.interview import InterviewStageEvent
+from app.interview_caller import CallerIn
+from app.round_confirm import ConfirmError, confirm_round
+from app.routers.callers import is_caller_manager
 from app.slack_transactions import _post_ephemeral
 
 log = logging.getLogger(__name__)
@@ -16,6 +23,9 @@ log = logging.getLogger(__name__)
 NOT_LINKED = "Link your Slack in Account settings first."
 TRY_AGAIN = "Something went wrong. Try again from the app."
 FORM_FAILED = "Couldn't open the form — click again."
+ROUND_GONE = "This round is gone."
+CHOOSE_REFUSED = "Only the owner or an interview manager can assign the caller."
+SELF_PICKED = "No caller (Self) — the caller request is off."
 
 
 @dataclass(frozen=True)
@@ -93,6 +103,82 @@ async def tell(channel: str, slack_user_id: str, text: str) -> None:
 
 
 HANDLERS: dict[str, Callable[[Click, UserExtra], Awaitable[None]]] = {}
+
+
+async def _find_round(iv_id: str, round_id: str) -> Optional[tuple[Interview, InterviewStageEvent]]:
+    """The interview and its round, or None when either is gone (or the id is not an object id)."""
+    from app.routers import interviews as ivr
+
+    try:
+        iv = await Interview.get(ivr.to_object_id(iv_id))
+    except HTTPException:
+        return None
+    if iv is None:
+        return None
+    entry = next((e for e in iv.stageHistory if e.id == round_id), None)
+    return (iv, entry) if entry is not None else None
+
+
+def _caller_name(out: dict, round_id: str) -> str:
+    """The caller's name on the round in an interview payload returned by a router function."""
+    for entry in out.get("stageHistory") or []:
+        if isinstance(entry, dict) and entry.get("id") == round_id:
+            return str(((entry.get("caller") or {}).get("callerName")) or "").strip() or "TBD"
+    return "TBD"
+
+
+async def choose_caller(click: Click, user: UserExtra) -> None:
+    """The caller select on the post. Managers go through the manager endpoint; the owner through the round's
+    `caller` field, which keeps the round's method and link."""
+    from app.routers import interviews as ivr
+
+    parts = click.value.split(":")
+    if len(parts) != 3 or not all(parts):
+        await reply(click.response_url, ROUND_GONE)
+        return
+    iv_id, round_id, pick = parts
+    found = await _find_round(iv_id, round_id)
+    if found is None:
+        await reply(click.response_url, ROUND_GONE)
+        return
+    iv, entry = found
+    is_self = pick == "self"
+    try:
+        if is_caller_manager(user):
+            body = ivr.CallerAssignIn(callerId="", enabled=False) if is_self else ivr.CallerAssignIn(
+                callerId=pick, enabled=True,
+            )
+            out = await ivr.assign_round_caller(iv_id, round_id, body, user)
+        elif str(iv.createdBy) == str(user.id):
+            prev = entry.caller
+            caller = CallerIn(enabled=False) if is_self else CallerIn(
+                enabled=True, callerId=pick,
+                method=prev.method if prev else None, methodValue=prev.methodValue if prev else "",
+            )
+            out = await ivr.update_interview_stage(iv_id, round_id, ivr.StagePatch(caller=caller), user)
+        else:
+            await reply(click.response_url, CHOOSE_REFUSED)
+            return
+    except HTTPException as exc:
+        await reply(click.response_url, str(exc.detail))
+        return
+    await reply(click.response_url, SELF_PICKED if is_self else f"Caller set: {_caller_name(out, round_id)}.")
+
+
+async def confirm(click: Click, user: UserExtra) -> None:
+    """The Confirm button. `confirm_round` syncs the post, which then shows "confirmed"; only a refusal replies."""
+    parts = click.value.split(":")
+    if len(parts) != 2 or not all(parts):
+        await reply(click.response_url, ROUND_GONE)
+        return
+    try:
+        await confirm_round(parts[0], parts[1], user, True)
+    except ConfirmError as exc:
+        await reply(click.response_url, exc.message)
+
+
+HANDLERS[COORD_CHOOSE_CALLER] = choose_caller
+HANDLERS[COORD_CONFIRM] = confirm
 
 
 async def process_coordination_click(click: Click) -> None:
