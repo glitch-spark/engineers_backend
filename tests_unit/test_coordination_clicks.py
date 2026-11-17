@@ -229,6 +229,17 @@ async def test_confirm_from_the_post(slack, cast):
     slack.sync.assert_awaited()
 
 
+async def test_confirm_on_an_already_confirmed_round_says_so(slack, cast):
+    iv = await make_interview(cast.justin, caller_id=str(cast.ana.id), kind="user", name="Ana")
+    await actions.process_coordination_click(click("coord_confirm", iv, "U0ANA00001"))
+    assert (await tip(iv)).confirmed is True and texts(slack) == []
+    slack.sync.reset_mock()
+    await actions.process_coordination_click(click("coord_confirm", iv, "U0ANA00001"))  # an old click, same button
+    assert texts(slack) == ["Already confirmed."]
+    assert (await tip(iv)).confirmed is True
+    slack.sync.assert_not_awaited()
+
+
 async def test_assigned_caller_and_stranger_confirm(slack, cast):
     iv = await make_interview(cast.justin, caller_id=str(cast.ana.id), kind="user", name="Ana")
     stranger = await make_user("Bob", slack_id="U0BOB000001")

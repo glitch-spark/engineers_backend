@@ -43,6 +43,7 @@ SELF_PICKED = "No caller (Self) — the caller request is off."
 UPDATE_REFUSED = "Only the owner or an interview manager can update this round."
 NEEDS_COMPLETED = "Mark the round completed first."
 ALREADY = "Already updated: {Label}."
+ALREADY_CONFIRMED = "Already confirmed."
 MOVED = "This round was moved — answer the new ask after it ends."
 
 
@@ -188,6 +189,10 @@ async def confirm(click: Click, user: UserExtra) -> None:
     parts = click.value.split(":")
     if len(parts) != 2 or not all(parts):
         await reply(click.response_url, ROUND_GONE)
+        return
+    found = await _find_round(parts[0], parts[1])
+    if found is not None and found[1].confirmed:  # an old click on a round confirmed since: still answered
+        await reply(click.response_url, ALREADY_CONFIRMED)
         return
     try:
         await confirm_round(parts[0], parts[1], user, True)
@@ -344,11 +349,14 @@ async def after_rescheduled(click: Click, user: UserExtra) -> None:
     await _open_form(click, iv, entry, reschedule_view, start=entry.scheduledAt or datetime.now(timezone.utc))
 
 
-async def _result_open(click: Click, entry: InterviewStageEvent) -> bool:
+async def _result_open(click: Click, iv: Interview, entry: InterviewStageEvent) -> bool:
     """A result can be set only on a completed round without one. Replies and returns False otherwise."""
     status = round_status(entry)
     if status in ("passed", "rejected"):
         await reply(click.response_url, f"Result already set: {_label(status)}.")
+        # An old Friday roundup row for a round whose result was set in the app: drop it from the roundup.
+        await show_answer(iv, channel=click.channel, ts=click.message_ts, response_url=click.response_url,
+                          line=f"Result already set: {_label(status)}")
         return False
     if status != "completed":
         await reply(click.response_url, NEEDS_COMPLETED)
@@ -358,14 +366,14 @@ async def _result_open(click: Click, entry: InterviewStageEvent) -> bool:
 
 async def result_passed(click: Click, user: UserExtra) -> None:
     found = await _clicked_round(click, user)
-    if found is None or not await _result_open(click, found[1]):
+    if found is None or not await _result_open(click, *found):
         return
     await _write_and_show(click, user, *found, "passed")
 
 
 async def result_rejected(click: Click, user: UserExtra) -> None:
     found = await _clicked_round(click, user)
-    if found is None or not await _result_open(click, found[1]):
+    if found is None or not await _result_open(click, *found):
         return
     await _open_form(click, *found, reject_view)
 

@@ -13,7 +13,6 @@ from app.interview_caller import (  # noqa: E402
     CallerError,
     CallerIn,
     build_round_caller,
-    caller_change_lines,
     round_caller_snapshot,
 )
 from app.models.interview import InterviewCaller, InterviewStageEvent  # noqa: E402
@@ -71,17 +70,6 @@ def test_build_round_caller_disabled_keeps_ts():
     caller = build_round_caller(CallerIn(enabled=False), starts_at=START, previous=prev)
     assert caller.enabled is False
     assert caller.slackChannelTs == "1.2"
-
-
-def test_change_lines_format():
-    a = round_caller_snapshot(_entry())
-    later = datetime(2026, 10, 1, 15, 30, tzinfo=timezone.utc)
-    b = round_caller_snapshot(_entry(
-        scheduledAt=later,
-        caller=InterviewCaller(enabled=True, callerName="Dana", startsAt=later, method="video", methodValue="https://meet"),
-    ))
-    lines = caller_change_lines(a, b, fmt_time=lambda d: d.strftime("%H:%M"), label=lambda k, v: str(v))
-    assert lines == ["Time: 14:00 → 15:30", "Caller assigned: TBD → Dana"]
 
 
 def test_build_round_caller_keeps_kind_when_caller_unchanged():

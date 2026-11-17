@@ -40,7 +40,7 @@ from app.interview_caller import (
     CallerIn,
     build_round_caller,
     caller_unassigned,
-    round_caller_snapshot,
+    round_post_state,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
@@ -318,7 +318,7 @@ async def _save_interview(iv: Interview) -> None:
 
 
 def _round_snapshots(iv: Interview) -> dict[str, Optional[dict]]:
-    return {e.id: round_caller_snapshot(e) for e in iv.stageHistory if e.id}
+    return {e.id: round_post_state(e) for e in iv.stageHistory if e.id}
 
 
 async def _sync_caller_posts(

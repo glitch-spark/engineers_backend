@@ -327,6 +327,21 @@ async def test_result_already_set(slack, cast, action_id):
     assert slack.of("views.open") == []
 
 
+@pytest.mark.parametrize("action_id", ["coord_result_passed", "coord_result_rejected"])
+async def test_result_already_set_on_an_old_roundup_drops_the_row(slack, cast, action_id):
+    """The result was set in the app after the roundup was posted: the click is answered, and the roundup is
+    refreshed so the row goes."""
+    iv = await make_interview(cast, status="passed")
+    roundup = await ResultRoundupPost(friday="2026-11-13", channel="C1", ts="300.3", refs=[ref(iv)], rendered="x").insert()
+    refresh = AsyncMock()
+    with patch("app.coordination.chase.refresh_roundup", refresh):
+        await actions.process_coordination_click(click(action_id, iv, "U0JUSTIN01", ts="300.3"))
+    assert ephemeral_texts(slack) == ["Result already set: Passed."]
+    refresh.assert_awaited_once()
+    assert refresh.await_args.args[0].id == roundup.id
+    assert slack.of("views.open") == []
+
+
 async def test_rejected_opens_the_form(slack, cast):
     iv = await make_interview(cast, status="completed")
     await actions.process_coordination_click(click("coord_result_rejected", iv, "U0JUSTIN01", ts=POST_TS))

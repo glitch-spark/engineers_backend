@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
 
@@ -86,17 +86,6 @@ def build_round_caller(
     )
 
 
-# Order of lines in a thread reply; keys of round_caller_snapshot.
-_CHANGE_FIELDS = (
-    ("time", "Time"),
-    ("stage", "Stage"),
-    ("status", "Status"),
-    ("method", "Method"),
-    ("link", "Link"),
-    ("caller", "Caller assigned"),
-)
-
-
 def round_caller_snapshot(entry: Any) -> Optional[dict]:
     """What #caller cares about for one round; None when no caller is requested."""
     caller = getattr(entry, "caller", None)
@@ -113,59 +102,13 @@ def round_caller_snapshot(entry: Any) -> Optional[dict]:
     }
 
 
+def round_post_state(entry: Any) -> dict:
+    """What the interview's post shows about one round: the caller snapshot, or just the round's status when no
+    caller is requested (so a status change on such a round still re-renders an existing post)."""
+    return round_caller_snapshot(entry) or {"status": normalize_status(getattr(entry, "status", None))}
+
+
 def caller_is_on(snapshot: Optional[dict]) -> bool:
     """A caller is requested and the round is not called off."""
     return snapshot is not None and snapshot.get("status") not in ENDED_STATUSES
 
-
-_is_on = caller_is_on
-
-
-def caller_thread_event(
-    prev: Optional[dict], new: Optional[dict], *, added: bool = False, removed: bool = False,
-) -> Optional[str]:
-    """The thread reply a write earns for one round (first match wins).
-
-    moved (round added) · removed · ended (canceled/rejected) · back_on · rescheduled · confirmed ·
-    unconfirmed · details (any other caller field) · None. Turning the caller on or off earns no reply:
-    the main post says so.
-    """
-    if removed:
-        return "removed"
-    if added:
-        return "moved"
-    if prev is None or new is None:
-        return None
-    was_on, is_on = _is_on(prev), _is_on(new)
-    if was_on and not is_on:
-        return "ended"
-    if is_on and not was_on:
-        return "back_on"
-    if prev.get("time") != new.get("time"):
-        return "rescheduled"
-    if prev.get("confirmed") != new.get("confirmed"):
-        return "confirmed" if new.get("confirmed") else "unconfirmed"
-    if prev != new:
-        return "details"
-    return None
-
-
-def caller_change_lines(
-    prev: dict,
-    new: dict,
-    *,
-    fmt_time: Callable[[datetime], str],
-    label: Callable[[str, Any], str],
-) -> list[str]:
-    """`Field: old → new` for each field that changed, in a fixed order."""
-    lines = []
-    for key, title in _CHANGE_FIELDS:
-        old, cur = prev.get(key), new.get(key)
-        if old == cur:
-            continue
-        if key == "time":
-            render = lambda v: fmt_time(v) if v is not None else "TBD"  # noqa: E731
-        else:
-            render = lambda v, k=key: label(k, v) if v not in (None, "") else "—"  # noqa: E731
-        lines.append(f"{title}: {render(old)} → {render(cur)}")
-    return lines

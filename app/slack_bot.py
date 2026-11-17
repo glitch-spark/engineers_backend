@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from beanie import PydanticObjectId
 
-from app.interview_caller import caller_is_on, round_caller_snapshot
+from app.interview_caller import caller_is_on, round_caller_snapshot, round_post_state
 
 from app.config import get_settings
 from app.models import Account, Interview, UserExtra
@@ -301,7 +301,7 @@ async def sync_caller_thread(
                 return bool(ts)
 
         touched = any(
-            before.get(e.id) != (None if e.id in deleted else round_caller_snapshot(e))
+            before.get(e.id) != (None if e.id in deleted else round_post_state(e))
             or e.id in added or e.id in deleted
             for e in rounds
         )

@@ -1,4 +1,4 @@
-"""One #caller thread per interview: sync_caller_thread with Slack faked (no network, no DB)."""
+"""One #caller thread per interview: sync_caller_thread with Slack faked (no network; the DB is an in-memory mongomock)."""
 
 import asyncio
 import os
@@ -14,7 +14,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app import slack_bot  # noqa: E402
-from app.interview_caller import round_caller_snapshot  # noqa: E402
+from app.interview_caller import round_caller_snapshot, round_post_state  # noqa: E402
 from app.models import UserExtra  # noqa: E402
 from app.models.account import Account  # noqa: E402
 from app.models.caller import Caller  # noqa: E402
@@ -41,7 +41,7 @@ def iv(*rounds, thread=None):
 
 
 def snaps(interview):
-    return {e.id: round_caller_snapshot(e) for e in interview.stageHistory}
+    return {e.id: round_post_state(e) for e in interview.stageHistory}
 
 
 def run(interview, before, *, fail=None, **kw):
@@ -134,6 +134,24 @@ def test_caller_turned_off_updates_main_post_without_reply():
     interview = iv(rnd("r1", caller=False), thread=THREAD)
     _, calls = run(interview, snaps(iv(rnd("r1"))))
     only_update(calls)
+
+
+def test_status_change_on_a_round_with_no_caller_edits_the_post():
+    """The caller is off, so the snapshot is None both times; the round's status still re-renders the post."""
+    interview = iv(rnd("r1", caller=False, status="completed"), thread=THREAD)
+    _, calls = run(interview, snaps(iv(rnd("r1", caller=False))))
+    only_update(calls)
+
+
+def test_unchanged_round_with_no_caller_does_nothing():
+    interview = iv(rnd("r1", caller=False), thread=THREAD)
+    assert run(interview, snaps(interview)) == (False, [])
+
+
+def test_status_change_with_no_caller_and_no_post_posts_nothing():
+    interview = iv(rnd("r1", caller=False, status="completed"))
+    assert run(interview, snaps(iv(rnd("r1", caller=False)))) == (False, [])
+    assert interview.slackThread is None
 
 
 def test_old_round_post_is_adopted_as_thread():

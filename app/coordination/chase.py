@@ -67,6 +67,13 @@ async def caller_rounds(status: str, *, ended_after: datetime, ended_by: datetim
         "stageHistory": {"$elemMatch": {
             "caller.enabled": True, "status": _status_query(status),
             "scheduledAt": {"$lte": ended_by.replace(tzinfo=None)},
+            # Bound below so the set does not grow with every round ever called. A round's end is endsAt when that is
+            # after the start, else start + 1 h, so it ends after `ended_after` only if it starts within the hour
+            # before it or its endsAt is after it. Looser than the Python filter, never tighter.
+            "$or": [
+                {"scheduledAt": {"$gt": (ended_after - timedelta(hours=1)).replace(tzinfo=None)}},
+                {"endsAt": {"$gt": ended_after.replace(tzinfo=None)}},
+            ],
         }},
     }).to_list()
     rows: list[tuple[Interview, InterviewStageEvent, datetime, datetime]] = []

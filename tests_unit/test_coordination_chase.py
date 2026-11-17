@@ -314,6 +314,33 @@ async def test_a_completed_round_ended_before_the_cutoff_gets_no_reminder(slack,
     assert await chase.run_result_reminders(utc(30, 19, 31)) == {"sent": 0, "failed": 0}
 
 
+async def test_chase_query_is_bounded_below_by_the_cutoff(slack, justin, db, monkeypatch):
+    """A round that ended before the lower bound is left out by the query itself, not only by the Python filter, and
+    one the filter would accept is never left out."""
+    cutoff = utc(2, 6)
+    await add(justin, company="Old", start=utc(1, 19), end=utc(1, 20))  # ended before the cutoff
+    await add(justin, company="OldNoEnd", start=utc(1, 19), end=None)  # start + 1 h, before it
+    await add(justin, company="EdgeNoEnd", start=utc(2, 5, 30), end=None)  # ends 06:30, after it
+    await add(justin, company="Long", start=utc(1, 22), end=utc(2, 8))  # starts early, ends after it
+    await add(justin, company="Inverted", start=utc(2, 5, 30), end=utc(2, 5, 0))  # end <= start: +1 h
+    await add(justin, company="Recent", start=utc(16, 18))
+
+    queries = []
+    real_find = Interview.find
+
+    def spy(query, *a, **kw):
+        queries.append(query)
+        return real_find(query, *a, **kw)
+
+    monkeypatch.setattr(Interview, "find", spy)
+    rounds = await chase.caller_rounds("scheduled", ended_after=cutoff, ended_by=utc(20, 0))
+    assert {c.interview.companyName for c in rounds} == {"EdgeNoEnd", "Long", "Inverted", "Recent"}
+
+    [query] = queries
+    found = {d["companyName"] async for d in db["interviews"].find(query)}
+    assert found == {"EdgeNoEnd", "Long", "Inverted", "Recent"}  # the two that ended before it never load
+
+
 async def test_failed_reminder_releases_the_claim(slack, justin):
     await add(justin, status="completed")
     slack.errors = ["ratelimited"]
