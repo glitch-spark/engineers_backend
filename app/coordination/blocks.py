@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Optional, Sequence
 
 from app.caller_directory import CallerEntry
@@ -167,3 +168,57 @@ def result_reminder_blocks(
 def answered_blocks(line: str) -> list[dict]:
     """What replaces an ask once it is answered: the answer line alone, no buttons."""
     return [_section(line)]
+
+
+MAX_ROUNDUP_BLOCKS = 49  # one under Slack's 50, so the "…and k more" context block always fits
+ROUNDUP_THANKS = "✅ All results are in — thanks."
+
+
+@dataclass
+class RoundupRow:
+    ref: str
+    company: str
+    stage: str
+    start: datetime
+    profile: str
+
+
+def roundup_blocks(
+    groups: Sequence[tuple[Optional[UserExtra], Sequence[RoundupRow]]], *, friday: date, origin: str,
+) -> tuple[str, list[dict]]:
+    """The Friday roundup: the rounds with no result, by owner, each with Passed / Rejected. Rows are added while the
+    message stays within 49 blocks; the rest are summarised in one context block."""
+    total = sum(len(rows) for _, rows in groups)
+    if not total:
+        return ROUNDUP_THANKS, [_section(ROUNDUP_THANKS)]
+    header = f"📋 Results still open — {friday:%a} {friday:%b} {friday.day}"
+    blocks: list[dict] = [_section(f"*{header}*")]
+    shown = 0
+    full = False
+    for owner, rows in groups:
+        if full:
+            break
+        n = len(rows)
+        title = f"{_who(owner, 'Unknown owner')} — {n} round{'s' if n != 1 else ''}"
+        added = False
+        for row in rows:
+            if len(blocks) + (0 if added else 1) + 2 > MAX_ROUNDUP_BLOCKS:
+                full = True
+                break
+            if not added:
+                blocks.append(_section(title))
+                added = True
+            parts = [_short(row.company, MAX_NAME, "—"), _stage_label(row.stage), slack_time(row.start),
+                     _short(row.profile, MAX_NAME)]
+            blocks.append(_section(" · ".join(p for p in parts if p)))
+            blocks.append({"type": "actions", "elements": [
+                _button("Passed", style="primary", action_id=COORD_RESULT_PASSED, value=row.ref),
+                _button("Rejected", style="danger", action_id=COORD_RESULT_REJECTED, value=row.ref),
+            ]})
+            shown += 1
+    if shown < total:
+        k = total - shown
+        blocks.append({"type": "context", "elements": [{
+            "type": "mrkdwn", "text": f"…and {k} more without a result — <{origin.rstrip('/')}/statistics|Statistics>",
+        }]})
+    return header, blocks

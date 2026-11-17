@@ -20,7 +20,7 @@ from app import slack_bot  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.coordination import chase  # noqa: E402
 from app.models import interview as interview_model  # noqa: E402
-from app.models import Account, Interview, SlackAlertLog, UserExtra  # noqa: E402
+from app.models import Account, Interview, ResultRoundupPost, SlackAlertLog, UserExtra  # noqa: E402
 from app.models.interview import InterviewCaller, InterviewStageEvent, SlackThread  # noqa: E402
 
 pytestmark = [
@@ -63,7 +63,7 @@ class Slack:
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["coord-chase-unit"]
-    await init_beanie(database=database, document_models=[Interview, UserExtra, Account, SlackAlertLog])
+    await init_beanie(database=database, document_models=[Interview, UserExtra, Account, SlackAlertLog, ResultRoundupPost])
     return database
 
 
@@ -327,7 +327,9 @@ async def test_failed_reminder_releases_the_claim(slack, justin):
 async def test_chase_parts_are_isolated(slack, justin, monkeypatch):
     monkeypatch.setattr(chase, "run_after_call_asks", AsyncMock(side_effect=RuntimeError("boom")))
     monkeypatch.setattr(chase, "run_result_reminders", AsyncMock(return_value={"sent": 2, "failed": 0}))
-    assert await chase.run_coordination_chase(utc(16, 19, 31)) == {"after_call_asks": 0, "result_reminders": 2}
+    assert await chase.run_coordination_chase(utc(16, 19, 31)) == {
+        "after_call_asks": 0, "result_reminders": 2, "result_roundup": "skipped",
+    }
 
 
 def _quiet_tick():

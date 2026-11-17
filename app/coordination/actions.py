@@ -25,7 +25,7 @@ from app.coordination.blocks import (
 from app.coordination.modals import Origin, cancel_view, reject_view, reschedule_view
 from app.interview_day.blocks import _short, _who
 from app.interview_normalize import interview_status_value
-from app.models import Interview, UserExtra
+from app.models import Interview, ResultRoundupPost, UserExtra
 from app.models.interview import InterviewStageEvent
 from app.interview_caller import CallerIn
 from app.round_confirm import ConfirmError, confirm_round
@@ -246,10 +246,17 @@ def answer_line(kind: str, user: UserExtra, *, note: str = "", new_start: Option
 async def show_answer(iv: Interview, *, channel: str, ts: str, response_url: str, line: str) -> None:
     """Replace the answered ask (or reminder) with its answer line. The coordination post itself is left alone: the
     write already re-rendered it. Never raises."""
-    thread = iv.slackThread
-    if thread is not None and ts and ts == thread.ts:
-        return
     try:
+        if ts:
+            roundup = await ResultRoundupPost.find_one({"ts": ts})
+            if roundup is not None:  # answered on the Friday roundup: it drops the row, edited in place
+                from app.coordination.chase import refresh_roundup  # chase imports the interview router
+
+                await refresh_roundup(roundup)
+                return
+        thread = iv.slackThread
+        if thread is not None and ts and ts == thread.ts:
+            return
         if response_url:
             await replace(response_url, line, answered_blocks(line))
         elif channel and ts:

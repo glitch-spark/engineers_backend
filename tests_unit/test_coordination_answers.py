@@ -28,7 +28,7 @@ from app.coordination.actions import (  # noqa: E402
     Click,
 )
 from app.coordination.modals import Origin  # noqa: E402
-from app.models import Account, UserExtra  # noqa: E402
+from app.models import Account, ResultRoundupPost, UserExtra  # noqa: E402
 from app.models.caller import Caller  # noqa: E402
 from app.models.interview import Interview, InterviewCaller, InterviewStageEvent, SlackThread  # noqa: E402
 from app.models.interview_day_post import InterviewDayPost  # noqa: E402
@@ -54,7 +54,7 @@ async def db():
     database = AsyncMongoMockClient()["coord-answers-unit"]
     await init_beanie(
         database=database,
-        document_models=[Interview, UserExtra, Account, InterviewQuestion, InterviewDayPost, Caller],
+        document_models=[Interview, UserExtra, Account, InterviewQuestion, InterviewDayPost, Caller, ResultRoundupPost],
     )
     return database
 
