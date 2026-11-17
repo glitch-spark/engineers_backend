@@ -246,9 +246,11 @@ async def performance(
         mine = {d: sum(c[:2]) for (bid, d), c in counts.items() if bid == k}
         cur = [(d, c) for (bid, d), c in counts.items() if bid == k and start <= d <= end]
         weekly = [0] * len(weeks)
+        weekly_pending = [0] * len(weeks)  # of `weekly`: the pending part, per column
         for d, c in cur:
             if d in week_of:  # stats-only callers pass no columns
                 weekly[week_of[d]] += c[0] + c[1]
+                weekly_pending[week_of[d]] += c[1]
         approved, pending, rejected = (sum(c[i] for _d, c in cur) for i in range(3))
         total = approved + pending
         prev_total = sum(n for d, n in mine.items() if prev_start <= d <= prev_end)
@@ -265,7 +267,7 @@ async def performance(
         rows.append({
             "id": k, "name": b.name, "ownerName": owners.get(b.createdBy), "profileId": str(b.profileId) if b.profileId else None,
             "profileName": accounts[b.profileId].name if b.profileId in accounts else None,
-            "status": "archived" if b.archivedAt else "active", "weekly": weekly, "total": total, "approved": approved,
+            "status": "archived" if b.archivedAt else "active", "weekly": weekly, "weeklyPending": weekly_pending, "total": total, "approved": approved,
             "pending": pending, "rejected": rejected, "previousTotal": prev_total,
             "change": _ratio(total - prev_total, prev_total, 3), **st,
             "hitRate": _ratio(st["hitDays"], st["weekdays"], 3), "avgPerWeekday": _ratio(total, st["weekdays"], 1),

@@ -103,6 +103,14 @@ async def test_every_row_says_the_bidder_status(db):
     assert month["dayCells"] is None and month["week"] is None   # the board is a pay-week thing
 
 
+async def test_month_columns_carry_pending(db):
+    pedro, ana, _bo = await setup()
+    rows = {x["id"]: x for x in (await perf(pedro, period="month", date="2026-11-01"))["bidders"]}
+    a = rows[str(ana.id)]
+    assert a["weekly"][2] == 14 and a["weeklyPending"][2] == 4
+    assert sum(a["weeklyPending"]) == 4 and len(a["weeklyPending"]) == len(a["weekly"])
+
+
 async def test_card_tops_add_streak_and_interviews(db):
     pedro, _ana, _bo = await setup()
     tops = (await bids_router.bids_insights(pedro, period="week", date="", to="", ownerId=None))["tops"]
