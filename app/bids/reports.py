@@ -243,7 +243,13 @@ async def _render(
 ) -> tuple[str, list[list[dict]]]:
     owner_ids = list({r.ownerId for r in rows})
     owners = await store.owners(owner_ids)
-    my_bids = await store.my_bids(owner_ids, *report_days(kind, rows[0].periodKey, sched)) if rows else {}
+    my_bids: dict[str, dict[str, int]] = {}
+    if rows:
+        try:  # My bids are extra: a failure must never block the post or an edit
+            my_bids = await store.my_bids(owner_ids, *report_days(kind, rows[0].periodKey, sched))
+        except Exception:
+            log.warning("bid %s report %s: My bids unavailable, posting without them", kind, rows[0].periodKey,
+                        exc_info=True)
     return format_report(
         kind, start, end, rows, owners, sched.tz, get_settings().FRONTEND_ORIGIN.rstrip("/"), updated_at,
         my_bids=my_bids,

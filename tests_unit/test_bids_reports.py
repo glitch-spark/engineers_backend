@@ -45,7 +45,7 @@ def _aware(dt): return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 class FakeStore:
     def __init__(self, bidders):
         self.bidders, self.rows, self.done, self.posts = bidders, [], set(), {}
-        self.mine, self.my_bids_calls = {}, []
+        self.mine, self.my_bids_calls, self.my_bids_ids, self.my_bids_error = {}, [], [], None
 
     async def claim(self, key):
         if key in self.done:
@@ -65,7 +65,10 @@ class FakeStore:
     async def profile_names(self, ids): return {}
     async def owners(self, ids): return {str(OWNER): Owner("Pedro", "Pedro")}
     async def my_bids(self, ids, first, last):
+        if self.my_bids_error:
+            raise self.my_bids_error
         self.my_bids_calls.append((first, last))
+        self.my_bids_ids.append(list(ids))
         return self.mine
     async def save_post(self, kind, pk, channel, ts):
         self.posts[(kind, pk)] = SimpleNamespace(kind=kind, periodKey=pk, channel=channel, ts=ts, rev=0, dirty=False)
@@ -537,3 +540,43 @@ async def test_store_my_bids_counts_self_bids_per_profile(db):
                   firstAt=datetime(2026, 10, 2, 15, 0)).insert()
     got = await reports.BeanieReportStore().my_bids([OWNER], date(2026, 10, 2), date(2026, 10, 2))
     assert got == {str(OWNER): {"Arda": 2}}
+
+
+async def test_post_goes_out_when_my_bids_fails(caplog):
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    store.my_bids_error = RuntimeError("db down")
+    with caplog.at_level("WARNING", logger="bids.reports"):
+        got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
+    assert got["daily"] == "posted" and len(post.sent) == 1
+    assert not any("My bids" in t for t in section_texts(post.messages[0]))
+    assert any("My bids" in m and "db down" in m for m in caplog.messages) or any(
+        r.exc_info for r in caplog.records if r.levelname == "WARNING")
+
+
+async def test_failed_my_bids_does_not_block_an_edit():
+    store, post, edit = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster(), Editor()
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post, edit)
+    store.my_bids_error = RuntimeError("db down")
+    store.posts[("daily", "2026-10-02")].dirty = True
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=10), store, FakeStorage({}), post, edit)
+    assert got["refreshed"] == 1 and len(edit.calls) == 1
+
+
+async def test_weekly_my_bids_cover_the_transition_week():
+    # the long week Sun Nov 15 -> Sun Nov 22, 2026 (eight report days), reported at the Sunday 20:00 cutoff
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    got, store, _ = await switch_tick(datetime(2026, 11, 22, 20, 5), store)
+    assert got["weekly"] == "posted"
+    assert (date(2026, 11, 15), date(2026, 11, 22)) in store.my_bids_calls
+
+
+async def test_my_bids_queries_only_the_owners_with_rows():
+    other, ghost = PydanticObjectId(), PydanticObjectId()
+    ana = bidder("Ana", "s3://b/ana/")
+    raj = bidder("Raj", "s3://b/raj/")
+    raj.createdBy = other  # all of this owner's rows are zero
+    store, post = FakeStore([ana, raj]), Poster()
+    store.mine = {str(OWNER): {"Arda": 1}, str(ghost): {"Zed": 5}}  # ghost has self bids but no bidder rows
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3, "s3://b/raj/": 0}), post)
+    (ids,) = store.my_bids_ids
+    assert set(ids) == {OWNER, other} and ghost not in ids
