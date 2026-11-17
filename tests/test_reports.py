@@ -1,11 +1,20 @@
-"""Admin team report for a week."""
+"""Team report for a week: open to every active signed-in user."""
 
 WEEK = "2026-09-28"
 
 
-async def test_team_requires_admin(client, staff_user, auth_header):
+async def test_team_readable_by_staff(client, staff_user, staff_user_2, admin_user, auth_header):
     r = await client.get(f"/reports/team?weekStart={WEEK}", headers=auth_header(staff_user))
-    assert r.status_code == 403
+    assert r.status_code == 200
+    assert [row["name"] for row in r.json()["users"]] == ["Staff One", "Staff Two"]  # same as the admin sees
+    assert r.json() == (await client.get(f"/reports/team?weekStart={WEEK}", headers=auth_header(admin_user))).json()
+
+
+async def test_team_needs_sign_in_and_active_account(client, staff_user, auth_header):
+    assert (await client.get(f"/reports/team?weekStart={WEEK}")).status_code == 401
+    staff_user.isActive = False
+    await staff_user.save()
+    assert (await client.get(f"/reports/team?weekStart={WEEK}", headers=auth_header(staff_user))).status_code == 403
 
 
 async def test_team_requires_monday(client, admin_user, auth_header):

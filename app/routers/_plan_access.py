@@ -1,7 +1,7 @@
 """Read/write rules and input parsing shared by the plan routers.
 
-Only the owner writes a plan (admins get 403). The owner or an admin can
-read it; staff reading someone else get 403.
+Any active signed-in user can read any existing user's plans. Only the owner
+writes a plan (admins get 403); no write route takes a user id.
 """
 
 import re
@@ -20,12 +20,17 @@ _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 M = TypeVar("M", bound=BaseModel)
 
 
+def require_active(user: UserExtra) -> None:
+    """get_current_user only checks the account exists, so a deactivated user's still-valid token stops here."""
+    if getattr(user, "isActive", True) is False:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active")
+
+
 async def read_subject(user: UserExtra, user_id: Optional[str]) -> PydanticObjectId:
-    """Whose plans to read: the caller, or (admins only) `user_id`."""
+    """Whose plans to read: the caller, or `user_id` (any existing user, for any active caller)."""
     if not user_id or user_id == str(user.id):
         return user.id
-    if user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only view your own plans")
+    require_active(user)
     sid = to_object_id(user_id)
     if await UserExtra.get(sid) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")

@@ -1,15 +1,15 @@
-"""Admin team report: every non-admin's Goal vs Done for one week."""
+"""Team report (any active signed-in user): every non-admin's Goal vs Done for one week."""
 
 from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 
-from app.deps import require_admin
+from app.deps import get_current_user
 from app.models import DailyPlan, UserExtra
 from app.models.plan_common import Counts
 from app.plan_auto import week_snapshot
-from app.routers._plan_access import parse_monday
+from app.routers._plan_access import parse_monday, require_active
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -33,9 +33,10 @@ async def _last_logged(user_ids: list, until: datetime) -> dict:
 
 @router.get("/team")
 async def team_report(
-    _admin: Annotated[UserExtra, Depends(require_admin)],
+    user: Annotated[UserExtra, Depends(get_current_user)],
     weekStart: str = Query(...),
 ) -> dict:
+    require_active(user)
     monday = parse_monday(weekStart)
     users = await UserExtra.find({"role": {"$ne": "admin"}}).to_list()
     users.sort(key=lambda u: ((u.name or u.email or "").lower(), str(u.id)))

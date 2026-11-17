@@ -173,7 +173,8 @@ async def test_permissions_matrix(client, staff_user, staff_user_2, admin_user, 
     other = f"/daily-plans/{DAY}?userId={staff_user.id}"
     assert (await client.put(f"/daily-plans/{DAY}", headers=auth_header(admin_user), json=_follow_up())).status_code == 403
     assert (await client.delete(f"/daily-plans/{DAY}", headers=auth_header(admin_user))).status_code == 403
-    assert (await client.get(other, headers=auth_header(staff_user_2))).status_code == 403
+    r = await client.get(other, headers=auth_header(staff_user_2))  # staff read other people's plans too
+    assert r.status_code == 200 and r.json()["done"]["bidsSelf"] == 140
     r = await client.get(other, headers=auth_header(admin_user))
     assert r.status_code == 200 and r.json()["done"]["bidsSelf"] == 140
     assert (await client.get(f"/daily-plans/{DAY}?userId={staff_user.id}", headers=auth_header(staff_user))).status_code == 200
@@ -213,3 +214,46 @@ async def test_day_followed_up_before_any_daily_goal_uses_the_weeks(client, staf
     assert (day["goal"]["bidsSelf"], day["goal"]["bidsBidder"]) == (150, 100)
     # Its own ticked lines are kept.
     assert [i["done"] for i in day["goalItems"]] == [True, False]
+
+
+async def test_staff_reads_another_users_daily_plans(client, staff_user, staff_user_2, auth_header):
+    await client.put(f"/daily-plans/{DAY}", headers=auth_header(staff_user), json=_follow_up())
+    h = auth_header(staff_user_2)
+    day = await client.get(f"/daily-plans/{DAY}?userId={staff_user.id}", headers=h)
+    assert day.status_code == 200 and day.json()["userId"] == str(staff_user.id) and day.json()["done"]["bidsSelf"] == 140
+    week = await client.get(f"/daily-plans?weekStart=2026-09-28&userId={staff_user.id}", headers=h)
+    assert week.status_code == 200 and week.json()["days"][3]["done"]["bidsSelf"] == 140
+
+
+async def test_unknown_user_is_404_for_everyone(client, staff_user, admin_user, auth_header):
+    ghost = "000000000000000000000000"
+    for who in (staff_user, admin_user):
+        h = auth_header(who)
+        assert (await client.get(f"/daily-plans/{DAY}?userId={ghost}", headers=h)).status_code == 404
+        assert (await client.get(f"/daily-plans?weekStart=2026-09-28&userId={ghost}", headers=h)).status_code == 404
+        assert (await client.get(f"/weekly-plans/2026-09-28?userId={ghost}", headers=h)).status_code == 404
+
+
+async def test_deactivated_user_cannot_read_others(client, staff_user, staff_user_2, auth_header):
+    staff_user_2.isActive = False
+    await staff_user_2.save()
+    other = f"/daily-plans/{DAY}?userId={staff_user.id}"
+    assert (await client.get(other, headers=auth_header(staff_user_2))).status_code == 403
+
+
+async def test_staff_cannot_write_another_users_daily_plan(client, staff_user, staff_user_2, auth_header):
+    """No write route takes a user id: a userId in the query or body is ignored and the caller's own plan is written."""
+    await client.put(f"/daily-plans/{DAY}", headers=auth_header(staff_user), json=_follow_up())
+    mine = auth_header(staff_user_2)
+    r = await client.put(f"/daily-plans/{DAY}?userId={staff_user.id}", headers=mine,
+                         json={**_follow_up(done={"bidsSelf": 1}), "userId": str(staff_user.id)})
+    assert r.status_code == 200 and r.json()["userId"] == str(staff_user_2.id)
+    assert (await DailyPlan.find_one({"userId": staff_user.id})).done.bidsSelf == 140  # untouched
+    assert (await DailyPlan.find_one({"userId": staff_user_2.id})).done.bidsSelf == 1
+    # Deleting with the other's id removes only the caller's own day.
+    assert (await client.delete(f"/daily-plans/{DAY}?userId={staff_user.id}", headers=mine)).status_code == 200
+    assert await DailyPlan.find_one({"userId": staff_user_2.id}) is None
+    assert await DailyPlan.find_one({"userId": staff_user.id}) is not None
+    # And with no plan of their own, the other's plan is not reachable through delete.
+    assert (await client.delete(f"/daily-plans/{DAY}?userId={staff_user.id}", headers=mine)).status_code == 404
+    assert await DailyPlan.find_one({"userId": staff_user.id}) is not None

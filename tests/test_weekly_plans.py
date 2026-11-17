@@ -114,7 +114,8 @@ async def test_week_permissions_matrix(client, staff_user, staff_user_2, admin_u
     assert (await client.put(f"/weekly-plans/{WEEK}", headers=auth_header(admin_user),
                              json=_week_body())).status_code == 403
     assert (await client.delete(f"/weekly-plans/{WEEK}", headers=auth_header(admin_user))).status_code == 403
-    assert (await client.get(other, headers=auth_header(staff_user_2))).status_code == 403
+    r = await client.get(other, headers=auth_header(staff_user_2))  # staff read other people's plans too
+    assert r.status_code == 200 and r.json()["goal"]["bidsSelf"] == 750
     r = await client.get(other, headers=auth_header(admin_user))
     assert r.status_code == 200 and r.json()["goal"]["bidsSelf"] == 750
 
@@ -144,3 +145,25 @@ async def test_legacy_weekly_doc_readable_by_weekStart(client, staff_user, auth_
     assert week["recapNotes"] == "Old plan\n\nOld recap"
     await client.put(f"/weekly-plans/{WEEK}", headers=auth_header(staff_user), json=_week_body())
     assert await WeeklyPlan.find({"userId": staff_user.id}).count() == 1
+
+
+async def test_staff_reads_another_users_weekly_plan(client, staff_user, staff_user_2, auth_header):
+    await client.put(f"/weekly-plans/{WEEK}", headers=auth_header(staff_user), json=_week_body())
+    r = await client.get(f"/weekly-plans/{WEEK}?userId={staff_user.id}", headers=auth_header(staff_user_2))
+    assert r.status_code == 200 and r.json()["userId"] == str(staff_user.id) and r.json()["goal"]["bidsSelf"] == 750
+
+
+async def test_staff_cannot_write_another_users_weekly_plan(client, staff_user, staff_user_2, auth_header):
+    """No write route takes a user id: a userId in the query or body is ignored and the caller's own plan is written."""
+    await client.put(f"/weekly-plans/{WEEK}", headers=auth_header(staff_user), json=_week_body())
+    mine = auth_header(staff_user_2)
+    r = await client.put(f"/weekly-plans/{WEEK}?userId={staff_user.id}", headers=mine,
+                         json={**_week_body(goal={"bidsSelf": 1}), "userId": str(staff_user.id)})
+    assert r.status_code == 200 and r.json()["userId"] == str(staff_user_2.id)
+    assert (await WeeklyPlan.find_one({"userId": staff_user.id})).goal.bidsSelf == 750  # untouched
+    assert (await WeeklyPlan.find_one({"userId": staff_user_2.id})).goal.bidsSelf == 1
+    assert (await client.delete(f"/weekly-plans/{WEEK}?userId={staff_user.id}", headers=mine)).status_code == 200
+    assert await WeeklyPlan.find_one({"userId": staff_user_2.id}) is None
+    assert await WeeklyPlan.find_one({"userId": staff_user.id}) is not None
+    assert (await client.delete(f"/weekly-plans/{WEEK}?userId={staff_user.id}", headers=mine)).status_code == 404
+    assert await WeeklyPlan.find_one({"userId": staff_user.id}) is not None
