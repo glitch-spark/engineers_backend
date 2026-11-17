@@ -25,6 +25,7 @@ from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
 from app.routers import bids as bids_router
 from tests_unit.test_bids_single_page import switch_on  # noqa: F401  (the switched schedule, Ruling 11)
+from tests_unit.test_bids_single_page import short_on  # noqa: F401  (the switch with the short week)
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -373,3 +374,45 @@ async def test_pay_admin_any_owner_or_all(db, switch_on, monkeypatch):
     assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Mia"]
     r = await pay(s["boss"], date="2026-11-22")
     assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Mia", "Ana"]
+
+
+# ---- the short week (switch Sun 2026-11-15 20:00, BID_SCHEDULE_SHORT_WEEK) --------------------------------------
+
+
+async def test_clock_after_the_short_week(db, short_on, monkeypatch):
+    s = await seed()
+    at(monkeypatch, datetime(2026, 11, 16, 23))  # Mon 23:00: Monday's day closed at 18:00; the short week before
+    assert await bids_router.bids_clock(s["pedro"]) == {
+        "today": "2026-11-17", "payWeekStart": "2026-11-16", "payWeekEnd": "2026-11-22",
+        "previousPayWeekStart": "2026-11-15", "timezone": "America/Chicago"}
+
+
+async def test_clock_in_the_short_week(db, short_on, monkeypatch):
+    s = await seed()
+    at(monkeypatch, datetime(2026, 11, 15, 19))  # Sun 19:00: in the short week, after Sunday's 18:30 day closed
+    assert await bids_router.bids_clock(s["pedro"]) == {
+        "today": "2026-11-16", "payWeekStart": "2026-11-15", "payWeekEnd": "2026-11-15",
+        "previousPayWeekStart": "2026-11-08", "timezone": "America/Chicago"}
+
+
+async def test_pay_lists_the_short_week_on_its_own(db, short_on, monkeypatch):
+    s = await seed()
+    at(monkeypatch, datetime(2026, 11, 16, 23))
+    await BidReport(
+        kind="weekly", periodKey="2026-11-14", periodStart=datetime(2026, 11, 7, 22), periodEnd=datetime(2026, 11, 14, 22),
+        bidderId=s["ana"].id, ownerId=s["pedro"].id, bidderName="Ana", country="US", profileName="Main",
+        rate=0.06, count=100, amount=6.0, pending=0, rejected=0).insert()
+    await bid(s["ana"], "approved", datetime(2026, 11, 14, 17))   # short week (after Sat 16:00)
+    await bid(s["ana"], "approved", datetime(2026, 11, 15, 19))   # short week (before Sun 20:00, Monday's report day)
+    await bid(s["ana"], "approved", datetime(2026, 11, 16, 10))   # first Sunday week
+    r = await pay(s["pedro"], period="custom", date="2026-11-08", to="2026-11-16")
+    assert [(w["weekEnd"], w["first"], w["last"], w["state"], w["source"]) for w in r["weeks"]] == [
+        ("2026-11-22", "2026-11-16", "2026-11-22", "open", "live"),
+        ("2026-11-15", "2026-11-15", "2026-11-15", "closed", "live"),
+        ("2026-11-14", "2026-11-08", "2026-11-14", "closed", "report")]
+    assert [row(w, "Ana")["approved"] for w in r["weeks"]] == [1, 2, 100]
+    short = await pay(s["pedro"], date="2026-11-15")
+    (w,) = short["weeks"]
+    assert (short["label"], w["weekEnd"], w["first"], w["last"]) == (
+        "Week ending Sun Nov 15", "2026-11-15", "2026-11-15", "2026-11-15")
+    assert row(w, "Ana")["approved"] == 2

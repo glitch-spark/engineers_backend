@@ -202,6 +202,24 @@ def switch_on(monkeypatch):
     monkeypatch.setattr(bids_router, "_folders_without_record", no_folders)
 
 
+@pytest.fixture
+def short_on(monkeypatch):
+    """The schedule switch at Sun 2026-11-15 20:00 with the short week (BID_SCHEDULE_SHORT_WEEK): Sat 11-14 16:00 ->
+    Sun 11-15 20:00 is its own pay week. In the settings schedule_from_settings reads, and no folder listing."""
+    from app.bids import windows
+    from app.config import get_settings
+
+    settings = get_settings().model_copy(update={
+        "BID_SCHEDULE_SWITCH_AT": "2026-11-15T20:00", "BID_NEXT_DAILY_REPORT_TIME": "18:00",
+        "BID_NEXT_WEEKLY_REPORT_DAY": "sunday", "BID_NEXT_WEEKLY_REPORT_TIME": "20:00",
+        "BID_SCHEDULE_SHORT_WEEK": True})
+    monkeypatch.setattr(windows, "get_settings", lambda: settings)
+
+    async def no_folders(bidders, *_a):
+        return {str(b.id): None for b in bidders}
+    monkeypatch.setattr(bids_router, "_folders_without_record", no_folders)
+
+
 async def listing(u, **kw):
     return await bids_router.list_bids(u, **{"day": None, "bidderId": None, "status": None, "week": None,
                                              "self_": False, "ownerId": None, **kw})

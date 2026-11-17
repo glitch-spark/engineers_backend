@@ -150,6 +150,11 @@ class Settings(BaseSettings):
     BID_NEXT_DAILY_REPORT_TIME: Optional[str] = None
     BID_NEXT_WEEKLY_REPORT_DAY: Optional[str] = None
     BID_NEXT_WEEKLY_REPORT_TIME: Optional[str] = None
+    # Opt-in short pay week at the switch. False (default): the old weekly cutoffs stop a week before the switch and
+    # the week ending at it is long (about 8 days). True: old weekly cutoffs run up to the switch itself, so the slice
+    # from the last old weekly cutoff to the switch is its own short pay week, reported and paid once (e.g. switch
+    # 2026-11-15T20:00: Sat 11-14 16:00 -> Sun 11-15 20:00, one report day). Ignored without BID_SCHEDULE_SWITCH_AT.
+    BID_SCHEDULE_SHORT_WEEK: bool = False
     # Reports, live counts and the Bidders page count approved bid records (the database). Optional
     # cut-over day (YYYY-MM-DD, in BID_REPORT_TIMEZONE): a window starting before that day's local
     # midnight (or straddling it) keeps the old screenshot-folder count. Unset = records everywhere.

@@ -8,6 +8,10 @@ and pay use the pay-week window itself and match the weekly Slack report.
 With a schedule switch (see app.bids.windows) the week ending at the switch is longer (Sat 2026-11-14 16:00 to
 Sun 2026-11-22 20:00, eight days) and the day straddling the switch counts in the week after it. Before the switch the
 midpoint rule picks the same days as the old "starts inside" rule, so old weeks are unchanged.
+
+With the short week (BidSchedule.short_week) the week ending at the switch is instead the stub from the last old weekly
+cutoff to the switch: for a switch at Sun 2026-11-15 20:00, Sat 11-14 16:00 to Sun 11-15 20:00 with one report day
+(Sun 11-15). A pay week can therefore have fewer than seven days; never step or size weeks by counting days.
 """
 
 from dataclasses import dataclass

@@ -23,6 +23,11 @@ sched_off = BidSchedule(tz=CHI, daily_at=time(18, 30), weekly_day=5, weekly_at=t
 sched_on = BidSchedule(tz=CHI, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0),
                        switch_at=datetime(2026, 11, 22, 20, 0, tzinfo=CHI),
                        next_rules=Rules(time(18, 0), 6, time(20, 0)))
+# The same rules switching at Sun 2026-11-15 20:00 with a short week (BID_SCHEDULE_SHORT_WEEK): the old week ends
+# Sat 11-14 16:00 and the slice up to the switch (Sat 11-14 16:00 -> Sun 11-15 20:00) is its own pay week.
+sched_short = BidSchedule(tz=CHI, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0),
+                          switch_at=datetime(2026, 11, 15, 20, 0, tzinfo=CHI),
+                          next_rules=Rules(time(18, 0), 6, time(20, 0)), short_week=True)
 
 
 def utc(*a):
@@ -279,3 +284,59 @@ def test_no_direct_schedule_reads():
     offenders = [f"{p.relative_to(root.parent).as_posix()}:{n}" for p in sorted(root.rglob("*.py")) if p != windows
                  for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1) if pattern.search(line)]
     assert offenders == []
+
+
+# --- the short week: switch Sun 2026-11-15 20:00 with BID_SCHEDULE_SHORT_WEEK ---
+
+
+def test_short_week_setting_is_off_by_default_and_threads_into_the_schedule():
+    assert schedule_from_settings(_settings(**_SWITCH)).short_week is False
+    on = schedule_from_settings(_settings(**{**_SWITCH, "BID_SCHEDULE_SWITCH_AT": "2026-11-15T20:00"},
+                                          BID_SCHEDULE_SHORT_WEEK=True))
+    assert on == sched_short
+
+
+def test_short_week_weekly_cutoffs_around_the_switch():
+    # Old Saturday cutoffs run up to the switch itself, so Sat 11-14 16:00 is still one; the switch is the next.
+    assert latest_cutoff("weekly", chi(2026, 11, 14, 15, 59), sched_short) == chi(2026, 11, 7, 16, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 14, 16, 0), sched_short) == chi(2026, 11, 14, 16, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 15, 19, 59), sched_short) == chi(2026, 11, 14, 16, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 15, 20, 0), sched_short) == chi(2026, 11, 15, 20, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 21, 17, 0), sched_short) == chi(2026, 11, 15, 20, 0)
+    assert latest_cutoff("weekly", chi(2026, 11, 22, 20, 0), sched_short) == chi(2026, 11, 22, 20, 0)
+    assert next_cutoff("weekly", chi(2026, 11, 14, 15, 59), sched_short) == chi(2026, 11, 14, 16, 0)
+    assert next_cutoff("weekly", chi(2026, 11, 14, 16, 0), sched_short) == chi(2026, 11, 15, 20, 0)
+    assert next_cutoff("weekly", chi(2026, 11, 15, 19, 59), sched_short) == chi(2026, 11, 15, 20, 0)
+    assert next_cutoff("weekly", chi(2026, 11, 15, 20, 0), sched_short) == chi(2026, 11, 22, 20, 0)
+    assert next_cutoff("weekly", chi(2026, 11, 15, 20, 0), sched_short).tzinfo is CHI
+
+
+def test_short_week_weekly_windows():
+    # the old week (unchanged), the short week, the first Sunday week
+    assert window_for("weekly", chi(2026, 11, 14, 16, 0), sched_short) == (
+        utc(2026, 11, 7, 22, 0), utc(2026, 11, 14, 22, 0))
+    assert window_for("weekly", chi(2026, 11, 15, 20, 0), sched_short) == (
+        utc(2026, 11, 14, 22, 0), utc(2026, 11, 16, 2, 0))
+    assert window_for("weekly", chi(2026, 11, 22, 20, 0), sched_short) == (
+        utc(2026, 11, 16, 2, 0), utc(2026, 11, 23, 2, 0))
+
+
+def test_short_week_daily_cutoffs_are_unaffected():
+    assert daily_cutoff_on(date(2026, 11, 14), sched_short) == chi(2026, 11, 14, 18, 30)
+    assert daily_cutoff_on(date(2026, 11, 15), sched_short) == chi(2026, 11, 15, 18, 30)
+    assert daily_cutoff_on(date(2026, 11, 16), sched_short) == chi(2026, 11, 16, 18, 0)
+    assert next_cutoff("daily", chi(2026, 11, 15, 18, 30), sched_short) == chi(2026, 11, 16, 18, 0)
+    # Mon 11-16: [Sun 18:30, Mon 18:00)
+    assert window_for("daily", chi(2026, 11, 16, 18, 0), sched_short) == (
+        utc(2026, 11, 16, 0, 30), utc(2026, 11, 17, 0, 0))
+    assert report_day(chi(2026, 11, 15, 19, 0), sched_short) == date(2026, 11, 16)
+
+
+def test_short_week_leaves_the_past_unchanged():
+    t, stop = chi(2026, 10, 1).astimezone(timezone.utc), chi(2026, 11, 14, 16).astimezone(timezone.utc)
+    while t < stop:
+        for kind in ("daily", "weekly"):
+            cutoff = latest_cutoff(kind, t, sched_off)
+            assert latest_cutoff(kind, t, sched_short) == cutoff, (kind, t)
+            assert window_for(kind, cutoff, sched_short) == window_for(kind, cutoff, sched_off), (kind, t)
+        t += timedelta(hours=1)

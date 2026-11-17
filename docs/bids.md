@@ -79,6 +79,11 @@ BID_SCHEDULE_SWITCH_AT=
 BID_NEXT_DAILY_REPORT_TIME=
 BID_NEXT_WEEKLY_REPORT_DAY=
 BID_NEXT_WEEKLY_REPORT_TIME=
+# Optional short week (BID_SCHEDULE_SHORT_WEEK=true, default false): instead of the long week, the old Saturday
+# weekly cutoffs run up to the switch and the slice from the last one to the switch is its own short pay week,
+# reported and paid once. For a switch at 2026-11-15T20:00: Sat 11-14 16:00 -> Sun 11-15 20:00, one report day
+# (Sun 11-15); the first Sunday week is then Mon 11-16 .. Sun 11-22. Set it on both services with the switch.
+# (Not listed as a KEY= line here; it is read from the environment like the values above.)
 # Optional cut-over day, YYYY-MM-DD in BID_REPORT_TIMEZONE: report windows starting before that day's
 # local midnight (or straddling it) keep counting screenshot folders. Blank = approved bid records
 # everywhere (section 6). Set it on the API service and on the report cron service.

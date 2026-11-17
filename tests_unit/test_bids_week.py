@@ -17,7 +17,7 @@ from app.models import Account, ResumeApplication, UserExtra
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
-from tests_unit.test_bids_windows import CHI, sched_off, sched_on
+from tests_unit.test_bids_windows import CHI, sched_off, sched_on, sched_short
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -427,3 +427,61 @@ def test_pay_weeks_touching_across_the_switch():
     assert [w.cutoff.date().isoformat() for w in weeks] == ["2026-11-29", "2026-11-22", "2026-11-14", "2026-11-07"]
     one = pay_weeks_touching(sched_on, chi(11, 25, 9), date(2026, 11, 22), date(2026, 11, 22))
     assert [w.cutoff.date().isoformat() for w in one] == ["2026-11-22"]
+
+
+# --- the short week (switch Sun 2026-11-15 20:00, BID_SCHEDULE_SHORT_WEEK): Sat 11-14 16:00 -> Sun 11-15 20:00 ---
+
+
+def test_short_week_is_its_own_pay_week_with_one_report_day():
+    from app.bids.week import pay_week, week_label
+
+    pw = pay_week(sched_short, chi(11, 16, 23), date(2026, 11, 15))
+    assert (pw.start, pw.end, pw.cutoff) == (chi(11, 14, 16), chi(11, 15, 20), chi(11, 15, 20))
+    assert [d.key for d in pw.days] == ["2026-11-15"]
+    assert (pw.days[0].start, pw.days[0].end) == (chi(11, 14, 18, 30), chi(11, 15, 18, 30))
+    assert week_label(pw) == "Week ending Sun Nov 15"
+    assert pay_week(sched_short, chi(11, 15, 19, 59)).cutoff == chi(11, 15, 20)  # now inside the short week
+
+
+def test_short_week_first_sunday_week_starts_monday():
+    from app.bids.week import pay_week
+
+    pw = pay_week(sched_short, chi(11, 16, 23), date(2026, 11, 16))
+    assert (pw.start, pw.end) == (chi(11, 15, 20), chi(11, 22, 20))
+    assert [d.key for d in pw.days] == [f"2026-11-{n:02d}" for n in range(16, 23)]
+    assert (pw.days[0].start, pw.days[0].end) == (chi(11, 15, 18, 30), chi(11, 16, 18))
+    assert pay_week(sched_short, chi(11, 16, 23)).cutoff == chi(11, 22, 20)  # the default: the week holding now
+
+
+def test_short_week_old_week_is_unchanged():
+    from app.bids.week import pay_week
+
+    on, off = pay_week(sched_short, chi(11, 16, 23), date(2026, 11, 14)), pay_week(sched_off, chi(11, 16, 23), date(2026, 11, 14))
+    assert (on.start, on.end, on.cutoff) == (off.start, off.end, off.cutoff) == (chi(11, 7, 16), chi(11, 14, 16), chi(11, 14, 16))
+    assert [d.key for d in on.days] == [f"2026-11-{n:02d}" for n in range(8, 15)]
+
+
+def test_short_week_pay_weeks_touching():
+    from app.bids.performance import pay_week_columns
+    from app.bids.week import pay_weeks_touching
+
+    weeks = pay_weeks_touching(sched_short, chi(11, 16, 23), date(2026, 11, 8), date(2026, 11, 25))
+    assert [w.cutoff.date().isoformat() for w in weeks] == ["2026-11-29", "2026-11-22", "2026-11-15", "2026-11-14"]
+    assert [(w.days[0].key, w.days[-1].key, len(w.days)) for w in weeks] == [
+        ("2026-11-23", "2026-11-29", 7), ("2026-11-16", "2026-11-22", 7), ("2026-11-15", "2026-11-15", 1),
+        ("2026-11-08", "2026-11-14", 7)]
+    one = pay_weeks_touching(sched_short, chi(11, 16, 23), date(2026, 11, 15), date(2026, 11, 15))
+    assert [w.cutoff.date().isoformat() for w in one] == ["2026-11-15"]
+    assert pay_week_columns(date(2026, 11, 8), date(2026, 11, 17), sched_short) == [
+        {"start": "2026-11-08", "end": "2026-11-14", "partial": False},
+        {"start": "2026-11-15", "end": "2026-11-15", "partial": False},
+        {"start": "2026-11-16", "end": "2026-11-17", "partial": True}]
+
+
+def test_short_week_previous_range():
+    from app.bids.performance import previous_range
+
+    D = lambda m, d: date(2026, m, d)
+    assert previous_range("week", D(11, 16), D(11, 22), sched_short) == (D(11, 15), D(11, 15))
+    assert previous_range("week", D(11, 15), D(11, 15), sched_short) == (D(11, 8), D(11, 14))
+    assert previous_range("week", D(11, 15), D(11, 22), sched_short, span=2) == (D(11, 1), D(11, 14))
