@@ -395,3 +395,55 @@ async def test_a_click_elsewhere_does_not_touch_the_roundup(slack, justin, ana, 
         await actions.process_coordination_click(click)
     assert slack.of("chat.update") == []
     assert len(replies) == 1 and replies[0][1]["replace_original"] is True
+
+
+async def test_a_deleted_roundup_stops_being_edited(slack, justin, monkeypatch):
+    iv = await add(justin)
+    await chase.run_result_roundup(FRIDAY)
+    await set_status(iv, "passed")
+    calls = []
+
+    async def gone(method, body):
+        calls.append(method)
+        raise RuntimeError("message_not_found")
+
+    monkeypatch.setattr(slack_bot, "_slack_api", gone)
+    await chase.refresh_latest_roundup()  # the one failed update
+    assert calls == ["chat.update"]
+    assert await ResultRoundupPost.find_all().to_list() == []
+    await chase.refresh_latest_roundup()  # next tick: nothing to edit
+    assert calls == ["chat.update"]
+    assert len(slack.of("chat.postMessage")) == 1  # nothing re-posted
+    assert await chase.run_result_roundup(chi(2026, 11, 20, 18, 5)) == "skipped"
+
+
+async def test_other_update_errors_keep_the_roundup(slack, justin, monkeypatch):
+    iv = await add(justin)
+    await chase.run_result_roundup(FRIDAY)
+    await set_status(iv, "passed")
+    monkeypatch.setattr(slack_bot, "_slack_api", AsyncMock(side_effect=RuntimeError("ratelimited")))
+    with pytest.raises(RuntimeError):
+        await chase.refresh_latest_roundup()
+    assert len(await ResultRoundupPost.find_all().to_list()) == 1
+
+
+async def test_a_failed_save_is_retried_once_and_logs_where_the_post_is(slack, justin, monkeypatch, caplog):
+    await add(justin)
+    real = ResultRoundupPost.insert
+    fails = [RuntimeError("db down")]
+
+    async def flaky(self, *a, **k):
+        if fails:
+            raise fails.pop()
+        return await real(self, *a, **k)
+
+    monkeypatch.setattr(ResultRoundupPost, "insert", flaky)
+    assert await chase.run_result_roundup(FRIDAY) == "posted"
+    assert len(await ResultRoundupPost.find_all().to_list()) == 1
+    assert "channel C1 ts 9.1" in caplog.text
+
+    await ResultRoundupPost.find_all().delete()
+    monkeypatch.setattr(ResultRoundupPost, "insert", AsyncMock(side_effect=RuntimeError("db down")))
+    assert await chase.run_result_roundup(chi(2026, 11, 27, 18, 0)) == "failed"
+    assert "posted at channel C1 ts 9.2" in caplog.text
+    assert len(slack.of("chat.postMessage")) == 2

@@ -238,6 +238,7 @@ async def run_result_roundup(now: datetime) -> str:
     if not await slack_bot._reminder_claim(key):
         return "skipped"
     posted = False
+    where = ""
     try:
         rounds = await caller_rounds("completed", ended_after=cutoff, ended_by=now)
         if not rounds:
@@ -248,13 +249,19 @@ async def run_result_roundup(now: datetime) -> str:
             "channel": channel, "text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False,
         })
         posted = True
-        await ResultRoundupPost(
+        where = f"channel {channel} ts {sent.get('ts')}"
+        record = ResultRoundupPost(
             friday=friday.isoformat(), channel=channel, ts=str(sent.get("ts") or ""), refs=refs,
             rendered=_rendered(blocks),
-        ).insert()
+        )
+        try:
+            await record.insert()
+        except Exception as first:
+            log.warning("coordination result roundup %s save failed (%s), retrying once: %s", key, where, first)
+            await record.insert()
         return "posted"
     except Exception as exc:
-        log.warning("coordination result roundup %s failed: %s", key, exc)
+        log.warning("coordination result roundup %s failed%s: %s", key, f" (posted at {where})" if posted else "", exc)
         if posted:
             return "failed"  # it is in the channel: keep the claim, so it is not posted twice
         try:
@@ -301,10 +308,19 @@ async def refresh_roundup(post: ResultRoundupPost) -> bool:
     digest = _rendered(blocks)
     if digest == post.rendered:
         return False
-    await slack_bot._slack_api("chat.update", {
-        "channel": post.channel, "ts": post.ts, "text": text, "blocks": blocks,
-        "unfurl_links": False, "unfurl_media": False,
-    })
+    try:
+        await slack_bot._slack_api("chat.update", {
+            "channel": post.channel, "ts": post.ts, "text": text, "blocks": blocks,
+            "unfurl_links": False, "unfurl_media": False,
+        })
+    except RuntimeError as exc:
+        if str(exc) not in slack_bot._MESSAGE_GONE:
+            raise
+        # Deleted in Slack: forget it so the tick stops retrying. Nothing is re-posted (the Friday's claim stays).
+        await post.delete()
+        log.info("coordination roundup %s (channel %s ts %s) is gone from Slack (%s); no longer edited",
+                 post.friday, post.channel, post.ts, exc)
+        return False
     post.rendered = digest
     await post.save()
     return True
