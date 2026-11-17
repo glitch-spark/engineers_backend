@@ -257,19 +257,24 @@ async def test_creator_picks_a_caller_when_adding_a_round(client):
         assert (caller["callerId"], caller["callerName"]) == (None, "TBD")
 
 
-async def test_creator_cannot_change_an_assigned_caller_but_can_edit_the_round(client):
+async def test_owner_changes_the_caller_in_the_round_form(client):
     pietro, jamil = await make_caller("Pietro"), await make_caller("Jamil's group")
     owner = await make_user()
     iv = await make_interview(owner, caller_name="Pietro", caller_id=str(pietro.id))
+    stored = await Interview.get(iv.id)
+    stored.stageHistory[-1].confirmed = True
+    await stored.save()
     url = f"/interviews/{iv.id}/stages/{rid(iv)}"
     async with client(owner) as c:
         res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(jamil.id)}})
-        assert res.status_code == 403
-        # The form leaves the caller out for non-managers: the assignment stays.
+        assert res.status_code == 200, res.text
+        assert res.json()["stageHistory"][-1]["caller"]["callerName"] == "Jamil's group"
+        assert res.json()["stageHistory"][-1]["confirmed"] is False
+        # A body without callerId keeps the assignment (now Jamil) and updates the rest.
         res = await c.patch(url, json={"note": "n", "caller": {"enabled": True, "method": "phone_hushed"}})
         assert res.status_code == 200, res.text
     caller = await fresh(iv)
-    assert (caller.callerId, caller.callerName, caller.method) == (str(pietro.id), "Pietro", "phone_hushed")
+    assert (caller.callerId, caller.callerName, caller.method) == (str(jamil.id), "Jamil's group", "phone_hushed")
 
 
 async def test_admin_changes_the_caller_in_the_round_form(client):
@@ -558,3 +563,30 @@ async def test_caller_rounds_list_filters_by_owner(client):
         every = (await c.get("/interviews/caller-rounds")).json()
         assert every["pagination"]["total"] == 3
         assert (await c.get("/interviews/caller-rounds", params={"creatorId": "nope"})).status_code == 400
+
+
+async def test_manager_turns_the_caller_request_off_and_on(client):
+    pietro, muhammad = await make_caller("Pietro"), await make_caller("Muhammad")
+    owner, puma = await make_user(), await make_user("Puma", role="interview_manager")
+    iv = await make_interview(owner, caller_name="Pietro", caller_id=str(pietro.id))
+    no_caller = await make_interview(owner, caller=False)
+    stored = await Interview.get(iv.id)
+    stored.stageHistory[-1].confirmed = True
+    await stored.save()
+    url = f"/interviews/{iv.id}/stages/{rid(iv)}/caller"
+    async with client(puma) as c:
+        res = await c.put(url, json={"callerId": "", "enabled": False})
+        assert res.status_code == 200, res.text
+        caller = await fresh(iv)
+        assert caller.enabled is False and caller.callerName == "Pietro"
+        assert (await Interview.get(iv.id)).stageHistory[-1].confirmed is False
+        res = await c.put(url, json={"callerId": str(muhammad.id), "enabled": True})
+        assert res.status_code == 200, res.text
+        caller = await fresh(iv)
+        assert caller.enabled is True and caller.callerName == "Muhammad"
+        assert caller.startsAt.replace(tzinfo=None) == (await Interview.get(iv.id)).stageHistory[-1].scheduledAt.replace(tzinfo=None)
+        # An old client sends no `enabled`: a round without a caller request is still refused.
+        res = await c.put(
+            f"/interviews/{no_caller.id}/stages/{rid(no_caller)}/caller", json={"callerId": str(muhammad.id)},
+        )
+        assert res.status_code == 400 and res.json()["detail"] == "This round has no caller request."

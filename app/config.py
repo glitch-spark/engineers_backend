@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     SLACK_BOT_TOKEN: Optional[str] = None
     SLACK_BOT_CRON_SECRET: Optional[str] = None
     SLACK_CALLER_CHANNEL_ID: Optional[str] = None
+    # Release cutoff of the coordination channel's chasers (after-call ask, 7-day result reminder, Friday roundup):
+    # only rounds that END after this local time (America/Chicago, "YYYY-MM-DDTHH:MM") are chased. Unset = all off.
+    SLACK_CALLER_ASKS_FROM: Optional[str] = None
     # Daily list of the day's caller interviews (e.g. #engineer-caller-test); unset = off.
     # Posted once a day at SLACK_CALLER_DAILY_TIME (HH:MM) in SLACK_CALLER_DAILY_TIMEZONE.
     SLACK_CALLER_DAILY_CHANNEL_ID: Optional[str] = None
@@ -182,6 +185,20 @@ class Settings(BaseSettings):
                 "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
             )
         return v
+
+    @field_validator("SLACK_CALLER_ASKS_FROM", mode="before")
+    @classmethod
+    def _validate_asks_from(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            datetime.strptime(s, "%Y-%m-%dT%H:%M")
+        except ValueError as e:
+            raise ValueError("SLACK_CALLER_ASKS_FROM must be YYYY-MM-DDTHH:MM") from e
+        return s
 
     @field_validator("BID_STORAGE_ENDPOINT_URL", mode="before")
     @classmethod

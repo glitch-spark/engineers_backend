@@ -17,7 +17,6 @@ from app.interview_caller import (
 )
 from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.slack_bot import (
-    caller_round_text,
     fmt_caller_time,
     slack_time,
 )
@@ -114,64 +113,3 @@ def _iv(owner, *, caller=None, company="Acme"):
 
 def _user(name, slack=None):
     return SimpleNamespace(name=name, email=f"{name}@x.com", slackUserId=slack)
-
-
-def test_caller_round_text_with_and_without_details():
-    account = SimpleNamespace(name="Orion Osborn", country="US")
-    iv = _iv(OWNER, company="Wikimedia")
-    iv.jobUrl = "https://job-boards.greenhouse.io/wikimedia/jobs/7919287"
-    entry = SimpleNamespace(
-        stage="intro",
-        scheduledAt=START,
-        status="scheduled",
-        interviewerName="Natalie Ross",
-        caller=InterviewCaller(
-            enabled=True,
-            startsAt=START,
-            method="phone_hushed",
-            methodValue="+1 555 0100",
-        ),
-    )
-    text = caller_round_text(iv, entry, account=account, owner=_user("A", "UA"))
-    assert text.startswith(":telephone_receiver: <@UA> — *Caller needed*")
-    assert "*Profile:* Orion Osborn" in text
-    assert "*Company name:* Wikimedia" in text
-    assert "*JD Link:* https://job-boards.greenhouse.io/wikimedia/jobs/7919287" in text
-    assert "*Recruiter name:* Natalie Ross 🇺🇸" in text
-    assert "*Stage:* Intro" in text
-    assert f"*Interview time:* {slack_time(START)}" in text
-    assert "*Method:* Phone (Hushed) — +1 555 0100" in text
-    assert "*Caller assigned:* TBD" in text
-    assert "*Coworkers:*" not in text and "*Interview manager:*" not in text
-    assert "cc " not in text  # no interview managers to cc
-
-    entry.interviewerName = None
-    entry.caller = InterviewCaller(enabled=True)
-    text = caller_round_text(iv, entry, account=account, owner=_user("A"))
-    assert "*Recruiter name:* —" in text
-    assert "*Method:* TBD" in text
-    assert "Canceled" not in text
-
-
-def test_caller_round_text_marks_canceled_rounds():
-    iv = _iv(OWNER, company="Wikimedia")
-    entry = SimpleNamespace(
-        stage="intro", scheduledAt=START, status="canceled", interviewerName=None,
-        caller=InterviewCaller(enabled=True, startsAt=START),
-    )
-    for status in ("canceled", "rejected"):
-        entry.status = status
-        text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"))
-        assert text.startswith(":x: <@UA> — *Canceled* ~Caller needed~")
-        assert f"*Interview time:* ~{slack_time(START)}~" in text
-
-
-def test_caller_round_text_without_a_caller_needs_none():
-    iv = _iv(OWNER, company="Wikimedia")
-    entry = SimpleNamespace(
-        stage="intro", scheduledAt=START, status="scheduled", interviewerName=None,
-        caller=InterviewCaller(enabled=False, startsAt=START),
-    )
-    text = caller_round_text(iv, entry, account=None, owner=_user("A", "UA"))
-    assert text.splitlines()[0] == ":telephone_receiver: <@UA> — *No caller needed* for Intro"
-    assert f"*Interview time:* {slack_time(START)}" in text

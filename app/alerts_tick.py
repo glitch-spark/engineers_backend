@@ -3,7 +3,8 @@
 Start command: python -m app.alerts_tick
 Must not start uvicorn — Railway skips the next cron if this process stays Active.
 
-Run Slack first so a slow inbox pass cannot miss the 5-minute digest window.
+Run Slack first so a slow inbox pass cannot miss the 5-minute digest window. The Slack step also posts the
+coordination asks (after-call ask, 7-day result reminder) once SLACK_CALLER_ASKS_FROM is set.
 """
 
 from __future__ import annotations

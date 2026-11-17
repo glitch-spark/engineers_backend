@@ -275,3 +275,31 @@ def test_round_blocks_cap_escape_heavy_text_in_every_typed_part(kind):
     last = text.rstrip("…")
     assert last.rfind("<") <= last.rfind(">") and last.rfind("&") <= last.rfind(";")
     assert text.startswith("⏰ *Starting in 30 min*")
+
+
+# --- day_round / status / caller_id (coordination post) --------------------------------------------
+
+
+async def test_load_rounds_unchanged(db):
+    owner = await UserExtra(name="Pedro", email="p@x.io").insert()
+    pietro = await Caller(name="Pietro", nameKey="pietro").insert()
+    await Interview(
+        accountId=PydanticObjectId(), createdBy=owner.id, scheduledAt=START, companyName="Acme",
+        stageHistory=[ev(), ev("final", START + timedelta(minutes=5), status="completed"),
+                      ev("panel", START + timedelta(minutes=9), caller=InterviewCaller(
+                          enabled=True, callerName="Pietro", callerId=str(pietro.id), callerKind="external"))],
+    ).insert()
+    got = await load_rounds(START - timedelta(hours=1), START + timedelta(hours=1))
+    assert [r.status for r in got] == ["scheduled", "completed", "scheduled"]
+    assert [r.caller_id for r in got] == ["", "", str(pietro.id)]
+
+
+async def test_day_round_tolerates_a_round_without_a_time(db):
+    from app.interview_day.rounds import day_round
+
+    owner = await UserExtra(name="Pedro", email="p@x.io").insert()
+    legacy = InterviewStageEvent(stage="intro", at=START, scheduledAt=None, status="scheduled").model_dump()
+    iv = Interview(accountId=PydanticObjectId(), createdBy=owner.id, scheduledAt=START, companyName="Acme",
+                   stageHistory=[legacy])
+    r = day_round(iv, 1, iv.stageHistory[0], owner=owner, account=None, caller_user=None)
+    assert r.start is None and r.status == "scheduled" and r.caller == "self" and r.caller_id == ""

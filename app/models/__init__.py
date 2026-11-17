@@ -16,6 +16,7 @@ from app.models.job_apply import (
 )
 from app.models.resume_application import ResumeApplication
 from app.models.resume_cache import ResumeLLMCache
+from app.models.result_roundup_post import ResultRoundupPost
 from app.models.notification import Notification
 from app.models.prompt_eval import EvalJobDescription, ResumePromptEval
 from app.models.recurring_charge import RecurringCharge
@@ -52,6 +53,7 @@ __all__ = [
     "Notification",
     "RecurringCharge",
     "ResumeApplication",
+    "ResultRoundupPost",
     "ResumeLLMCache",
     "ResumePromptEval",
     "Skill",
