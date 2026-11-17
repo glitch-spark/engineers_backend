@@ -1,6 +1,7 @@
 """Block Kit rounds for the interview day post (pure builder; loader against mongomock)."""
 
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -119,26 +120,101 @@ def test_thread_link_only_on_caller_rounds_and_text_is_escaped():
     assert "thread" not in text_of(blocks(rnd(thread_link="https://slack.example/p1")))
 
 
-def test_thirty_rounds_split_under_fifty_blocks():
-    rounds = [rnd(round_id=f"R{i}", start=START + timedelta(minutes=i)) for i in range(30)]
-    msgs = day_messages(date(2026, 10, 7), rounds, managers=[MANAGER], origin=ORIGIN)
-    assert len(msgs) >= 2 and all(len(m) <= 50 for m in msgs)
-    assert msgs[0][0]["type"] == "header" and all(m[0]["type"] != "header" for m in msgs[1:])
-    for m in msgs:  # a round's section is always followed by its actions block
-        kinds = [b["type"] for b in m if b["type"] != "divider"]
-        assert kinds.count("section") == kinds.count("actions")
-        assert [k for k in kinds if k != "header"] == ["section", "actions"] * kinds.count("section")
-    seen = [b["elements"][0]["url"] for m in msgs for b in m if b["type"] == "actions"]
-    assert seen == [f"https://app.test/interview/IV?brief=R{i}" for i in range(30)]
+PANDA = SimpleNamespace(name="Panda", email="pa@x.io", slackUserId="U0PANDA001", isActive=True)
+JUSTIN = SimpleNamespace(name="Justin", email="j@x.io", slackUserId="U0JUSTIN01", isActive=True)
+NOV17 = datetime(2026, 11, 17, 14, 0, tzinfo=timezone.utc)
+
+
+def _t(minutes):
+    at = NOV17 + timedelta(minutes=minutes)
+    return at, slack_time(at, with_day=False)
+
+
+def test_day_post_groups_rounds_by_owner_one_line_each():
+    """Two owners, Self, an assigned caller, TBD and a canceled round: the exact text."""
+    (t1, s1), (t2, s2), (t3, s3), (t4, s4), (t5, s5) = (_t(m) for m in (0, 30, 60, 90, 120))
+    rounds = [
+        rnd(round_id="R2", interview_id="IV2", start=t2, company="Proofpoint", stage="tech_round_1",
+            interviewer="Shane Kelly", caller="user", caller_name="Nicholas", caller_user=CALLER,
+            owner=PANDA, owner_id="pa"),
+        rnd(round_id="R1", interview_id="IV1", start=t1, company="Workster & Jobs", interviewer="Liviu <Ciulei>",
+            owner=PANDA, owner_id="pa"),
+        rnd(round_id="R3", interview_id="IV3", start=t3, company="Hexagon", caller="tbd", caller_name="TBD",
+            owner=PANDA, owner_id="pa"),
+        rnd(round_id="R5", interview_id="IV5", start=t5, company="Globex", caller="external", caller_name="Pietro",
+            owner=JUSTIN, owner_id="ju"),
+        rnd(round_id="R4", interview_id="IV4", start=t4, company="Initech", caller="user", caller_name="Sam",
+            caller_user=CALLER, owner=JUSTIN, owner_id="ju", status="canceled"),
+    ]
+    msgs = day_messages(date(2026, 11, 17), rounds, origin=ORIGIN + "/")
+    assert len(msgs) == 1 and [b["type"] for b in msgs[0]] == ["header", "section", "section"]
+    assert msgs[0][0]["text"]["text"] == "⏰ Interviews today — Tue Nov 17 · 5 interviews · 2 with a caller"
+    app = "https://app.test"
+    assert msgs[0][1]["text"]["text"] == "\n".join([
+        "<@U0PANDA001> — 3",
+        f"• {s1}  Workster &amp; Jobs · Intro · Liviu &lt;Ciulei&gt; — Self · "
+        f"<{app}/interview/IV1?brief=R1|Brief> · <{app}/interviews?panel=IV1|Open>",
+        f"• {s2}  Proofpoint · Tech Round 1 · Shane Kelly — 📞 <@U0CALLER01> · "
+        f"<{app}/interview/IV2?brief=R2|Brief> · <{app}/interviews?panel=IV2|Open>",
+        f"• {s3}  Hexagon · Intro — 📞 No caller yet · "
+        f"<{app}/interview/IV3?brief=R3|Brief> · <{app}/interviews?panel=IV3|Open>",
+    ])
+    assert msgs[0][2]["text"]["text"] == "\n".join([
+        "<@U0JUSTIN01> — 2",
+        f"• ~{s4}  Initech · Intro~ — ❌ Canceled · "
+        f"<{app}/interview/IV4?brief=R4|Brief> · <{app}/interviews?panel=IV4|Open>",
+        f"• {s5}  Globex · Intro — 📞 Pietro · "
+        f"<{app}/interview/IV5?brief=R5|Brief> · <{app}/interviews?panel=IV5|Open>",
+    ])
+    assert not any(b["type"] == "actions" for m in msgs for b in m)  # links, no buttons
+
+
+@pytest.mark.parametrize("origin", ["", "  ", "app.test", "ftp://app.test"])
+def test_without_a_usable_app_url_the_links_are_left_out(origin):
+    msgs = day_messages(date(2026, 11, 17), [rnd(owner_id="o", interviewer="")], origin=origin)
+    line = msgs[0][1]["text"]["text"].split("\n")[1]
+    assert line.endswith("Acme · Intro — Self") and "Brief" not in line and "Open" not in line
+
+
+def test_owners_ordered_by_first_round_then_name_and_unknown_owner():
+    early, _ = _t(0)
+    late, _ = _t(60)
+    rounds = [rnd(round_id="a", start=late, owner=JUSTIN, owner_id="ju"),
+              rnd(round_id="b", start=early, owner=None, owner_id="gone"),
+              rnd(round_id="c", start=late, owner=PANDA, owner_id="pa")]
+    heads = [b["text"]["text"].split("\n")[0] for b in day_messages(date(2026, 11, 17), rounds, origin=ORIGIN)[0][1:]]
+    assert heads == ["Unknown owner — 1", "<@U0JUSTIN01> — 1", "<@U0PANDA001> — 1"]
+
+
+def test_thirty_rounds_stay_within_slack_limits():
+    """One owner with 30 long rounds splits into "(cont.)" sections; 30 owners stay under 50 blocks per message."""
+    long_name = "Z" * 200
+    one_owner = [rnd(round_id=f"R{i}", start=START + timedelta(minutes=i), company=long_name, interviewer=long_name,
+                     owner_id="o") for i in range(30)]
+    msgs = day_messages(date(2026, 10, 7), one_owner, origin=ORIGIN)
+    sections = [b["text"]["text"] for m in msgs for b in m if b["type"] == "section"]
+    assert len(sections) >= 2 and all(len(t) <= 3000 for t in sections)
+    assert sections[0].startswith("<@U0OWNER001> — 30") and all(t.startswith("<@U0OWNER001> (cont.)") for t in sections[1:])
+    briefs = re.findall(r"brief=(R\d+)\|", "\n".join(sections))
+    assert briefs == [f"R{i}" for i in range(30)]  # every round once, in time order
+
+    many = [rnd(round_id=f"R{i}", start=START + timedelta(minutes=i), owner_id=f"o{i}") for i in range(30)]
+    msgs = day_messages(date(2026, 10, 7), many, origin=ORIGIN)
+    assert all(len(m) <= 50 for m in msgs) and msgs[0][0]["type"] == "header"
+    assert sum(len(m) for m in msgs) == 31
+
+    sixty = [rnd(round_id=f"R{i}", start=START + timedelta(minutes=i), owner_id=f"o{i}") for i in range(60)]
+    msgs = day_messages(date(2026, 10, 7), sixty, origin=ORIGIN)
+    assert [len(m) for m in msgs] == [50, 11] and all(m[0]["type"] != "header" for m in msgs[1:])
 
 
 def test_empty_day_and_fallback():
     msgs = day_messages(date(2026, 11, 13), [], managers=[], origin=ORIGIN)
     assert len(msgs) == 1 and len(msgs[0]) == 1 and msgs[0][0]["text"]["text"] == "No interviews today."
     one = day_messages(date(2026, 11, 13), [rnd()], managers=[], origin=ORIGIN)
-    assert one[0][0]["text"]["text"] == "⏰ Interviews today — Fri Nov 13"
-    assert fallback_text(date(2026, 11, 13), 4) == "Interviews today — Fri Nov 13 · 4 rounds"
-    assert fallback_text(date(2026, 11, 13), 1) == "Interviews today — Fri Nov 13 · 1 round"
+    assert one[0][0]["text"]["text"] == "⏰ Interviews today — Fri Nov 13 · 1 interview · 0 with a caller"
+    assert fallback_text(date(2026, 11, 13), 4) == "Interviews today — Fri Nov 13 · 4 interviews"
+    assert fallback_text(date(2026, 11, 13), 1) == "Interviews today — Fri Nov 13 · 1 interview"
 
 
 # --- loader ---------------------------------------------------------------------------------------

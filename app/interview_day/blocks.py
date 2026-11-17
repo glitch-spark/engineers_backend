@@ -1,4 +1,6 @@
-"""Block Kit for the interview day post: one section + one actions block per round. Pure, no Slack calls."""
+"""Block Kit for the interview day post (a header, then one section per owner with one compact line per round and
+Brief / Open links) and for the 30-minute reminders (`round_blocks`: one section + one actions block). Pure, no Slack
+calls."""
 
 from __future__ import annotations
 
@@ -115,26 +117,98 @@ def _title(day: date) -> str:
     return f"Interviews today — {day:%a} {day:%b} {day.day}"
 
 
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 def fallback_text(day: date, n: int) -> str:
     """Plain text for notifications and old clients."""
-    return f"{_title(day)} · {n} round{'' if n == 1 else 's'}"
+    return f"{_title(day)} · {_plural(n, 'interview')}"
+
+
+_ENDED_MARKS = {"canceled": "❌ Canceled", "rejected": "❌ Rejected"}
+
+
+def _app_base(origin: str) -> str:
+    """The app's URL for the Brief / Open links; "" when it is not a usable http(s) URL (the links are left out)."""
+    base = (origin or "").strip().rstrip("/")
+    return base if base.startswith(("http://", "https://")) else ""
+
+
+def _call_part(r: DayRound) -> str:
+    """Who is on the call: Self, the caller (a platform user is tagged), or no caller yet."""
+    if r.caller == "self":
+        return "Self"
+    if r.caller == "tbd":
+        return "📞 No caller yet"
+    if r.caller == "user":
+        return f"📞 {_who(r.caller_user, r.caller_name)}"
+    return f"📞 {_short(r.caller_name, MAX_NAME, 'someone')}"
+
+
+def day_line(r: DayRound, base: str) -> str:
+    """One round of the day post: `• time  Company · Stage · Interviewer — who's on the call · Brief · Open`. A
+    called-off round is struck through and says so instead of naming the caller."""
+    what = " · ".join(p for p in (_short(r.company, MAX_NAME, "—"), _stage_label(r.stage),
+                                  _short(r.interviewer, MAX_NAME)) if p)
+    head = f"{slack_time(r.start, with_day=False)}  {what}"
+    ended = _ENDED_MARKS.get(r.status)
+    parts = [f"~{head}~ — {ended}" if ended else f"{head} — {_call_part(r)}"]
+    if base:
+        parts.append(_mrkdwn_link(f"{base}/interview/{r.interview_id}?brief={r.round_id}", "Brief"))
+        parts.append(_mrkdwn_link(f"{base}/interviews?panel={r.interview_id}", "Open"))
+    return "• " + " · ".join(parts)
+
+
+def _section(text: str) -> dict:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": _cap(text)}}
+
+
+def _owner_sections(owner: Optional[UserExtra], rounds: list[DayRound], base: str) -> list[dict]:
+    """`@owner — N` and one line per round, in as many sections as Slack's 3000 characters need; a section after
+    the first is headed `@owner (cont.)`."""
+    who = _who(owner, "Unknown owner")
+    sections: list[dict] = []
+    current = [f"{who} — {len(rounds)}"]
+    for r in rounds:
+        line = day_line(r, base)
+        if len(current) > 1 and len("\n".join([*current, line])) > MAX_SECTION_TEXT:
+            sections.append(_section("\n".join(current)))
+            current = [f"{who} (cont.)"]
+        current.append(line)
+    sections.append(_section("\n".join(current)))
+    return sections
+
+
+def _by_time(r: DayRound) -> tuple:
+    return (r.start is None, r.start.timestamp() if r.start else 0.0)
 
 
 def day_messages(
-    day: date, rounds: list[DayRound], *, managers: Sequence[UserExtra], origin: str,
+    day: date, rounds: list[DayRound], *, managers: Sequence[UserExtra] = (), origin: str,
 ) -> list[list[dict]]:
-    """The day's header and rounds as messages of at most 50 blocks. Only the first message has the header, and
-    a round's section never ends up apart from its actions block."""
+    """The day's post as messages of at most 50 blocks: a header with the counts, then one section per owner
+    (owners ordered by their first round's time, then name; rounds by time). Only the first message has the
+    header. `managers` is no longer used (kept for callers)."""
     if not rounds:
-        return [[{"type": "section", "text": {"type": "mrkdwn", "text": "No interviews today."}}]]
-    header = {"type": "header", "text": {"type": "plain_text", "text": f"⏰ {_title(day)}", "emoji": True}}
+        return [[_section("No interviews today.")]]
+    with_caller = sum(1 for r in rounds if r.caller in ("user", "external") and r.status not in _ENDED_MARKS)
+    title = f"⏰ {_title(day)} · {_plural(len(rounds), 'interview')} · {with_caller} with a caller"
+    header = {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}}
+
+    groups: dict[str, list[DayRound]] = {}
+    for r in sorted(rounds, key=_by_time):
+        groups.setdefault(r.owner_id or f"?{id(r.owner)}", []).append(r)
+
+    def owner_name(rs: list[DayRound]) -> str:
+        o = rs[0].owner
+        return (getattr(o, "name", None) or getattr(o, "email", None) or "").lower()
+
+    base = _app_base(origin)
     messages: list[list[dict]] = [[header]]
-    for r in rounds:
-        unit = round_blocks(r, managers=managers, origin=origin)
-        current = messages[-1]
-        divider = [{"type": "divider"}] if current and current[-1]["type"] != "header" else []
-        if len(current) + len(divider) + len(unit) > MAX_BLOCKS:
-            current, divider = [], []
-            messages.append(current)
-        current.extend([*divider, *unit])
+    for rs in sorted(groups.values(), key=lambda rs: (_by_time(rs[0]), owner_name(rs))):
+        for block in _owner_sections(rs[0].owner, rs, base):
+            if len(messages[-1]) >= MAX_BLOCKS:
+                messages.append([])
+            messages[-1].append(block)
     return messages
