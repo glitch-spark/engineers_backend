@@ -521,7 +521,7 @@ async def test_daily_post_carries_my_bids():
     store.mine = {str(OWNER): {"Arda": 12, "Cory": 23}}
     got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
     assert got["daily"] == "posted"
-    assert any("My bids — 35 (Arda 12 · Cory 23)" in t for t in section_texts(post.messages[0]))
+    assert any("_My bids · 35 — Arda 12 · Cory 23_" in t for t in section_texts(post.messages[0]))
     assert store.my_bids_calls == [(date(2026, 10, 2), date(2026, 10, 2))]
 
 

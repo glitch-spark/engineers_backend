@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from beanie import PydanticObjectId
 
-from app.bids.slack_format import Owner, format_report
+from app.bids.slack_format import Owner, _short_profile, format_report
 from app.models.bid_report import BidReportRow
 
 CT = ZoneInfo("America/Chicago")
@@ -48,7 +48,8 @@ def test_daily_post_lists_only_bidders_with_bids():
     assert text == "Daily bids — Fri Oct 2: 160 approved · 12 pending"
     assert texts(messages) == [
         "📨 *Daily bids — Fri Oct 2* · Thu 6:30 PM → Fri 6:30 PM CDT",
-        "*<@U1>* — 160 approved · 12 pending · 1 failed\n• 🇧🇷 Ana Silva · AI Full-stack — 160 approved · 12 pending\n"
+        "*<@U1>* — 160 approved · 12 pending · 1 failed",
+        "• 🇧🇷 Ana Silva · AI Full-stack — 160 approved · 12 pending\n"
         "• ⚠️ John Doe — couldn't read screenshot folder",
         "*Total: 160 approved · 12 pending · 1 bidder with bids* · <https://app.example/bidders|View in app>",
     ]
@@ -75,8 +76,9 @@ def test_period_key_falls_back_to_the_end_day_without_rows():
 def test_rejected_only_when_some():
     _, messages = format_report("daily", START, END, [rec(PEDRO, "Ana", 5, 0, 2)], OWNERS, CT, APP)
     t = texts(messages)
-    assert t[1] == "*<@U1>* — 5 approved · 0 pending · 2 rejected\n• Ana — 5 approved · 0 pending · 2 rejected"
-    assert t[2].startswith("*Total: 5 approved · 0 pending · 2 rejected · 1 bidder with bids*")
+    assert t[1] == "*<@U1>* — 5 approved · 0 pending · 2 rejected"
+    assert t[2] == "• Ana — 5 approved · 0 pending · 2 rejected"
+    assert t[3].startswith("*Total: 5 approved · 0 pending · 2 rejected · 1 bidder with bids*")
 
 
 def test_weekly_post_pay_lines_and_open_pay():
@@ -85,15 +87,15 @@ def test_weekly_post_pay_lines_and_open_pay():
     text, messages = format_report("weekly", START, END, rows, OWNERS, CT, APP)
     assert text == "Weekly bids & pay — week ending Fri Oct 2: 160 approved · 12 pending · $9.60"
     t = texts(messages)
-    assert len(t) == 3
-    assert t[1] == ("*<@U1>* — 160 approved · 12 pending · *$9.60*\n"
-                    "• 🇧🇷 Ana Silva · AI Full-stack — 160 approved × $0.06 = $9.60 · 12 pending")
-    assert t[2] == "*Total: 160 approved · 12 pending · $9.60 · 1 bidder with bids* · <https://app.example/bidders|View in app>"
+    assert len(t) == 4
+    assert t[1] == "*<@U1>* — 160 approved · 12 pending · *$9.60*"
+    assert t[2] == "• 🇧🇷 Ana Silva · AI Full-stack — 160 approved × $0.06 = $9.60 · 12 pending"
+    assert t[3] == "*Total: 160 approved · 12 pending · $9.60 · 1 bidder with bids* · <https://app.example/bidders|View in app>"
     assert accessories(messages) == [
         {"type": "button", "text": {"type": "plain_text", "text": "Open Pay"},
          "url": f"https://app.example/bidders?section=pay&owner={PEDRO}&range=pay_week&date=2026-10-02",
          "action_id": f"bids-link-{PEDRO}"}]
-    assert "accessory" not in messages[0][-1]
+    assert "accessory" not in messages[0][-1] and "accessory" not in messages[0][2]
 
 
 def test_no_bids_says_so():
@@ -112,8 +114,9 @@ def test_my_bids_line_per_owner():
     _, plain = format_report("daily", START, END, rows, OWNERS, CT, APP)
     _, messages = format_report("daily", START, END, rows, OWNERS, CT, APP, my_bids=my)
     t = texts(messages)
-    assert t[1] == "*Maria*\nMy bids — 5 (Solo 5)"
-    assert t[2].endswith("\nMy bids — 35 (Arda 12 · Cory 23)")
+    assert t[1:3] == ["*Maria*", "_My bids · 5 — Solo 5_"]
+    assert t[3] == "*<@U1>* — 160 approved · 12 pending"
+    assert t[4].endswith("\n_My bids · 35 — Arda 12 · Cory 23_")
     assert t[-1] == texts(plain)[-1] == "*Total: 160 approved · 12 pending · 1 bidder with bids* · <https://app.example/bidders|View in app>"
     assert [a["text"]["text"] for a in accessories(messages)] == ["Open Bids", "Review 12 pending"]
 
@@ -123,8 +126,8 @@ def test_my_bids_names_are_escaped_sorted_and_unknown_owners_survive():
     my = {str(PEDRO): {"zed": 1, "Bob <!channel>": 2, "alice": 3}, stranger: {"Solo": 1}, str(MARIA): {"Zero": 0}}
     _, messages = format_report("daily", START, END, [rec(PEDRO, "Ana", 1, 0)], OWNERS, CT, APP, my_bids=my)
     t = texts(messages)
-    assert "*Unknown owner*\nMy bids — 1 (Solo 1)" in t
-    assert t[1].endswith("\nMy bids — 6 (alice 3 · Bob &lt;!channel&gt; 2 · zed 1)")
+    assert t[t.index("*Unknown owner*") + 1] == "_My bids · 1 — Solo 1_"
+    assert t[2].endswith("\n_My bids · 6 — alice 3 · Bob &lt;!channel&gt; 2 · zed 1_")
     assert not any("Maria" in x for x in t)  # zero My bids and no rows: no section
 
 
@@ -132,11 +135,11 @@ def test_folder_rows_keep_the_bids_wording():
     folder = row(PEDRO, "Ana Silva", 2, country="BR")
     _, messages = format_report("weekly", START, END, [folder], OWNERS, CT, APP)
     t = texts(messages)
-    assert t[1] == "*<@U1>* — 2 bids · *$1.00*\n• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00"
-    assert t[2].startswith("*Total: 2 bids · $1.00 · 1 bidder with bids*")
+    assert t[1:3] == ["*<@U1>* — 2 bids · *$1.00*", "• 🇧🇷 Ana Silva — 2 bids × $0.50 = $1.00"]
+    assert t[3].startswith("*Total: 2 bids · $1.00 · 1 bidder with bids*")
     _, daily = format_report("daily", START, END, [folder], OWNERS, CT, APP)
-    assert texts(daily)[1] == "*<@U1>* — 2 bids\n• 🇧🇷 Ana Silva — 2 bids"
-    assert texts(daily)[2].startswith("*Total: 2 bids · 1 bidder with bids*")
+    assert texts(daily)[1:3] == ["*<@U1>* — 2 bids", "• 🇧🇷 Ana Silva — 2 bids"]
+    assert texts(daily)[3].startswith("*Total: 2 bids · 1 bidder with bids*")
 
 
 def test_no_buttons_without_an_app_url():
@@ -150,7 +153,7 @@ def test_no_buttons_without_an_app_url():
 def test_missing_owner_falls_back():
     stranger = PydanticObjectId()
     _, messages = format_report("daily", START, END, [row(stranger, "Lee", 3)], OWNERS, CT, "https://a")
-    assert texts(messages)[1] == "*Unknown owner* — 3 bids\n• Lee — 3 bids"
+    assert texts(messages)[1:3] == ["*Unknown owner* — 3 bids", "• Lee — 3 bids"]
 
 
 def test_large_reports_respect_slack_limits():
@@ -161,9 +164,13 @@ def test_large_reports_respect_slack_limits():
     _, messages = format_report("daily", START, END, rows, owners, CT, "https://a")
     assert len(messages) > 1 and all(len(m) <= 50 for m in messages)
     assert all(len(s) <= 3000 for s in texts(messages))
+    ids = [b["accessory"]["action_id"] for m in messages for b in m if "accessory" in b]
+    assert len(ids) == len(set(ids)) == 60  # every action_id in the post is unique
+    for m in messages:  # a header is never left at the end of a message, away from its body
+        assert "accessory" not in m[-1]
     body = "\n".join(texts(messages))
     assert all(body.count(f"Bidder {i:03d} ") == 1 for i in range(300))
-    assert "(cont.)" in body and len(accessories(messages)) == 60  # one button per owner, none on "(cont.)"
+    assert "(cont.)" in body and len(accessories(messages)) == 60  # one button per owner, only on the header
 
 
 def test_user_text_is_escaped_but_slack_mentions_are_kept():
@@ -174,9 +181,9 @@ def test_user_text_is_escaped_but_slack_mentions_are_kept():
             row(MARIA, "Mia", 1)]
     _, messages = format_report("daily", START, END, rows, owners, CT, "https://app.example")
     t = texts(messages)
-    assert t[1] == "*&lt;https://evil.example|Maria&gt;* — 1 bid\n• Mia — 1 bid"
-    assert t[2] == ("*<@U1>* — 2 bids · 1 failed\n"
-                    "• Ana &lt;!channel&gt; &amp; co · &lt;https://evil.example|click&gt; — 2 bids\n"
+    assert t[1:3] == ["*&lt;https://evil.example|Maria&gt;* — 1 bid", "• Mia — 1 bid"]
+    assert t[3] == "*<@U1>* — 2 bids · 1 failed"
+    assert t[4] == ("• Ana &lt;!channel&gt; &amp; co · &lt;https://evil.example|click&gt; — 2 bids\n"
                     "• ⚠️ Bad &lt;!here&gt; — couldn't read screenshot folder")
     assert "<!" not in "".join(t)
 
@@ -192,3 +199,46 @@ def test_refreshed_report_footer_says_when_it_was_updated():
     updated = datetime(2026, 10, 3, 14, 5, tzinfo=timezone.utc)  # Sat 9:05 AM CDT
     _, messages = format_report("daily", START, END, [row(PEDRO, "Ana", 3)], OWNERS, CT, "https://a", updated_at=updated)
     assert texts(messages)[-1] == "*Total: 3 bids · 1 bidder with bids* · <https://a/bidders|View in app> · updated Sat 9:05 AM"
+
+
+def test_owner_is_a_header_with_the_button_and_a_full_width_body():
+    rows = [rec(PEDRO, "Ana Silva", 160, 12), rec(PEDRO, "Raj", 3, 0)]
+    _, messages = format_report("daily", START, END, rows, OWNERS, CT, APP, my_bids={str(PEDRO): {"Cory": 2}})
+    blocks = messages[0]
+    assert [("accessory" in b) for b in blocks] == [False, True, False, False]  # title, header, body, footer
+    assert blocks[1]["text"]["text"] == "*<@U1>* — 163 approved · 12 pending"
+    assert blocks[2]["text"]["text"] == ("• Ana Silva — 160 approved · 12 pending\n• Raj — 3 approved · 0 pending\n"
+                                         "_My bids · 2 — Cory 2_")
+
+
+def test_my_bids_only_owner_still_gets_a_header_and_a_body():
+    _, messages = format_report("daily", START, END, [rec(PEDRO, "Ana", 1, 0)], OWNERS, CT, APP,
+                                my_bids={str(MARIA): {"Solo": 5}})
+    maria = messages[0][1:3]
+    assert [b["text"]["text"] for b in maria] == ["*Maria*", "_My bids · 5 — Solo 5_"]
+    assert "accessory" in maria[0] and "accessory" not in maria[1]
+
+
+def test_continuation_bodies_have_no_accessory():
+    rows = [row(PEDRO, f"Bidder {i} " + "x" * 600, 10 - i) for i in range(8)]
+    _, messages = format_report("daily", START, END, rows, OWNERS, CT, APP)
+    blocks = messages[0][1:-1]
+    assert len(blocks) > 2 and [("accessory" in b) for b in blocks] == [True] + [False] * (len(blocks) - 1)
+    assert not blocks[1]["text"]["text"].startswith("*")
+    assert blocks[2]["text"]["text"].split("\n")[0] == "*<@U1>* — 52 bids (cont.)"
+
+
+def test_short_profile_names():
+    assert _short_profile("Brazil | Fabricio Suzuki(Senior Data Engineer)") == "Fabricio Suzuki"
+    assert _short_profile("Brazil | Lucas Saito(Senior Software Engineer)") == "Lucas Saito"
+    assert _short_profile("A | B | Carla (QA)") == "Carla"  # text after the LAST "|"
+    assert _short_profile("Andre Ballard") == "Andre Ballard"
+    assert _short_profile("(x)") == "(x)"  # nothing left: the full name
+    assert _short_profile("Brazil | (x)") == "Brazil | (x)"
+    assert _short_profile("Brazil |") == "Brazil |"
+
+
+def test_my_bids_line_uses_short_names_but_sorts_by_full_name():
+    my = {str(PEDRO): {"brazil | Zed(QA)": 1, "Andre Ballard": 2, "Brazil | Cory(Dev)": 0}}
+    _, messages = format_report("daily", START, END, [rec(PEDRO, "Ana", 1, 0)], OWNERS, CT, APP, my_bids=my)
+    assert texts(messages)[2].endswith("\n_My bids · 3 — Andre Ballard 2 · Zed 1_")
