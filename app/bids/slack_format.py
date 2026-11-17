@@ -97,7 +97,7 @@ def _short_profile(name: str) -> str:
 def _my_bids_line(profiles: Mapping[str, int]) -> Optional[str]:
     """"_My bids · 35 — Arda 12 · Cory 23_" (italic, so it stands apart): the owner's own bids per profile;
     never part of any total."""
-    shown = sorted(((name, n) for name, n in profiles.items() if (n or 0) > 0), key=lambda p: p[0].lower())
+    shown = sorted(((name, n) for name, n in profiles.items() if (n or 0) > 0), key=lambda p: (_short_profile(p[0]).lower(), p[0].lower()))
     if not shown:
         return None
     return (f"_My bids · {sum(n for _, n in shown):,} — "

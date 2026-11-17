@@ -238,7 +238,15 @@ def test_short_profile_names():
     assert _short_profile("Brazil |") == "Brazil |"
 
 
-def test_my_bids_line_uses_short_names_but_sorts_by_full_name():
+def test_my_bids_line_uses_short_names():
     my = {str(PEDRO): {"brazil | Zed(QA)": 1, "Andre Ballard": 2, "Brazil | Cory(Dev)": 0}}
     _, messages = format_report("daily", START, END, [rec(PEDRO, "Ana", 1, 0)], OWNERS, CT, APP, my_bids=my)
     assert texts(messages)[2].endswith("\n_My bids · 3 — Andre Ballard 2 · Zed 1_")
+
+
+def test_my_bids_profiles_sort_by_the_shown_name():
+    my = {str(PEDRO): {"Brazil | Zed(QA)": 1, "Arda": 2, "brazil | bob(Dev)": 3, "Bob": 4, "Aaa | Bob": 5}}
+    _, messages = format_report("daily", START, END, [rec(PEDRO, "Ana", 1, 0)], OWNERS, CT, APP, my_bids=my)
+    # shown name first, case-insensitive; the full name breaks the tie between the three Bobs
+    assert texts(messages)[2].endswith("_My bids · 15 — Arda 2 · Bob 5 · Bob 4 · bob 3 · Zed 1_")
+    assert texts(messages)[2].index("Arda") < texts(messages)[2].index("Zed")
