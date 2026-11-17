@@ -580,3 +580,55 @@ async def test_my_bids_queries_only_the_owners_with_rows():
     await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3, "s3://b/raj/": 0}), post)
     (ids,) = store.my_bids_ids
     assert set(ids) == {OWNER, other} and ghost not in ids
+
+
+# --- the short week: switch Sun 2026-11-15 20:00 with BID_SCHEDULE_SHORT_WEEK; Sat 11-14 16:00 -> Sun 11-15 20:00 ---
+
+SHORT_SCHED = BidSchedule(tz=CT, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0),
+                          switch_at=datetime(2026, 11, 15, 20, 0, tzinfo=CT),
+                          next_rules=Rules(time(18, 0), 6, time(20, 0)), short_week=True)
+
+
+async def short_tick(local, store, post):
+    return await run_bid_reports_tick(local.replace(tzinfo=CT).astimezone(timezone.utc), store=store,
+                                      storage=FakeStorage({"s3://b/ana/": 3}), post=post, sched=SHORT_SCHED)
+
+
+async def test_short_week_weekly_report_posts_once_beside_the_paid_week():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    # the old week ending Sat 11-14 16:00, already reported and paid; the short week touches it only at 11-14 16:00
+    stored_weekly(store, "2026-11-14", datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc))
+    got = await short_tick(datetime(2026, 11, 15, 20, 5), store, post)
+    assert got["weekly"] == "posted" and "bids-weekly:2026-11-15" in store.done
+    rows = [r for r in weekly_rows(store) if r.periodKey == "2026-11-15"]
+    assert rows and all((_aware(r.periodStart), _aware(r.periodEnd)) == (
+        datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc), datetime(2026, 11, 16, 2, 0, tzinfo=timezone.utc))
+        for r in rows)
+    weekly = [t for t in post.sent if "Weekly bids & pay" in t]
+    assert len(weekly) == 1 and "week ending Sun Nov 15" in weekly[0]
+    assert (date(2026, 11, 15), date(2026, 11, 15)) in store.my_bids_calls  # My bids: the one report day
+    again = await short_tick(datetime(2026, 11, 15, 20, 10), store, post)
+    assert again["weekly"] == "done" and len([t for t in post.sent if "Weekly bids & pay" in t]) == 1
+
+
+async def test_short_week_no_weekly_report_before_the_switch():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    got = await short_tick(datetime(2026, 11, 15, 19, 55), store, post)
+    assert got["weekly"] == "not-due" and weekly_rows(store) == []
+
+
+async def test_short_week_daily_reports_around_the_switch():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    got = await short_tick(datetime(2026, 11, 15, 18, 35), store, post)
+    assert got["daily"] == "posted" and "bids-daily:2026-11-15" in store.done
+    got = await short_tick(datetime(2026, 11, 16, 18, 5), store, post)
+    assert got["daily"] == "posted"
+    (mon,) = {(_aware(r.periodStart), _aware(r.periodEnd)) for r in store.rows if r.periodKey == "2026-11-16"}
+    assert mon == (datetime(2026, 11, 16, 0, 30, tzinfo=timezone.utc), datetime(2026, 11, 17, 0, 0, tzinfo=timezone.utc))
+
+
+def test_short_week_report_days():
+    assert reports.report_days("weekly", "2026-11-15", SHORT_SCHED) == (date(2026, 11, 15), date(2026, 11, 15))
+    assert reports.report_days("weekly", "2026-11-22", SHORT_SCHED) == (date(2026, 11, 16), date(2026, 11, 22))
+    assert reports.report_days("weekly", "2026-11-14", SHORT_SCHED) == (date(2026, 11, 8), date(2026, 11, 14))

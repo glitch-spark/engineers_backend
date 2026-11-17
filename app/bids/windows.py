@@ -5,8 +5,9 @@ and only then converted to UTC, so a day spanning a DST change is 23 or 25 hours
 cutoff always lands on the configured wall-clock time.
 
 An optional switch (BidSchedule.switch_at) changes the rules once: cutoffs before it follow the old rules and
-cutoffs after it the next rules, so the period straddling the switch is longer than usual. With no switch every
-function returns what it did before the switch existed.
+cutoffs after it the next rules, so the period straddling the switch is longer than usual. With short_week
+(BID_SCHEDULE_SHORT_WEEK) the weekly period straddling it is instead shorter: [last old weekly cutoff, switch). With no
+switch every function returns what it did before the switch existed.
 """
 
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ class BidSchedule:
     weekly_at: time
     switch_at: Optional[datetime] = None  # aware in tz; next_rules apply from here on
     next_rules: Optional[Rules] = None
+    short_week: bool = False  # weekly old era ends at the switch itself (a short pay week), not a week before it
 
 
 def _parse_hhmm(s: str) -> time:
@@ -61,6 +63,7 @@ def schedule_from_settings(s: Optional[Settings] = None) -> BidSchedule:
         weekly_at=_parse_hhmm(s.BID_WEEKLY_REPORT_TIME),
         switch_at=switch_at,
         next_rules=next_rules,
+        short_week=bool(s.BID_SCHEDULE_SHORT_WEEK),
     )
 
 
@@ -99,12 +102,13 @@ def _next(kind: Kind, after: datetime, tz: ZoneInfo, rules: Rules) -> datetime:
 
 # With a switch, old-rule cutoffs exist only up to the old era's end and new-rule cutoffs only from the switch on:
 #   weekly: old at or before switch - 7 days (no stub week before the switch), new at or after the switch;
+#           with short_week, old at or before the switch itself (the stub [last old cutoff, switch) is a pay week);
 #   daily:  old at or before the switch, new strictly after it.
 
 
 def _old_era_end(kind: Kind, sched: BidSchedule) -> datetime:
     switch = sched.switch_at.astimezone(sched.tz)
-    if kind == "daily":
+    if kind == "daily" or sched.short_week:
         return switch
     return datetime.combine(switch.date() - timedelta(days=7), switch.time(), tzinfo=sched.tz)
 
@@ -141,7 +145,7 @@ def next_cutoff(kind: Kind, after: datetime, sched: BidSchedule) -> datetime:
 
 def window_for(kind: Kind, cutoff: datetime, sched: BidSchedule) -> tuple[datetime, datetime]:
     """UTC-aware [start, end) window ending at `cutoff` and starting at the cutoff before it: one local day
-    (daily) or seven (weekly) long, except around the switch."""
+    (daily) or seven (weekly) long, except around the switch (longer, or shorter with short_week)."""
     end = _utc(cutoff)
     return _utc(latest_cutoff(kind, end - timedelta(microseconds=1), sched)), end
 

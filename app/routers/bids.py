@@ -527,8 +527,8 @@ async def bids_alerts(
 @router.get("/clock")
 async def bids_clock(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
     """"Now" as the report schedule sees it, so the client never hard-codes the schedule: the open report day, the
-    first and last report days of the pay week holding now (7 days, 8 across the switch) and the first report day of
-    the pay week before it. Any signed-in user."""
+    first and last report days of the pay week holding now (7 days; at the switch 8, or 1 with the short week) and the
+    first report day of the pay week before it. Any signed-in user."""
     sched, now = schedule_from_settings(), _now()
     week = pay_week(sched, now)
     previous = pay_week(sched, week.start - timedelta(microseconds=1))
