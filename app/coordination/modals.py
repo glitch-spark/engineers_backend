@@ -129,7 +129,7 @@ def reschedule_view(origin: Origin, title_line: str, *, start: datetime) -> dict
         {
             "type": "input",
             "block_id": "time",
-            "label": _plain(f"Time ({origin.tz or 'UTC'})"),
+            "label": _plain(f"Time ({_zone(origin.tz).key})"),
             "element": {"type": "timepicker", "action_id": "time_input", "initial_time": local.strftime("%H:%M")},
         },
     ]

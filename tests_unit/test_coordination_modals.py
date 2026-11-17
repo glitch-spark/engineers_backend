@@ -175,3 +175,14 @@ def test_submission_errors_never_raises(monkeypatch):
     assert list(errors) == ["note"] and errors["note"]
     for junk in (None, 5, "x", {"state": 3}, {"callback_id": "coord_reschedule", "state": {"values": []}}):
         assert isinstance(submission_errors(junk, NOW), dict)
+
+
+def test_unknown_zone_is_labelled_and_read_as_utc():
+    origin = Origin("IV:R", "C1", "200.2", "Mars/Foo")
+    start = datetime(2026, 11, 16, 18, 30, tzinfo=UTC)
+    view = reschedule_view(origin, "Acme", start=start)
+    time_block = next(b for b in view["blocks"] if b.get("block_id") == "time")
+    assert time_block["label"]["text"] == "Time (UTC)"
+    assert time_block["element"]["initial_time"] == "18:30"
+    answer = read_submission(submitted("coord_reschedule", tz="Mars/Foo", date="2026-11-18", time="09:15"))
+    assert answer.new_start == datetime(2026, 11, 18, 9, 15, tzinfo=UTC)
