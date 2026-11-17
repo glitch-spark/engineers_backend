@@ -138,7 +138,7 @@ async def test_owner_picks_a_caller_through_the_round_field(slack, spies, cast):
     c = entry.caller
     assert (c.callerName, c.callerId, c.callerKind) == ("Ana", str(cast.ana.id), "user")
     assert c.method == "video" and c.methodValue == LINK  # the round's method and link survive
-    assert entry.confirmed is False
+    assert entry.confirmed is True  # assigning a caller confirms the round
     spies.update.assert_awaited_once()
     spies.assign.assert_not_awaited()
     assert texts(slack) == ["Caller set: Ana."]
@@ -148,9 +148,11 @@ async def test_owner_picks_a_caller_through_the_round_field(slack, spies, cast):
 async def test_manager_picks_through_the_manager_endpoint(slack, spies, cast):
     iv = await make_interview(cast.justin)
     await actions.process_coordination_click(click("coord_choose_caller", iv, "U0PUMA0001", str(cast.pietro.id)))
-    c = (await tip(iv)).caller
+    entry = await tip(iv)
+    c = entry.caller
     assert (c.callerName, c.callerKind) == ("Pietro", "external")
     assert c.method == "video" and c.methodValue == LINK
+    assert entry.confirmed is True  # assigning a caller confirms the round
     spies.assign.assert_awaited_once()
     spies.update.assert_not_awaited()
     assert texts(slack) == ["Caller set: Pietro."]
@@ -164,6 +166,16 @@ async def test_self_turns_the_caller_request_off(slack, cast, who):
     assert (await tip(iv)).caller.enabled is False
     assert texts(slack) == ["No caller (Self) — the caller request is off."]
     slack.sync.assert_awaited()
+
+
+@pytest.mark.parametrize("who", ["U0JUSTIN01", "U0PUMA0001"])
+async def test_self_after_a_caller_unconfirms(slack, cast, who):
+    iv = await make_interview(cast.justin)
+    await actions.process_coordination_click(click("coord_choose_caller", iv, who, str(cast.pietro.id)))
+    assert (await tip(iv)).confirmed is True
+    await actions.process_coordination_click(click("coord_choose_caller", iv, who, "self"))
+    entry = await tip(iv)
+    assert entry.caller.enabled is False and entry.confirmed is False
 
 
 @pytest.mark.parametrize("who", ["U0JUSTIN01", "U0PUMA0001"])
@@ -237,7 +249,18 @@ async def test_confirm_on_an_already_confirmed_round_says_so(slack, cast):
     await actions.process_coordination_click(click("coord_confirm", iv, "U0ANA00001"))  # an old click, same button
     assert texts(slack) == ["Already confirmed."]
     assert (await tip(iv)).confirmed is True
-    slack.sync.assert_not_awaited()
+    slack.sync.assert_awaited()  # the post is re-rendered, so the old Confirm button goes away
+
+
+async def test_old_confirm_click_on_a_round_assigned_since_says_already_confirmed(slack, cast):
+    """Assigning confirms now; a Confirm button left on an old post is answered and the post re-rendered."""
+    iv = await make_interview(cast.justin)
+    await actions.process_coordination_click(click("coord_choose_caller", iv, "U0PUMA0001", str(cast.ana.id)))
+    assert (await tip(iv)).confirmed is True
+    slack.sync.reset_mock()
+    await actions.process_coordination_click(click("coord_confirm", iv, "U0ANA00001"))
+    assert texts(slack)[-1] == "Already confirmed."
+    slack.sync.assert_awaited()
 
 
 async def test_assigned_caller_and_stranger_confirm(slack, cast):

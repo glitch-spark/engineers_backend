@@ -40,6 +40,7 @@ from app.interview_caller import (
     CallerIn,
     build_round_caller,
     caller_unassigned,
+    confirmed_by_assignment,
     round_post_state,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
@@ -253,10 +254,10 @@ async def _resolve_caller(
     return body.model_copy(update={"callerId": entry["_id"], "callerName": entry["name"], "callerKind": entry["kind"]})
 
 
-def _assignment(caller: Optional[InterviewCaller]) -> tuple:
-    if caller is None:
-        return (None, "TBD")
-    return (caller.callerId, (caller.callerName or "").strip() or "TBD")
+def _confirm_by_assignment(entry: InterviewStageEvent) -> None:
+    """Assigning a caller confirms the round (there is no separate Confirm step); clearing the caller, TBD, Self
+    or calling the round off unconfirms it. Every caller write goes through here."""
+    entry.confirmed = confirmed_by_assignment(entry)
 
 
 def mark_previous_passed(history: list[InterviewStageEvent]) -> bool:
@@ -1075,6 +1076,7 @@ def _build_round(
     )
     if rnd.caller is not None:
         entry.caller = _round_caller(rnd.caller, starts_at=start, previous=None)
+    _confirm_by_assignment(entry)
     return entry
 
 
@@ -1246,8 +1248,8 @@ async def update_interview(
     tip = _tip(iv)
     if tip is not None:
         tip.status = iv.status
-        if _status_value(tip.status) in ENDED_STATUSES:
-            tip.confirmed = False
+        if body.status is not None or _status_value(tip.status) in ENDED_STATUSES:
+            _confirm_by_assignment(tip)  # called off: not confirmed; back on with a caller: confirmed again
         if tip.caller is not None and tip.caller.enabled and tip.scheduledAt is not None:
             tip.caller.startsAt = tip.scheduledAt
     _sync_top_from_tip(iv)
@@ -1322,7 +1324,6 @@ async def assign_round_caller(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This round has no caller request.")
     if body.enabled is False:
         entry.caller = (previous or InterviewCaller()).model_copy(update={"enabled": False})
-        entry.confirmed = False
     else:
         was_on = previous is not None and previous.enabled
         picked = await _resolve_caller(
@@ -1332,8 +1333,7 @@ async def assign_round_caller(
         if not was_on:
             update.update({"enabled": True, "startsAt": entry.scheduledAt})
         entry.caller = (previous or InterviewCaller()).model_copy(update=update)
-        if not was_on or _assignment(entry.caller) != _assignment(previous):
-            entry.confirmed = False  # the new caller has not agreed yet
+    _confirm_by_assignment(entry)
     iv.stageHistory[idx] = entry
     _sync_top_from_tip(iv)
     await _save_interview(iv)
@@ -1362,9 +1362,7 @@ async def update_interview_stage(
         if sched is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
         old_start, old_end = entry.scheduledAt, entry.endsAt
-        if old_start is None or _utc_naive(old_start) != _utc_naive(sched):
-            entry.confirmed = False  # a new time needs the caller lined up again
-        entry.scheduledAt = sched
+        entry.scheduledAt = sched  # a new time keeps the assigned caller, so the round stays confirmed
         # Rescheduling keeps the round's duration unless a new end is sent.
         if body.endsAt is None and old_start is not None and old_end is not None:
             entry.endsAt = round_ends_at(sched, sched + (_utc_naive(old_end) - _utc_naive(old_start)))
@@ -1394,18 +1392,14 @@ async def update_interview_stage(
         entry.transcript = body.transcript
     if body.note is not None:
         entry.note = body.note
-    assignment_changed = False
     if body.caller is not None:
         previous = entry.caller
         resolved = await _resolve_caller(body.caller, owner_id=str(iv.createdBy), previous=previous)
         entry.caller = _round_caller(resolved, starts_at=entry.scheduledAt, previous=previous)
-        if _assignment(entry.caller) != _assignment(previous):
-            entry.confirmed = False  # the new caller has not agreed yet
-            assignment_changed = True
     ended = _status_value(entry.status) in ENDED_STATUSES
-    if entry.caller is None or not entry.caller.enabled or ended:
-        entry.confirmed = False  # a caller is only lined up for an active caller round
-    if body.confirmed is not None and not assignment_changed:  # a new caller has not confirmed yet
+    if body.caller is not None or _status_value(entry.status) != old_status or ended:
+        _confirm_by_assignment(entry)  # assigning confirms; no caller, Self or a called-off round does not
+    if body.confirmed is not None and body.caller is None:  # an old client's Confirm toggle; a caller write wins
         if body.confirmed and (entry.caller is None or not entry.caller.enabled):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only caller rounds are confirmed")
         if body.confirmed and ended:

@@ -269,7 +269,7 @@ async def test_owner_changes_the_caller_in_the_round_form(client):
         res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(jamil.id)}})
         assert res.status_code == 200, res.text
         assert res.json()["stageHistory"][-1]["caller"]["callerName"] == "Jamil's group"
-        assert res.json()["stageHistory"][-1]["confirmed"] is False
+        assert res.json()["stageHistory"][-1]["confirmed"] is True  # assigning confirms
         # A body without callerId keeps the assignment (now Jamil) and updates the rest.
         res = await c.patch(url, json={"note": "n", "caller": {"enabled": True, "method": "phone_hushed"}})
         assert res.status_code == 200, res.text
@@ -383,23 +383,31 @@ async def _confirmed(iv) -> bool:
     return (await Interview.get(iv.id)).stageHistory[-1].confirmed
 
 
-async def test_changing_caller_clears_confirmed(client):
+async def test_assigning_a_caller_confirms_clearing_it_unconfirms(client):
     ana, bob = await make_user("Ana"), await make_user("Bob")
     pietro, puma = await make_caller("Pietro"), await make_user("Puma", role="interview_manager")
-    iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
-    await _confirm(iv)
+    iv = await make_interview(await make_user("Owner"), caller_name="TBD")
+    assert await _confirmed(iv) is False
     url = f"/interviews/{iv.id}/stages/{rid(iv)}/caller"
     async with client(puma) as c:
+        assert (await c.put(url, json={"callerId": str(ana.id)})).status_code == 200  # a platform user
+        assert await _confirmed(iv) is True
+        assert (await Interview.get(iv.id)).confirmed is True  # the interview mirrors its latest round
         assert (await c.put(url, json={"callerId": str(ana.id)})).status_code == 200  # same caller
         assert await _confirmed(iv) is True
         assert (await c.put(url, json={"callerId": str(bob.id)})).status_code == 200
+        assert await _confirmed(iv) is True
+        assert (await c.put(url, json={"callerId": str(pietro.id)})).status_code == 200  # an external caller
+        assert await _confirmed(iv) is True
+        assert (await c.put(url, json={"callerId": ""})).status_code == 200  # back to TBD
         assert await _confirmed(iv) is False
-        await _confirm(iv)
-        assert (await c.put(url, json={"callerId": str(pietro.id)})).status_code == 200
+        assert (await c.put(url, json={"callerId": str(bob.id), "enabled": True})).status_code == 200
+        assert await _confirmed(iv) is True
+        assert (await c.put(url, json={"callerId": "", "enabled": False})).status_code == 200  # Self / off
         assert await _confirmed(iv) is False
 
 
-async def test_patch_changing_caller_clears_confirmed_same_caller_keeps_it(client):
+async def test_patch_changing_caller_keeps_it_confirmed(client):
     ana, bob = await make_user("Ana"), await make_user("Bob")
     admin = await make_user("Admin", role="admin")
     iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
@@ -411,8 +419,16 @@ async def test_patch_changing_caller_clears_confirmed_same_caller_keeps_it(clien
         assert await _confirmed(iv) is True
         res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(bob.id)}})
         assert res.status_code == 200, res.text
+        assert await _confirmed(iv) is True
+        assert (await fresh(iv)).callerKind == "user"
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": ""}})  # back to TBD
+        assert res.status_code == 200, res.text
         assert await _confirmed(iv) is False
-    assert (await fresh(iv)).callerKind == "user"
+        res = await c.patch(url, json={"caller": {"enabled": True, "callerId": str(bob.id)}})
+        assert await _confirmed(iv) is True
+        res = await c.patch(url, json={"caller": {"enabled": False}})  # Self
+        assert res.status_code == 200, res.text
+        assert await _confirmed(iv) is False
 
 
 async def test_resending_an_archived_external_caller_keeps_it(client):
@@ -461,16 +477,18 @@ async def test_resending_a_deactivated_user_caller_keeps_it(client):
     assert await _confirmed(iv) is True
 
 
-async def test_patch_ignores_confirmed_when_the_caller_changes_in_the_same_request(client):
+async def test_patch_caller_write_wins_over_confirmed_in_the_same_request(client):
     ana, bob = await make_user("Ana"), await make_user("Bob")
     admin = await make_user("Admin", role="admin")
     iv = await make_interview(await make_user("Owner"), caller_name="Ana", caller_id=str(ana.id))
     url = f"/interviews/{iv.id}/stages/{rid(iv)}"
     async with client(admin) as c:
-        res = await c.patch(url, json={"confirmed": True, "caller": {"enabled": True, "callerId": str(bob.id)}})
+        res = await c.patch(url, json={"confirmed": False, "caller": {"enabled": True, "callerId": str(bob.id)}})
         assert res.status_code == 200, res.text
+        assert await _confirmed(iv) is True
+        # Without a caller in the body, an old client's Confirm toggle is still honoured.
+        assert (await c.patch(url, json={"confirmed": False})).status_code == 200
         assert await _confirmed(iv) is False
-        # Without a caller change, confirmed is honoured.
         assert (await c.patch(url, json={"confirmed": True})).status_code == 200
         assert await _confirmed(iv) is True
 
@@ -584,6 +602,7 @@ async def test_manager_turns_the_caller_request_off_and_on(client):
         assert res.status_code == 200, res.text
         caller = await fresh(iv)
         assert caller.enabled is True and caller.callerName == "Muhammad"
+        assert (await Interview.get(iv.id)).stageHistory[-1].confirmed is True  # turned on with a caller
         assert caller.startsAt.replace(tzinfo=None) == (await Interview.get(iv.id)).stageHistory[-1].scheduledAt.replace(tzinfo=None)
         # An old client sends no `enabled`: a round without a caller request is still refused.
         res = await c.put(

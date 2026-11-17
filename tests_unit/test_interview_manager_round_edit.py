@@ -100,7 +100,7 @@ async def test_manager_reschedules_anyones_round(client):
     entry = await stored(iv)
     assert naive(entry.scheduledAt) == datetime(2026, 10, 10, 16, 0)
     assert naive(entry.endsAt) == datetime(2026, 10, 10, 17, 0)  # the duration is kept
-    assert entry.confirmed is False
+    assert entry.confirmed is True  # a new time keeps the caller, so it stays confirmed
 
 
 async def test_manager_cannot_touch_other_round_fields(client):

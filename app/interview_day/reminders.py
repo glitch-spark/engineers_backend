@@ -45,7 +45,7 @@ async def _send(channel: str, parent: str | None, text: str, blocks: list[dict])
 
 
 async def rebuild_reminder(iv_id: str, round_id: str, now: datetime) -> tuple[str, list[dict]]:
-    """The round's message as it reads now (plain text, blocks), for replacing a reminder after a Confirm click. The
+    """The round's message as it reads now (plain text, blocks), for replacing a reminder after a Confirm click on an old message. The
     "Starting in" header is kept, recounted, while the round has not started. Raises LookupError when the round
     is gone, was moved or is no longer listed."""
     iv = await Interview.get(PydanticObjectId(iv_id))

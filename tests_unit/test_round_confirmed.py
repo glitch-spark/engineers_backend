@@ -111,12 +111,20 @@ async def test_confirm_non_caller_round_is_400(client):
     assert (r.status_code, r.json()["detail"]) == (400, "Only caller rounds are confirmed")
 
 
-async def test_reschedule_resets_confirmed(client):
+async def test_reschedule_keeps_confirmed(client):
+    """A new time keeps the assigned caller, so the round stays confirmed."""
     owner = await make_user()
     iv = await make_interview(owner, confirmed=True)
     r = await patch(client, owner, iv, {"scheduledAt": "2026-10-08T15:00:00Z"})
     assert r.status_code == 200, r.text
-    assert r.json()["stageHistory"][-1]["confirmed"] is False and r.json()["confirmed"] is False
+    assert r.json()["stageHistory"][-1]["confirmed"] is True and r.json()["confirmed"] is True
+
+
+async def test_reschedule_and_end_change_keeps_confirmed(client):
+    owner = await make_user()
+    iv = await make_interview(owner, confirmed=True)
+    r = await patch(client, owner, iv, {"scheduledAt": "2026-10-08T15:00:00Z", "endsAt": "2026-10-08T16:30:00Z"})
+    assert r.json()["stageHistory"][-1]["confirmed"] is True
 
 
 async def test_same_time_keeps_confirmed(client):
@@ -141,7 +149,7 @@ async def test_turning_caller_off_unconfirms(client):
     assert r.json()["stageHistory"][-1]["confirmed"] is False
 
 
-async def test_new_round_starts_unconfirmed(client):
+async def test_new_round_with_a_caller_is_confirmed(client):
     owner = await make_user()
     iv = await make_interview(owner, confirmed=True)
     async with client(owner) as c:
@@ -151,7 +159,62 @@ async def test_new_round_starts_unconfirmed(client):
         })
     assert r.status_code == 201, r.text
     rounds = r.json()["stageHistory"]
-    assert (rounds[0]["confirmed"], rounds[-1]["confirmed"], r.json()["confirmed"]) == (True, False, False)
+    assert (rounds[0]["confirmed"], rounds[-1]["confirmed"], r.json()["confirmed"]) == (True, True, True)
+
+
+@pytest.mark.parametrize("caller", [
+    {"enabled": True, "callerId": "", "method": "video"},  # TBD
+    {"enabled": True, "callerName": "TBD", "method": "video"},
+    {"enabled": False},  # Self
+    None,
+])
+async def test_new_round_without_a_caller_is_not_confirmed(client, caller):
+    owner = await make_user()
+    iv = await make_interview(owner, confirmed=True)
+    body = {"stage": "tech_round_1", "scheduledAt": "2026-10-09T15:00:00Z"}
+    if caller is not None:
+        body["caller"] = caller
+    async with client(owner) as c:
+        r = await c.post(f"/interviews/{iv.id}/stages", json=body)
+    assert r.status_code == 201, r.text
+    assert r.json()["stageHistory"][-1]["confirmed"] is False
+
+
+async def test_patch_assigning_a_caller_confirms(client):
+    owner = await make_user()
+    iv = await make_interview(owner, name="TBD")
+    r = await patch(client, owner, iv, {"caller": {"enabled": True, "callerName": "Ana", "method": "video"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["stageHistory"][-1]["confirmed"] is True and r.json()["confirmed"] is True
+
+
+async def test_patch_clearing_the_caller_to_tbd_unconfirms(client):
+    owner = await make_user()
+    iv = await make_interview(owner, confirmed=True)
+    r = await patch(client, owner, iv, {"caller": {"enabled": True, "callerId": "", "method": "video"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["stageHistory"][-1]["confirmed"] is False
+
+
+async def test_uncanceling_an_assigned_round_confirms_it_again(client):
+    owner = await make_user()
+    iv = await make_interview(owner, confirmed=True)
+    await patch(client, owner, iv, {"status": "canceled"})
+    r = await patch(client, owner, iv, {"status": "scheduled"})
+    assert r.json()["stageHistory"][-1]["confirmed"] is True
+
+
+async def test_create_interview_with_a_caller_is_confirmed(client, db):
+    owner = await make_user()
+    account = await Account(name="P", createdBy=owner.id).insert()
+    async with client(owner) as c:
+        r = await c.post("/interviews", json={
+            "accountId": str(account.id), "companyName": "Acme",
+            "round": {"stage": "intro", "scheduledAt": "2026-10-09T15:00:00Z",
+                      "caller": {"enabled": True, "callerName": "Sam", "method": "video"}},
+        })
+    assert r.status_code == 201, r.text
+    assert r.json()["stageHistory"][-1]["confirmed"] is True and r.json()["confirmed"] is True
 
 
 async def test_other_user_cannot_confirm(client):

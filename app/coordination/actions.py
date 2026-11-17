@@ -185,14 +185,19 @@ async def choose_caller(click: Click, user: UserExtra) -> None:
 
 
 async def confirm(click: Click, user: UserExtra) -> None:
-    """The Confirm button. `confirm_round` syncs the post, which then shows "confirmed"; only a refusal replies."""
+    """The Confirm button of an old post (assigning a caller now confirms the round, and new posts have no Confirm
+    button). `confirm_round` syncs the post, which re-renders without the button; only a refusal replies. A round
+    confirmed since is answered and its post re-rendered, so the stale button goes away."""
+    from app.routers import interviews as ivr
+
     parts = click.value.split(":")
     if len(parts) != 2 or not all(parts):
         await reply(click.response_url, ROUND_GONE)
         return
     found = await _find_round(parts[0], parts[1])
-    if found is not None and found[1].confirmed:  # an old click on a round confirmed since: still answered
+    if found is not None and found[1].confirmed:
         await reply(click.response_url, ALREADY_CONFIRMED)
+        await ivr._sync_caller_posts(found[0], {})  # an empty "before" re-renders the post
         return
     try:
         await confirm_round(parts[0], parts[1], user, True)

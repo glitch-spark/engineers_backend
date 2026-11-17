@@ -6,12 +6,12 @@ interview in the private SLACK_CALLER_CHANNEL_ID (the coordination channel), the
 SLACK_CALLER_DAILY_CHANNEL_ID, and each daily plan in SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the
 plan changes).
 
-The #caller post is built in app/coordination/blocks.py (Choose caller, Confirm, Download brief, Open interview). It
+The #caller post is built in app/coordination/blocks.py (Choose caller, Download brief, Open interview). It
 describes the interview's latest round and is rewritten with chat.update whenever the round changes; the thread gets
 no change-log replies.
 
 Each morning (SLACK_CALLER_DAILY_TIME) one day post lists every round of the local day, whoever is on the call, with
-Confirm / Assign caller / Download brief buttons; it is edited in place whenever an interview changes. About 30
+Assign caller / Download brief buttons (assigning a caller confirms the round; old Confirm buttons still work); it is edited in place whenever an interview changes. About 30
 minutes before a round starts it gets a reminder reply in the day post's thread, built like its block in the post.
 Dedup rows (SlackAlertLog) use the keys "interview-day:<YYYY-MM-DD>" and "round-reminder:<roundId>:<startEpoch>";
 there are no per-user digest DMs. Once SLACK_CALLER_ASKS_FROM is set, app/coordination/chase.py also replies in each

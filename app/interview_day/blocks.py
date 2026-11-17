@@ -13,7 +13,7 @@ MAX_BLOCKS = 50  # Slack's limit per message
 MAX_SECTION_TEXT = 3000  # Slack rejects the whole message when a section's text is longer
 # Caps on typed text (the link field can hold a whole pasted invite), so one round cannot sink the post.
 MAX_NAME, MAX_LINK = 200, 300
-CONFIRM_ACTION_ID = "interview_confirm"
+CONFIRM_ACTION_ID = "interview_confirm"  # no longer rendered (assigning confirms); old posts still carry it
 
 
 def _who(user: Optional[UserExtra], fallback: str = "someone") -> str:
@@ -63,15 +63,14 @@ def _method_part(r: DayRound) -> str:
 def _on_the_call(r: DayRound, managers: Sequence[UserExtra]) -> str:
     owner = _who(r.owner, "—")
     flag = f" — {_tags(managers)}" if managers else ""
-    state = "✅ confirmed" if r.confirmed else "⏳ not confirmed"
     if r.caller == "self":
         return f"On the call: Self · {owner}" if r.owner is not None else "On the call: Self"
     if r.caller == "tbd":
         return f"⚠️ No caller yet{flag} · owner {owner}"
     if r.caller == "user":
         name = _who(r.caller_user, r.caller_name)
-        return f"On the call: {name} (caller) {state} · owner {owner}"
-    return f"caller {_short(r.caller_name, MAX_NAME, 'someone')} (external) {state}{'' if r.confirmed else flag} · owner {owner}"
+        return f"On the call: {name} (caller) · owner {owner}"
+    return f"caller {_short(r.caller_name, MAX_NAME, 'someone')} (external) · owner {owner}"
 
 
 def _button(label: str, *, url: Optional[str] = None, style: Optional[str] = None, **extra: Any) -> dict:
@@ -106,8 +105,6 @@ def round_blocks(
     ]
     if r.caller == "tbd":
         elements.append(_button("Assign caller", url=f"{base}/interviews/callers?round={ref}"))
-    elif r.caller in ("user", "external") and not r.confirmed:
-        elements.append(_button("Confirm", style="primary", action_id=CONFIRM_ACTION_ID, value=ref))
     return [
         {"type": "section", "text": {"type": "mrkdwn", "text": _cap("\n".join(lines))}},
         {"type": "actions", "elements": elements},

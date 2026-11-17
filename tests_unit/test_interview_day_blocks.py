@@ -73,13 +73,11 @@ def test_user_caller_tagged_with_owner_cc():
     r = rnd(caller="user", caller_name="Sam", caller_user=CALLER)
     bs = blocks(r)
     assert "<@U0CALLER01> (caller)" in text_of(bs) and "owner <@U0OWNER001>" in text_of(bs)
-    assert "⏳ not confirmed" in text_of(bs)
-    confirm = buttons(bs)["Confirm"]
-    assert confirm["action_id"] == "interview_confirm" and confirm["value"] == "IV:R"
-    assert list(buttons(bs)) == ["Download brief", "Open interview", "Confirm"]
+    assert "confirmed" not in text_of(bs)  # assigning confirms: no Confirm step, no confirmed wording
+    assert list(buttons(bs)) == ["Download brief", "Open interview"]
 
     done = blocks(rnd(caller="user", caller_name="Sam", caller_user=CALLER, confirmed=True))
-    assert "✅ confirmed" in text_of(done) and "Confirm" not in buttons(done)
+    assert "confirmed" not in text_of(done) and list(buttons(done)) == ["Download brief", "Open interview"]
 
 
 def test_tbd_round_flags_managers_and_offers_assign():
@@ -90,13 +88,12 @@ def test_tbd_round_flags_managers_and_offers_assign():
     assert "Confirm" not in btn
 
 
-def test_external_unconfirmed_tags_managers():
-    bs = blocks(rnd(caller="external", caller_name="Pietro"))
-    assert "caller Pietro (external)" in text_of(bs)
-    assert "⏳ not confirmed — <@U0MANAGER1>" in text_of(bs)
-    assert "Confirm" in buttons(bs) and "Assign caller" not in buttons(bs)
-    done = blocks(rnd(caller="external", caller_name="Pietro", confirmed=True))
-    assert "✅ confirmed" in text_of(done) and "<@U0MANAGER1>" not in text_of(done) and "Confirm" not in buttons(done)
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_external_caller_has_no_confirm_and_no_manager_tag(confirmed):
+    bs = blocks(rnd(caller="external", caller_name="Pietro", confirmed=confirmed))
+    assert "caller Pietro (external) · owner" in text_of(bs)
+    assert "confirmed" not in text_of(bs) and "<@U0MANAGER1>" not in text_of(bs)
+    assert list(buttons(bs)) == ["Download brief", "Open interview"]
 
 
 @pytest.mark.parametrize("bad", [{"isActive": False}, {"slackUserId": None}])
@@ -221,7 +218,7 @@ async def test_typed_name_without_a_caller_id_is_a_named_external_caller_not_tbd
     assert [(r.caller, r.caller_name) for r in got] == [
         ("external", "Sam"), ("tbd", "TBD"), ("tbd", "tbd"), ("tbd", " "), ("tbd", ""),
     ]
-    assert "Confirm" in buttons(blocks(got[0])) and "Assign caller" not in buttons(blocks(got[0]))
+    assert "Assign caller" not in buttons(blocks(got[0])) and "Assign caller" in buttons(blocks(got[1]))
 
 
 # --- limits and link text -------------------------------------------------------------------------

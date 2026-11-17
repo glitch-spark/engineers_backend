@@ -60,7 +60,7 @@ def test_post_reads_like_the_sketch():
     assert [b["type"] for b in bs] == ["section", "actions"]
     assert lines(bs) == [
         f"📞 *Lumin Digital · Intro · {slack_time(START)} · Brandon Mayer*",
-        "Owner <@U0JUSTIN01> · Caller: <@U0NICK0001> ✅ confirmed · Video meeting (<https://meet.x/abc|link>)",
+        "Owner <@U0JUSTIN01> · Caller: <@U0NICK0001> · Video meeting (<https://meet.x/abc|link>)",
     ]
     assert ids(bs) == ["coord_choose_caller", "coord_open_brief", "coord_open_interview"]
     by = {e["action_id"]: e for e in bs[1]["elements"]}
@@ -68,12 +68,14 @@ def test_post_reads_like_the_sketch():
     assert by["coord_open_interview"]["url"] == f"https://app.x/interviews?panel={IV}"
 
 
-def test_unconfirmed_caller_gets_confirm():
-    _, bs = build(rnd(confirmed=False))
-    assert "⏳ not confirmed" in lines(bs)[1]
-    assert ids(bs) == ["coord_choose_caller", "coord_confirm", "coord_open_brief", "coord_open_interview"]
-    confirm = bs[1]["elements"][1]
-    assert confirm["value"] == f"{IV}:{R}" and confirm["style"] == "primary"
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_no_confirm_button_and_no_confirmed_wording(confirmed):
+    """Assigning a caller confirms the round: the post has no Confirm step, whatever the stored flag says."""
+    _, bs = build(rnd(confirmed=confirmed))
+    assert "confirmed" not in lines(bs)[1]
+    assert ids(bs) == ["coord_choose_caller", "coord_open_brief", "coord_open_interview"]
+    ext = rnd(caller="external", caller_name="Pietro", caller_user=None, caller_id="e1", confirmed=confirmed)
+    assert "coord_confirm" not in ids(build(ext)[1])
 
 
 def test_tbd_tags_managers():
@@ -98,7 +100,7 @@ def test_external_caller_is_the_initial_option():
     select = bs[1]["elements"][0]
     assert select["initial_option"]["value"] == f"{IV}:{R}:{ext['_id']}"
     assert select["initial_option"]["text"] == {"type": "plain_text", "text": "Pietro & Co"}
-    assert "Caller: Pietro &amp; Co ⏳ not confirmed" in lines(bs)[1]
+    assert "Caller: Pietro &amp; Co · Video meeting" in lines(bs)[1]
 
 
 def test_unlisted_caller_has_no_initial_option():
