@@ -11,7 +11,7 @@ from beanie import PydanticObjectId
 from app.interview_caller import ENDED_STATUSES, caller_unassigned
 from app.interview_normalize import interview_status_value, normalize_stage
 from app.models import Account, Interview, UserExtra
-from app.models.interview import InterviewStage
+from app.models.interview import InterviewStage, InterviewStageEvent
 from app.slack_bot import _aware_utc, _profile_label
 
 CallerState = Literal["self", "tbd", "external", "user"]
@@ -21,7 +21,7 @@ CallerState = Literal["self", "tbd", "external", "user"]
 class DayRound:
     interview_id: str
     round_id: str
-    start: datetime  # aware UTC
+    start: Optional[datetime]  # aware UTC; None for a legacy round with no time yet (shown as TBD)
     company: str
     stage: str  # the stage key ("tech_round_1"); the builder labels it
     profile: str
@@ -35,6 +35,8 @@ class DayRound:
     confirmed: bool
     owner: Optional[UserExtra]
     thread_link: Optional[str] = None  # filled by the day post from #caller, not here
+    status: str = "scheduled"  # scheduled | completed | passed | rejected | canceled
+    caller_id: str = ""  # the user's or external caller's id; "" for self / tbd
 
 
 def _is_round(entry: Any, start: datetime, end: datetime) -> bool:
@@ -68,6 +70,37 @@ async def _by_id(model: Any, ids: set[PydanticObjectId]) -> dict[str, Any]:
     return {str(doc.id): doc for doc in await model.find({"_id": {"$in": list(ids)}}).to_list()}
 
 
+def day_round(
+    iv: Interview, no: int, entry: InterviewStageEvent, *,
+    owner: Optional[UserExtra], account: Optional[Account], caller_user: Optional[UserExtra],
+) -> DayRound:
+    """One round as the Slack builders read it. `caller_user` is the platform user of a "user" caller."""
+    caller, state = entry.caller, _caller_state(entry.caller)
+    user = caller_user if state == "user" else None
+    name = "Self" if state == "self" else ((user.name or user.email) if user else None) or caller.callerName
+    at = entry.scheduledAt
+    return DayRound(
+        interview_id=str(iv.id),
+        round_id=entry.id,
+        start=_aware_utc(at) if at is not None else None,
+        company=(iv.companyName or "").strip(),
+        stage=normalize_stage(entry.stage) or "",
+        profile=_profile_label(account),
+        position=(iv.appliedPosition or "").strip(),
+        round_no=no,
+        # A self round is not a caller call: a method kept from an earlier caller is not shown.
+        method=(caller.method or "") if state != "self" else "",
+        link=(caller.methodValue or "").strip() if state != "self" else "",
+        caller=state,
+        caller_name=name,
+        caller_user=user,
+        confirmed=bool(entry.confirmed),
+        owner=owner,
+        status=interview_status_value(entry.status) or "scheduled",
+        caller_id=(caller.callerId or "") if state in ("user", "external") else "",
+    )
+
+
 async def load_rounds(start: datetime, end: datetime) -> list[DayRound]:
     """Active rounds starting in [start, end) of every interview, by start. Home assessments are not calls and
     ended (canceled / rejected) rounds are off, so neither is listed."""
@@ -85,28 +118,10 @@ async def load_rounds(start: datetime, end: datetime) -> list[DayRound]:
     caller_ids = {_object_id(e.caller.callerId) for _, _, e in rows if _caller_state(e.caller) == "user"}
     callers = await _by_id(UserExtra, {i for i in caller_ids if i is not None})
 
-    out: list[DayRound] = []
-    for iv, no, e in rows:
-        caller, state = e.caller, _caller_state(e.caller)
-        user = callers.get(str(caller.callerId)) if state == "user" else None
-        name = "Self" if state == "self" else ((user.name or user.email) if user else None) or caller.callerName
-        out.append(DayRound(
-            interview_id=str(iv.id),
-            round_id=e.id,
-            start=_aware_utc(e.scheduledAt),
-            company=(iv.companyName or "").strip(),
-            stage=normalize_stage(e.stage) or "",
-            profile=_profile_label(accounts.get(str(iv.accountId))),
-            position=(iv.appliedPosition or "").strip(),
-            round_no=no,
-            # A self round is not a caller call: a method kept from an earlier caller is not shown.
-            method=(caller.method or "") if state != "self" else "",
-            link=(caller.methodValue or "").strip() if state != "self" else "",
-            caller=state,
-            caller_name=name,
-            caller_user=user,
-            confirmed=bool(e.confirmed),
-            owner=owners.get(str(iv.createdBy)),
-        ))
-    out.sort(key=lambda r: r.start)
+    out = [
+        day_round(iv, no, e, owner=owners.get(str(iv.createdBy)), account=accounts.get(str(iv.accountId)),
+                  caller_user=callers.get(str(e.caller.callerId)) if _caller_state(e.caller) == "user" else None)
+        for iv, no, e in rows
+    ]
+    out.sort(key=lambda r: r.start)  # every listed round has a time
     return out
