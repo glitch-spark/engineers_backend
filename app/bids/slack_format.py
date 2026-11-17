@@ -86,18 +86,29 @@ def _bidder_line(kind: Kind, r: BidReportRow) -> str:
     return line
 
 
+def _short_profile(name: str) -> str:
+    """A profile name as the My bids line shows it: the text after the last "|", cut at the first "(", trimmed.
+    "Brazil | Fabricio Suzuki(Senior Data Engineer)" -> "Fabricio Suzuki". Falls back to the full name when
+    that leaves nothing."""
+    short = name.rsplit("|", 1)[-1].split("(", 1)[0].strip()
+    return short or name
+
+
 def _my_bids_line(profiles: Mapping[str, int]) -> Optional[str]:
-    """"My bids — 35 (Arda 12 · Cory 23)": the owner's own bids per profile; never part of any total."""
-    shown = sorted(((name, n) for name, n in profiles.items() if (n or 0) > 0), key=lambda p: p[0].lower())
+    """"_My bids · 35 — Arda 12 · Cory 23_" (italic, so it stands apart): the owner's own bids per profile;
+    never part of any total."""
+    shown = sorted(((name, n) for name, n in profiles.items() if (n or 0) > 0), key=lambda p: (_short_profile(p[0]).lower(), p[0].lower()))
     if not shown:
         return None
-    return (f"My bids — {sum(n for _, n in shown):,} ("
-            + " · ".join(f"{_slack_escape(name)} {n:,}" for name, n in shown) + ")")
+    return (f"_My bids · {sum(n for _, n in shown):,} — "
+            + " · ".join(f"{_slack_escape(_short_profile(name))} {n:,}" for name, n in shown) + "_")
 
 
 def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow],
-                    my_bids_line: Optional[str] = None) -> list[str]:
-    """One mrkdwn text per owner; split into "(cont.)" sections to stay under Slack's 3,000-char limit."""
+                    my_bids_line: Optional[str] = None) -> tuple[str, list[str]]:
+    """(header, bodies) for one owner. The header is the short line that carries the button; the bodies hold the
+    bidder lines and the My bids line, with no accessory so they get the full message width. Long owners split
+    into "(cont.)" bodies to stay under Slack's 3,000-char limit; bodies is empty when there are no lines."""
     ok = [r for r in rows if not r.error]
     failed = len(rows) - len(ok)
     head = f"*{_owner_label(label)}*"
@@ -112,14 +123,17 @@ def _owner_sections(kind: Kind, label: str, rows: Sequence[BidReportRow],
     if my_bids_line:
         lines.append(my_bids_line)
     cont = f"{head} (cont.)"
-    sections, current = [], head
+    bodies: list[str] = []
+    current = ""
     for line in lines:
-        if len(current) + 1 + len(line) > MAX_SECTION_CHARS:
-            sections.append(current)
-            current = cont
-        current += "\n" + line
-    sections.append(current)
-    return sections
+        if current and len(current) + 1 + len(line) > MAX_SECTION_CHARS:
+            bodies.append(current)
+            current = cont + "\n" + line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        bodies.append(current)
+    return head, bodies
 
 
 def _owner_button(kind: Kind, app_url: str, owner_id: str, period_key: str, pending: int) -> dict:
@@ -139,7 +153,7 @@ def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[Bid
                   my_bids: Optional[Mapping[str, Mapping[str, int]]] = None) -> tuple[str, list[list[dict]]]:
     """Return (fallback_text, messages); messages[0] is the channel post, the rest are thread replies.
     Only bidders with bids are listed. `my_bids` maps owner id -> {profile name: own bids}; it adds a line to the
-    owner's section and is never counted in a total. `updated_at` is set when a posted report is edited after
+    owner's body section and is never counted in a total. `updated_at` is set when a posted report is edited after
     a review, and shown in the footer."""
     start, end = start.astimezone(tz), end.astimezone(tz)
     period_key = rows[0].periodKey if rows else end.date().isoformat()  # the report day the buttons open
@@ -179,14 +193,20 @@ def format_report(kind: Kind, start: datetime, end: datetime, rows: Sequence[Bid
         updated_at = updated_at.astimezone(tz)
         footer += f" · updated {updated_at:%a} {_time(updated_at)}"
 
-    blocks = [_section(header)]
+    # Packed in units that must not be split across messages: an owner's header and its first body stay together.
+    units: list[list[dict]] = [[_section(header)]]
     for owner_id, owner, owner_rows in resolved:
         accessory = None
         if buttons:
             pending = sum(r.pending or 0 for r in owner_rows if not r.error)
             accessory = _owner_button(kind, app_url, owner_id, period_key, pending)
-        for i, text in enumerate(_owner_sections(kind, owner.label, owner_rows, my_lines.get(owner_id))):
-            blocks.append(_section(text, accessory if i == 0 else None))
-    blocks.append(_section(footer))
-    messages = [blocks[i:i + MAX_BLOCKS] for i in range(0, len(blocks), MAX_BLOCKS)]
+        head, bodies = _owner_sections(kind, owner.label, owner_rows, my_lines.get(owner_id))
+        units.append([_section(head, accessory)] + [_section(b) for b in bodies[:1]])
+        units.extend([_section(b)] for b in bodies[1:])
+    units.append([_section(footer)])
+    messages: list[list[dict]] = [[]]
+    for unit in units:
+        if messages[-1] and len(messages[-1]) + len(unit) > MAX_BLOCKS:
+            messages.append([])
+        messages[-1].extend(unit)
     return fallback, messages
