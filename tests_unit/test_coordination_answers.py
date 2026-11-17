@@ -453,6 +453,30 @@ async def test_stale_submission_says_already_updated(slack, cast):
     assert status_of(await tip(iv)) == "canceled"
 
 
+@pytest.mark.parametrize("kind", ["cancel", "reschedule"])
+async def test_form_from_an_old_ask_cannot_apply_after_a_move(slack, cast, monkeypatch, kind):
+    """The form was opened from the old ask; the round was then moved later. The submission writes nothing."""
+    iv = await make_interview(cast)
+    if kind == "cancel":
+        view = submission(modals.cancel_view(origin(iv), "Acme · Intro"), note="Recruiter canceled")
+    else:
+        view = submission(modals.reschedule_view(origin(iv), "Acme · Intro", start=START),
+                          date="2026-11-18", time="10:15")
+    later = datetime.now(UTC).replace(microsecond=0) + timedelta(days=2)
+    moved = await Interview.get(iv.id)
+    moved.stageHistory[-1].scheduledAt = later
+    moved.stageHistory[-1].endsAt = later + timedelta(hours=1)
+    await moved.save()
+    spy = AsyncMock(wraps=interviews.update_interview_stage)
+    monkeypatch.setattr(interviews, "update_interview_stage", spy)
+    await modals.process_coordination_submission(view, "U0JUSTIN01")
+    spy.assert_not_awaited()
+    assert slack.of("chat.postEphemeral") == [{"channel": "C1", "user": "U0JUSTIN01", "text": MOVED}]
+    assert slack.of("chat.update") == []
+    entry = await tip(iv)
+    assert status_of(entry) == "scheduled" and slack_bot._aware_utc(entry.scheduledAt) == later
+
+
 async def test_malformed_submission_tries_again(slack, cast):
     iv = await make_interview(cast)
     view = submission(modals.reschedule_view(origin(iv), "Acme · Intro", start=START), date="nope", time="10:15")

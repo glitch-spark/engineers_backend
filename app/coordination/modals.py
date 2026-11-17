@@ -259,6 +259,14 @@ async def process_coordination_submission(view: dict, slack_user_id: str) -> Non
         if status != _NEEDED_STATUS[answer.kind]:
             await tell(actions.ALREADY.format(Label=status.capitalize()))
             return
+        if answer.kind in ("canceled", "rescheduled") and entry.scheduledAt is not None:
+            # A form opened from an old ask must not apply to a round that was moved since and hasn't ended.
+            from app.routers.interviews import round_ends_at
+
+            end = slack_bot._aware_utc(round_ends_at(entry.scheduledAt, entry.endsAt))
+            if end > datetime.now(timezone.utc):
+                await tell(actions.MOVED)
+                return
 
         iv_id, round_id = origin.ref.split(":")
         try:
