@@ -418,3 +418,12 @@ async def test_list_bids_week_filter(make_client):
 async def test_list_bids_day_and_week_is_400(make_client):
     r = await make_client(await make_user("Pedro")).get("/bids", params={"day": "2026-10-05", "week": "2026-10-10"})
     assert (r.status_code, r.json()["detail"]) == (400, "use day or week, not both")
+
+
+def test_pay_weeks_touching_across_the_switch():
+    from app.bids.week import pay_weeks_touching
+
+    weeks = pay_weeks_touching(sched_on, chi(11, 25, 9), date(2026, 11, 1), date(2026, 11, 25))
+    assert [w.cutoff.date().isoformat() for w in weeks] == ["2026-11-29", "2026-11-22", "2026-11-14", "2026-11-07"]
+    one = pay_weeks_touching(sched_on, chi(11, 25, 9), date(2026, 11, 22), date(2026, 11, 22))
+    assert [w.cutoff.date().isoformat() for w in one] == ["2026-11-22"]

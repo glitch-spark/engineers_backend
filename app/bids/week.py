@@ -60,6 +60,22 @@ def pay_week(sched: BidSchedule, now: datetime, week: Optional[date] = None) -> 
     return PayWeek(start, end, cutoff, days)
 
 
+def pay_weeks_touching(sched: BidSchedule, now: datetime, first: date, last: date) -> list[PayWeek]:
+    """Every pay week with a report day in [first, last], newest first (the week at the schedule switch is longer, so
+    stepping back goes week by week from `last`, never by counting 7 days)."""
+    out: list[PayWeek] = []
+    if first > last:
+        return out
+    pw = pay_week(sched, now, last)
+    while pw.days:
+        if date.fromisoformat(pw.days[-1].key) < first:
+            break
+        if date.fromisoformat(pw.days[0].key) <= last:
+            out.append(pw)
+        pw = pay_week(sched, now, date.fromisoformat(pw.days[0].key) - timedelta(days=1))
+    return out
+
+
 def _sum_or_none(values) -> Optional[float]:
     """Sum of the values; None when any is unknown (a folder day or a failed listing), since a partial sum would
     pass for the total."""

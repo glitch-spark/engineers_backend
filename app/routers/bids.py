@@ -18,7 +18,7 @@ from app.bids.performance import day_columns, pay_week_columns, performance
 from app.bids.records import _naive_utc, count_by_status, refresh_report_rows
 from app.bids.schemas import _iso_utc
 from app.bids.storage import BidStorageError, count_folders, get_bid_storage
-from app.bids.week import PayWeek, combine_boards, pay_week, week_board, week_label
+from app.bids.week import PayWeek, combine_boards, pay_week, pay_weeks_touching, week_board, week_label
 from app.profile_metrics import bid_report_day
 from app.bids.windows import (daily_cutoff_on, latest_cutoff, next_cutoff, open_window, period_key,
                               report_day, schedule_from_settings, window_for)
@@ -27,6 +27,7 @@ from app.deps import get_current_user
 from app.interview_rates import label, window
 from app.models import UserExtra
 from app.models.bid import Bid
+from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
 from app.routers._util import to_object_id
 from app.routers.metrics import _stats_days
@@ -643,6 +644,86 @@ async def bids_backlog(
     return {"today": today.isoformat(), "total": sum(r["pending"] for r in rows),
             "todayCount": sum(d == today for v in days.values() for d in v),
             "oldestDay": min((r["oldestDay"] for r in rows), default=None), "bidders": rows}
+
+
+def _pay_bidder(bidder_id, name, country, profile, owner_id, owner_name, approved, pending, rate, pay, error) -> dict:
+    return {"bidderId": str(bidder_id), "name": name, "country": country, "profileName": profile,
+            "ownerId": str(owner_id), "ownerName": owner_name, "approved": approved, "pending": pending, "rate": rate,
+            "pay": pay, "error": error}
+
+
+@router.get("/pay")
+async def bids_pay(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: str = Query("week"),
+    date: str = Query(""),
+    to: str = Query(""),
+    weeks: Annotated[int, Query(ge=1, le=2)] = 1,
+    ownerId: Optional[str] = None,
+) -> dict:
+    """Each pay week's pay per bidder, newest week first, for a pay week (`weeks=2`: that and the one before), a month
+    or a custom range (every pay week touching it). A closed week is what its weekly report stored (so a later rate
+    edit never changes it; `source` "report"), falling back to the live board when nothing was stored; the open week is
+    the live board. Staff: their own bidders; an admin: one owner's (`ownerId`) or everyone's. Archived bidders are
+    listed only with approved or pending bids."""
+    sched, now = schedule_from_settings(), _now()
+    p = bid_period(period, date, to, now, weeks)
+    if p.pay_week:
+        pws = [p.pay_week]
+    elif p.pay_weeks:
+        pws = list(reversed(p.pay_weeks))
+    else:
+        pws = pay_weeks_touching(sched, now, p.start, p.end)
+    owner = to_object_id(ownerId) if ownerId else None
+    visible = await _visible_bidders(user, owner)
+    by_id = {b.id: b for b in visible}
+    if user.role != "admin":
+        owner_scope = {user.id} if owner in (None, user.id) else set()
+    else:
+        owner_scope = {owner} if owner else None
+    owner_ids = {b.createdBy for b in visible}
+    reports: dict[str, list[BidReport]] = {}
+    for pw in pws:
+        if pw.end <= now:
+            query: dict = {"kind": "weekly", "periodKey": period_key(pw.cutoff)}
+            if owner_scope is not None:
+                query["ownerId"] = {"$in": list(owner_scope)}
+            reports[period_key(pw.cutoff)] = await BidReport.find(query).to_list() if owner_scope != set() else []
+            owner_ids.update(r.ownerId for r in reports[period_key(pw.cutoff)])
+    names = {u.id: u.name for u in await UserExtra.find({"_id": {"$in": list(owner_ids)}}).to_list()} if owner_ids else {}
+
+    out_weeks = []
+    for pw in pws:
+        key, closed = period_key(pw.cutoff), pw.end <= now
+        rows = reports.get(key, []) if closed else []
+        if rows:
+            source, bidders = "report", []
+            for r in rows:
+                bidder = by_id.get(r.bidderId)
+                if bidder is not None and bidder.archivedAt is not None and not (r.count or 0) and not (r.pending or 0):
+                    continue
+                bidders.append(_pay_bidder(r.bidderId, r.bidderName, r.country, r.profileName, r.ownerId,
+                                           names.get(r.ownerId), r.count, r.pending, r.rate, r.amount, r.error))
+        else:
+            source, bidders = "live", []
+            board = await week_board(visible, pw, now, sched, get_bid_storage(), FOLDER_CACHE) if visible else None
+            for r in board["bidders"] if board else []:
+                w = r["week"]
+                if r["status"] == "archived" and not (w["approved"] or 0) and not (w["pending"] or 0):
+                    continue
+                bidders.append(_pay_bidder(r["id"], r["name"], r["country"], r["profileName"], r["ownerId"],
+                                           r["ownerName"], w["approved"], w["pending"], r["rate"], w["pay"], w["error"]))
+        bidders.sort(key=lambda b: ((b["ownerName"] or "").lower(), b["name"].lower()))
+        pays = [b["pay"] for b in bidders if b["pay"] is not None]
+        out_weeks.append({
+            "weekEnd": key, "label": week_label(pw), "end": _iso_utc(pw.end), "first": pw.days[0].key,
+            "last": pw.days[-1].key, "state": "closed" if closed else "open", "source": source, "bidders": bidders,
+            "totals": {"approved": sum(b["approved"] or 0 for b in bidders), "pending": sum(b["pending"] or 0 for b in bidders),
+                       "pay": round(sum(pays), 2), "errors": sum(1 for b in bidders if b["error"])},
+        })
+    return {"label": p.label, "timezone": sched.tz.key,
+            "first": min((w["first"] for w in out_weeks), default=p.start.isoformat()),
+            "last": max((w["last"] for w in out_weeks), default=p.end.isoformat()), "weeks": out_weeks}
 
 
 @router.get("/{bid_id}")

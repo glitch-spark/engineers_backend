@@ -263,3 +263,113 @@ async def test_backlog_admin_any_owner_or_all(db, switch_on, monkeypatch):
     s = await seed_backlog(monkeypatch)
     assert (await backlog(s["boss"], ownerId=str(s["maria"].id)))["total"] == 1
     assert (await backlog(s["boss"]))["total"] == 6
+
+
+# ---- /bids/pay -------------------------------------------------------------------------------------------------
+
+
+async def pay(user, **kw):
+    return await bids_router.bids_pay(user, **{"period": "week", "date": "", "to": "", "weeks": 1, "ownerId": None, **kw})
+
+
+async def stored(bidder, count, week_end="2026-11-22", pending=0, rate=0.06, amount=None) -> BidReport:
+    """A weekly report row of `bidder` for the pay week ending `week_end` (the Sunday of the long week by default)."""
+    return await BidReport(
+        kind="weekly", periodKey=week_end, periodStart=datetime(2026, 11, 15, 2), periodEnd=datetime(2026, 11, 23, 2),
+        bidderId=bidder.id, ownerId=bidder.createdBy, bidderName=bidder.name, country="US", profileName="Main",
+        rate=rate, count=count, amount=round(count * rate, 2) if amount is None else amount, pending=pending,
+        rejected=0).insert()
+
+
+async def seed_pay(monkeypatch) -> dict:
+    """Wed 2026-11-25 09:00 CST. Ana's stored report for the week ending Nov 22: 158 approved at $0.06 (9.48), 3 pending;
+    her live rate is then edited to 0.10. She has 2 approved bids in the long week and 1 approved + 1 pending on Nov 24."""
+    s = await seed()
+    at(monkeypatch, datetime(2026, 11, 25, 9))
+    await stored(s["ana"], 158, pending=3, amount=9.48)
+    s["ana"].rate = 0.10
+    await s["ana"].save()
+    for d in (datetime(2026, 11, 17, 10), datetime(2026, 11, 20, 10)):
+        await bid(s["ana"], "approved", d)
+    await bid(s["ana"], "approved", datetime(2026, 11, 24, 10))
+    await bid(s["ana"], "pending", datetime(2026, 11, 24, 11))
+    return s
+
+
+def row(week: dict, name: str) -> dict:
+    return next(b for b in week["bidders"] if b["name"] == name)
+
+
+async def test_pay_closed_week_uses_the_stored_report(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    r = await pay(s["pedro"], date="2026-11-22")
+    assert (r["label"], r["timezone"], r["first"], r["last"]) == (
+        "Week ending Sun Nov 22", "America/Chicago", "2026-11-15", "2026-11-22")
+    (w,) = r["weeks"]
+    assert (w["weekEnd"], w["state"], w["source"], w["label"], w["first"], w["last"]) == (
+        "2026-11-22", "closed", "report", "Week ending Sun Nov 22", "2026-11-15", "2026-11-22")
+    assert w["end"].startswith("2026-11-23T02:00")
+    assert w["bidders"] == [{
+        "bidderId": str(s["ana"].id), "name": "Ana", "country": "US", "profileName": "Main",
+        "ownerId": str(s["pedro"].id), "ownerName": "Pedro", "approved": 158, "pending": 3, "rate": 0.06,
+        "pay": 9.48, "error": None}]
+    assert w["totals"] == {"approved": 158, "pending": 3, "pay": 9.48, "errors": 0}
+
+
+async def test_pay_open_week_uses_the_live_board(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    r = await pay(s["pedro"])
+    (w,) = r["weeks"]
+    assert (w["state"], w["source"], w["weekEnd"]) == ("open", "live", "2026-11-29")
+    ana = row(w, "Ana")
+    assert (ana["approved"], ana["pending"], ana["rate"], ana["pay"]) == (1, 1, 0.10, 0.1)
+    assert ana["ownerName"] == "Pedro"
+
+
+async def test_pay_closed_week_without_a_report_is_live(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    r = await pay(s["pedro"], date="2026-11-14")
+    (w,) = r["weeks"]
+    assert (w["weekEnd"], w["state"], w["source"]) == ("2026-11-14", "closed", "live")
+
+
+async def test_pay_month_lists_the_pay_weeks_it_touches(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    r = await pay(s["pedro"], period="month", date="2026-11-01")
+    assert [w["weekEnd"] for w in r["weeks"]] == ["2026-11-29", "2026-11-22", "2026-11-14", "2026-11-07"]
+    assert (r["first"], r["last"]) == ("2026-11-01", "2026-11-29")
+
+
+async def test_pay_two_pay_weeks(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    r = await pay(s["pedro"], weeks=2)
+    assert [w["weekEnd"] for w in r["weeks"]] == ["2026-11-29", "2026-11-22"]
+
+
+async def test_pay_hides_archived_bidders_without_bids(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    await stored(s["lee"], 0)
+    r = await pay(s["pedro"], date="2026-11-22")
+    assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Ana"]
+    await BidReport.find_one(BidReport.bidderId == s["lee"].id).delete()
+    await stored(s["lee"], 4)
+    r = await pay(s["pedro"], date="2026-11-22")
+    assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Ana", "Lee"]
+
+
+async def test_pay_staff_see_only_their_own(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    await stored(s["mia"], 10, rate=0.5)
+    r = await pay(s["pedro"], date="2026-11-22")
+    assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Ana"]
+    r = await pay(s["pedro"], period="month", date="2026-11-01", ownerId=str(s["maria"].id))
+    assert all(w["bidders"] == [] for w in r["weeks"])
+
+
+async def test_pay_admin_any_owner_or_all(db, switch_on, monkeypatch):
+    s = await seed_pay(monkeypatch)
+    await stored(s["mia"], 10, rate=0.5)
+    r = await pay(s["boss"], date="2026-11-22", ownerId=str(s["maria"].id))
+    assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Mia"]
+    r = await pay(s["boss"], date="2026-11-22")
+    assert [b["name"] for b in r["weeks"][0]["bidders"]] == ["Mia", "Ana"]

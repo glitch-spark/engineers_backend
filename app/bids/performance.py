@@ -46,15 +46,13 @@ def day_columns(days: list[date]) -> list[dict]:
 
 def pay_week_columns(start: date, end: date, sched: BidSchedule) -> list[dict]:
     """Every pay week touching [start, end] (its report days), clipped to it; `partial` when the range cuts it."""
-    from app.bids.week import pay_week
+    from app.bids.week import pay_weeks_touching
 
-    out, d = [], start
-    while d <= end:
-        days = [date.fromisoformat(w.key) for w in pay_week(sched, datetime.now(timezone.utc), d).days]
-        first, last = days[0], days[-1]
+    out = []
+    for pw in reversed(pay_weeks_touching(sched, datetime.now(timezone.utc), start, end)):  # oldest first
+        first, last = date.fromisoformat(pw.days[0].key), date.fromisoformat(pw.days[-1].key)
         s, e = max(first, start), min(last, end)
         out.append({"start": s.isoformat(), "end": e.isoformat(), "partial": s != first or e != last})
-        d = last + timedelta(days=1)
     return out
 
 
