@@ -289,6 +289,19 @@ async def test_result_reminder_seven_days_after(slack, justin):
     assert [r.kind for r in await SlackAlertLog.find_all().to_list()] == [f"result-reminder:{rid}"]
 
 
+async def test_a_round_stored_without_a_status_gets_the_reminder(slack, justin, db):
+    iv = await add(justin)
+    raw = iv.model_dump()["stageHistory"]
+    raw[0]["status"] = None
+    await Interview.find_one(Interview.id == iv.id).update({"$set": {"stageHistory": raw}})
+    assert (await db["interviews"].find_one({}))["stageHistory"][0]["status"] is None  # stored without a status
+    # Its time is past, so loading reads it as completed (app/interview_normalize.py).
+    assert (await Interview.get(iv.id)).stageHistory[0].status.value == "completed"
+    assert await chase.run_result_reminders(utc(23, 19, 29)) == {"sent": 0, "failed": 0}
+    assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 1, "failed": 0}
+    assert action_ids(slack.posts()[0]) == ["coord_result_passed", "coord_result_rejected"]
+
+
 async def test_a_passed_round_gets_no_reminder(slack, justin):
     await add(justin, status="passed")
     assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 0, "failed": 0}

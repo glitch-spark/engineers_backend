@@ -45,9 +45,10 @@ class ChaseRound:
 
 
 def _status_query(status: str) -> Any:
-    # Stored values, not normalized ones: a legacy "rescheduled" and a missing status (None also matches a missing
-    # field) both read as scheduled.
-    return {"$in": ["scheduled", "rescheduled", None]} if status == "scheduled" else status
+    # Stored values, not normalized ones; the Python filter on the read status is the real check. A missing status
+    # (None also matches a missing field) reads as scheduled while the round is ahead and as completed once it is
+    # past (app/interview_normalize.py), and a legacy "rescheduled" reads as scheduled.
+    return {"$in": ["scheduled", "rescheduled", None]} if status == "scheduled" else {"$in": [status, None]}
 
 
 async def caller_rounds(status: str, *, ended_after: datetime, ended_by: datetime) -> list[ChaseRound]:
