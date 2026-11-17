@@ -5,12 +5,26 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import HTTPException
 
 from app import slack_bot
-from app.coordination.blocks import COORD_CHOOSE_CALLER, COORD_CONFIRM
+from app.caller_access import can_update_round
+from app.coordination.blocks import (
+    COORD_AFTER_CANCELED,
+    COORD_AFTER_COMPLETED,
+    COORD_AFTER_RESCHEDULED,
+    COORD_CHOOSE_CALLER,
+    COORD_CONFIRM,
+    COORD_RESULT_PASSED,
+    COORD_RESULT_REJECTED,
+    answered_blocks,
+)
+from app.coordination.modals import Origin, cancel_view, reject_view, reschedule_view
+from app.interview_day.blocks import _short, _who
+from app.interview_normalize import interview_status_value
 from app.models import Interview, UserExtra
 from app.models.interview import InterviewStageEvent
 from app.interview_caller import CallerIn
@@ -26,6 +40,10 @@ FORM_FAILED = "Couldn't open the form — click again."
 ROUND_GONE = "This round is gone."
 CHOOSE_REFUSED = "Only the owner or an interview manager can assign the caller."
 SELF_PICKED = "No caller (Self) — the caller request is off."
+UPDATE_REFUSED = "Only the owner or an interview manager can update this round."
+NEEDS_COMPLETED = "Mark the round completed first."
+ALREADY = "Already updated: {Label}."
+MOVED = "This round was moved — answer the new ask after it ends."
 
 
 @dataclass(frozen=True)
@@ -179,6 +197,177 @@ async def confirm(click: Click, user: UserExtra) -> None:
 
 HANDLERS[COORD_CHOOSE_CALLER] = choose_caller
 HANDLERS[COORD_CONFIRM] = confirm
+
+
+# --- after-call answers and results ----------------------------------------------------------------------------
+
+
+async def load_round(ref: str) -> tuple[Interview, InterviewStageEvent]:
+    """The interview and round named by "<interviewId>:<roundId>". `LookupError` when malformed or gone."""
+    parts = (ref or "").split(":")
+    if len(parts) != 2 or not all(parts):
+        raise LookupError(ref)
+    found = await _find_round(parts[0], parts[1])
+    if found is None:
+        raise LookupError(ref)
+    return found
+
+
+async def set_round(iv_id: str, round_id: str, user: UserExtra, **fields: Any) -> None:
+    """The app's round write. Only the given fields are sent, so a manager's PATCH carries nothing it may not."""
+    from app.routers import interviews as ivr
+
+    await ivr.update_interview_stage(iv_id, round_id, ivr.StagePatch(**fields), user)
+
+
+def round_status(entry: InterviewStageEvent) -> str:
+    """The round's status as the post reads it; a missing status is scheduled."""
+    return interview_status_value(entry.status) or "scheduled"
+
+
+def _label(status: str) -> str:
+    return status.capitalize()
+
+
+_ANSWER_HEADS = {
+    "completed": "✅ Completed", "canceled": "❌ Canceled", "passed": "🎉 Passed", "rejected": "❌ Rejected",
+}
+
+
+def answer_line(kind: str, user: UserExtra, *, note: str = "", new_start: Optional[datetime] = None) -> str:
+    """What an answered ask shows."""
+    head = f"🔁 Rescheduled to {slack_bot.slack_time(new_start)}" if kind == "rescheduled" else _ANSWER_HEADS[kind]
+    line = f"{head} — by {_who(user)}"
+    if kind == "canceled" and note:
+        line += f" · {_short(note, 200)}"
+    return line
+
+
+async def show_answer(iv: Interview, *, channel: str, ts: str, response_url: str, line: str) -> None:
+    """Replace the answered ask (or reminder) with its answer line. The coordination post itself is left alone: the
+    write already re-rendered it. Never raises."""
+    thread = iv.slackThread
+    if thread is not None and ts and ts == thread.ts:
+        return
+    try:
+        if response_url:
+            await replace(response_url, line, answered_blocks(line))
+        elif channel and ts:
+            await slack_bot._slack_api(
+                "chat.update", {"channel": channel, "ts": ts, "text": line, "blocks": answered_blocks(line)},
+            )
+    except Exception as exc:
+        log.warning("coordination: showing the answer on %s failed: %s", ts, exc)
+
+
+async def _clicked_round(
+    click: Click, user: UserExtra,
+) -> Optional[tuple[Interview, InterviewStageEvent]]:
+    """The clicked round when the clicker may update it; otherwise the refusal is replied and None returned."""
+    try:
+        iv, entry = await load_round(click.value)
+    except LookupError:
+        await reply(click.response_url, ROUND_GONE)
+        return None
+    if not can_update_round(iv, user):
+        await reply(click.response_url, UPDATE_REFUSED)
+        return None
+    return iv, entry
+
+
+async def _ask_still_open(click: Click, iv: Interview, entry: InterviewStageEvent) -> bool:
+    """The checks shared by the three after-call answers: the round is still scheduled, and has really ended (an old
+    ask answered after a reschedule must not touch the moved round). Replies and returns False otherwise."""
+    from app.routers import interviews as ivr
+
+    status = round_status(entry)
+    if status != "scheduled":
+        await reply(click.response_url, ALREADY.format(Label=_label(status)))
+        await show_answer(iv, channel=click.channel, ts=click.message_ts, response_url=click.response_url,
+                          line=f"Already updated: {_label(status)}")
+        return False
+    if entry.scheduledAt is not None:
+        end = slack_bot._aware_utc(ivr.round_ends_at(entry.scheduledAt, entry.endsAt))
+        if end > datetime.now(timezone.utc):
+            await reply(click.response_url, MOVED)
+            await show_answer(iv, channel=click.channel, ts=click.message_ts, response_url=click.response_url,
+                              line=MOVED)
+            return False
+    return True
+
+
+async def _write_and_show(click: Click, user: UserExtra, iv: Interview, entry: InterviewStageEvent, kind: str) -> None:
+    try:
+        await set_round(str(iv.id), entry.id, user, status=kind)
+    except HTTPException as exc:
+        await reply(click.response_url, str(exc.detail))
+        return
+    await show_answer(iv, channel=click.channel, ts=click.message_ts, response_url=click.response_url,
+                      line=answer_line(kind, user))
+
+
+async def _open_form(click: Click, iv: Interview, entry: InterviewStageEvent, build: Callable[..., dict],
+                     **extra: Any) -> None:
+    owner = await UserExtra.get(iv.createdBy) if iv.createdBy else None
+    origin = Origin(click.value, click.channel, click.message_ts, tz=slack_bot.resolve_user_tz(owner).key)
+    title = f"{iv.companyName or '—'} · {slack_bot._stage_label(entry.stage)}"
+    if not await open_modal(click.trigger_id, build(origin, title, **extra)):
+        await reply(click.response_url, FORM_FAILED)
+
+
+async def after_completed(click: Click, user: UserExtra) -> None:
+    found = await _clicked_round(click, user)
+    if found is None or not await _ask_still_open(click, *found):
+        return
+    await _write_and_show(click, user, *found, "completed")
+
+
+async def after_canceled(click: Click, user: UserExtra) -> None:
+    found = await _clicked_round(click, user)
+    if found is None or not await _ask_still_open(click, *found):
+        return
+    await _open_form(click, *found, cancel_view)
+
+
+async def after_rescheduled(click: Click, user: UserExtra) -> None:
+    found = await _clicked_round(click, user)
+    if found is None or not await _ask_still_open(click, *found):
+        return
+    iv, entry = found
+    await _open_form(click, iv, entry, reschedule_view, start=entry.scheduledAt or datetime.now(timezone.utc))
+
+
+async def _result_open(click: Click, entry: InterviewStageEvent) -> bool:
+    """A result can be set only on a completed round without one. Replies and returns False otherwise."""
+    status = round_status(entry)
+    if status in ("passed", "rejected"):
+        await reply(click.response_url, f"Result already set: {_label(status)}.")
+        return False
+    if status != "completed":
+        await reply(click.response_url, NEEDS_COMPLETED)
+        return False
+    return True
+
+
+async def result_passed(click: Click, user: UserExtra) -> None:
+    found = await _clicked_round(click, user)
+    if found is None or not await _result_open(click, found[1]):
+        return
+    await _write_and_show(click, user, *found, "passed")
+
+
+async def result_rejected(click: Click, user: UserExtra) -> None:
+    found = await _clicked_round(click, user)
+    if found is None or not await _result_open(click, found[1]):
+        return
+    await _open_form(click, *found, reject_view)
+
+
+HANDLERS[COORD_AFTER_COMPLETED] = after_completed
+HANDLERS[COORD_AFTER_CANCELED] = after_canceled
+HANDLERS[COORD_AFTER_RESCHEDULED] = after_rescheduled
+HANDLERS[COORD_RESULT_PASSED] = result_passed
+HANDLERS[COORD_RESULT_REJECTED] = result_rejected
 
 
 async def process_coordination_click(click: Click) -> None:

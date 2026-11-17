@@ -210,6 +210,85 @@ def submission_errors(view: dict, now: datetime) -> dict[str, str]:
         return {"note": FORM_ERROR}
 
 
+_NEEDED_STATUS = {"canceled": "scheduled", "rescheduled": "scheduled", "rejected": "completed"}
+
+
 async def process_coordination_submission(view: dict, slack_user_id: str) -> None:
-    """Apply a submitted form. Never raises."""
-    log.info("coordination submission for %s: %s", slack_user_id, view.get("callback_id"))
+    """Apply a submitted form through the app's round write; the post re-renders through its sync, and the answered
+    ask (or reminder) is replaced with its answer line. Runs after the form closed, so every check is made again
+    here and the submitter hears any refusal ephemerally. Never raises."""
+    from fastapi import HTTPException
+
+    from app import slack_bot
+    from app.coordination import actions
+    from app.caller_access import can_update_round
+
+    channel = ""
+    try:
+        try:
+            answer = read_submission(view)
+        except ValueError as exc:
+            log.warning("coordination submission from %s is malformed: %s", slack_user_id, exc)
+            raw = view.get("private_metadata") if isinstance(view, dict) else None
+            try:
+                channel = Origin.from_metadata(raw or "").channel
+            except ValueError:
+                channel = ""
+            if channel:
+                await actions.tell(channel, slack_user_id, actions.TRY_AGAIN)
+            return
+        origin = answer.origin
+        channel = origin.channel
+
+        async def tell(text: str) -> None:
+            await actions.tell(origin.channel, slack_user_id, text)
+
+        user = await actions.slack_platform_user(slack_user_id)
+        if user is None:
+            await tell(actions.NOT_LINKED)
+            return
+        try:
+            iv, entry = await actions.load_round(origin.ref)
+        except LookupError:
+            await tell(actions.ROUND_GONE)
+            return
+        if not can_update_round(iv, user):
+            await tell(actions.UPDATE_REFUSED)
+            return
+        status = actions.round_status(entry)
+        if status != _NEEDED_STATUS[answer.kind]:
+            await tell(actions.ALREADY.format(Label=status.capitalize()))
+            return
+
+        iv_id, round_id = origin.ref.split(":")
+        try:
+            if answer.kind == "rescheduled":
+                await actions.set_round(
+                    iv_id, round_id, user, scheduledAt=answer.new_start.isoformat(),
+                    **({"statusNote": answer.note} if answer.note else {}),
+                )
+            else:
+                await actions.set_round(iv_id, round_id, user, status=answer.kind, statusNote=answer.note)
+        except HTTPException as exc:
+            await tell(str(exc.detail))
+            return
+
+        if answer.kind == "rescheduled":
+            # Show the time actually saved (a time in a DST gap moves forward), in the owner's zone.
+            iv, entry = await actions.load_round(origin.ref)
+            saved = slack_bot._aware_utc(entry.scheduledAt) if entry.scheduledAt else answer.new_start
+            line = actions.answer_line("rescheduled", user, new_start=saved)
+            await actions.show_answer(iv, channel=origin.channel, ts=origin.ts, response_url="", line=line)
+            await tell(f"Rescheduled to {slack_bot.fmt_caller_time(saved, _zone(origin.tz))}.")
+            return
+        line = actions.answer_line(answer.kind, user, note=answer.note)
+        await actions.show_answer(iv, channel=origin.channel, ts=origin.ts, response_url="", line=line)
+    except Exception as exc:  # noqa: BLE001 - a background task: log, tell, never raise
+        log.exception("coordination submission from %s failed: %s", slack_user_id, exc)
+        if channel:
+            try:
+                from app.coordination import actions
+
+                await actions.tell(channel, slack_user_id, actions.TRY_AGAIN)
+            except Exception:  # noqa: BLE001
+                pass
