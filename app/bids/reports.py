@@ -7,7 +7,8 @@ a review that recounts a row marks it dirty and a later tick edits the post in p
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
 from beanie import PydanticObjectId
@@ -16,6 +17,7 @@ from pymongo.errors import BulkWriteError, DuplicateKeyError
 from app.bids.records import count_by_status, uses_records
 from app.bids.slack_format import Owner, format_report
 from app.bids.storage import BidStorage, count_folders, get_bid_storage
+from app.bids.week import pay_week
 from app.bids.windows import BidSchedule, Kind, latest_cutoff, period_key, schedule_from_settings, window_for
 from app.config import get_settings
 from app.models import Account, UserExtra
@@ -44,6 +46,7 @@ class ReportStore(Protocol):
     async def active_bidders(self) -> list: ...
     async def profile_names(self, ids: list[PydanticObjectId]) -> dict[str, str]: ...
     async def owners(self, ids: list[PydanticObjectId]) -> dict[str, Owner]: ...
+    async def my_bids(self, owner_ids: list[PydanticObjectId], first: date, last: date) -> dict[str, dict[str, int]]: ...
     async def save_post(self, kind: Kind, period_key: str, channel: str, ts: list[str]) -> None: ...
     async def dirty_posts(self) -> list: ...
     async def mark_synced(self, post, ts: list[str]) -> None: ...
@@ -110,6 +113,23 @@ class BeanieReportStore:
             return {}
         users = await UserExtra.find({"_id": {"$in": ids}}).to_list()
         return {str(u.id): Owner(name=u.name or u.email or "", label=_mention(u)) for u in users}
+
+    async def my_bids(self, owner_ids: list[PydanticObjectId], first: date, last: date) -> dict[str, dict[str, int]]:
+        """{owner id: {profile name: own bids}} over the report days [first, last]: the extension's self bids."""
+        from app.self_bids import tracked_counts  # imported here: app.self_bids -> app.bids is a cycle at load time
+
+        per_owner: dict[str, dict[str, int]] = {}
+        for owner in owner_ids:
+            by_profile: dict[str, int] = defaultdict(int)
+            for (profile_id, _day), n in (await tracked_counts(owner, first, last)).items():
+                by_profile[profile_id] += n
+            if by_profile:
+                names = await self.profile_names([PydanticObjectId(p) for p in by_profile])
+                named: dict[str, int] = defaultdict(int)
+                for profile_id, n in by_profile.items():
+                    named[names.get(profile_id, "Unknown profile")] += n
+                per_owner[str(owner)] = dict(named)
+        return per_owner
 
     async def save_post(self, kind: Kind, period_key: str, channel: str, ts: list[str]) -> None:
         await BidReportPost.get_motor_collection().update_one(
@@ -208,13 +228,25 @@ async def update_report(channel: str, ts: list[str], text: str, messages: list[l
     return kept
 
 
+def report_days(kind: Kind, period_key: str, sched: BidSchedule) -> tuple[date, date]:
+    """The report days a post covers: the day itself, or the pay week's first to last day (as the My bids tab)."""
+    day = date.fromisoformat(period_key)
+    if kind == "daily":
+        return day, day
+    days = pay_week(sched, datetime.now(timezone.utc), day).days
+    return date.fromisoformat(days[0].key), date.fromisoformat(days[-1].key)
+
+
 async def _render(
     kind: Kind, start: datetime, end: datetime, rows: list[BidReportRow], store: ReportStore, sched: BidSchedule,
     updated_at: Optional[datetime] = None,
 ) -> tuple[str, list[list[dict]]]:
-    owners = await store.owners(list({r.ownerId for r in rows}))
+    owner_ids = list({r.ownerId for r in rows})
+    owners = await store.owners(owner_ids)
+    my_bids = await store.my_bids(owner_ids, *report_days(kind, rows[0].periodKey, sched)) if rows else {}
     return format_report(
         kind, start, end, rows, owners, sched.tz, get_settings().FRONTEND_ORIGIN.rstrip("/"), updated_at,
+        my_bids=my_bids,
     )
 
 

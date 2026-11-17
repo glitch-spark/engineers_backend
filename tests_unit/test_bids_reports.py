@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,7 @@ from app.bids.slack_format import Owner
 from app.bids.storage import BidStorageError
 from app.bids.windows import BidSchedule, Rules
 from app.config import get_settings
+from app.models import Account
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bid_report_post import BidReportPost
@@ -44,6 +45,7 @@ def _aware(dt): return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 class FakeStore:
     def __init__(self, bidders):
         self.bidders, self.rows, self.done, self.posts = bidders, [], set(), {}
+        self.mine, self.my_bids_calls = {}, []
 
     async def claim(self, key):
         if key in self.done:
@@ -62,6 +64,9 @@ class FakeStore:
     async def active_bidders(self): return self.bidders
     async def profile_names(self, ids): return {}
     async def owners(self, ids): return {str(OWNER): Owner("Pedro", "Pedro")}
+    async def my_bids(self, ids, first, last):
+        self.my_bids_calls.append((first, last))
+        return self.mine
     async def save_post(self, kind, pk, channel, ts):
         self.posts[(kind, pk)] = SimpleNamespace(kind=kind, periodKey=pk, channel=channel, ts=ts, rev=0, dirty=False)
     async def dirty_posts(self): return [p for p in self.posts.values() if p.dirty]
@@ -81,12 +86,13 @@ class FakeStorage:
 
 
 class Poster:
-    def __init__(self, fail=False): self.fail, self.sent = fail, []
+    def __init__(self, fail=False): self.fail, self.sent, self.messages = fail, [], []
 
     async def __call__(self, text, messages):
         if self.fail:
             raise RuntimeError("slack down")
         self.sent.append(text)
+        self.messages.append(messages)
         return "C1", [f"{len(self.sent)}.0"]
 
 
@@ -191,7 +197,7 @@ START, END = datetime(2026, 10, 1, 23, 30, tzinfo=timezone.utc), DAILY_CUTOFF  #
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["bid-reports-unit"]
-    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, BidReportPost])
+    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, BidReportPost, Account])
     return database
 
 
@@ -499,3 +505,35 @@ async def test_real_store_finds_an_overlapping_weekly_report(db):
                     bidderName="Ana", rate=0.5, count=1, amount=0.5).insert()
     assert await store.overlapping_weekly(start, end, "2026-11-22") == "2026-11-21"
     assert await store.overlapping_weekly(start, end, "2026-11-21") is None
+
+
+# --- each owner's My bids (self bids per profile) ride along in the post ---
+
+def section_texts(messages):
+    return [b["text"]["text"] for blocks in messages for b in blocks if b.get("type") == "section"]
+
+
+async def test_daily_post_carries_my_bids():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    store.mine = {str(OWNER): {"Arda": 12, "Cory": 23}}
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
+    assert got["daily"] == "posted"
+    assert any("My bids — 35 (Arda 12 · Cory 23)" in t for t in section_texts(post.messages[0]))
+    assert store.my_bids_calls == [(date(2026, 10, 2), date(2026, 10, 2))]
+
+
+async def test_weekly_my_bids_cover_the_pay_weeks_report_days():
+    now = datetime(2026, 10, 3, 21, 5, tzinfo=timezone.utc)  # Sat 16:05 CDT
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    got = await tick(now, store, FakeStorage({"s3://b/ana/": 3}), post)
+    assert got["weekly"] == "posted"
+    assert (date(2026, 9, 27), date(2026, 10, 3)) in store.my_bids_calls
+
+
+async def test_store_my_bids_counts_self_bids_per_profile(db):
+    arda = await Account(name="Arda", createdBy=OWNER).insert()
+    for i in range(2):
+        await Bid(kind="self", ownerId=OWNER, accountId=arda.id, jobKey=f"self-{i}",
+                  firstAt=datetime(2026, 10, 2, 15, 0)).insert()
+    got = await reports.BeanieReportStore().my_bids([OWNER], date(2026, 10, 2), date(2026, 10, 2))
+    assert got == {str(OWNER): {"Arda": 2}}
