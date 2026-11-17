@@ -1,4 +1,4 @@
-"""Which thread reply a change gets, and the #caller post / reply text (pure, no Slack, no DB)."""
+"""Which thread event a change is, and the owner mention (pure, no Slack, no DB)."""
 
 import os
 from datetime import datetime, timedelta, timezone
@@ -9,7 +9,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.interview_caller import caller_thread_event, round_caller_snapshot  # noqa: E402
 from app.models.interview import InterviewCaller, InterviewStageEvent  # noqa: E402
-from app.slack_bot import _mention, caller_round_text, caller_thread_reply, cc_line, slack_time  # noqa: E402
+from app.slack_bot import _mention  # noqa: E402
 
 START = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
 LATER = START + timedelta(days=1)
@@ -29,14 +29,6 @@ def snap(**kw):
 
 def user(name, slack=None):
     return SimpleNamespace(name=name, email=f"{name.lower()}@x.io", slackUserId=slack)
-
-
-IV = SimpleNamespace(companyName="Acme", jobUrl="https://jobs.example/1", accountId=None)
-OWNER, MANAGER = user("Pedro", "U0OWNER001"), user("Maria", "U0MANAGER1")
-
-
-def reply(event, e, prev=None, *, owner=OWNER, managers=(MANAGER,)):
-    return caller_thread_reply(event, e, prev, owner=owner, managers=list(managers))
 
 
 # --- caller_thread_event ------------------------------------------------------------------------
@@ -77,250 +69,8 @@ def test_event_none_when_unchanged_or_caller_toggled():
     assert caller_thread_event(None, snap()) is None
 
 
-# --- cc line -----------------------------------------------------------------------------------
-
-
-def test_cc_line_mentions_each_user_once_in_order():
-    assert cc_line(OWNER, MANAGER, OWNER) == "cc <@U0OWNER001> <@U0MANAGER1>"
-    assert cc_line(user("Maria"), user("Ana", "U0ANA00001")) == "cc Maria <@U0ANA00001>"
-
-
 def test_mention_without_slack_id_is_escaped_so_a_name_cannot_ping():
     assert _mention(user("<!channel> & co")) == "&lt;!channel&gt; &amp; co"
     assert _mention(user("Maria")) == "Maria"
     assert _mention(user("Ana", "U0ANA00001")) == "<@U0ANA00001>"
     assert _mention(SimpleNamespace(name="", email="<!here>@x.io", slackUserId=None)) == "&lt;!here&gt;@x.io"
-    assert cc_line(user("<!everyone>")) == "cc &lt;!everyone&gt;"
-
-
-def test_cc_line_skips_missing_users_and_is_none_without_anyone():
-    assert cc_line(None, MANAGER) == "cc <@U0MANAGER1>"
-    assert cc_line() is None
-    assert cc_line(None) is None
-
-
-# --- main post ------------------------------------------------------------------------------
-
-
-def test_main_post_owner_first_managers_cc_last():
-    lines = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[MANAGER]).splitlines()
-    assert lines[0] == ":telephone_receiver: <@U0OWNER001> — *Caller needed*"
-    assert lines[-2:] == [":hourglass_flowing_sand: Not confirmed yet", "cc <@U0MANAGER1>"]
-    assert not any(l.startswith(("*Coworkers:*", "*Interview manager:*")) for l in lines)
-
-
-def test_main_post_detail_lines_in_order():
-    lines = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[MANAGER]).splitlines()
-    assert [l.split(":*")[0] for l in lines[1:9]] == [
-        "*Profile", "*Company name", "*JD Link", "*Recruiter name", "*Stage", "*Interview time", "*Method",
-        "*Caller assigned",
-    ]
-
-
-def test_main_post_confirmed_badge():
-    text = caller_round_text(IV, entry(confirmed=True), account=None, owner=OWNER, managers=[MANAGER])
-    assert text.splitlines()[-2:] == [":white_check_mark: Confirmed", "cc <@U0MANAGER1>"]
-
-
-def test_main_post_without_managers_has_no_cc():
-    assert "cc " not in caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[])
-
-
-def test_main_post_cc_names_managers_without_slack_id_and_tags_every_manager():
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[user("Maria")])
-    assert text.splitlines()[-1] == "cc Maria"
-    text = caller_round_text(IV, entry(), account=None, owner=OWNER, managers=[MANAGER, user("Ana", "U0MANAGER2")])
-    assert text.splitlines()[-1] == "cc <@U0MANAGER1> <@U0MANAGER2>"
-
-
-def test_main_post_without_owner_says_someone():
-    head = caller_round_text(IV, entry(), account=None, owner=None, managers=[]).splitlines()[0]
-    assert head == ":telephone_receiver: someone — *Caller needed*"
-
-
-def test_canceled_and_no_caller_heads():
-    assert caller_round_text(IV, entry(status="canceled"), account=None, owner=OWNER, managers=[]).startswith(
-        ":x: <@U0OWNER001> — *Canceled* ~Caller needed~")
-    assert caller_round_text(IV, entry(caller=False, stage="tech_round_1"), account=None, owner=OWNER, managers=[]
-                             ).splitlines()[0] == ":telephone_receiver: <@U0OWNER001> — *No caller needed* for Tech Round 1"
-
-
-def test_main_post_no_caller_variant():
-    text = caller_round_text(IV, entry(caller=False, stage="tech_round_1"), account=None, owner=OWNER,
-                             managers=[MANAGER])
-    assert [l.split(":*")[0] for l in text.splitlines()[1:5]] == [
-        "*Profile", "*Company name", "*Stage", "*Interview time"]
-    assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
-    assert "Caller assigned" not in text and "Confirmed" not in text
-
-
-def test_canceled_main_post_has_no_badge_and_strikes_the_time():
-    text = caller_round_text(IV, entry(status="canceled"), account=None, owner=OWNER, managers=[MANAGER])
-    assert "Not confirmed yet" not in text and ":white_check_mark:" not in text
-    assert f"*Interview time:* ~{slack_time(START)}~" in text
-    assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
-
-
-def test_rejected_round_reads_canceled_and_a_disabled_caller_needs_none():
-    rejected = caller_round_text(IV, entry(status="rejected"), account=None, owner=OWNER, managers=[])
-    assert rejected.splitlines()[0] == ":x: <@U0OWNER001> — *Canceled* ~Caller needed~"
-    off = caller_round_text(IV, entry(caller=False), account=None, owner=OWNER, managers=[])
-    assert off.splitlines()[0] == ":telephone_receiver: <@U0OWNER001> — *No caller needed* for Intro"
-
-
-# --- thread replies ----------------------------------------------------------------------------
-
-
-def test_reply_texts_match_copy():
-    t, t2 = slack_time(START), slack_time(LATER)
-    first = lambda s: s.splitlines()[0]  # noqa: E731
-    who = "<@U0OWNER001>"
-    assert first(reply("moved", entry(stage="tech_round_1"))) == f":arrow_right: {who} — *Moved to Tech Round 1* — {t} · needs confirmation"
-    assert first(reply("moved", entry(stage="final", caller=False))) == f":arrow_right: {who} — *Moved to Final* — {t} · no caller needed"
-    assert first(reply("ended", entry(status="canceled"), snap())) == f":no_entry: {who} — *Canceled* — Intro · {t}"
-    assert first(reply("ended", entry(status="rejected"), snap())) == f":no_entry: {who} — *Rejected* — Intro · {t}"
-    assert first(reply("back_on", entry(), snap(status="canceled"))) == f":white_check_mark: {who} — *Back on* — Intro · {t} · needs confirmation"
-    assert first(reply("rescheduled", entry(at=LATER), snap())) == f":repeat: {who} — *Rescheduled* — {t} → {t2} · needs confirmation"
-    assert first(reply("confirmed", entry(confirmed=True), snap())) == f":white_check_mark: {who} — *Confirmed* — Intro · {t} · caller Sam"
-    assert first(reply("unconfirmed", entry(), snap(confirmed=True))) == f":warning: {who} — *Confirmation removed* — Intro · {t}"
-    assert first(reply("removed", entry(stage="panel"))) == f":wastebasket: {who} — *Round removed* — Panel"
-
-
-def test_reply_owner_first_cc_managers():
-    text = reply("confirmed", entry(confirmed=True), snap())
-    assert text.splitlines()[0] == f":white_check_mark: <@U0OWNER001> — *Confirmed* — Intro · {slack_time(START)} · caller Sam"
-    assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
-    assert reply("confirmed", entry(confirmed=True), snap(), managers=[]).splitlines()[-1].startswith(":white_check_mark:")
-
-
-def test_details_reply_lists_changes_and_none_without_changes():
-    text = reply("details", entry(name="Dana"), snap(name="TBD"))
-    assert text.splitlines()[0] == ":pencil2: <@U0OWNER001> — *Caller details updated*"
-    assert "Caller assigned: TBD → Dana" in text
-    assert text.splitlines()[-1] == "cc <@U0MANAGER1>"
-    assert reply("details", entry(), snap()) is None
-    assert reply("details", entry(name="Dana"), snap(name="TBD"), managers=[]).splitlines()[-1] == "Caller assigned: TBD → Dana"
-
-
-def test_reply_cc_line_tags_managers_only():
-    text = reply("confirmed", entry(confirmed=True), snap())
-    assert text.count("<@U0OWNER001>") == 1  # the owner leads the first line, not the cc line
-    assert reply("confirmed", entry(confirmed=True), snap(), managers=[user("Maria")], owner=user("Pedro")).splitlines()[-1] == "cc Maria"
-    two = reply("confirmed", entry(confirmed=True), snap(), managers=[MANAGER, user("Ana", "U0MANAGER2")])
-    assert two.splitlines()[-1] == "cc <@U0MANAGER1> <@U0MANAGER2>"
-
-
-def test_reply_without_owner_says_someone_and_unknown_event_has_none():
-    assert reply("removed", entry(stage="panel"), owner=None).splitlines()[0] == ":wastebasket: someone — *Round removed* — Panel"
-    assert reply("nope", entry()) is None
-
-
-def test_rescheduled_and_confirmed_reply_says_confirmed():
-    t, t2 = slack_time(START), slack_time(LATER)
-    first = reply("rescheduled", entry(at=LATER, confirmed=True), snap()).splitlines()[0]
-    assert first == f":repeat: <@U0OWNER001> — *Rescheduled* — {t} → {t2} · confirmed, caller Sam"
-
-
-# --- user-entered text is escaped ------------------------------------------------------------------
-
-HOSTILE_COMPANY = "Acme <!channel> & Co"
-ESCAPED_COMPANY = "Acme &lt;!channel&gt; &amp; Co"
-HOSTILE_NAME = "<@U123> Jane"
-ESCAPED_NAME = "&lt;@U123&gt; Jane"
-
-
-def hostile_entry(**kw):
-    e = entry(name=HOSTILE_NAME, **kw)
-    e.interviewerName = HOSTILE_NAME
-    return e
-
-
-def test_main_post_escapes_user_entered_text():
-    iv = SimpleNamespace(companyName=HOSTILE_COMPANY, jobUrl="https://jobs.example/1", accountId=None)
-    account = SimpleNamespace(name="<!here> Profile", country="us")
-    text = caller_round_text(iv, hostile_entry(), account=account, owner=OWNER, managers=[MANAGER])
-    lines = text.splitlines()
-    assert f"*Company name:* {ESCAPED_COMPANY}" in lines
-    assert f"*Recruiter name:* {ESCAPED_NAME} 🇺🇸" in lines
-    assert f"*Caller assigned:* {ESCAPED_NAME}" in lines
-    assert "*Profile:* &lt;!here&gt; Profile" in lines
-    assert "<!channel>" not in text and "<@U123>" not in text and "<!here>" not in text
-    # Slack's own tokens survive: the owner and cc mentions, the time tag.
-    assert lines[0].startswith(":telephone_receiver: <@U0OWNER001> — ")
-    assert lines[-1] == "cc <@U0MANAGER1>"
-    assert "<!date^" in text
-
-
-def test_main_post_escapes_job_link_text_and_method_value():
-    iv = SimpleNamespace(companyName="Acme", jobUrl="<!channel>?a=1&b=2", accountId=None)
-    e = entry()
-    e.caller.methodValue = "call <!here> & wait"
-    lines = caller_round_text(iv, e, account=None, owner=OWNER, managers=[]).splitlines()
-    assert "*JD Link:* &lt;!channel&gt;?a=1&amp;b=2" in lines
-    assert "*Method:* Video meeting — call &lt;!here&gt; &amp; wait" in lines
-
-
-def test_main_post_keeps_a_meeting_link_intact_and_escapes_only_its_text():
-    e = entry()
-    e.caller.methodValue = "https://meet.example/x?a=1&b=2"
-    line = next(l for l in caller_round_text(IV, e, account=None, owner=OWNER, managers=[]).splitlines()
-                if l.startswith("*Method:*"))
-    assert line == "*Method:* Video meeting — <https://meet.example/x?a=1&b=2|https://meet.example/x?a=1&amp;b=2>"
-
-
-def test_main_post_no_caller_variant_escapes_company_and_profile():
-    iv = SimpleNamespace(companyName=HOSTILE_COMPANY, jobUrl=None, accountId=None)
-    account = SimpleNamespace(name="<!here> Profile", country=None)
-    text = caller_round_text(iv, entry(caller=False), account=account, owner=OWNER, managers=[])
-    assert f"*Company name:* {ESCAPED_COMPANY}" in text and "*Profile:* &lt;!here&gt; Profile" in text
-    assert "<!channel>" not in text
-
-
-def test_reply_escapes_the_caller_name():
-    confirmed = reply("confirmed", hostile_entry(confirmed=True), snap())
-    assert confirmed.splitlines()[0].endswith(f"· caller {ESCAPED_NAME}") and "<@U123>" not in confirmed
-    resched = reply("rescheduled", hostile_entry(at=LATER, confirmed=True), snap())
-    assert resched.splitlines()[0].endswith(f"· confirmed, caller {ESCAPED_NAME}") and "<@U123>" not in resched
-
-
-def test_details_reply_escapes_the_changed_values():
-    text = reply("details", hostile_entry(), snap(name="<!channel>"))
-    assert f"Caller assigned: &lt;!channel&gt; → {ESCAPED_NAME}" in text.splitlines()
-    assert "<!channel>" not in text and "<@U123>" not in text
-    new = entry()
-    new.caller.methodValue = "https://x.example/?a=1&b=2"
-    old = snap()
-    old["link"] = "<!here>"
-    text = reply("details", new, old)
-    assert "Link: &lt;!here&gt; → https://x.example/?a=1&amp;b=2" in text.splitlines()
-
-
-def test_details_reply_keeps_the_time_tag_unescaped():
-    text = reply("details", entry(name="Dana", at=LATER), snap(name="TBD"))
-    assert f"Time: {slack_time(START)} → {slack_time(LATER)}" in text.splitlines()
-
-
-BAD_URL = "https://x.example/><!channel>"
-
-
-def test_method_text_never_links_a_malformed_url():
-    from app.slack_bot import _method_text
-
-    caller = SimpleNamespace(method="video", methodValue=BAD_URL)
-    assert _method_text(caller) == "Video meeting — https://x.example/&gt;&lt;!channel&gt;"
-    for bad in ("https://x.example/a|b", "https://x.example/a b", "https://x.example/<a>"):
-        text = _method_text(SimpleNamespace(method="video", methodValue=bad))
-        assert "<http" not in text and "<a>" not in text and "|" not in text
-    ok = _method_text(SimpleNamespace(method="video", methodValue="https://x.example/a?b=1"))
-    assert ok == "Video meeting — <https://x.example/a?b=1|https://x.example/a?b=1>"
-
-
-def test_main_post_and_details_do_not_inject_through_a_malformed_meeting_link():
-    e = entry()
-    e.caller.methodValue = BAD_URL
-    text = caller_round_text(IV, e, account=None, owner=OWNER, managers=[MANAGER])
-    assert "<!channel>" not in text
-    assert "*Method:* Video meeting — https://x.example/&gt;&lt;!channel&gt;" in text.splitlines()
-    old = snap()
-    new_text = reply("details", e, old)
-    assert "<!channel>" not in new_text
