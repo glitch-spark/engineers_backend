@@ -14,8 +14,11 @@ Each morning (SLACK_CALLER_DAILY_TIME) one day post lists every round of the loc
 Confirm / Assign caller / Download brief buttons; it is edited in place whenever an interview changes. About 30
 minutes before a round starts it gets a reminder reply in the day post's thread, built like its block in the post.
 Dedup rows (SlackAlertLog) use the keys "interview-day:<YYYY-MM-DD>" and "round-reminder:<roundId>:<startEpoch>";
-there are no per-user digest DMs. The day post and reminders live in app/interview_day/, button clicks in
-app/interview_day/actions.py, transactions in app/slack_transactions.py.
+there are no per-user digest DMs. Once SLACK_CALLER_ASKS_FROM is set, app/coordination/chase.py also replies in each
+interview's #caller thread after a caller round ends (key "after-call:<roundId>:<startEpoch>") and 7 days after a
+completed round with no result (key "result-reminder:<roundId>").
+The day post and reminders live in app/interview_day/, button clicks in app/interview_day/actions.py, transactions in
+app/slack_transactions.py.
 """
 
 from __future__ import annotations
@@ -561,7 +564,7 @@ async def run_alert_tick() -> dict[str, Any]:
     """Cron entrypoint: the day post first (a round starting at 05:00-05:30 is reminded in the same tick and
     threads under it), then the 30-minute round reminders, then a refresh of today's post so changes no interview
     write reports (renames, deactivations, Slack ID changes, archives, a refresh that failed) reach it. Each step
-    is isolated from the others. Sends no DMs."""
+    is isolated from the others; the coordination asks (app/coordination/chase.py) come last. Sends no DMs."""
     from app.interview_day.post import refresh_today, run_day_post  # post imports this module
     from app.interview_day.reminders import run_round_reminders
 
@@ -579,4 +582,14 @@ async def run_alert_tick() -> dict[str, Any]:
         await refresh_today()  # no interview id: the unconditional refresh
     except Exception as exc:
         log.warning("slack_bot day post refresh failed: %s", exc)
-    return {"caller_reminders": reminders["sent"], "caller_daily": caller_daily}
+    try:
+        from app.coordination.chase import run_coordination_chase  # imports the interview router, so not at the top
+
+        chase = await run_coordination_chase(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot coordination chase crashed: %s", exc)
+        chase = {}
+    return {
+        "caller_reminders": reminders["sent"], "caller_daily": caller_daily,
+        "after_call_asks": chase.get("after_call_asks", 0), "result_reminders": chase.get("result_reminders", 0),
+    }

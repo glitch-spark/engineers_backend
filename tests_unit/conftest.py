@@ -12,7 +12,7 @@ os.environ["REDIS_URL"] = ""
 # transaction or a caller round would post to the real workspace. Tests that need Slack patch it themselves.
 for _key in (
     "SLACK_BOT_TOKEN", "SLACK_DAILY_PLAN_CHANNEL_ID", "SLACK_TRANSACTIONS_CHANNEL_ID", "SLACK_CALLER_CHANNEL_ID",
-    "SLACK_CALLER_DAILY_CHANNEL_ID", "SLACK_BIDS_CHANNEL_ID",
+    "SLACK_CALLER_DAILY_CHANNEL_ID", "SLACK_BIDS_CHANNEL_ID", "SLACK_CALLER_ASKS_FROM",
 ):
     os.environ[_key] = ""
 

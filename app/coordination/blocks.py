@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Optional, Sequence
 
 from app.caller_directory import CallerEntry
@@ -132,3 +133,37 @@ def post_blocks(
         {"type": "section", "text": {"type": "mrkdwn", "text": _cap("\n".join(lines))}},
         {"type": "actions", "elements": elements},
     ]
+
+
+def _section(text: str) -> dict:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": _cap(text)}}
+
+
+def ask_blocks(
+    ref: str, *, owner: Optional[UserExtra], company: str, stage: str, end: datetime,
+) -> tuple[str, list[dict]]:
+    """The after-call ask posted in the interview's thread once a caller round has ended."""
+    text = (f"{_who(owner, 'Owner')} — {_short(company, MAX_NAME, '—')} {_stage_label(stage)} ended at "
+            f"{slack_time(end, with_day=False)}. How did it go?")
+    return text, [_section(text), {"type": "actions", "elements": [
+        _button("Completed", style="primary", action_id=COORD_AFTER_COMPLETED, value=ref),
+        _button("Canceled", action_id=COORD_AFTER_CANCELED, value=ref),
+        _button("Rescheduled…", action_id=COORD_AFTER_RESCHEDULED, value=ref),
+    ]}]
+
+
+def result_reminder_blocks(
+    ref: str, *, owner: Optional[UserExtra], company: str, stage: str, start: datetime,
+) -> tuple[str, list[dict]]:
+    """The reminder posted in the thread when a completed round has had no result for 7 days."""
+    text = (f"{_who(owner, 'Owner')} — {_short(company, MAX_NAME, '—')} {_stage_label(stage)} on "
+            f"{slack_time(start)} has no result yet. How did it end?")
+    return text, [_section(text), {"type": "actions", "elements": [
+        _button("Passed", style="primary", action_id=COORD_RESULT_PASSED, value=ref),
+        _button("Rejected", style="danger", action_id=COORD_RESULT_REJECTED, value=ref),
+    ]}]
+
+
+def answered_blocks(line: str) -> list[dict]:
+    """What replaces an ask once it is answered: the answer line alone, no buttons."""
+    return [_section(line)]
