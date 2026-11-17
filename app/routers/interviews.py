@@ -45,9 +45,9 @@ from app.interview_caller import (
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
 from app.caller_directory import resolve_caller
-from app.routers.callers import is_caller_manager, require_caller_manager
+from app.routers.callers import require_caller_manager
 from app.round_confirm import ConfirmError, confirm_round
-from app.caller_access import is_assigned_caller
+from app.caller_access import can_update_round, is_assigned_caller
 
 log = logging.getLogger(__name__)
 
@@ -503,6 +503,26 @@ async def _load_editable(iv_id: str, user: UserExtra) -> Interview:
     if user.role != "admin" and str(iv.createdBy) != str(user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     return iv
+
+
+# What an interview manager may change on someone else's round.
+MANAGER_ROUND_FIELDS: frozenset[str] = frozenset({"status", "statusNote", "scheduledAt", "endsAt"})
+MANAGER_FIELDS_ONLY = "Interview managers can change only the status, its reason and the time of someone else's round."
+
+
+async def _load_round_editable(iv_id: str, user: UserExtra, fields: set[str]) -> Interview:
+    """`_load_editable` for editing a round: an active interview manager may also send the status, its reason and
+    the time (`MANAGER_ROUND_FIELDS`) of any interview's round, and nothing else."""
+    iv = await Interview.get(to_object_id(iv_id))
+    if iv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if user.role == "admin" or str(iv.createdBy) == str(user.id):
+        return iv
+    if can_update_round(iv, user):  # an active interview manager
+        if not set(fields) <= MANAGER_ROUND_FIELDS:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MANAGER_FIELDS_ONLY)
+        return iv
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
 
 async def _after_save(
@@ -1277,6 +1297,9 @@ async def add_interview_stage(
 
 class CallerAssignIn(BaseModel):
     callerId: str = ""  # "" = not assigned yet
+    # None (old clients): assign on a round whose caller request is on. False turns the request off (callerId is
+    # ignored); True turns it on, or keeps it on, with the picked caller.
+    enabled: Optional[bool] = None
 
 
 @router.put("/{iv_id}/stages/{stage_id}/caller")
@@ -1294,17 +1317,23 @@ async def assign_round_caller(
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
     entry = iv.stageHistory[idx]
-    if entry.caller is None or not entry.caller.enabled:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This round has no caller request.")
     previous = entry.caller
-    picked = await _resolve_caller(
-        CallerIn(enabled=True, callerId=body.callerId), owner_id=str(iv.createdBy), previous=previous,
-    )
-    entry.caller = previous.model_copy(
-        update={"callerId": picked.callerId or None, "callerName": picked.callerName, "callerKind": picked.callerKind},
-    )
-    if _assignment(entry.caller) != _assignment(previous):
-        entry.confirmed = False  # the new caller has not agreed yet
+    if body.enabled is None and (previous is None or not previous.enabled):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This round has no caller request.")
+    if body.enabled is False:
+        entry.caller = (previous or InterviewCaller()).model_copy(update={"enabled": False})
+        entry.confirmed = False
+    else:
+        was_on = previous is not None and previous.enabled
+        picked = await _resolve_caller(
+            CallerIn(enabled=True, callerId=body.callerId), owner_id=str(iv.createdBy), previous=previous,
+        )
+        update = {"callerId": picked.callerId or None, "callerName": picked.callerName, "callerKind": picked.callerKind}
+        if not was_on:
+            update.update({"enabled": True, "startsAt": entry.scheduledAt})
+        entry.caller = (previous or InterviewCaller()).model_copy(update=update)
+        if not was_on or _assignment(entry.caller) != _assignment(previous):
+            entry.confirmed = False  # the new caller has not agreed yet
     iv.stageHistory[idx] = entry
     _sync_top_from_tip(iv)
     await _save_interview(iv)
@@ -1319,7 +1348,7 @@ async def update_interview_stage(
     body: StagePatch,
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
-    iv = await _load_editable(iv_id, user)
+    iv = await _load_round_editable(iv_id, user, body.model_fields_set)
     before = _round_snapshots(iv)
     migrate_legacy_stage_fields(iv)
     idx = _find_stage(iv, stage_id)
@@ -1370,12 +1399,6 @@ async def update_interview_stage(
         previous = entry.caller
         resolved = await _resolve_caller(body.caller, owner_id=str(iv.createdBy), previous=previous)
         entry.caller = _round_caller(resolved, starts_at=entry.scheduledAt, previous=previous)
-        # The creator picks a caller when adding a round; after that the caller managers assign it.
-        if not is_caller_manager(user) and _assignment(entry.caller) != _assignment(previous):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only Admin or an interview manager can change the caller.",
-            )
         if _assignment(entry.caller) != _assignment(previous):
             entry.confirmed = False  # the new caller has not agreed yet
             assignment_changed = True

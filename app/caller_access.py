@@ -32,6 +32,13 @@ def is_assigned_caller(iv: Interview, user: UserExtra) -> bool:
     return any(_is_user_caller(e, user) for e in iv.stageHistory)
 
 
+def can_update_round(iv: Interview, user: UserExtra) -> bool:
+    """Owner, admin or interview manager may update a round (status, reason, time). A deactivated user may not."""
+    if getattr(user, "isActive", True) is False:
+        return False
+    return user.role in MANAGER_ROLES or str(iv.createdBy) == str(user.id)
+
+
 def can_confirm(iv: Interview, entry: InterviewStageEvent, user: UserExtra) -> bool:
     """Admin, interview manager, the interview's owner, or this round's assigned user caller."""
     return (
