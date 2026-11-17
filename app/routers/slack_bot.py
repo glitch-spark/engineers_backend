@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Annotated, Optional
+from datetime import datetime, timezone
+from typing import Annotated, Any, Optional
 
 from urllib.parse import parse_qs
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.coordination.actions import click_from_payload, process_coordination_click
+from app.coordination.blocks import COORD_ACTIONS
+from app.coordination.modals import COORD_VIEWS, process_coordination_submission, submission_errors
 from app.deps import get_current_user
 from app.interview_day.actions import process_confirm_click
 from app.interview_day.blocks import CONFIRM_ACTION_ID
@@ -119,10 +124,12 @@ async def slack_test_dm(user: Annotated[UserExtra, Depends(get_current_user)]) -
 
 
 @router.post("/interactions")
-async def slack_interactions(request: Request, background: BackgroundTasks) -> dict:
-    """Slack button clicks. No app login: Slack signs the request with SLACK_SIGNING_SECRET, checked over the raw
-    body before anything is parsed. Handled clicks are acknowledged at once and applied in the background
-    (Slack wants an answer within 3 seconds); refusals reach the clicker as ephemeral text."""
+async def slack_interactions(request: Request, background: BackgroundTasks) -> Any:
+    """Slack button clicks and form submissions. No app login: Slack signs the request with SLACK_SIGNING_SECRET,
+    checked over the raw body before anything is parsed. Handled clicks are acknowledged at once and applied in the
+    background (Slack wants an answer within 3 seconds); refusals reach the clicker as ephemeral text. A submitted
+    coordination form is checked inline (field errors go back to the form); otherwise it is closed with an empty 200
+    and applied in the background."""
     secret = (get_settings().SLACK_SIGNING_SECRET or "").strip()
     if not secret:
         raise HTTPException(
@@ -141,7 +148,19 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> d
         payload = json.loads(parse_qs(body.decode("utf-8")).get("payload", [""])[0])
     except (UnicodeDecodeError, ValueError):
         return {"ok": True}
-    if not isinstance(payload, dict) or payload.get("type") != "block_actions":
+    if not isinstance(payload, dict):
+        return {"ok": True}
+    if payload.get("type") == "view_submission":
+        view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
+        if view.get("callback_id") not in COORD_VIEWS:
+            return {"ok": True}
+        errors = submission_errors(view, datetime.now(timezone.utc))
+        if errors:
+            return JSONResponse({"response_action": "errors", "errors": errors})
+        submitter = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        background.add_task(process_coordination_submission, view, str(submitter.get("id") or ""))
+        return Response(status_code=200)
+    if payload.get("type") != "block_actions":
         return {"ok": True}
     actions = payload.get("actions") or []
     action = actions[0] if actions and isinstance(actions[0], dict) else {}
@@ -151,7 +170,9 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> d
     slack_user_id = str(user.get("id") or "")
     response_url = str(payload.get("response_url") or "")
     message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
-    if action_id == CONFIRM_ACTION_ID:
+    if action_id in COORD_ACTIONS:
+        background.add_task(process_coordination_click, click_from_payload(payload))
+    elif action_id == CONFIRM_ACTION_ID:
         background.add_task(process_confirm_click, value, slack_user_id, response_url, str(message.get("ts") or ""))
     elif is_transaction_action(action_id):
         background.add_task(process_transaction_click, action_id, value, slack_user_id, response_url)
