@@ -13,7 +13,7 @@ from app.models import UserExtra
 from app.slack_bot import _stage_label, slack_time
 
 COORD_CHOOSE_CALLER = "coord_choose_caller"  # static select
-COORD_CONFIRM = "coord_confirm"
+COORD_CONFIRM = "coord_confirm"  # no longer rendered (assigning confirms); old posts still carry it
 COORD_OPEN_BRIEF = "coord_open_brief"  # URL buttons: the server acknowledges them and does nothing
 COORD_OPEN_INTERVIEW = "coord_open_interview"
 COORD_AFTER_COMPLETED = "coord_after_completed"
@@ -22,7 +22,7 @@ COORD_AFTER_RESCHEDULED = "coord_after_rescheduled"
 COORD_RESULT_PASSED = "coord_result_passed"
 COORD_RESULT_REJECTED = "coord_result_rejected"
 
-# Every id the server acts on (the two URL buttons are only acknowledged).
+# Every id the server acts on (the two URL buttons are only acknowledged). COORD_CONFIRM stays for old posts.
 COORD_ACTIONS = frozenset({
     COORD_CHOOSE_CALLER, COORD_CONFIRM, COORD_AFTER_COMPLETED, COORD_AFTER_CANCELED, COORD_AFTER_RESCHEDULED,
     COORD_RESULT_PASSED, COORD_RESULT_REJECTED,
@@ -82,8 +82,7 @@ def _caller_part(r: DayRound, managers: Sequence[UserExtra]) -> str:
         return "No caller (Self)"
     if r.caller == "tbd":
         return f"⚠️ No caller yet — {_tags(managers)}" if managers else "⚠️ No caller yet"
-    state = "✅ confirmed" if r.confirmed else "⏳ not confirmed"
-    part = f"Caller: {_who(r.caller_user, r.caller_name)} {state}"
+    part = f"Caller: {_who(r.caller_user, r.caller_name)}"
     method = _method_part(r)
     return f"{part} · {method}" if method else part
 
@@ -126,10 +125,7 @@ def post_blocks(
     elif r.status in _STATUS_LINES:  # passed, rejected, canceled: nothing left to do but look
         elements = links
     else:
-        elements = [caller_select(r, directory)]
-        if r.caller in ("user", "external") and not r.confirmed:
-            elements.append(_button("Confirm", style="primary", action_id=COORD_CONFIRM, value=ref))
-        elements += links
+        elements = [caller_select(r, directory), *links]
     return f"📞 {company} · {stage}", [
         {"type": "section", "text": {"type": "mrkdwn", "text": _cap("\n".join(lines))}},
         {"type": "actions", "elements": elements},

@@ -24,6 +24,19 @@ def caller_unassigned(caller: Any) -> bool:
     return (getattr(caller, "callerName", "") or "").strip().upper() in ("", "TBD")
 
 
+def caller_assigned(caller: Any) -> bool:
+    """A person (platform user or external caller) is on the round's caller request: it is on and not TBD."""
+    return caller is not None and bool(getattr(caller, "enabled", False)) and not caller_unassigned(caller)
+
+
+def confirmed_by_assignment(entry: Any) -> bool:
+    """Assigning a caller is their confirmation: a round is confirmed while a person is assigned to it and it is
+    not called off. No caller, TBD, "Self" (caller off) or a canceled / rejected round is not confirmed."""
+    return caller_assigned(getattr(entry, "caller", None)) and (
+        normalize_status(getattr(entry, "status", None)) not in ENDED_STATUSES
+    )
+
+
 class CallerIn(BaseModel):
     # Older clients also send `timezone`; it is ignored (Slack shows each
     # reader their own time).

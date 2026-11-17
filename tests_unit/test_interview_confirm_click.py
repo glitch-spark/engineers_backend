@@ -115,7 +115,7 @@ async def test_reminder_click_replaces_the_reminder_with_the_confirmed_round(sla
     assert url == RESPONSE_URL and payload["replace_original"] is True
     assert payload["response_type"] == "in_channel"
     text = _text(payload["blocks"])
-    assert "✅ confirmed" in text and "not confirmed" not in text and "Starting in 20 min" in text
+    assert "confirmed" not in text and "Starting in 20 min" in text  # rebuilt as new posts read: no Confirm step
     assert "Confirm" not in _button_labels(payload["blocks"])
     assert "Download brief" in _button_labels(payload["blocks"]) and payload["text"]
 
@@ -166,6 +166,22 @@ async def test_refusal_does_not_touch_the_reminder(slack):
     await make_user("Other", slack_id="U0OTHER001")
     await actions.process_confirm_click(value(iv), "U0OTHER001", RESPONSE_URL, REMINDER_TS)
     assert [(p["replace_original"], p["text"]) for _, p in slack] == [(False, REFUSAL)]
+
+
+async def test_old_reminder_click_on_an_already_confirmed_round_still_re_renders(slack):
+    """Assigning confirms now, so a Confirm button on an old reminder meets a confirmed round: still fine, and the
+    reminder is rebuilt without the button."""
+    owner = await make_user()
+    caller = await make_user("Cal", slack_id="U0CALLER01")
+    iv = await make_interview(owner, caller_id=str(caller.id))
+    stored = await Interview.get(iv.id)
+    stored.stageHistory[-1].confirmed = True
+    await stored.save()
+    with patch.object(actions, "_now", lambda: START - timedelta(minutes=20)):
+        await actions.process_confirm_click(value(iv), "U0CALLER01", RESPONSE_URL, REMINDER_TS)
+    assert await confirmed(iv) is True
+    ((_, payload),) = slack
+    assert payload["replace_original"] is True and "Confirm" not in _button_labels(payload["blocks"])
 
 
 async def test_clicking_again_keeps_it_confirmed(slack):

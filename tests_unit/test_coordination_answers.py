@@ -381,7 +381,7 @@ async def test_reschedule_submission_moves_the_round(slack, cast):
     assert slack_bot._aware_utc(entry.scheduledAt) == NEW
     assert slack_bot._aware_utc(entry.endsAt) == NEW + timedelta(hours=1)  # the 1 h duration is kept
     assert status_of(entry) == "scheduled"
-    assert entry.confirmed is False
+    assert entry.confirmed is True  # a reschedule keeps the assigned caller confirmed
     assert entry.statusNote == "Moved by recruiter"
     assert [b["text"] for b in slack.of("chat.update")] == [f"🔁 Rescheduled to {slack_time(NEW)} — by <@U0JUSTIN01>"]
     # The submitter sees the time actually saved, in the owner's zone.

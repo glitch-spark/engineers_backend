@@ -52,8 +52,7 @@ async def _thread_links(rounds: list[DayRound]) -> None:
 async def _build(day: date, tz: ZoneInfo) -> tuple[list[list[dict]], str, list[str]]:
     """The day's messages (blocks), the plain fallback text that goes with each, and the interviews listed."""
     start, end = slack_bot.caller_daily_bounds(day, tz)
-    rounds = await load_rounds(start, end)
-    await _thread_links(rounds)
+    rounds = await load_rounds(start, end)  # the compact lines carry no #caller thread link (reminders still do)
     origin = get_settings().FRONTEND_ORIGIN.rstrip("/")
     messages = day_messages(day, rounds, managers=await slack_bot.interview_managers(), origin=origin)
     return messages, fallback_text(day, len(rounds)), sorted({r.interview_id for r in rounds})

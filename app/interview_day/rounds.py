@@ -37,6 +37,8 @@ class DayRound:
     thread_link: Optional[str] = None  # filled by the day post from #caller, not here
     status: str = "scheduled"  # scheduled | completed | passed | rejected | canceled
     caller_id: str = ""  # the user's or external caller's id; "" for self / tbd
+    owner_id: str = ""  # the interview's createdBy; the day post groups rounds by it
+    interviewer: str = ""  # the round's interviewer name, "" when none
 
 
 def _is_round(entry: Any, start: datetime, end: datetime) -> bool:
@@ -98,6 +100,8 @@ def day_round(
         owner=owner,
         status=interview_status_value(entry.status) or "scheduled",
         caller_id=(caller.callerId or "") if state in ("user", "external") else "",
+        owner_id=str(iv.createdBy or ""),
+        interviewer=(entry.interviewerName or "").strip(),
     )
 
 

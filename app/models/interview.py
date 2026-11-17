@@ -99,7 +99,8 @@ class InterviewStageEvent(BaseModel):
     interviewerName: Optional[str] = None
     endsAt: Optional[datetime] = None
     caller: Optional[InterviewCaller] = None
-    # A caller round whose caller is lined up (set by the owner or an admin). Cleared when the time changes.
+    # A caller round whose caller is lined up. Assigning a person as the caller sets it; clearing the caller (TBD,
+    # Self, caller off) or calling the round off clears it. A new time keeps it.
     confirmed: bool = False
 
     @field_serializer("at", "scheduledAt", "endsAt", when_used="json")

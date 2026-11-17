@@ -98,7 +98,7 @@ async def test_posts_once_per_day_and_stores_ts(slack):
     posted = slack.of("chat.postMessage")
     assert len(posted) == 1 and posted[0]["channel"] == "C_DAILY"
     assert "Acme" in text_of(posted[0]["blocks"])
-    assert posted[0]["text"] == "Interviews today — Wed Oct 7 · 1 round"
+    assert posted[0]["text"] == "Interviews today — Wed Oct 7 · 1 interview"
     stored = await stored_post()
     assert stored.ts == ["1"] and stored.channel == "C_DAILY"
     assert await SlackAlertLog.find(SlackAlertLog.kind == "interview-day:2026-10-07").count() == 1
@@ -116,8 +116,8 @@ async def test_off_without_channel(slack, monkeypatch):
 
 
 async def test_failed_post_releases_claim_and_removes_partial(slack):
-    for i in range(30):
-        await add(f"Co{i:02d}", 6 + i // 4)
+    for i in range(60):
+        await add(f"Co{i:02d}", 6 + i // 8)
     slack.errors["chat.postMessage"] = [None, "ratelimited"]  # the first message goes out, the second fails
     assert await post.run_day_post(chi(5, 2)) == "failed"
     assert [b["ts"] for b in slack.of("chat.delete")] == ["1"]
@@ -140,14 +140,14 @@ async def test_refresh_drops_round_moved_to_tomorrow(slack):
     update = slack.of("chat.update")[0]
     assert update["channel"] == "C_DAILY" and update["ts"] == "1"
     assert "Keep" in text_of(update["blocks"]) and "Move" not in text_of(update["blocks"])
-    assert update["text"] == "Interviews today — Wed Oct 7 · 1 round"
+    assert update["text"] == "Interviews today — Wed Oct 7 · 1 interview"
 
 
 async def test_refresh_deletes_surplus_message(slack):
-    ivs = [await add(f"Co{i:02d}", 6 + i // 4) for i in range(30)]
+    ivs = [await add(f"Co{i:02d}", 6 + i // 8) for i in range(60)]  # 60 owners: header + 60 sections, 2 messages
     await post.run_day_post(chi(5, 2))
     assert (await stored_post()).ts == ["1", "2"]
-    for iv in ivs[:25]:
+    for iv in ivs[:55]:
         iv.stageHistory[0].status = "canceled"
         await iv.save()
     slack.calls.clear()
@@ -162,8 +162,8 @@ async def test_refresh_posts_extra_message_when_day_grows(slack):
     for i in range(3):
         await add(f"Co{i}", 9)
     await post.run_day_post(chi(5, 2))
-    for i in range(30):
-        await add(f"More{i:02d}", 10 + i // 10)
+    for i in range(60):
+        await add(f"More{i:02d}", 10 + i // 20)
     slack.calls.clear()
     assert await post.refresh_today(chi(8)) is True
     assert len(slack.of("chat.update")) == 1 and len(slack.of("chat.postMessage")) == 1
@@ -181,8 +181,8 @@ async def test_refresh_reposts_a_message_slack_lost(slack):
 
 
 async def test_refresh_keeps_progress_when_slack_fails_midway(slack):
-    for i in range(30):
-        await add(f"Co{i:02d}", 6 + i // 4)
+    for i in range(60):
+        await add(f"Co{i:02d}", 6 + i // 8)
     await post.run_day_post(chi(5, 2))
     slack.calls.clear()
     slack.errors["chat.update"] = [None, "ratelimited"]
@@ -234,20 +234,16 @@ async def test_parent_ts_for_day_is_that_days_first_message(slack):
     assert await post.parent_ts_for_day(DAY + timedelta(days=1)) is None
 
 
-async def test_one_permalink_per_interview_for_all_its_rounds(slack):
+async def test_day_post_fetches_no_caller_thread_permalinks(slack):
+    """The compact lines carry no #caller thread link, so posting and refreshing make no permalink calls."""
     iv = await add("Acme", 9)
     iv.slackThread = SlackThread(channel="C_CALLER", ts="100.1")
-    iv.stageHistory.append(iv.stageHistory[0].model_copy(update={"id": "r2", "stage": "tech_round_1"}))
     await iv.save()
-    other = await add("Beta", 11)
-    other.slackThread = SlackThread(channel="C_CALLER", ts="200.1")
-    await other.save()
     slack.replies["chat.getPermalink"] = {"permalink": "https://slack.example/p1"}
     await post.run_day_post(chi(5, 2))
-    assert sorted(b["message_ts"] for b in slack.of("chat.getPermalink")) == ["100.1", "200.1"]
-    slack.calls.clear()
     await post.refresh_today(chi(8))
-    assert len(slack.of("chat.getPermalink")) == 2
+    assert slack.of("chat.getPermalink") == []
+    assert "thread" not in text_of(slack.of("chat.postMessage")[0]["blocks"])
 
 
 async def test_post_remembers_which_interviews_it_lists(slack):
@@ -296,15 +292,14 @@ async def test_failed_refresh_keeps_an_interview_listed_that_may_still_show(slac
     assert str(drop.id) in (await stored_post()).interviewIds
 
 
-async def test_caller_rounds_link_to_their_caller_thread(slack):
-    iv = await add("Acme", 9)
-    iv.slackThread = SlackThread(channel="C_CALLER", ts="100.1")
-    await iv.save()
+async def test_posted_day_is_grouped_by_owner_with_links_not_buttons(slack):
+    await add("Acme", 9)
     await add("Mine", 10, caller=False)
-    slack.replies["chat.getPermalink"] = {"permalink": "https://slack.example/p1"}
     await post.run_day_post(chi(5, 2))
-    assert [b["channel"] for b in slack.of("chat.getPermalink")] == ["C_CALLER"]  # none for the self round
-    assert text_of(slack.of("chat.postMessage")[0]["blocks"]).count("<https://slack.example/p1|thread>") == 1
+    blocks = slack.of("chat.postMessage")[0]["blocks"]
+    assert [b["type"] for b in blocks] == ["header", "section", "section"]  # two interviews, two owners
+    assert blocks[0]["text"]["text"].endswith("· 2 interviews · 1 with a caller")
+    assert "📞 Sam" in text_of(blocks) and "— Self" in text_of(blocks) and "|Brief>" in text_of(blocks)
 
 
 # --- the interview write hook (router) ---------------------------------------------------------
