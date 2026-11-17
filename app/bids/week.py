@@ -198,6 +198,7 @@ async def week_board(
                     "toReview": None, "source": "folders", "error": error}
         rows.append({
             "id": bid_id, "name": b.name, "status": bidder_status(b), "country": b.country,
+            "profileId": str(b.profileId) if b.profileId in profiles else None,
             "profileName": profiles.get(b.profileId), "rate": b.rate, "days": days, "week": week,
             "ownerId": str(b.createdBy), "ownerName": owners.get(b.createdBy),
         })

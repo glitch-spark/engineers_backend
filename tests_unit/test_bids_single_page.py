@@ -82,6 +82,17 @@ async def test_week_rows_carry_the_board_cells_and_pay(db):
     assert rows[str(ana.id)]["week"]["pay"] == 5.0 and rows[str(ana.id)]["week"]["toReview"] == 4
 
 
+async def test_board_rows_carry_the_profile_id(db):
+    pedro, ana, _bo = await setup()
+    profile = await Account(name="Dev-A", createdBy=pedro.id).insert()
+    ana.profileId = profile.id
+    await ana.save()
+    rows = (await board(pedro))["bidders"]
+    assert rows[0]["name"] == "Ana" and rows[0]["profileName"] == "Dev-A"
+    assert rows[0]["profileId"] == str(profile.id)
+    assert rows[1]["profileId"] is None     # Bo has no profile
+
+
 async def test_week_totals_match_the_board_and_say_today(db):
     pedro, _ana, _bo = await setup()
     r, b = await perf(pedro), await board(pedro)
