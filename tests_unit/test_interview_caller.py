@@ -82,3 +82,23 @@ def test_change_lines_format():
     ))
     lines = caller_change_lines(a, b, fmt_time=lambda d: d.strftime("%H:%M"), label=lambda k, v: str(v))
     assert lines == ["Time: 14:00 → 15:30", "Caller assigned: TBD → Dana"]
+
+
+def test_build_round_caller_keeps_kind_when_caller_unchanged():
+    prev = InterviewCaller(enabled=True, callerName="Ana", callerId="u1", callerKind="user", startsAt=START)
+    # Nothing about the caller sent: keeps it, kind included.
+    kept = build_round_caller(CallerIn(enabled=True, method="video"), starts_at=START, previous=prev)
+    assert (kept.callerId, kept.callerKind) == ("u1", "user")
+    # Same id sent back without a kind (older form): kind stays.
+    same = build_round_caller(CallerIn(enabled=True, callerId="u1", callerName="Ana"), starts_at=START, previous=prev)
+    assert same.callerKind == "user"
+    # A different caller with an explicit kind carries it; unassigned falls back to external.
+    other = build_round_caller(
+        CallerIn(enabled=True, callerId="u2", callerName="Bob", callerKind="user"), starts_at=START, previous=prev,
+    )
+    assert (other.callerId, other.callerKind) == ("u2", "user")
+    tbd = build_round_caller(CallerIn(enabled=True, callerId="", callerName="TBD"), starts_at=START, previous=prev)
+    assert (tbd.callerId, tbd.callerKind) == (None, "external")
+    # Different id with no kind: external, not the previous kind.
+    ext = build_round_caller(CallerIn(enabled=True, callerId="e1", callerName="Pietro"), starts_at=START, previous=prev)
+    assert ext.callerKind == "external"

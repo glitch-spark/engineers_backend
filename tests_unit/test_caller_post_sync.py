@@ -160,33 +160,3 @@ def test_slack_error_never_raises():
     interview = iv(rnd("r1", confirmed=True), thread=THREAD)
     changed, _ = run(interview, {"r1": round_caller_snapshot(rnd("r1"))}, fail=("chat.update", "ratelimited"))
     assert changed is False
-
-
-# --- the 30-minute reminder follows the interview thread ---------------------------------------
-
-
-def _remind(interview, entry):
-    calls = []
-
-    async def api(method, body):
-        calls.append((method, body))
-        return {"ok": True}
-
-    with (
-        patch.object(slack_bot, "_slack_api", api),
-        patch.object(slack_bot, "get_settings", lambda: SimpleNamespace(SLACK_CALLER_CHANNEL_ID="C1")),
-    ):
-        assert asyncio.run(slack_bot._reminder_post(interview, entry, "soon")) is True
-    return calls
-
-
-def test_reminder_posts_in_interview_thread():
-    entry = rnd("r2", legacy_ts="555.000")
-    calls = _remind(iv(rnd("r1"), entry, thread=SlackThread(channel="C9", ts="111.222")), entry)
-    assert (calls[0][1]["channel"], calls[0][1]["thread_ts"]) == ("C9", "111.222")
-
-
-def test_reminder_falls_back_to_round_post():
-    entry = rnd("r1", legacy_ts="555.000")
-    calls = _remind(iv(entry), entry)
-    assert (calls[0][1]["channel"], calls[0][1]["thread_ts"]) == ("C1", "555.000")

@@ -3,7 +3,7 @@ range. See docs/superpowers/specs/2026-11-06-callers-statistics-design.md.
 
 Rounds come from app/interview_rounds.merged_rounds (consecutive entries of one stage are one round), held on the app's
 local day of their scheduledAt, in the region of the interview's profile. AI interviews, home assessments and stages
-with no group don't count. A caller round has an enabled caller: its caller is caller.callerId, else the caller whose
+with no group don't count. A caller round has an enabled caller (an external caller or a platform user): its caller is caller.callerId, else the caller whose
 name was typed (rounds saved before the caller list), else Unassigned. Every other round is a self round.
 - interviews done = passed + rejected + awaiting (held, no result yet); canceled and still-scheduled rounds aren't done;
 - pass rate = passed / (passed + rejected); a caller is ranked from MIN_DECIDED decided rounds;
@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+from app.caller_directory import CallerEntry, list_directory
 from app.interview_rates import Period, Region, _profile_regions, buckets, label, rate, unit, window
 
 RESULTS = ("passed", "rejected", "awaiting", "canceled", "scheduled")
@@ -32,6 +33,14 @@ def typed_caller(name: str, callers: dict):
     """The caller (`callers`: nameKey → caller) a typed caller name means, or None (TBD, unknown names)."""
     key = name_key(name)
     return callers.get(ALIASES.get(key, key))
+
+
+def _caller_id(caller, by_key: dict) -> Optional[str]:
+    """The id a caller round counts for: its callerId, else the caller whose name was typed, else None."""
+    if caller.callerId:
+        return caller.callerId
+    typed = typed_caller(caller.callerName, by_key)
+    return str(typed.id) if typed else None
 
 
 def _utc(v: datetime) -> datetime:
@@ -85,8 +94,8 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
     first = local_day_start_utc(start, tz)
     last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     regions, _ = await _profile_regions()
-    callers = sorted(await Caller.find_all().to_list(), key=lambda c: c.nameKey)
-    by_key = {c.nameKey: c for c in callers}
+    directory = await list_directory(include_archived=True)
+    by_key = {c.nameKey: c for c in await Caller.find_all().to_list()}
 
     caller_rounds, self_rounds = [], []
     ivs = await Interview.find({"$or": [{"scheduledAt": {"$gte": first, "$lte": last}},
@@ -107,17 +116,16 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
             if caller is None or not getattr(caller, "enabled", False):
                 self_rounds.append(row)
                 continue
-            typed = None if caller.callerId else typed_caller(caller.callerName, by_key)
             row.update({
                 "interviewId": str(iv.id), "roundId": rd.entry_id,
-                "callerId": caller.callerId or (str(typed.id) if typed else None),
+                "callerId": _caller_id(caller, by_key),
                 "callerName": (caller.callerName or "").strip(), "roundDate": _iso(held),
                 "company": (iv.companyName or "").strip(), "stage": rd.stage, "engineerId": iv.createdBy,
             })
             caller_rounds.append(row)
 
     team = summary(caller_rounds)
-    rows = _caller_rows(callers, caller_rounds, team["passRate"])
+    rows = _caller_rows(directory, caller_rounds, team["passRate"])
     chart_unit = unit(period, start, end)
     weekly = []
     for s, e, lbl in buckets(chart_unit, start, end):
@@ -149,11 +157,12 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
     }
 
 
-def _caller_rows(callers: list, rounds: list[dict], team_rate: Optional[float]) -> list[dict]:
-    """Every caller on the list (even with no rounds), then callers no longer on it that have rounds, then
-    Unassigned when it has any. Rounds of a caller no longer on the list keep its id and typed name."""
-    known = {str(c.id) for c in callers}
-    rows = [{"callerId": str(c.id), "name": c.name, "color": c.color} for c in callers]
+def _caller_rows(directory: list[CallerEntry], rounds: list[dict], team_rate: Optional[float]) -> list[dict]:
+    """Every entry of the caller directory (platform users and external callers, archived ones too, even with no
+    rounds), then callers no longer in it that have rounds, then Unassigned when it has any. Rounds of a caller no
+    longer in the directory keep its id and typed name."""
+    known = {e["_id"] for e in directory}
+    rows = [{"callerId": e["_id"], "name": e["name"], "color": e["color"]} for e in directory]
     for r in rounds:
         cid = r["callerId"]
         if cid and cid not in known:
@@ -167,3 +176,54 @@ def _caller_rows(callers: list, rounds: list[dict], team_rate: Optional[float]) 
         row["ranked"] = s["counts"]["passed"] + s["counts"]["rejected"] >= MIN_DECIDED
         row["vsTeam"] = round(s["passRate"] - team_rate, 4) if s["passRate"] is not None and team_rate is not None else None
     return rows
+
+
+OVERVIEW_DAYS = 90  # the overview's pass rate looks back this far
+
+
+async def caller_overview(now: datetime) -> dict[str, dict]:
+    """Per caller id, for the Callers tab: {upcoming, thisWeek, passRate, rounds}. Counts rounds like caller_stats
+    does. upcoming = scheduled rounds starting after `now`; thisWeek = rounds (not canceled) on a day of the app-time
+    Monday-Sunday week of `now`; passRate = passed / (passed + rejected) over the 90 days before `now`; rounds = every
+    round the caller has had or has coming (any status). Callers with nothing are left out. Unassigned isn't listed."""
+    from app.dashboard_stats import app_tz
+    from app.interview_rounds import _ROUND_COUNT_EXCLUDED, _breakdown_group, merged_rounds
+    from app.models import Interview
+    from app.models.caller import Caller
+
+    tz = app_tz()
+    now = _utc(now)
+    today = now.astimezone(tz).date()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    since = now - timedelta(days=OVERVIEW_DAYS)
+    by_key = {c.nameKey: c for c in await Caller.find_all().to_list()}
+    stats: dict[str, dict] = defaultdict(lambda: {"upcoming": 0, "thisWeek": 0, "passed": 0, "rejected": 0, "rounds": 0})
+
+    ivs = await Interview.find({"$or": [{"stageHistory.caller.enabled": True}, {"caller.enabled": True}]}).to_list()
+    for iv in ivs:
+        for rd in merged_rounds(iv):
+            if rd.at is None or _breakdown_group(rd.stage) is None or rd.stage in _ROUND_COUNT_EXCLUDED:
+                continue
+            caller = rd.caller
+            if caller is None or not getattr(caller, "enabled", False):
+                continue
+            cid = _caller_id(caller, by_key)
+            if cid is None:
+                continue
+            held = _utc(rd.at)
+            result = round_result(rd.status)
+            st = stats[cid]
+            st["rounds"] += 1
+            if result == "scheduled" and held > now:
+                st["upcoming"] += 1
+            if result != "canceled" and monday <= held.astimezone(tz).date() <= sunday:
+                st["thisWeek"] += 1
+            if result in ("passed", "rejected") and since <= held <= now:
+                st[result] += 1
+
+    return {
+        cid: {"upcoming": st["upcoming"], "thisWeek": st["thisWeek"],
+              "passRate": _pass_rate(st["passed"], st["rejected"]), "rounds": st["rounds"]}
+        for cid, st in stats.items()
+    }

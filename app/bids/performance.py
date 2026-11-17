@@ -16,7 +16,7 @@ from app.bids.records import records_start_utc
 from app.bids.schemas import _iso_utc
 from app.bids.week import DayWindow, _day_counts
 from app.bids.schemas import bidder_status
-from app.bids.windows import BidSchedule, period_key, schedule_from_settings, window_for
+from app.bids.windows import BidSchedule, daily_cutoff_on, period_key, schedule_from_settings, window_for
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import split_rounds_by_day
 from app.models import Account, Interview, UserExtra
@@ -46,24 +46,42 @@ def day_columns(days: list[date]) -> list[dict]:
 
 def pay_week_columns(start: date, end: date, sched: BidSchedule) -> list[dict]:
     """Every pay week touching [start, end] (its report days), clipped to it; `partial` when the range cuts it."""
-    from app.bids.week import pay_week
+    from app.bids.week import pay_weeks_touching
 
-    out, d = [], start
-    while d <= end:
-        days = [date.fromisoformat(w.key) for w in pay_week(sched, datetime.now(timezone.utc), d).days]
-        first, last = days[0], days[-1]
+    out = []
+    for pw in reversed(pay_weeks_touching(sched, datetime.now(timezone.utc), start, end)):  # oldest first
+        first, last = date.fromisoformat(pw.days[0].key), date.fromisoformat(pw.days[-1].key)
         s, e = max(first, start), min(last, end)
         out.append({"start": s.isoformat(), "end": e.isoformat(), "partial": s != first or e != last})
-        d = last + timedelta(days=1)
     return out
 
 
-def previous_range(period: str, start: date, end: date) -> tuple[date, date]:
-    """The period to compare with: the week before; the month before, cut to the same number of days (clipped to its
-    last day); a custom range's length of days just before it."""
+def previous_range(period: str, start: date, end: date, sched: Optional[BidSchedule] = None,
+                   span: int = 1) -> tuple[date, date]:
+    """The period to compare with: the `span` pay weeks before (`start` is a pay week's first report day; a period so
+    far, its end clipped to today, compares with as many days of it); the month before, cut to the same number of days
+    (clipped to its last day); a custom range's length of days just before it. Pay weeks come from `pay_week`, never
+    from counting 7 days, since the week at the schedule switch is longer."""
     days = (end - start).days + 1
     if period == "week":
-        return start - timedelta(days=7), end - timedelta(days=7)
+        from app.bids.week import pay_week
+
+        sched = sched or schedule_from_settings()
+        now = datetime.now(timezone.utc)
+
+        def week_days(d: date) -> list[date]:
+            return [date.fromisoformat(w.key) for w in pay_week(sched, now, d).days]
+
+        this_last = week_days(start)[-1]
+        for _ in range(span - 1):  # the period's later pay weeks
+            this_last = week_days(this_last + timedelta(days=1))[-1]
+        prev_last = week_days(start - timedelta(days=1))[-1]
+        prev_first = start
+        for _ in range(span):  # the same number of pay weeks just before it
+            prev_first = week_days(prev_first - timedelta(days=1))[0]
+        if end >= this_last:
+            return prev_first, prev_last
+        return prev_first, min(prev_first + timedelta(days=days - 1), prev_last)
     if period == "month":
         first = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
         return first, min(first + timedelta(days=days - 1), date(first.year, first.month, monthrange(first.year, first.month)[1]))
@@ -132,7 +150,7 @@ def day_windows(start: date, end: date, sched: BidSchedule) -> list[DayWindow]:
     """One window per local date of [start, end]: the daily window ending at that date's cutoff."""
     out = []
     for i in range((end - start).days + 1):
-        cutoff = datetime.combine(start + timedelta(days=i), sched.daily_at, tzinfo=sched.tz)
+        cutoff = daily_cutoff_on(start + timedelta(days=i), sched)
         s, e = window_for("daily", cutoff, sched)
         out.append(DayWindow(period_key(cutoff), s, e))
     return out
@@ -198,11 +216,11 @@ def _ratio(n, d, digits):
 
 async def performance(
     bidders: list[Bidder], period: str, start: date, end: date, label: str, today: date,
-    columns: Optional[list[dict]] = None,
+    columns: Optional[list[dict]] = None, span: int = 1,
 ) -> dict:
     """The /bids/performance response (spec section 3): per-bidder bids by week, streaks, interviews and the top cards."""
     sched = schedule_from_settings()
-    prev_start, prev_end = previous_range(period, start, end)
+    prev_start, prev_end = previous_range(period, start, end, sched, span)
     counts = await day_counts(bidders, min(prev_start, start), end, sched)
     weeks = columns if columns is not None else week_columns(start, end)
     week_of = {date.fromisoformat(w["start"]) + timedelta(days=i): n
@@ -226,9 +244,11 @@ async def performance(
         mine = {d: sum(c[:2]) for (bid, d), c in counts.items() if bid == k}
         cur = [(d, c) for (bid, d), c in counts.items() if bid == k and start <= d <= end]
         weekly = [0] * len(weeks)
+        weekly_pending = [0] * len(weeks)  # of `weekly`: the pending part, per column
         for d, c in cur:
             if d in week_of:  # stats-only callers pass no columns
                 weekly[week_of[d]] += c[0] + c[1]
+                weekly_pending[week_of[d]] += c[1]
         approved, pending, rejected = (sum(c[i] for _d, c in cur) for i in range(3))
         total = approved + pending
         prev_total = sum(n for d, n in mine.items() if prev_start <= d <= prev_end)
@@ -245,7 +265,7 @@ async def performance(
         rows.append({
             "id": k, "name": b.name, "ownerName": owners.get(b.createdBy), "profileId": str(b.profileId) if b.profileId else None,
             "profileName": accounts[b.profileId].name if b.profileId in accounts else None,
-            "status": "archived" if b.archivedAt else "active", "weekly": weekly, "total": total, "approved": approved,
+            "status": "archived" if b.archivedAt else "active", "weekly": weekly, "weeklyPending": weekly_pending, "total": total, "approved": approved,
             "pending": pending, "rejected": rejected, "previousTotal": prev_total,
             "change": _ratio(total - prev_total, prev_total, 3), **st,
             "hitRate": _ratio(st["hitDays"], st["weekdays"], 3), "avgPerWeekday": _ratio(total, st["weekdays"], 1),

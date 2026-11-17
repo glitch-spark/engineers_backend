@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -15,8 +15,9 @@ from app.bids import records, reports
 from app.bids.reports import run_bid_reports_tick
 from app.bids.slack_format import Owner
 from app.bids.storage import BidStorageError
-from app.bids.windows import BidSchedule
+from app.bids.windows import BidSchedule, Rules
 from app.config import get_settings
+from app.models import Account
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bid_report_post import BidReportPost
@@ -38,9 +39,13 @@ def bidder(name, folder, rate=0.5):
                            rate=rate, screenshotFolderUrl=folder)
 
 
+def _aware(dt): return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 class FakeStore:
     def __init__(self, bidders):
         self.bidders, self.rows, self.done, self.posts = bidders, [], set(), {}
+        self.mine, self.my_bids_calls, self.my_bids_ids, self.my_bids_error = {}, [], [], None
 
     async def claim(self, key):
         if key in self.done:
@@ -50,9 +55,21 @@ class FakeStore:
     async def release(self, key): self.done.discard(key)
     async def load_rows(self, kind, pk): return [r for r in self.rows if (r.kind, r.periodKey) == (kind, pk)]
     async def save_rows(self, rows): self.rows += rows; return rows
+    async def overlapping_weekly(self, start, end, exclude_key):
+        for r in self.rows:
+            if (r.kind == "weekly" and r.periodKey != exclude_key and _aware(r.periodStart) < end
+                    and _aware(r.periodEnd) > start):
+                return r.periodKey
+        return None
     async def active_bidders(self): return self.bidders
     async def profile_names(self, ids): return {}
     async def owners(self, ids): return {str(OWNER): Owner("Pedro", "Pedro")}
+    async def my_bids(self, ids, first, last):
+        if self.my_bids_error:
+            raise self.my_bids_error
+        self.my_bids_calls.append((first, last))
+        self.my_bids_ids.append(list(ids))
+        return self.mine
     async def save_post(self, kind, pk, channel, ts):
         self.posts[(kind, pk)] = SimpleNamespace(kind=kind, periodKey=pk, channel=channel, ts=ts, rev=0, dirty=False)
     async def dirty_posts(self): return [p for p in self.posts.values() if p.dirty]
@@ -72,12 +89,13 @@ class FakeStorage:
 
 
 class Poster:
-    def __init__(self, fail=False): self.fail, self.sent = fail, []
+    def __init__(self, fail=False): self.fail, self.sent, self.messages = fail, [], []
 
     async def __call__(self, text, messages):
         if self.fail:
             raise RuntimeError("slack down")
         self.sent.append(text)
+        self.messages.append(messages)
         return "C1", [f"{len(self.sent)}.0"]
 
 
@@ -182,7 +200,7 @@ START, END = datetime(2026, 10, 1, 23, 30, tzinfo=timezone.utc), DAILY_CUTOFF  #
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["bid-reports-unit"]
-    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, BidReportPost])
+    await init_beanie(database=database, document_models=[Bidder, Bid, BidReport, BidReportPost, Account])
     return database
 
 
@@ -351,3 +369,214 @@ async def test_update_report_edits_each_message_and_fits_a_new_length(monkeypatc
     calls.clear()
     assert await reports.update_report("C1", ["1.0"], "t", [[{"b": 1}], [{"b": 2}]]) == ["1.0", "9.0"]
     assert calls == [("chat.update", "1.0", None), ("chat.postMessage", None, "1.0")]
+
+
+# --- the schedule switch: Sun 2026-11-22 20:00 CST, daily 18:30 -> 18:00, weekly Sat 16:00 -> Sun 20:00 ---
+
+SWITCH_SCHED = BidSchedule(tz=CT, daily_at=time(18, 30), weekly_day=5, weekly_at=time(16, 0),
+                           switch_at=datetime(2026, 11, 22, 20, 0, tzinfo=CT),
+                           next_rules=Rules(time(18, 0), 6, time(20, 0)))
+
+
+async def switch_tick(local, store=None):
+    store = store or FakeStore([bidder("Ana", "s3://b/ana/")])
+    post = Poster()
+    got = await run_bid_reports_tick(local.replace(tzinfo=CT).astimezone(timezone.utc), store=store,
+                                     storage=FakeStorage({"s3://b/ana/": 3}), post=post, sched=SWITCH_SCHED)
+    return got, store, post
+
+
+def weekly_rows(store):
+    return [r for r in store.rows if r.kind == "weekly"]
+
+
+async def test_switch_no_weekly_report_on_the_saturday_before():
+    # Sat 11-21 16:05: the old Saturday cutoff no longer exists, the long week is still open
+    got, store, post = await switch_tick(datetime(2026, 11, 21, 16, 5))
+    assert got["weekly"] == "not-due" and weekly_rows(store) == []
+    assert not any("Weekly" in t for t in post.sent)
+    assert "bids-weekly:2026-11-21" not in store.done and "bids-weekly:2026-11-14" not in store.done
+
+
+async def test_switch_weekly_report_posts_at_the_sunday_cutoff():
+    got, store, post = await switch_tick(datetime(2026, 11, 22, 20, 5))
+    assert got["weekly"] == "posted" and "bids-weekly:2026-11-22" in store.done
+    rows = weekly_rows(store)
+    assert rows and {r.periodKey for r in rows} == {"2026-11-22"}
+    assert all(r.periodStart.replace(tzinfo=timezone.utc) == datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc) and
+               r.periodEnd.replace(tzinfo=timezone.utc) == datetime(2026, 11, 23, 2, 0, tzinfo=timezone.utc)
+               for r in rows)
+    weekly = [t for t in post.sent if "Weekly bids & pay" in t]
+    assert len(weekly) == 1 and "week ending Sun Nov 22" in weekly[0]
+
+
+async def test_switch_day_report_posts_at_the_old_cutoff_on_the_switch_day():
+    got, store, post = await switch_tick(datetime(2026, 11, 22, 18, 35))
+    assert got["daily"] == "posted" and "bids-daily:2026-11-22" in store.done
+    assert got["weekly"] == "not-due" and weekly_rows(store) == []
+    daily = [r for r in store.rows if r.kind == "daily"]
+    assert {r.periodKey for r in daily} == {"2026-11-22"}
+    # the day ending at the old Sun 18:30 cutoff: Sat 18:30 -> Sun 18:30 CST
+    assert {(r.periodStart.replace(tzinfo=timezone.utc), r.periodEnd.replace(tzinfo=timezone.utc)) for r in daily} == {
+        (datetime(2026, 11, 22, 0, 30, tzinfo=timezone.utc), datetime(2026, 11, 23, 0, 30, tzinfo=timezone.utc))}
+
+
+async def test_switch_daily_report_moves_to_the_new_time_after_the_switch():
+    got, store, post = await switch_tick(datetime(2026, 11, 23, 18, 5))
+    assert got["daily"] == "posted" and "bids-daily:2026-11-23" in store.done
+    daily = [r for r in store.rows if r.kind == "daily"]
+    assert {r.periodKey for r in daily} == {"2026-11-23"}
+    start = {r.periodStart.replace(tzinfo=timezone.utc) for r in daily}
+    end = {r.periodEnd.replace(tzinfo=timezone.utc) for r in daily}
+    # Sun 18:30 -> Mon 18:00 CST
+    assert start == {datetime(2026, 11, 23, 0, 30, tzinfo=timezone.utc)}
+    assert end == {datetime(2026, 11, 24, 0, 0, tzinfo=timezone.utc)}
+
+
+async def test_switch_nothing_new_before_the_first_new_daily_cutoff():
+    # Mon 11-23 17:59: the old 18:30 cutoff would not be until later, the new 18:00 not yet; the latest
+    # cutoff is still Sun 11-22 18:30, long past its catch-up window, and nothing is posted or saved.
+    got, store, post = await switch_tick(datetime(2026, 11, 23, 17, 59))
+    assert got["daily"] == "not-due" and got["weekly"] == "not-due"
+    assert store.rows == [] and post.sent == []
+
+
+async def test_switch_read_from_settings(monkeypatch):
+    s = get_settings().model_copy(update={
+        "BID_SCHEDULE_SWITCH_AT": "2026-11-22T20:00", "BID_NEXT_DAILY_REPORT_TIME": "18:00",
+        "BID_NEXT_WEEKLY_REPORT_DAY": "sunday", "BID_NEXT_WEEKLY_REPORT_TIME": "20:00"})
+    monkeypatch.setattr("app.bids.windows.get_settings", lambda: s)
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    now = datetime(2026, 11, 22, 20, 5, tzinfo=CT).astimezone(timezone.utc)
+    got = await run_bid_reports_tick(now, store=store, storage=FakeStorage({"s3://b/ana/": 3}), post=post)
+    assert got["weekly"] == "posted" and "bids-weekly:2026-11-22" in store.done
+
+
+# --- the double-report guard: a weekly window may not overlap a stored weekly report of another period ---
+
+def stored_weekly(store, key, start, end):
+    store.rows.append(BidReport.model_construct(
+        kind="weekly", periodKey=key, periodStart=start, periodEnd=end, bidderId=PydanticObjectId(),
+        ownerId=OWNER, bidderName="Ana", rate=0.5, count=1, amount=0.5))
+
+
+async def test_switch_weekly_overlapping_a_stored_report_is_refused(caplog):
+    # old code posted weekly 2026-11-21 (11-14 -> 11-21); the long week 11-14 -> 11-22 would pay those days twice
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    stored_weekly(store, "2026-11-21", datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 21, 22, 0, tzinfo=timezone.utc))
+    with caplog.at_level("ERROR", logger="bids.reports"):
+        got, store, post = await switch_tick(datetime(2026, 11, 22, 20, 5), store)
+    assert got["weekly"] == "overlap:2026-11-21"
+    assert not any("Weekly" in t for t in post.sent)
+    assert {r.periodKey for r in weekly_rows(store)} == {"2026-11-21"}
+    assert "bids-weekly:2026-11-22" in store.done  # the claim stays: later ticks do not retry
+    assert any("2026-11-22" in m and "2026-11-21" in m for m in caplog.messages)
+    again = await run_bid_reports_tick(datetime(2026, 11, 22, 20, 10, tzinfo=CT).astimezone(timezone.utc),
+                                       store=store, storage=FakeStorage({}), post=post, sched=SWITCH_SCHED)
+    assert again["weekly"] == "done" and not any("Weekly" in t for t in post.sent)
+
+
+async def test_switch_weekly_after_a_normal_previous_week_is_not_refused():
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    stored_weekly(store, "2026-11-14", datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc))
+    got, store, post = await switch_tick(datetime(2026, 11, 22, 20, 5), store)
+    assert got["weekly"] == "posted"
+
+
+async def test_overlap_guard_does_not_apply_to_daily_reports():
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    stored_weekly(store, "2026-11-21", datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 21, 22, 0, tzinfo=timezone.utc))
+    got, _, _ = await switch_tick(datetime(2026, 11, 22, 18, 35), store)
+    assert got["daily"] == "posted"
+
+
+async def test_real_store_finds_an_overlapping_weekly_report(db):
+    start, end = datetime(2026, 11, 14, 22, 0, tzinfo=timezone.utc), datetime(2026, 11, 23, 2, 0, tzinfo=timezone.utc)
+    store = reports.BeanieReportStore()
+    for kind, key, s_, e_ in [
+        ("weekly", "2026-11-14", datetime(2026, 11, 7, 22, 0), datetime(2026, 11, 14, 22, 0)),   # adjacent
+        ("daily", "2026-11-20", datetime(2026, 11, 19, 23, 30), datetime(2026, 11, 20, 23, 30)),  # not weekly
+    ]:
+        await BidReport(kind=kind, periodKey=key, periodStart=s_, periodEnd=e_, bidderId=PydanticObjectId(),
+                        ownerId=OWNER, bidderName="Ana", rate=0.5, count=1, amount=0.5).insert()
+    assert await store.overlapping_weekly(start, end, "2026-11-22") is None
+    await BidReport(kind="weekly", periodKey="2026-11-21", periodStart=datetime(2026, 11, 14, 22, 0),
+                    periodEnd=datetime(2026, 11, 21, 22, 0), bidderId=PydanticObjectId(), ownerId=OWNER,
+                    bidderName="Ana", rate=0.5, count=1, amount=0.5).insert()
+    assert await store.overlapping_weekly(start, end, "2026-11-22") == "2026-11-21"
+    assert await store.overlapping_weekly(start, end, "2026-11-21") is None
+
+
+# --- each owner's My bids (self bids per profile) ride along in the post ---
+
+def section_texts(messages):
+    return [b["text"]["text"] for blocks in messages for b in blocks if b.get("type") == "section"]
+
+
+async def test_daily_post_carries_my_bids():
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    store.mine = {str(OWNER): {"Arda": 12, "Cory": 23}}
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
+    assert got["daily"] == "posted"
+    assert any("My bids — 35 (Arda 12 · Cory 23)" in t for t in section_texts(post.messages[0]))
+    assert store.my_bids_calls == [(date(2026, 10, 2), date(2026, 10, 2))]
+
+
+async def test_weekly_my_bids_cover_the_pay_weeks_report_days():
+    now = datetime(2026, 10, 3, 21, 5, tzinfo=timezone.utc)  # Sat 16:05 CDT
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    got = await tick(now, store, FakeStorage({"s3://b/ana/": 3}), post)
+    assert got["weekly"] == "posted"
+    assert (date(2026, 9, 27), date(2026, 10, 3)) in store.my_bids_calls
+
+
+async def test_store_my_bids_counts_self_bids_per_profile(db):
+    arda = await Account(name="Arda", createdBy=OWNER).insert()
+    for i in range(2):
+        await Bid(kind="self", ownerId=OWNER, accountId=arda.id, jobKey=f"self-{i}",
+                  firstAt=datetime(2026, 10, 2, 15, 0)).insert()
+    got = await reports.BeanieReportStore().my_bids([OWNER], date(2026, 10, 2), date(2026, 10, 2))
+    assert got == {str(OWNER): {"Arda": 2}}
+
+
+async def test_post_goes_out_when_my_bids_fails(caplog):
+    store, post = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster()
+    store.my_bids_error = RuntimeError("db down")
+    with caplog.at_level("WARNING", logger="bids.reports"):
+        got = await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post)
+    assert got["daily"] == "posted" and len(post.sent) == 1
+    assert not any("My bids" in t for t in section_texts(post.messages[0]))
+    assert any("My bids" in m and "db down" in m for m in caplog.messages) or any(
+        r.exc_info for r in caplog.records if r.levelname == "WARNING")
+
+
+async def test_failed_my_bids_does_not_block_an_edit():
+    store, post, edit = FakeStore([bidder("Ana", "s3://b/ana/")]), Poster(), Editor()
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3}), post, edit)
+    store.my_bids_error = RuntimeError("db down")
+    store.posts[("daily", "2026-10-02")].dirty = True
+    got = await tick(DAILY_CUTOFF + timedelta(minutes=10), store, FakeStorage({}), post, edit)
+    assert got["refreshed"] == 1 and len(edit.calls) == 1
+
+
+async def test_weekly_my_bids_cover_the_transition_week():
+    # the long week Sun Nov 15 -> Sun Nov 22, 2026 (eight report days), reported at the Sunday 20:00 cutoff
+    store = FakeStore([bidder("Ana", "s3://b/ana/")])
+    got, store, _ = await switch_tick(datetime(2026, 11, 22, 20, 5), store)
+    assert got["weekly"] == "posted"
+    assert (date(2026, 11, 15), date(2026, 11, 22)) in store.my_bids_calls
+
+
+async def test_my_bids_queries_only_the_owners_with_rows():
+    other, ghost = PydanticObjectId(), PydanticObjectId()
+    ana = bidder("Ana", "s3://b/ana/")
+    raj = bidder("Raj", "s3://b/raj/")
+    raj.createdBy = other  # all of this owner's rows are zero
+    store, post = FakeStore([ana, raj]), Poster()
+    store.mine = {str(OWNER): {"Arda": 1}, str(ghost): {"Zed": 5}}  # ghost has self bids but no bidder rows
+    await tick(DAILY_CUTOFF + timedelta(minutes=5), store, FakeStorage({"s3://b/ana/": 3, "s3://b/raj/": 0}), post)
+    (ids,) = store.my_bids_ids
+    assert set(ids) == {OWNER, other} and ghost not in ids

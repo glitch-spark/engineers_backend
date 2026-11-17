@@ -17,6 +17,7 @@ from app import ai_usage
 from app.config import get_settings
 from app.deps import get_current_user
 from app.interview_analyze import extract_and_score
+from app.interview_day.post import refresh_today
 from app.interview_resume_link import ResumeLinkIn, build_link, resolve_link, search_matches
 from app.llm_router import is_reasoning_model
 from app.models import (
@@ -38,11 +39,15 @@ from app.interview_caller import (
     CallerError,
     CallerIn,
     build_round_caller,
+    caller_unassigned,
     round_caller_snapshot,
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
-from app.routers.callers import get_caller, is_caller_manager, require_caller_manager
+from app.caller_directory import resolve_caller
+from app.routers.callers import is_caller_manager, require_caller_manager
+from app.round_confirm import ConfirmError, confirm_round
+from app.caller_access import is_assigned_caller
 
 log = logging.getLogger(__name__)
 
@@ -223,16 +228,29 @@ def _round_caller(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
-async def _resolve_caller(body: Optional[CallerIn]) -> Optional[CallerIn]:
-    """A caller picked from the caller list gets the list's name; "" means not assigned yet."""
+async def _resolve_caller(
+    body: Optional[CallerIn], *, owner_id: str, previous: Optional[InterviewCaller] = None,
+) -> Optional[CallerIn]:
+    """A caller picked from the directory (active user or external caller) gets the directory's name and kind;
+    "" means not assigned yet. Nobody takes their own interview as the caller. Re-sending the round's current
+    caller keeps it as saved, even if they have since left the list (archived or deactivated)."""
     if body is None or body.callerId is None:
         return body
     if not body.callerId:
-        return body.model_copy(update={"callerName": "TBD"})
-    caller = await get_caller(body.callerId)
-    if caller is None:
+        return body.model_copy(update={"callerName": "TBD", "callerKind": "external"})
+    if previous is not None and previous.callerId and body.callerId == previous.callerId:
+        return body.model_copy(
+            update={"callerName": previous.callerName, "callerKind": previous.callerKind},
+        )
+    if body.callerId == owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You take your own interview as Self — pick someone else as the caller.",
+        )
+    entry = await resolve_caller(body.callerId)
+    if entry is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That caller is no longer on the list.")
-    return body.model_copy(update={"callerId": str(caller.id), "callerName": caller.name})
+    return body.model_copy(update={"callerId": entry["_id"], "callerName": entry["name"], "callerKind": entry["kind"]})
 
 
 def _assignment(caller: Optional[InterviewCaller]) -> tuple:
@@ -315,11 +333,41 @@ async def _sync_caller_posts(
     gone = set(deleted)
     if await sync_caller_thread(iv, before, added=added, deleted=gone) and not gone:
         await _save_interview(iv)
+    if not gone:  # a delete refreshes once the round is really gone
+        _refresh_day_post(iv.id)
+
+
+_day_post_tasks: set[asyncio.Task] = set()
+
+
+def _refresh_day_post(iv_id: object, *, deleted: bool = False) -> None:
+    """Edit today's day post in the background (the response never waits on Slack). The refresh itself skips writes
+    that cannot change the post. Slack trouble is logged, never raised."""
+    task = asyncio.create_task(_run_day_post_refresh(str(iv_id), deleted))
+    _day_post_tasks.add(task)
+    task.add_done_callback(_day_post_tasks.discard)
+
+
+async def _run_day_post_refresh(iv_id: str, deleted: bool) -> None:
+    try:
+        await refresh_today(interview_id=iv_id, deleted=deleted)
+    except Exception as exc:
+        log.warning("interviews: day post refresh failed: %s", exc)
+
+
+async def drain_day_post_refreshes() -> None:
+    """Wait for the scheduled day post refreshes (tests and shutdown)."""
+    while _day_post_tasks:
+        await asyncio.gather(*list(_day_post_tasks), return_exceptions=True)
 
 
 def _can_view(iv: Interview, user: UserExtra) -> bool:
-    """Admin, interview manager, or owner."""
-    return user.role in ("admin", "interview_manager") or str(iv.createdBy) == str(user.id)
+    """Admin, interview manager, owner, or a round's assigned platform-user caller."""
+    return (
+        user.role in ("admin", "interview_manager")
+        or str(iv.createdBy) == str(user.id)
+        or is_assigned_caller(iv, user)
+    )
 
 
 _JOB_URL_MAX = 2000
@@ -471,6 +519,102 @@ async def _interview_out(iv: Interview) -> dict:
     rows = await populate_owner([iv], field="createdBy")
     out = await _populate_account(rows)
     return out[0]
+
+
+def _caller_summary(caller: Optional[dict]) -> dict:
+    """Who takes a round, and nothing about how (no id, method or link)."""
+    caller = caller or {}
+    on = bool(caller.get("enabled"))
+    return {
+        "enabled": on,
+        "callerName": caller.get("callerName") if on else None,
+        "callerKind": caller.get("callerKind") if on else None,
+    }
+
+
+def _summary_fields(item: dict) -> dict:
+    """The read-only view of one populated interview dict (as `_interview_out` / the list feeds build it): who and where
+    (company, position, profile, owner) and the rounds timeline. A whitelist, so notes, transcripts, interviewer names,
+    links, the applying bidder, caller method/link and questions can never ride along."""
+    account = item.get("accountId")
+    owner = item.get("createdBy")
+    rounds = [
+        {
+            "id": e.get("id"),
+            "stage": _stage_value(e.get("stage")),
+            "status": _status_value(e.get("status")),
+            "scheduledAt": _iso_utc(e.get("scheduledAt")),
+            "endsAt": _iso_utc(e.get("endsAt")),
+            "confirmed": bool(e.get("confirmed")),
+            "caller": _caller_summary(e.get("caller")),
+        }
+        for e in item.get("stageHistory") or []
+    ]
+    owner_ok = isinstance(owner, dict)
+    return {
+        "_id": str(item.get("_id")),
+        "companyName": item.get("companyName"),
+        "appliedPosition": item.get("appliedPosition"),
+        "accountId": (
+            {k: account.get(k) for k in ("_id", "name", "region", "country")} if isinstance(account, dict) else None
+        ),
+        "createdBy": {"_id": owner.get("_id"), "name": owner.get("name")} if owner_ok else None,
+        "ownerName": owner.get("name") if owner_ok else None,
+        "stage": _stage_value(item.get("stage")),
+        "status": _status_value(item.get("status")),
+        "scheduledAt": _iso_utc(item.get("scheduledAt")),
+        # The latest round's caller and confirmed flag, which the Interviews list shows in a column.
+        "caller": _caller_summary(item.get("caller")),
+        "confirmed": bool(item.get("confirmed")),
+        "summaryOnly": True,
+        "stageHistory": rounds,
+    }
+
+
+async def summary_out(iv: Interview) -> dict:
+    """What a signed-in user who is not the interview's owner, an admin, an interview manager or an assigned caller
+    sees of it (`GET /interviews/{id}`)."""
+    return _summary_fields(await _interview_out(iv))
+
+
+def _sees_full(item: dict, user: UserExtra) -> bool:
+    """`_can_view` for a populated interview dict: admin, interview manager, owner, or a round's assigned platform-user
+    caller (an inactive user is not one)."""
+    if user.role in ("admin", "interview_manager"):
+        return True
+    owner = item.get("createdBy")
+    owner_id = owner.get("_id") if isinstance(owner, dict) else owner
+    uid = str(user.id)
+    if str(owner_id) == uid:
+        return True
+    if getattr(user, "isActive", True) is False:
+        return False
+    return any(
+        (c := e.get("caller") or {}).get("enabled") and c.get("callerKind") == "user" and c.get("callerId") == uid
+        for e in item.get("stageHistory") or []
+    )
+
+
+def trim_for_viewer(items: list[dict], user: UserExtra) -> list[dict]:
+    """List and calendar feeds: interviews the user can't fully see shrink to the read-only summary fields (with
+    `summaryOnly`); the ones they can see stay as they are."""
+    return [it if _sees_full(it, user) else _summary_fields(it) for it in items]
+
+
+def trim_feed(items: list[dict], rounds: list[dict], user: UserExtra) -> list[dict]:
+    """Round feeds (calendar, caller schedule): the interviews behind the rows are trimmed as in the list, and a round of
+    an interview the user can't fully see loses its status reason and any email fallback in its names (the rest of a row is what the calendar draws)."""
+    hidden = {str(it.get("_id")): it for it in items if not _sees_full(it, user)}
+    for r in rounds:
+        iv = hidden.get(r["interviewId"])
+        if iv is None:
+            continue
+        # Names only: the row builder falls back to an email when a name is missing.
+        account, owner = iv.get("accountId"), iv.get("createdBy")
+        r["statusNote"] = None
+        r["profileLabel"] = ((account.get("name") or "").strip() or None) if isinstance(account, dict) else None
+        r["ownerName"] = ((owner.get("name") or "").strip() or None) if isinstance(owner, dict) else None
+    return trim_for_viewer(items, user)
 
 
 def _list_view(items: list) -> list:
@@ -632,6 +776,23 @@ def _call_type_match(call_type: str) -> Any:
     return True if call_type == "caller" else {"$ne": True}
 
 
+def _search_match(q: str) -> dict:
+    """Mongo match for the feeds' `q`: the company or the position contains it, case-insensitive and literal
+    (regex characters in what the user typed mean themselves). Empty / blank q matches everything ({})."""
+    text = (q or "").strip()
+    if not text:
+        return {}
+    rx = {"$regex": re.escape(text), "$options": "i"}
+    return {"$or": [{"companyName": rx}, {"appliedPosition": rx}]}
+
+
+def _and_search(query: dict, q: str) -> None:
+    """Add the `q` match to `query` without clobbering an `$or` already there (the date range uses one)."""
+    cond = _search_match(q)
+    if cond:
+        query.setdefault("$and", []).append(cond)
+
+
 _SORT_FIELDS = {"latest": "scheduledAt", "company": "companyName", "stage": "stage", "status": "status"}
 
 
@@ -649,6 +810,7 @@ async def list_interviews(
     callType: str = Query("", description="self | caller: who takes the latest round"),
     sort: str = Query("latest"),
     dir: str = Query("desc"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
 ) -> dict:
     # Every authenticated user can list/filter all interviews. Pass creatorId
     # to narrow to one owner; omit it to see everyone.
@@ -667,6 +829,7 @@ async def list_interviews(
         query["createdBy"] = to_object_id(creatorId)
     if callType:
         query["caller.enabled"] = _call_type_match(callType)
+    _and_search(query, q)
 
     # Legacy clients send sort=asc|desc (by date).
     if sort in ("asc", "desc"):
@@ -680,7 +843,7 @@ async def list_interviews(
         [(field, direction), ("_id", direction)]
     ).skip(skip).limit(limit).to_list()
     rows_with_owner = await populate_owner(rows, field="createdBy")
-    rows_out = _list_view(await _populate_account(rows_with_owner))
+    rows_out = trim_for_viewer(_list_view(await _populate_account(rows_with_owner)), user)
 
     total_pages = (total + limit - 1) // limit if limit else 0
     return {
@@ -708,6 +871,7 @@ async def list_interview_rounds(
     callerOnly: bool = Query(False),
     callerId: str = Query(""),
     callType: str = Query("", description="self | caller: who takes the round"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
 ) -> dict:
     """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list.
     callerOnly / callerId narrow it to caller rounds (the Callers calendar); callType to self or caller rounds."""
@@ -728,12 +892,14 @@ async def list_interview_rounds(
         query["accountId"] = to_object_id(accountId)
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
+    _and_search(query, q)
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(
         out, from_dt=f_dt, to_dt=t_dt, stage=stage, status=status_, caller_only=callerOnly, caller_id=callerId,
         call_type=callType,
     )
+    out = trim_feed(out, rounds, user)
     # The interviews behind the rounds, so a click can open the side panel
     # (GET /{id} is limited to owner/admin/interview manager; this feed is not).
     shown = {r["interviewId"] for r in rounds}
@@ -752,6 +918,7 @@ async def list_caller_rounds(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=200),
     dir: str = Query("desc"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
 ) -> dict:
     """Callers list: every user's caller rounds (or `creatorId`'s), one row per round, by start time (desc by
     default), paginated. `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
@@ -773,9 +940,11 @@ async def list_caller_rounds(
     query: dict[str, Any] = {"stageHistory": {"$elemMatch": in_range}}
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
+    _and_search(query, q)
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
+    out = trim_feed(out, rounds, user)
     if dir != "asc":
         rounds.reverse()  # flatten_rounds sorts oldest first
     total = len(rounds)
@@ -837,7 +1006,9 @@ async def get_interview(
     if iv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     if not _can_view(iv, user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+        # Anyone else signed in sees a read-only summary (no notes, resume, brief or questions).
+        migrate_legacy_stage_fields(iv)  # in memory only; the owner's next read saves it
+        return await summary_out(iv)
     if migrate_legacy_stage_fields(iv):
         await _save_interview(iv)
         tip = _tip(iv)
@@ -944,7 +1115,7 @@ async def create_interview(
         )
     applied_by = await _applied_by(body.appliedBy, account_oid) if body.appliedBy else None
     first = body.round or _legacy_round(body)
-    first.caller = await _resolve_caller(first.caller)
+    first.caller = await _resolve_caller(first.caller, owner_id=str(user.id))
     entry = _build_round(first, user=user, source="create")
 
     # History is appended after construction: the model's read-time resolver
@@ -1084,7 +1255,7 @@ async def add_interview_stage(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="rejected is a status; set status on the current round",
         )
-    body.caller = await _resolve_caller(body.caller)
+    body.caller = await _resolve_caller(body.caller, owner_id=str(iv.createdBy))
     entry = _build_round(body, user=user, source="stage")
     prev_tip = _tip(iv)
     if prev_tip is not None and _normalize_stage(prev_tip.stage) == entry.stage:
@@ -1125,8 +1296,15 @@ async def assign_round_caller(
     entry = iv.stageHistory[idx]
     if entry.caller is None or not entry.caller.enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This round has no caller request.")
-    picked = await _resolve_caller(CallerIn(enabled=True, callerId=body.callerId))
-    entry.caller = entry.caller.model_copy(update={"callerId": picked.callerId or None, "callerName": picked.callerName})
+    previous = entry.caller
+    picked = await _resolve_caller(
+        CallerIn(enabled=True, callerId=body.callerId), owner_id=str(iv.createdBy), previous=previous,
+    )
+    entry.caller = previous.model_copy(
+        update={"callerId": picked.callerId or None, "callerName": picked.callerName, "callerKind": picked.callerKind},
+    )
+    if _assignment(entry.caller) != _assignment(previous):
+        entry.confirmed = False  # the new caller has not agreed yet
     iv.stageHistory[idx] = entry
     _sync_top_from_tip(iv)
     await _save_interview(iv)
@@ -1187,25 +1365,32 @@ async def update_interview_stage(
         entry.transcript = body.transcript
     if body.note is not None:
         entry.note = body.note
+    assignment_changed = False
     if body.caller is not None:
         previous = entry.caller
-        entry.caller = _round_caller(await _resolve_caller(body.caller), starts_at=entry.scheduledAt, previous=previous)
+        resolved = await _resolve_caller(body.caller, owner_id=str(iv.createdBy), previous=previous)
+        entry.caller = _round_caller(resolved, starts_at=entry.scheduledAt, previous=previous)
         # The creator picks a caller when adding a round; after that the caller managers assign it.
         if not is_caller_manager(user) and _assignment(entry.caller) != _assignment(previous):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only Admin or an interview manager can change the caller.",
             )
+        if _assignment(entry.caller) != _assignment(previous):
+            entry.confirmed = False  # the new caller has not agreed yet
+            assignment_changed = True
     ended = _status_value(entry.status) in ENDED_STATUSES
     if entry.caller is None or not entry.caller.enabled or ended:
         entry.confirmed = False  # a caller is only lined up for an active caller round
-    if body.confirmed is not None:
+    if body.confirmed is not None and not assignment_changed:  # a new caller has not confirmed yet
         if body.confirmed and (entry.caller is None or not entry.caller.enabled):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only caller rounds are confirmed")
         if body.confirmed and ended:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="A canceled or rejected round can't be confirmed",
             )
+        if body.confirmed and caller_unassigned(entry.caller):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Assign a caller first")
         entry.confirmed = body.confirmed
     iv.stageHistory[idx] = entry
 
@@ -1221,6 +1406,25 @@ async def update_interview_stage(
             await InterviewQuestion.find({"interviewId": iv.id, "stageId": entry.id}).delete()
     await _sync_caller_posts(iv, before)
     await _after_save(iv, extract_stage_ids=extract_ids)
+    return await _interview_out(iv)
+
+
+class ConfirmIn(BaseModel):
+    confirmed: bool
+
+
+@router.post("/{iv_id}/stages/{stage_id}/confirm")
+async def confirm_interview_round(
+    iv_id: str,
+    stage_id: str,
+    body: ConfirmIn,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """The round's assigned caller, an interview manager, admin or the owner confirms (or unconfirms) it."""
+    try:
+        iv = await confirm_round(iv_id, stage_id, user, body.confirmed)
+    except ConfirmError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message)
     return await _interview_out(iv)
 
 
@@ -1269,6 +1473,7 @@ async def delete_interview_stage(
     _sync_top_from_tip(iv)
     await _save_interview(iv)
     await InterviewQuestion.find({"interviewId": iv.id, "stageId": stage_id}).delete()
+    _refresh_day_post(iv.id, deleted=True)
     return await _interview_out(iv)
 
 
@@ -1291,6 +1496,7 @@ async def delete_interview(
     await _sync_caller_posts(iv, before, deleted=set(before))
     await iv.delete()
     await InterviewQuestion.find({"interviewId": iv.id}).delete()
+    _refresh_day_post(iv.id, deleted=True)
     return {"ok": True}
 
 

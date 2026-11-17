@@ -206,7 +206,7 @@ async def resolve_link(body: ResumeLinkIn, account_oid: PydanticObjectId, user) 
         if body.reason is None:
             raise _bad("Pick why no company was found.")
         if body.reason == "fixed_resume":  # forks replaced it: the company search finds the fixed resume
-            raise _bad("Search the company: a fixed resume used in Job Applies is found there.")
+            raise _bad("Search the company: a fixed resume used in Auto apply is found there.")
         if body.reason == "other" and not note:
             raise _bad("Add a note for the reason Other.")
         return InterviewResumeLink(kind="none", reason=body.reason, reasonNote=note or None)

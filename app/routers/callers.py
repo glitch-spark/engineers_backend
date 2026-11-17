@@ -1,11 +1,13 @@
-"""Caller list: everyone reads it; admins and interview managers add, edit and delete callers."""
+"""Caller directory: everyone reads it; admins and interview managers add, edit, archive and delete callers."""
 
+from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from pymongo.errors import DuplicateKeyError
 
+from app.caller_directory import CallerEntry, _external_entry, _user_entry, list_directory
 from app.deps import get_current_user
 from app.models import Interview, UserExtra
 from app.models.caller import CALLER_COLORS, DEFAULT_CALLERS, Caller
@@ -14,6 +16,7 @@ from app.routers._util import to_object_id
 router = APIRouter(prefix="/callers", tags=["callers"])
 
 MAX_NAME = 60
+HAS_ROUNDS = "This caller has rounds — archive them instead."
 
 
 def is_caller_manager(user: UserExtra) -> bool:
@@ -29,10 +32,11 @@ async def require_caller_manager(user: Annotated[UserExtra, Depends(get_current_
 class CallerIn(BaseModel):
     name: Optional[str] = None
     color: Optional[str] = None
+    archived: Optional[bool] = None  # external callers only: hide from new rounds, keep on past ones
 
 
-def caller_out(c: Caller) -> dict:
-    return {"_id": str(c.id), "name": c.name, "color": c.color}
+def caller_out(c: Caller) -> CallerEntry:
+    return _external_entry(c)
 
 
 def _clean_name(raw: Optional[str]) -> str:
@@ -77,10 +81,18 @@ async def get_caller(caller_id: str) -> Optional[Caller]:
 
 
 @router.get("")
-async def list_callers(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
-    callers = await Caller.find_all().to_list()
-    callers.sort(key=lambda c: c.nameKey)
-    return {"callers": [caller_out(c) for c in callers], "canManage": is_caller_manager(user)}
+async def list_callers(user: Annotated[UserExtra, Depends(get_current_user)], archived: int = 0) -> dict:
+    """Active platform users, then external callers; `?archived=1` also lists archived external callers."""
+    return {"callers": await list_directory(include_archived=bool(archived)), "canManage": is_caller_manager(user)}
+
+
+@router.get("/overview")
+async def callers_overview(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+    """Per caller id: upcoming and this-week rounds, pass rate (last 90 days) and all-time rounds. Callers with
+    nothing are left out (read as zeros). Declared before /{caller_id}."""
+    from app.caller_stats import caller_overview
+
+    return {"overview": await caller_overview(datetime.now(timezone.utc))}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -94,7 +106,7 @@ async def create_caller(body: CallerIn, user: Annotated[UserExtra, Depends(requi
     return caller_out(c)
 
 
-async def _rename_on_rounds(caller_id: str, name: str) -> None:
+async def rename_on_rounds(caller_id: str, name: str) -> None:
     """Rounds keep the caller's name for Slack and older screens: follow the rename."""
     coll = Interview.get_motor_collection()
     # One positional update per round: only the name field is written, so a concurrent round edit isn't undone.
@@ -108,10 +120,31 @@ async def _rename_on_rounds(caller_id: str, name: str) -> None:
     await coll.update_many({"caller.callerId": caller_id}, {"$set": {"caller.callerName": name}})
 
 
+async def _get_user(caller_id: str) -> Optional[UserExtra]:
+    try:
+        return await UserExtra.get(to_object_id(caller_id))
+    except HTTPException:
+        return None
+
+
+async def _has_rounds(caller_id: str) -> bool:
+    found = await Interview.find_one({"$or": [{"stageHistory.caller.callerId": caller_id}, {"caller.callerId": caller_id}]})
+    return found is not None
+
+
 @router.put("/{caller_id}")
 async def update_caller(
     caller_id: str, body: CallerIn, user: Annotated[UserExtra, Depends(require_caller_manager)],
 ) -> dict:
+    platform_user = await _get_user(caller_id)
+    if platform_user is not None:
+        # A platform user's name is their profile name; only the calendar colour is the directory's to set.
+        if body.name is not None or body.archived is not None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A platform user's caller only takes a colour.")
+        if body.color is not None:
+            platform_user.callerColor = _check_color(body.color)
+            await platform_user.save()
+        return _user_entry(platform_user)
     c = await get_caller(caller_id)
     if c is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Caller not found.")
@@ -122,20 +155,26 @@ async def update_caller(
         c.name, c.nameKey = name, name.lower()
     if body.color is not None:
         c.color = _check_color(body.color)
+    if body.archived is not None:
+        c.archivedAt = (c.archivedAt or datetime.now(timezone.utc)) if body.archived else None
     try:
         await c.save()
     except DuplicateKeyError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"{c.name} is already on the list.")
     if renamed:
-        await _rename_on_rounds(str(c.id), c.name)
+        await rename_on_rounds(str(c.id), c.name)
     return caller_out(c)
 
 
 @router.delete("/{caller_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_caller(caller_id: str, user: Annotated[UserExtra, Depends(require_caller_manager)]) -> Response:
-    """Rounds already assigned keep the caller's name."""
+    """Only an external caller with no rounds can be deleted; otherwise archive it."""
+    if await _get_user(caller_id) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A platform user can't be deleted from the caller list.")
     c = await get_caller(caller_id)
     if c is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Caller not found.")
+    if await _has_rounds(str(c.id)):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=HAS_ROUNDS)
     await c.delete()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from beanie import init_beanie
+from fastapi import HTTPException
 from mongomock_motor import AsyncMongoMockClient
 
 from app.bids import insights as ins
@@ -81,6 +82,17 @@ async def test_week_rows_carry_the_board_cells_and_pay(db):
     assert rows[str(ana.id)]["week"]["pay"] == 5.0 and rows[str(ana.id)]["week"]["toReview"] == 4
 
 
+async def test_board_rows_carry_the_profile_id(db):
+    pedro, ana, _bo = await setup()
+    profile = await Account(name="Dev-A", createdBy=pedro.id).insert()
+    ana.profileId = profile.id
+    await ana.save()
+    rows = (await board(pedro))["bidders"]
+    assert rows[0]["name"] == "Ana" and rows[0]["profileName"] == "Dev-A"
+    assert rows[0]["profileId"] == str(profile.id)
+    assert rows[1]["profileId"] is None     # Bo has no profile
+
+
 async def test_week_totals_match_the_board_and_say_today(db):
     pedro, _ana, _bo = await setup()
     r, b = await perf(pedro), await board(pedro)
@@ -102,6 +114,14 @@ async def test_every_row_says_the_bidder_status(db):
     assert month["dayCells"] is None and month["week"] is None   # the board is a pay-week thing
 
 
+async def test_month_columns_carry_pending(db):
+    pedro, ana, _bo = await setup()
+    rows = {x["id"]: x for x in (await perf(pedro, period="month", date="2026-11-01"))["bidders"]}
+    a = rows[str(ana.id)]
+    assert a["weekly"][2] == 14 and a["weeklyPending"][2] == 4
+    assert sum(a["weeklyPending"]) == 4 and len(a["weeklyPending"]) == len(a["weekly"])
+
+
 async def test_card_tops_add_streak_and_interviews(db):
     pedro, _ana, _bo = await setup()
     tops = (await bids_router.bids_insights(pedro, period="week", date="", to="", ownerId=None))["tops"]
@@ -119,6 +139,88 @@ async def test_the_owners_self_bids_get_their_own_row_outside_the_totals(db):
                       firstAt=first, status="approved", screenshots=[]).insert()
     r = await perf(pedro)
     assert r["selfRows"] == [{"ownerId": str(pedro.id), "ownerName": "Pedro", "total": 5,
-                              "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0, "lastBidAt": r["selfRows"][0]["lastBidAt"]}]
+                              "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0, "lastBidAt": r["selfRows"][0]["lastBidAt"],
+                              "profiles": [{"accountId": str(alpha.id), "name": "Alpha", "total": 5,
+                                            "weekly": [0, 3, 2, 0, 0, 0, 0], "interviews": 0}]}]
     assert r["selfRows"][0]["lastBidAt"] is not None
     assert r["totals"]["total"] == 14 and r["totals"]["approved"] == 10   # Ana's bidder bids only
+
+
+async def _self_bids(owner, account, day: int, n: int):
+    first = datetime(2026, 11, day, 10, tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+    for _ in range(n):
+        await Bid(kind="self", bidderId=None, ownerId=owner.id, accountId=account.id, jobKey=f"self-{owner.id}/x/j{next(_n)}",
+                  firstAt=first, status="approved", screenshots=[]).insert()
+
+
+async def test_a_self_row_splits_by_profile_and_the_profiles_add_up_to_it(db):
+    pedro, _ana, _bo = await setup()
+    zeta = await Account(name="Zeta", createdBy=pedro.id).insert()
+    alpha = await Account(name="Alpha", createdBy=pedro.id).insert()
+    await Account(name="Idle", createdBy=pedro.id).insert()            # no self bids: no sub-row
+    await _self_bids(pedro, zeta, 16, 2)
+    await _self_bids(pedro, alpha, 16, 1)
+    await _self_bids(pedro, alpha, 17, 4)
+    row = (await perf(pedro))["selfRows"][0]
+    assert [(p["name"], p["total"], p["weekly"]) for p in row["profiles"]] == [
+        ("Alpha", 5, [0, 1, 4, 0, 0, 0, 0]),
+        ("Zeta", 2, [0, 2, 0, 0, 0, 0, 0]),
+    ]
+    assert row["total"] == sum(p["total"] for p in row["profiles"]) == 7
+    assert row["weekly"] == [sum(col) for col in zip(*(p["weekly"] for p in row["profiles"]))]
+
+
+async def test_the_self_listing_narrows_to_one_profile(db):
+    pedro, _ana, _bo = await setup()
+    alpha = await Account(name="Alpha", createdBy=pedro.id).insert()
+    zeta = await Account(name="Zeta", createdBy=pedro.id).insert()
+    await _self_bids(pedro, alpha, 16, 2)
+    await _self_bids(pedro, zeta, 16, 3)
+    every = await bids_router.list_bids(pedro, day="2026-11-16", self_=True)
+    only = await bids_router.list_bids(pedro, day="2026-11-16", self_=True, accountId=str(alpha.id))
+    assert len(every["bids"]) == 5 and len(only["bids"]) == 2
+    assert {b["profileName"] for b in only["bids"]} == {"Alpha"}
+    with pytest.raises(HTTPException) as bad:
+        await bids_router.list_bids(pedro, day="2026-11-16", self_=True, accountId="not-an-id")
+    assert bad.value.status_code == 400
+
+
+@pytest.fixture
+def switch_on(monkeypatch):
+    """The schedule switch (Sun 2026-11-22 20:00: daily 18:00, weekly Sunday 20:00) in the settings
+    schedule_from_settings reads, and no folder listing."""
+    from app.bids import windows
+    from app.config import get_settings
+
+    settings = get_settings().model_copy(update={
+        "BID_SCHEDULE_SWITCH_AT": "2026-11-22T20:00", "BID_NEXT_DAILY_REPORT_TIME": "18:00",
+        "BID_NEXT_WEEKLY_REPORT_DAY": "sunday", "BID_NEXT_WEEKLY_REPORT_TIME": "20:00"})
+    monkeypatch.setattr(windows, "get_settings", lambda: settings)
+
+    async def no_folders(bidders, *_a):
+        return {str(b.id): None for b in bidders}
+    monkeypatch.setattr(bids_router, "_folders_without_record", no_folders)
+
+
+async def listing(u, **kw):
+    return await bids_router.list_bids(u, **{"day": None, "bidderId": None, "status": None, "week": None,
+                                             "self_": False, "ownerId": None, **kw})
+
+
+async def test_listing_a_day_after_the_switch(db, switch_on, monkeypatch):
+    pedro, ana, _bo = await setup()
+    inside, outside = [], []
+    for at, into in ((datetime(2026, 11, 22, 18, 40), inside), (datetime(2026, 11, 23, 17, 50), inside),
+                     (datetime(2026, 11, 23, 18, 0), outside)):
+        first = at.replace(tzinfo=CHI).astimezone(timezone.utc).replace(tzinfo=None)
+        into.append(await Bid(bidderId=ana.id, ownerId=pedro.id, jobKey=f"ana/x/j{next(_n)}",
+                              jobUrl="https://j.example/x", jobTitle="x", firstAt=first, status="pending",
+                              screenshots=[]).insert())
+    r = await listing(pedro, day="2026-11-23")
+    assert sorted(b["id"] for b in r["bids"]) == sorted(str(b.id) for b in inside)
+    assert (r["day"], r["start"], r["end"]) == ("2026-11-23", "2026-11-23T00:30:00Z", "2026-11-24T00:00:00Z")
+
+    # The open window on Mon 11-23 is the same day: it ends at Monday's 18:00 cutoff.
+    monkeypatch.setattr(bids_router, "_now", lambda: datetime(2026, 11, 23, 12, tzinfo=CHI).astimezone(timezone.utc))
+    r = await listing(pedro)
+    assert (r["day"], r["start"], r["end"]) == ("2026-11-23", "2026-11-23T00:30:00Z", "2026-11-24T00:00:00Z")

@@ -232,7 +232,7 @@ async def _tick_weekly_plans(users: list[UserExtra], *, now: datetime) -> int:
             kind="weekly_plan",
             title="New week — add this week's plan",
             body="It's Monday. Set targets before the week gets away from you.",
-            href="/weekly-plan",
+            href="/plans",
             period_key=period,
             dedupe_id="weekly_plan",
             meta={"year": year, "weekNumber": week},

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from pydantic import BaseModel
 
 from app import resume_files
+from app.caller_access import caller_interview
 from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, UserExtra
@@ -766,15 +767,26 @@ def _can_open_resume_files(acc: Optional[Account], user: UserExtra) -> bool:
     return acc is not None and (user.role in ("admin", "interview_manager") or str(acc.createdBy) == str(user.id))
 
 
+async def _may_open_resume_files(
+    acc: Optional[Account], user: UserExtra, interview_id: Optional[str]
+) -> bool:
+    """The normal access, or the interview's assigned caller opening the profile that interview belongs to."""
+    if _can_open_resume_files(acc, user):
+        return True
+    iv = await caller_interview(interview_id, user)
+    return acc is not None and iv is not None and str(iv.accountId) == str(acc.id)
+
+
 @router.get("/{account_id}/resume-files")
 async def resume_files_list(
     account_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    interview_id: Annotated[Optional[str], Query(alias="interviewId")] = None,
 ) -> dict:
     """The profile's resumes whose original file is stored (to send one with an interview brief): id, file name and
     upload time, no text. Same access as /resumes/{id}/file."""
     acc = await Account.get(to_object_id(account_id))
-    if not _can_open_resume_files(acc, user):
+    if not await _may_open_resume_files(acc, user, interview_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     return {"resumes": [
         {"id": str(r.id), "filename": r.filename, "uploadedAt": r.uploadedAt.isoformat() + "Z" if r.uploadedAt else None}
@@ -787,11 +799,13 @@ async def resume_file_url(
     account_id: str,
     resume_id: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
+    interview_id: Annotated[Optional[str], Query(alias="interviewId")] = None,
 ) -> dict:
     """Short-lived download link for a resume's original file. Owner, admin, or an interview manager (they open
-    everyone's interviews, so they can save the resume an interview came from)."""
+    everyone's interviews, so they can save the resume an interview came from); also the assigned caller of an
+    interview of this profile, given as ?interviewId=."""
     acc = await Account.get(to_object_id(account_id))
-    if not _can_open_resume_files(acc, user):
+    if not await _may_open_resume_files(acc, user, interview_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     resume = next((r for r in acc.resumes if str(r.id) == resume_id), None)
     if resume is None or not resume.s3Key:

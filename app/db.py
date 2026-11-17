@@ -65,6 +65,7 @@ from app.models import (
     ResumePromptEval,
 )
 from app.models.bid_report_post import BidReportPost
+from app.models.interview_day_post import InterviewDayPost
 from app.models.slack_alert_log import SlackAlertLog
 
 DOCUMENT_MODELS = [
@@ -96,6 +97,7 @@ DOCUMENT_MODELS = [
     Bidder,
     BidReport,
     BidReportPost,
+    InterviewDayPost,
     Bid,
     EvalJobDescription,
     ResumePromptEval,

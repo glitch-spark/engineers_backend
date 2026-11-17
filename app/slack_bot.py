@@ -1,21 +1,22 @@
-"""Slack interview bot: #caller threads, reminders and the daily caller list.
+"""Slack interview bot: #caller threads, the interview day post and its 30-minute reminders.
 
 Uses the workspace Bot Token (chat.postMessage). Users type their Slack member id in Profile; it is
 stored on UserExtra and used to @-mention them (and for the Profile test DM). Channel posts: one "Caller needed" thread per
-interview in the private SLACK_CALLER_CHANNEL_ID, the daily caller list in SLACK_CALLER_DAILY_CHANNEL_ID, and
+interview in the private SLACK_CALLER_CHANNEL_ID, the interview day post in SLACK_CALLER_DAILY_CHANNEL_ID, and
 each daily plan in SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the plan changes).
 
-A round with a caller gets a reply in its #caller thread ~30 minutes before it starts, tagging the owner and
-the interview managers. Each morning the day's caller interviews are listed in SLACK_CALLER_DAILY_CHANNEL_ID,
-tagging each owner and cc'ing the managers; there are no per-user digest DMs. Transactions live in
-app/slack_transactions.py.
+Each morning (SLACK_CALLER_DAILY_TIME) one day post lists every round of the local day, whoever is on the call, with
+Confirm / Assign caller / Download brief buttons; it is edited in place whenever an interview changes. About 30
+minutes before a round starts it gets a reminder reply in the day post's thread, built like its block in the post.
+Dedup rows (SlackAlertLog) use the keys "interview-day:<YYYY-MM-DD>" and "round-reminder:<roundId>:<startEpoch>";
+there are no per-user digest DMs. The day post and reminders live in app/interview_day/, button clicks in
+app/interview_day/actions.py, transactions in app/slack_transactions.py.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import math
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -569,7 +570,7 @@ def daily_plan_text(
         *body,
         _PLAN_DIVIDER,
         "```",
-        f":link: <{_frontend_link(f'/report?week={monday}')}|Open Report>",
+        f":link: <{_frontend_link(f'/plans?week={monday}')}|Open Daily plan>",
     ])
 
 
@@ -631,59 +632,6 @@ def _aware_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def due_caller_reminders(interviews: list, now: datetime) -> list[tuple[Any, Any]]:
-    """(interview, round) for scheduled caller rounds starting in (now, now + 30 min], by start."""
-    now = _aware_utc(now)
-    rows = []
-    for iv in interviews:
-        for entry in getattr(iv, "stageHistory", None) or []:
-            caller = getattr(entry, "caller", None)
-            when = getattr(entry, "scheduledAt", None)
-            if caller is None or not caller.enabled or when is None:
-                continue
-            if interview_status_value(entry.status) != "scheduled":
-                continue
-            if now < _aware_utc(when) <= now + CALLER_REMINDER_LEAD:
-                rows.append((iv, entry))
-    rows.sort(key=lambda row: _aware_utc(row[1].scheduledAt))
-    return rows
-
-
-def caller_reminder_key(entry: Any) -> str:
-    """One reminder per round and start time, so a rescheduled round gets a new one."""
-    return f"caller-reminder:{entry.id}:{int(_aware_utc(entry.scheduledAt).timestamp())}"
-
-
-def caller_reminder_text(
-    interview: Any,
-    entry: Any,
-    *,
-    now: datetime,
-    owner: Optional[UserExtra],
-    managers: Sequence[UserExtra],
-    account: Optional[Account],
-) -> str:
-    start = _aware_utc(entry.scheduledAt)
-    minutes = max(1, math.ceil((start - _aware_utc(now)).total_seconds() / 60))
-    company = _text(getattr(interview, "companyName", None))
-    caller = entry.caller
-    lines = [
-        f":alarm_clock: *Starting in {minutes} min* — {slack_time(start, with_day=False)}"
-        f" · {_stage_label(entry.stage)} · {company}",
-        f"*Profile:* {_text(_profile_label(account))}",
-        f"*Method:* {_method_text(caller)}",
-        f"*Caller assigned:* {_text(caller.callerName, 'TBD')}",
-    ]
-    cc = cc_line(owner, *managers)
-    return "\n".join([*lines, cc] if cc else lines)
-
-
-async def _reminder_load(start: datetime, end: datetime) -> list:
-    return await Interview.find(
-        {"stageHistory": {"$elemMatch": {"caller.enabled": True, "scheduledAt": {"$gt": start, "$lte": end}}}}
-    ).to_list()
-
-
 async def _reminder_claim(key: str) -> bool:
     try:
         await SlackAlertLog(
@@ -700,76 +648,7 @@ async def _reminder_release(key: str) -> None:
     ).delete()
 
 
-async def _reminder_post(interview: Any, entry: Any, text: str) -> bool:
-    """Reply in the interview's #caller thread (or the round's older post), else post to #caller."""
-    channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
-    thread = getattr(interview, "slackThread", None)
-    if thread is not None:
-        channel, parent = thread.channel, thread.ts
-    else:
-        parent = (entry.caller.slackChannelTs or "").strip()
-    body = {"channel": channel, "text": text, "unfurl_links": False, "unfurl_media": False}
-    try:
-        try:
-            await _slack_api("chat.postMessage", {**body, "thread_ts": parent} if parent else body)
-        except RuntimeError as exc:
-            if not parent or str(exc) not in _MESSAGE_GONE | {"thread_not_found"}:
-                raise
-            await _slack_api("chat.postMessage", body)
-        return True
-    except Exception as exc:
-        log.warning("slack_bot caller reminder post failed for round %s: %s", entry.id, exc)
-        return False
-
-
-async def _reminder_people(
-    interview: Any, entry: Any,
-) -> tuple[Optional[UserExtra], list[UserExtra], Optional[Account]]:
-    """The interview's owner, every interview manager, and its profile account."""
-    owner, managers = await _owner_and_managers(interview)
-    return owner, managers, await _interview_account(interview)
-
-
-def _reminder_configured() -> bool:
-    return slack_bot_configured() and bool((get_settings().SLACK_CALLER_CHANNEL_ID or "").strip())
-
-
-async def run_caller_reminders(
-    now: datetime,
-    *,
-    load=_reminder_load,
-    claim=_reminder_claim,
-    release=_reminder_release,
-    post=_reminder_post,
-    people=_reminder_people,
-    configured=_reminder_configured,
-) -> dict[str, int]:
-    """Remind each caller round's thread once, ~30 min before it starts (claim first, release on failure)."""
-    sent = failed = 0
-    if not configured():
-        return {"sent": sent, "failed": failed}
-    now = _aware_utc(now)
-    window = (now.replace(tzinfo=None), (now + CALLER_REMINDER_LEAD).replace(tzinfo=None))
-    for iv, entry in due_caller_reminders(await load(*window), now):
-        key = caller_reminder_key(entry)
-        if not await claim(key):
-            continue
-        ok = False
-        try:
-            owner, managers, account = await people(iv, entry)
-            text = caller_reminder_text(iv, entry, now=now, owner=owner, managers=managers, account=account)
-            ok = await post(iv, entry, text)
-        except Exception as exc:
-            log.warning("slack_bot caller reminder failed for round %s: %s", entry.id, exc)
-        if ok:
-            sent += 1
-        else:
-            failed += 1
-            await release(key)
-    return {"sent": sent, "failed": failed}
-
-
-# --- daily list of caller interviews ---------------------------------------------------------------
+# --- the daily post's schedule (the post itself is app/interview_day/post.py) -------------------------
 
 
 def caller_daily_due(now: datetime, *, at: time, tz: ZoneInfo) -> Optional[date]:
@@ -785,57 +664,6 @@ def caller_daily_bounds(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
-def _day_title(day: date) -> str:
-    return f"{day:%a} {day:%b} {day.day}"
-
-
-def caller_daily_text(day: date, rows: list[dict[str, Any]], managers: Sequence[UserExtra]) -> str:
-    """The list for `day`: one line per active caller round, by start time, flagging unconfirmed ones and
-    tagging each round's owner, then one cc line for the interview managers."""
-    title = f":alarm_clock: *Caller interviews today* — {_day_title(day)}"
-    if not rows:
-        return f"{title} · none today."
-    lines = [title]
-    for r in sorted(rows, key=lambda r: r["start"]):
-        parts = [slack_time(r["start"], with_day=False), r["company"], r["stage"], r["profile"],
-                 f"caller {r['callerName']}", r["method"],
-                 None if r["confirmed"] else ":hourglass_flowing_sand: not confirmed"]
-        line = "• " + " · ".join(p for p in parts if p)
-        if r["mentions"]:
-            line += f" — {r['mentions']}"
-        if r["link"]:
-            line += f" · <{r['link']}|thread>"
-        lines.append(line)
-    cc = cc_line(*managers)
-    return "\n".join([*lines, cc] if cc else lines)
-
-
-def _is_listed(entry: Any, start: datetime, end: datetime) -> bool:
-    caller = getattr(entry, "caller", None)
-    at = getattr(entry, "scheduledAt", None)
-    return bool(
-        caller is not None and caller.enabled and at is not None
-        and interview_status_value(getattr(entry, "status", None)) not in ENDED_STATUSES
-        and start <= _aware_utc(at) < end
-    )
-
-
-async def _caller_daily_load(start: datetime, end: datetime) -> list[tuple[Any, Any]]:
-    """(interview, round) for active caller rounds starting in [start, end), confirmed or not."""
-    found = await Interview.find({"stageHistory": {"$elemMatch": {
-        "caller.enabled": True, "status": {"$nin": list(ENDED_STATUSES)},
-        "scheduledAt": {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)},
-    }}}).to_list()
-    return [(iv, e) for iv in found for e in iv.stageHistory if _is_listed(e, start, end)]
-
-
-async def _caller_daily_people(interview: Any, entry: Any) -> dict[str, Any]:
-    return {
-        "owner": await UserExtra.get(interview.createdBy),
-        "profile": _profile_label(await _interview_account(interview)),
-    }
-
-
 async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
     thread = getattr(interview, "slackThread", None)
     channel, ts = (thread.channel, thread.ts) if thread else (
@@ -847,16 +675,6 @@ async def _caller_daily_permalink(interview: Any, entry: Any) -> Optional[str]:
     except Exception as exc:
         log.info("slack_bot caller daily permalink failed: %s", exc)
         return None
-
-
-async def _caller_daily_post(channel: str, text: str) -> bool:
-    try:
-        await _slack_api("chat.postMessage", {"channel": channel, "text": text, "unfurl_links": False,
-                                              "unfurl_media": False})
-        return True
-    except Exception as exc:
-        log.warning("slack_bot caller daily post failed: %s", exc)
-        return False
 
 
 def _caller_daily_configured() -> Optional[tuple[str, time, ZoneInfo]]:
@@ -873,67 +691,26 @@ def _caller_daily_configured() -> Optional[tuple[str, time, ZoneInfo]]:
         return None
 
 
-async def run_caller_daily(
-    now: datetime,
-    *,
-    load=_caller_daily_load,
-    claim=_reminder_claim,
-    release=_reminder_release,
-    post=_caller_daily_post,
-    people=_caller_daily_people,
-    managers=interview_managers,
-    permalink=_caller_daily_permalink,
-    configured=_caller_daily_configured,
-) -> str:
-    """Post the day's caller interviews once (claim first, release on failure).
-
-    Returns "posted", "not_due", "already_sent", "off" or "failed"."""
-    cfg = configured()
-    if cfg is None:
-        return "off"
-    channel, at, tz = cfg
-    day = caller_daily_due(now, at=at, tz=tz)
-    if day is None:
-        return "not_due"
-    key = f"caller-daily:{day.isoformat()}"
-    if not await claim(key):
-        return "already_sent"
-    ok = False
-    try:
-        start, end = caller_daily_bounds(day, tz)
-        rows = []
-        for iv, entry in await load(start, end):
-            who = await people(iv, entry)
-            rows.append({
-                "start": _aware_utc(entry.scheduledAt),
-                "company": _text(iv.companyName),
-                "stage": _stage_label(entry.stage),
-                "profile": _slack_escape(who["profile"]),
-                "callerName": _text(entry.caller.callerName, "TBD"),
-                "method": _METHOD_LABELS.get(entry.caller.method or "", ""),
-                "mentions": _mention(who["owner"]),
-                "link": await permalink(iv, entry),
-                "confirmed": bool(getattr(entry, "confirmed", False)),
-            })
-        ok = await post(channel, caller_daily_text(day, rows, await managers()))
-    except Exception as exc:
-        log.warning("slack_bot caller daily list failed: %s", exc)
-    if not ok:
-        await release(key)
-        return "failed"
-    return "posted"
-
-
 async def run_alert_tick() -> dict[str, Any]:
-    """Cron entrypoint: #caller thread reminders, then the daily caller list. Sends no DMs."""
+    """Cron entrypoint: the day post first (a round starting at 05:00-05:30 is reminded in the same tick and
+    threads under it), then the 30-minute round reminders, then a refresh of today's post so changes no interview
+    write reports (renames, deactivations, Slack ID changes, archives, a refresh that failed) reach it. Each step
+    is isolated from the others. Sends no DMs."""
+    from app.interview_day.post import refresh_today, run_day_post  # post imports this module
+    from app.interview_day.reminders import run_round_reminders
+
     try:
-        reminders = await run_caller_reminders(datetime.now(timezone.utc))
-    except Exception as exc:  # never block the daily list
-        log.exception("slack_bot caller reminders crashed: %s", exc)
+        caller_daily = await run_day_post(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot interview day post crashed: %s", exc)
+        caller_daily = "failed"
+    try:
+        reminders = await run_round_reminders(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot round reminders crashed: %s", exc)
         reminders = {"sent": 0, "failed": 0}
     try:
-        caller_daily = await run_caller_daily(datetime.now(timezone.utc))
+        await refresh_today()  # no interview id: the unconditional refresh
     except Exception as exc:
-        log.exception("slack_bot caller daily list crashed: %s", exc)
-        caller_daily = "failed"
+        log.warning("slack_bot day post refresh failed: %s", exc)
     return {"caller_reminders": reminders["sent"], "caller_daily": caller_daily}
