@@ -176,13 +176,8 @@ async def load_interviews_for_window(user_ids: list, start: datetime, end: datet
     ).to_list()
 
 
-def held_rounds(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
-    """(local date, breakdown group, caller or None, stage) for each round held in the window.
-
-    Same rules as `count_interview_rounds` (canceled rounds, AI interviews and
-    home assessments don't count). A round is a caller round when it has an
-    enabled caller (returned); otherwise the owner took it (None).
-    """
+def _held(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
+    """(local date, group, caller or None, stage, status) for each round held in the window."""
     out = []
     for stage, dt, round_status, caller in _dated_rounds(iv):
         if not _dt_in_range(dt, start, end) or round_status == "canceled" or stage in _ROUND_COUNT_EXCLUDED:
@@ -191,8 +186,26 @@ def held_rounds(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple
         if not group:
             continue
         day = _as_aware(dt).astimezone(tz).date()
-        out.append((day, group, caller if caller is not None and getattr(caller, "enabled", False) else None, stage))
+        out.append((day, group, caller if caller is not None and getattr(caller, "enabled", False) else None, stage,
+                    round_status))
     return out
+
+
+def held_rounds(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
+    """(local date, breakdown group, caller or None, stage) for each round held in the window.
+
+    Same rules as `count_interview_rounds` (canceled rounds, AI interviews and
+    home assessments don't count). A round is a caller round when it has an
+    enabled caller (returned); otherwise the owner took it (None).
+    """
+    return [r[:4] for r in _held(iv, start, end, tz)]
+
+
+def held_round_results(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:
+    """(local date, group, is_caller, result) for the rounds `held_rounds` keeps; result is `round_result(status)`."""
+    from app.caller_stats import round_result
+
+    return [(day, group, caller is not None, round_result(status)) for day, group, caller, _stage, status in _held(iv, start, end, tz)]
 
 
 def split_rounds_by_day(iv: Interview, start: datetime, end: datetime, tz) -> list[tuple]:

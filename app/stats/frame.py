@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from collections import defaultdict
 from datetime import date, timedelta
+from statistics import median
 from typing import Optional
 
 from app import interview_rates
 
 _SEVERITY = {"bad": 0, "watch": 1, "good": 2}
 MAX_TIPS = 4
+UP_RATIO = 0.15
 
 
 def _quantile(s: list[float], q: float) -> float:
@@ -62,3 +65,32 @@ def trend_buckets(start: date, end: date) -> tuple[str, list[tuple[date, date, s
 def order_tips(tips: list[dict]) -> list[dict]:
     ordered = sorted(tips, key=lambda t: (_SEVERITY[t["severity"]], -t["impact"]))
     return [{k: v for k, v in t.items() if k != "impact"} for t in ordered[:MAX_TIPS]]
+
+
+def tip(id: str, severity: str, text: str, detail: str, evidence: dict, impact: float) -> dict:
+    return {"id": id, "severity": severity, "text": text, "detail": detail, "evidence": evidence, "impact": impact}
+
+
+def up_vs_last_period(tab: str, noun: str, now: int, before: int, window: str) -> Optional[dict]:
+    if not before or now / before - 1 < UP_RATIO:
+        return None
+    change = now / before - 1
+    return tip(f"{tab}.up_vs_last_period", "good", f"Your {noun} are up {change:+.0%} vs the previous period — keep it.",
+               f"{now} {noun} vs {window}: {before}.", {"now": now, "before": before, "change": change}, now - before)
+
+
+def trend(start: date, end: date, today: date, days: dict, parts: tuple[int, ...], subject_id, team_ids: list) -> dict:
+    """Per bucket (clipped to today) the subject's sum of `days` values[parts] against the team members' median."""
+    unit, buckets = trend_buckets(start, min(end, today))
+    out = []
+    for s, e, lbl in buckets:
+        sums: dict = defaultdict(int)
+        for (d, uid), v in days.items():
+            if s <= d <= e:
+                sums[uid] += sum(v[i] for i in parts)
+        out.append({"label": lbl, "you": sums[subject_id], "median": median([sums[u] for u in team_ids]) if team_ids else 0})
+    return {"unit": unit, "buckets": out}
+
+
+def not_enough_data(team_size: int, n_days: int) -> bool:
+    return team_size < 3 or n_days < 3

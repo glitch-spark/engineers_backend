@@ -14,7 +14,6 @@ SELF_SHARE_GAP = 0.15  # bad when the self share is this far below the team medi
 WEAK_DAY_RATIO = 0.6
 IDLE_DAYS = 7
 BEHIND_RATIO = 0.85
-UP_RATIO = 0.15
 _DAYS = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays"]
 
 DEFINITIONS = [
@@ -25,8 +24,7 @@ DEFINITIONS = [
 
 
 def _tip(id: str, severity: str, text: str, detail: str, evidence: dict, impact: float) -> dict:
-    return {"id": f"bids.{id}", "severity": severity, "text": text, "detail": detail, "evidence": evidence,
-            "impact": impact}
+    return frame.tip(f"bids.{id}", severity, text, detail, evidence, impact)
 
 
 def low_self_share(me_self: int, me_total: int, team_shares: list[float]) -> Optional[dict]:
@@ -88,13 +86,7 @@ def behind_target(actual: int, target: int) -> Optional[dict]:
 
 
 def up_vs_last_period(now: int, before: int, window: str = "the previous period") -> Optional[dict]:
-    if not before or now / before - 1 < UP_RATIO:
-        return None
-    change = now / before - 1
-    return _tip(
-        "up_vs_last_period", "good", f"Your bids are up {change:+.0%} vs the previous period — keep it.",
-        f"{now} bids vs {window}: {before}.",
-        {"now": now, "before": before, "change": change}, now - before)
+    return frame.up_vs_last_period("bids", "bids", now, before, window)
 
 
 def _span(a: date, b: date) -> str:
@@ -198,17 +190,9 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
                      "parts": {"self": bids[uid] - bidder[uid], "bidder": bidder[uid]}, "isSubject": uid == subject.id})
     rows.sort(key=lambda r: (-r["value"], r["name"].lower()))
 
-    unit, buckets = frame.trend_buckets(start, min(end, today))
-    trend = []
-    for s, e, lbl in buckets:
-        sums: dict = defaultdict(int)
-        for (d, uid), v in days.items():
-            if s <= d <= e:
-                sums[uid] += v[0] + v[1]
-        trend.append({"label": lbl, "you": sums[subject.id],
-                      "median": median([sums[u] for u in team_ids]) if team_ids else 0})
+    trend = frame.trend(start, end, today, days, (0, 1), subject.id, team_ids)
 
-    not_enough = len(team_ids) < 3 or n_days < 3
+    not_enough = frame.not_enough_data(len(team_ids), n_days)
     tips: list[dict] = []
     if not not_enough:
         shares = [(bids[u] - bidder[u]) / bids[u] for u in team_ids]
@@ -237,5 +221,5 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
         "tab": "bids", "label": interview_rates.label(period, start, end),
         "subject": {"userId": str(subject.id), "name": _display_name(subject)},
         "headline": headline, "tips": tips, "everyone": {"metric": "bids", "rows": rows},
-        "trend": {"unit": unit, "buckets": trend}, "notEnoughData": not_enough, "definitions": DEFINITIONS,
+        "trend": trend, "notEnoughData": not_enough, "definitions": DEFINITIONS,
     }
