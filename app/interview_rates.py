@@ -109,23 +109,26 @@ async def bid_records_start() -> Optional[date]:
 
 
 async def counts(
-    user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None,
+    user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None, logged_only: bool = True,
 ) -> dict:
     """userId → [bids, interviews, bidder bids, caller interviews] over the local days [start, end], in the selected
     region unless `all`. Bids are self + bidder (see the module docstring); interviews are the rounds held, of which
     the caller ones had an enabled caller. With `days`, also fills
-    (day, userId) → [self bids, bidder bids, self interviews, caller interviews] for the per-user charts."""
+    (day, userId) → [self bids, bidder bids, self interviews, caller interviews] for the per-user charts.
+    `logged_only=False` also counts self bids of days not yet followed up (every stored day)."""
     from app.dashboard_stats import app_tz, local_day_start_utc
     from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
     from app.models import DailyPlan
 
     out: dict = defaultdict(lambda: [0, 0, 0, 0])
     field = _BID_FIELD.get(region)
-    plans = await DailyPlan.find({
+    query = {
         "userId": {"$in": user_ids},
         "date": {"$gte": datetime(start.year, start.month, start.day), "$lte": datetime(end.year, end.month, end.day)},
-        "loggedAt": {"$ne": None},  # a goal-only day hasn't been followed up: no bids yet (plan_auto.weekly_done)
-    }).to_list()
+    }
+    if logged_only:
+        query["loggedAt"] = {"$ne": None}  # a goal-only day hasn't been followed up: no bids yet (plan_auto.weekly_done)
+    plans = await DailyPlan.find(query).to_list()
     for p in plans:
         own = getattr(p.done, field) if field else p.done.bidsSelf
         out[p.userId][0] += own
