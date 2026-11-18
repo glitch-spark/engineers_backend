@@ -2,6 +2,7 @@ from app.models.account import Account
 from app.models.ai_review import AiReviewRun, GlobalPrompt, Skill
 from app.models.ai_usage_event import AiUsageEvent
 from app.models.analyze_chat_log import AnalyzeChatLog
+from app.models.application import Application
 from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
@@ -32,6 +33,7 @@ __all__ = [
     "AiReviewRun",
     "AiUsageEvent",
     "AnalyzeChatLog",
+    "Application",
     "Bid",
     "BidReport",
     "Bidder",
