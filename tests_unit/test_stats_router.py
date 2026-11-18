@@ -105,3 +105,9 @@ async def test_callers_tab_served(db):
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     out = await _call(ana, tab="callers")
     assert out["tab"] == "callers" and out["mode"] == "engineer"
+
+
+async def test_earnings_tab_served(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    out = await _call(ana, tab="earnings")
+    assert out["tab"] == "earnings"
