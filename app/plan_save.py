@@ -45,6 +45,10 @@ class ProgressIn(BaseModel):
     focus: Optional[list[str]] = None
 
 
+def _sent_done(r: "ItemResultIn") -> Optional[bool]:
+    return r.done if "done" in r.model_fields_set else None
+
+
 def result_done(kind: str, value: Optional[float], sent_done: Optional[bool], target: Optional[float],
                 old: Optional[ItemResult]) -> bool:
     """`sent_done` None = not sent (Slack form): keep the stored done. Checks follow it; counts / hours are done when
@@ -82,7 +86,7 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
 
     plan.results = {
         iid: ItemResult(
-            done=result_done(items[iid]["item"].kind, r.value, r.done if "done" in r.model_fields_set else None, frozen(iid), old.get(iid)),
+            done=result_done(items[iid]["item"].kind, r.value, _sent_done(r), frozen(iid), old.get(iid)),
             value=r.value, target=frozen(iid))
         for iid, r in body.results.items() if iid in items
     }
@@ -167,9 +171,10 @@ async def save_progress(user: UserExtra, when: date, body: ProgressIn) -> None:
     for iid, r in body.results.items():
         prev = old.get(iid)
         frozen = prev.target if prev and prev.target is not None else items[iid]["item"].target
+        value = r.value if "value" in r.model_fields_set or prev is None else prev.value  # unsent keeps the amount
         fields[f"results.{iid}"] = ItemResult(
-            done=result_done(items[iid]["item"].kind, r.value, r.done if "done" in r.model_fields_set else None, frozen, prev),
-            value=r.value, target=prev.target if prev else None).model_dump()
+            done=result_done(items[iid]["item"].kind, value, _sent_done(r), frozen, prev),
+            value=value, target=prev.target if prev else None).model_dump()
     if focus is not None:
         fields["focus"] = focus
     year, week_number, _key = app_week_key(_midnight(when))

@@ -186,3 +186,17 @@ def test_goal_done_on_is_earliest_done_day():
     weekly = N(weeklyGoals=[N(id="g1", target=250)])
     out = goal_progress(weekly, _days((11, 10, True), (10, 10, True)))["g1"]
     assert out["doneOn"] == "2026-11-10"
+
+
+async def test_untick_without_value_keeps_stored_value(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": False}}}, submit=False)
+    r = await _r2(me)
+    assert r.done is False and r.value == 31
+
+
+async def test_slack_values_only_submit_keeps_ticked_count(db, me, week):
+    from app.plan_save import DayIn, ItemResultIn, save_day
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=31)}))
+    assert (await _r2(me)).done is True
