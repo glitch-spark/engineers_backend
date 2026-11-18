@@ -1,4 +1,4 @@
-"""One-shot Railway cron entrypoint: Slack digest, in-app alerts, bid reports, resume retention, then exit.
+"""One-shot Railway cron entrypoint: Slack digest, in-app alerts, bid reports, resume retention, applications sync, then exit.
 
 Start command: python -m app.alerts_tick
 Must not start uvicorn — Railway skips the next cron if this process stays Active.
@@ -54,6 +54,14 @@ async def run_cron_ticks() -> int:
         log.info("resume retention tick %s", retention)
     except Exception:
         log.exception("resume retention tick failed")
+        code = 1
+    try:
+        from app.applications.sync import run_applications_tick
+
+        applications = await run_applications_tick()
+        log.info("applications tick %s", applications)
+    except Exception:
+        log.exception("applications tick failed")
         code = 1
     return code
 

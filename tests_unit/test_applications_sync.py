@@ -1,0 +1,146 @@
+"""Applications sync against an in-memory MongoDB (mongomock-motor); no real database."""
+
+import os
+from datetime import date, datetime, timedelta
+
+import pytest
+from beanie import init_beanie
+from bson import ObjectId
+from mongomock_motor import AsyncMongoMockClient
+
+from app.applications import sync
+from app.models import Account, Application, Bid, Interview, ResumeApplication
+
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
+    pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
+]
+
+ACC, OWN = ObjectId(), ObjectId()
+T0 = datetime(2026, 9, 1, 10)
+SINCE = date(2026, 8, 1)
+URL = "https://jobs.acme.com/1"
+
+
+@pytest.fixture
+async def db(monkeypatch):
+    database = AsyncMongoMockClient()["apps-unit"]
+    await init_beanie(database=database, document_models=[Application, Bid, ResumeApplication, Interview, Account])
+
+    async def loop_upsert(coll, ops):  # mongomock cannot bulk_write
+        for k, u in ops:
+            await coll.update_one({"key": k}, u, upsert=True)
+
+    monkeypatch.setattr(sync, "_bulk_upsert", loop_upsert)
+    await database["accounts"].insert_one({"_id": ACC, "region": "EU", "createdAt": datetime(2026, 8, 1)})
+    return database
+
+
+async def add_bid(db, url=URL, at=T0, **kw):
+    doc = {"_id": ObjectId(), "kind": "bidder", "bidderId": ObjectId(), "accountId": ACC, "ownerId": OWN,
+           "jobKey": f"f/2026-09-01/p/{ObjectId()}", "jobUrl": url, "firstAt": at, "status": "approved",
+           "createdAt": at, "updatedAt": at, **kw}
+    await db["bids"].insert_one(doc)
+    return doc
+
+
+async def add_resume(db, url=URL, at=T0, **kw):
+    doc = {"_id": ObjectId(), "userId": OWN, "accountId": ACC, "jobUrl": url, "createdAt": at, "updatedAt": at, **kw}
+    await db["resumeapplications"].insert_one(doc)
+    return doc
+
+
+async def add_interview(db, url=URL, days=3, at=None, resume_id=None, acc=ACC):
+    when = T0 + timedelta(days=days)
+    doc = {"_id": ObjectId(), "accountId": acc, "createdBy": OWN, "scheduledAt": when, "stage": "intro",
+           "status": "completed", "jobUrl": url, "stageHistory": [], "createdAt": at or when, "updatedAt": at or when}
+    if resume_id:
+        doc["resumeLink"] = {"kind": "tailored", "resumeJobId": resume_id}
+    await db["interviews"].insert_one(doc)
+    return doc
+
+
+async def snapshot(db):
+    return sorted(({k: v for k, v in d.items() if k not in ("_id", "syncedAt", "createdAt", "updatedAt")}
+                   for d in await db["applications"].find({}).to_list(None)), key=lambda d: d["key"])
+
+
+async def test_full_rebuild_idempotent(db):
+    await add_bid(db)
+    await add_bid(db, url="https://jobs.b.com/2")
+    await add_interview(db)
+    c1 = await sync.full_rebuild(SINCE, apply=True)
+    s1 = await snapshot(db)
+    c2 = await sync.full_rebuild(SINCE, apply=True)
+    assert c1 == c2 == {"rows": 2, "matched": 1, "unmatched": 0, "noLink": 0, "deleted": 0}
+    assert await snapshot(db) == s1 and len(s1) == 2
+    assert await db["applications"].count_documents({}) == 2
+
+
+async def test_dry_run_writes_nothing(db):
+    await add_bid(db)
+    c = await sync.full_rebuild(SINCE, apply=False)
+    assert c["rows"] == 1 and await db["applications"].count_documents({}) == 0
+
+
+async def test_deleted_bid_removed_on_full_rebuild(db):
+    b = await add_bid(db)
+    await sync.full_rebuild(SINCE, apply=True)
+    await db["bids"].delete_one({"_id": b["_id"]})
+    assert (await sync.full_rebuild(SINCE, apply=False))["deleted"] == 1
+    assert await db["applications"].count_documents({}) == 1
+    c = await sync.full_rebuild(SINCE, apply=True)
+    assert c["deleted"] == 1 and await db["applications"].count_documents({}) == 0
+
+
+async def test_incremental_adds_new_bid_and_matches_new_interview(db):
+    await add_bid(db, at=T0 - timedelta(days=30))
+    await sync.full_rebuild(SINCE, apply=True)
+    cp = datetime(2026, 9, 10)
+    await add_bid(db, url="https://jobs.b.com/2", at=cp + timedelta(hours=1))
+    await add_interview(db, url="https://jobs.b.com/2", days=20, at=cp + timedelta(hours=2))
+    await sync.incremental(cp)
+    rows = {r["jobKey"]: r for r in await db["applications"].find({}).to_list(None)}
+    assert set(rows) == {"jobs.acme.com/1", "jobs.b.com/2"}
+    assert rows["jobs.b.com/2"].get("interviewId") and rows["jobs.acme.com/1"].get("interviewId") is None
+
+
+async def test_relinked_interview_moves_match(db):
+    r1 = await add_resume(db, url="https://a.com/1")
+    r2 = await add_resume(db, url="https://b.com/2")
+    iv = await add_interview(db, url=None, resume_id=r1["_id"])
+    await sync.full_rebuild(SINCE, apply=True)
+    old = await db["applications"].find_one({"jobKey": "a.com/1"})
+    assert old["interviewId"] == iv["_id"]
+    cp = datetime(2026, 9, 20)
+    await db["interviews"].update_one({"_id": iv["_id"]}, {"$set": {
+        "resumeLink.resumeJobId": r2["_id"], "updatedAt": cp + timedelta(hours=1)}})
+    await sync.incremental(cp)
+    old = await db["applications"].find_one({"jobKey": "a.com/1"})
+    new = await db["applications"].find_one({"jobKey": "b.com/2"})
+    assert new["interviewId"] == iv["_id"]
+    for f in ("interviewId", "firstRoundAt", "daysToInterview", "furthest", "result"):
+        assert f not in old
+
+
+async def test_tick_runs_full_first_then_incremental(db):
+    await add_bid(db)
+    now = datetime(2026, 9, 20, 12)
+    assert "rows" in await sync.run_applications_tick(now)  # full
+    st = await db["app_settings"].find_one({"_id": "applications_sync"})
+    assert st["checkpoint"] == now and st["lastFull"] == now
+    await add_bid(db, url="https://jobs.b.com/2", at=now + timedelta(minutes=1), updatedAt=now + timedelta(minutes=1))
+    later = now + timedelta(minutes=5)
+    out = await sync.run_applications_tick(later)
+    assert out.get("incremental") is True
+    st = await db["app_settings"].find_one({"_id": "applications_sync"})
+    assert st["checkpoint"] == later and st["lastFull"] == now
+    assert await db["applications"].count_documents({}) == 2
+    out = await sync.run_applications_tick(now + timedelta(hours=25))
+    assert "incremental" not in out
+
+
+async def test_tick_disabled_env(db, monkeypatch):
+    monkeypatch.setenv("APPLICATIONS_SYNC_DISABLED", "1")
+    assert await sync.run_applications_tick() == {"skipped": "disabled"}
+    assert await db["app_settings"].count_documents({}) == 0
