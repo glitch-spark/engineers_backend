@@ -125,7 +125,7 @@ async def test_get_day_has_targets_items_progress(me):
     assert [(i["id"], i["scope"], i["kind"], i["target"], i["result"]) for i in day["items"]] == [
         (review, "routine", "check", None, None), (contact, "routine", "count", 50, None),
         (goal, "goal", "count", 250, None)]
-    assert day["progress"][goal] == {"value": 100, "done": False, "target": 250}
+    assert day["progress"][goal] == {"value": 100, "done": False, "target": 250, "doneOn": None}
     assert day["submitted"] is False and day["bidsBidderAuto"] == 0
     week = await list_week(me, weekStart=WEEK, userId=None)
     assert week["days"][0]["submitted"] is True and week["days"][1]["targets"]["bidsSelf"] == 20

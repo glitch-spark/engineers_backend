@@ -146,11 +146,14 @@ def routines_tally(weekly: Any, plans: dict, days: list) -> tuple[int, int]:
 
 
 def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
-    """Per weekly goal id: summed values, whether any day marked it done, and its target."""
+    """Per weekly goal id: summed values, done (a day ticked it or the week total reached the target), doneOn (earliest done day) and target."""
     out = {}
     for g in weekly.weeklyGoals:
-        rs = [r for d in days if (r := d.results.get(g.id)) is not None]
-        out[g.id] = {"value": sum(r.value or 0 for r in rs), "done": any(r.done for r in rs), "target": g.target}
+        rs = [(d, r) for d in days if (r := d.results.get(g.id)) is not None]
+        value = sum(r.value or 0 for _, r in rs)
+        done_days = sorted(str(d.date)[:10] for d, r in rs if r.done)
+        out[g.id] = {"value": value, "done": bool(done_days) or bool(g.target and value >= g.target),
+                     "target": g.target, "doneOn": done_days[0] if done_days else None}
     return out
 
 

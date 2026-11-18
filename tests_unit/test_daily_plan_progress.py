@@ -136,3 +136,53 @@ async def test_carry_over_draft_is_not_a_saved_week(db, me):
     with pytest.raises(HTTPException) as e:
         await put_day("2026-11-10", me, {"results": {}}, submit=False)
     assert e.value.status_code == 422
+
+
+async def _r2(me):
+    return (await DailyPlan.find_one({"userId": me.id})).results["r2"]
+
+
+async def test_tick_marks_count_done_without_reaching_target(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    r = await _r2(me)
+    assert r.done is True and r.value == 31
+
+
+async def test_untick_count_below_target(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": False, "value": 31}}}, submit=False)
+    assert (await _r2(me)).done is False
+
+
+async def test_count_reaching_target_is_done_even_unticked(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": False, "value": 50}}}, submit=False)
+    assert (await _r2(me)).done is True
+
+
+async def test_values_only_keeps_stored_done(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": 31}}, "focus": [], "notes": "", "done": {}})
+    assert (await _r2(me)).done is True
+
+
+def _days(*specs):
+    from types import SimpleNamespace as N
+    return [N(date=date(2026, 11, d), results={"g1": N(done=done, value=v)}) for d, v, done in specs]
+
+
+def test_goal_progress_done_on_and_week_total():
+    from types import SimpleNamespace as N
+    from app.plan_auto import goal_progress
+    weekly = N(weeklyGoals=[N(id="g1", target=250)])
+    out = goal_progress(weekly, _days((9, 100, False), (10, 150, False)))["g1"]
+    assert out["done"] is True and out["doneOn"] is None and out["value"] == 250
+    out = goal_progress(weekly, _days((9, 100, False), (10, 150, True)))["g1"]
+    assert out["doneOn"] == "2026-11-10"
+
+
+def test_goal_done_on_is_earliest_done_day():
+    from types import SimpleNamespace as N
+    from app.plan_auto import goal_progress
+    weekly = N(weeklyGoals=[N(id="g1", target=250)])
+    out = goal_progress(weekly, _days((11, 10, True), (10, 10, True)))["g1"]
+    assert out["doneOn"] == "2026-11-10"
