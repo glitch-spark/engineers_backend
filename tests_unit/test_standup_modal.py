@@ -274,9 +274,9 @@ async def test_closed_loading_view_is_log_only(me, slack, monkeypatch):
 
 async def test_count_done_is_computed_by_the_server_same_from_app_and_slack(me, db, slack):
     (review, contact), (goal,) = await week(me)
-    # The app sends done with values (old client: done derived on its side); the server decides done itself.
+    # Unticked counts below target are not done, from the app or the Slack form.
     await put_day("2026-11-10", me, {"results": {review: {"done": True}, contact: {"value": 50, "done": False},
-                                                 goal: {"value": 10, "done": True}}})
+                                                 goal: {"value": 10, "done": False}}})
     app = (await stored(me, TUE)).results
     await DailyPlan.find_one({"userId": me.id}).delete()
     view = await build_view(me, TUE)
@@ -293,7 +293,7 @@ async def test_count_without_target_done_when_value_positive(me, db):
     (_r, _c), (goal,) = await week(me, goals=[{"text": "Calls", "kind": "count"}])
     await put_day("2026-11-10", me, {"results": {goal: {"value": 3}}})
     assert (await stored(me, TUE)).results[goal].done is True
-    await put_day("2026-11-10", me, {"results": {goal: {"value": 0, "done": True}}})
+    await put_day("2026-11-10", me, {"results": {goal: {"value": 0, "done": False}}})
     assert (await stored(me, TUE)).results[goal].done is False
 
 

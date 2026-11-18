@@ -136,3 +136,89 @@ async def test_carry_over_draft_is_not_a_saved_week(db, me):
     with pytest.raises(HTTPException) as e:
         await put_day("2026-11-10", me, {"results": {}}, submit=False)
     assert e.value.status_code == 422
+
+
+async def _r2(me):
+    return (await DailyPlan.find_one({"userId": me.id})).results["r2"]
+
+
+async def test_tick_marks_count_done_without_reaching_target(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    r = await _r2(me)
+    assert r.done is True and r.value == 31
+
+
+async def test_untick_count_below_target(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": False, "value": 31}}}, submit=False)
+    assert (await _r2(me)).done is False
+
+
+async def test_count_reaching_target_is_done_even_unticked(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": False, "value": 50}}}, submit=False)
+    assert (await _r2(me)).done is True
+
+
+async def test_values_only_keeps_stored_done(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": 31}}, "focus": [], "notes": "", "done": {}})
+    assert (await _r2(me)).done is True
+
+
+def _days(*specs):
+    from types import SimpleNamespace as N
+    return [N(date=date(2026, 11, d), results={"g1": N(done=done, value=v)}) for d, v, done in specs]
+
+
+def test_goal_progress_done_on_and_week_total():
+    from types import SimpleNamespace as N
+    from app.plan_auto import goal_progress
+    weekly = N(weeklyGoals=[N(id="g1", target=250)])
+    out = goal_progress(weekly, _days((9, 100, False), (10, 150, False)))["g1"]
+    assert out["done"] is True and out["doneOn"] is None and out["value"] == 250
+    out = goal_progress(weekly, _days((9, 100, False), (10, 150, True)))["g1"]
+    assert out["doneOn"] == "2026-11-10"
+
+
+def test_goal_done_on_is_earliest_done_day():
+    from types import SimpleNamespace as N
+    from app.plan_auto import goal_progress
+    weekly = N(weeklyGoals=[N(id="g1", target=250)])
+    out = goal_progress(weekly, _days((11, 10, True), (10, 10, True)))["g1"]
+    assert out["doneOn"] == "2026-11-10"
+
+
+async def test_untick_without_value_keeps_stored_value(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": False}}}, submit=False)
+    r = await _r2(me)
+    assert r.done is False and r.value == 31
+
+
+async def test_slack_values_only_submit_keeps_ticked_count(db, me, week):
+    from app.plan_save import DayIn, ItemResultIn, save_day
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=31)}))
+    assert (await _r2(me)).done is True
+
+
+async def test_value_caused_done_does_not_stick_on_values_only_resubmit(db, me, week):
+    from app.plan_save import DayIn, ItemResultIn, save_day
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=50)}))
+    assert (await _r2(me)).done is True
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=30)}))
+    r = await _r2(me)
+    assert r.done is False and r.value == 30
+
+
+async def test_migrated_tick_without_value_stays_done(db, me, week):
+    from app.plan_save import DayIn, ItemResultIn, save_day
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True}}}, submit=False)
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn()}))
+    assert (await _r2(me)).done is True
+
+
+async def test_explicit_null_value_clears_stored_number(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": None}}}, submit=False)
+    assert (await _r2(me)).value is None

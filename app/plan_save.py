@@ -45,15 +45,22 @@ class ProgressIn(BaseModel):
     focus: Optional[list[str]] = None
 
 
-def result_done(kind: str, value: Optional[float], sent_done: bool, target: Optional[float],
+def _sent_done(r: "ItemResultIn") -> Optional[bool]:
+    return r.done if "done" in r.model_fields_set else None
+
+
+def result_done(kind: str, value: Optional[float], sent_done: Optional[bool], target: Optional[float],
                 old: Optional[ItemResult]) -> bool:
-    """Checks keep the sent done; counts / hours are done at their frozen target (any value without one). A
-    migrated done line without a value stays done until a value is typed."""
+    """`sent_done` None = not sent (Slack form): keep the stored done. Checks follow it; counts / hours are done when
+    ticked, or at their frozen target (any value without one)."""
+    def reached(v: Optional[float]) -> bool:
+        return v is not None and (v >= target if target else v > 0)
+
+    # not sent: keep a stored done only when the stored number did not already explain it (else it would stick)
+    base = sent_done if sent_done is not None else bool(old and old.done and (kind == "check" or not reached(old.value)))
     if kind == "check":
-        return sent_done
-    if value is None:
-        return bool(old and old.done and old.value is None)
-    return value >= target if target else value > 0
+        return bool(base)
+    return base or reached(value)
 
 
 def _midnight(d: date) -> datetime:
@@ -83,7 +90,7 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
 
     plan.results = {
         iid: ItemResult(
-            done=result_done(items[iid]["item"].kind, r.value, r.done, frozen(iid), old.get(iid)),
+            done=result_done(items[iid]["item"].kind, r.value, _sent_done(r), frozen(iid), old.get(iid)),
             value=r.value, target=frozen(iid))
         for iid, r in body.results.items() if iid in items
     }
@@ -168,9 +175,10 @@ async def save_progress(user: UserExtra, when: date, body: ProgressIn) -> None:
     for iid, r in body.results.items():
         prev = old.get(iid)
         frozen = prev.target if prev and prev.target is not None else items[iid]["item"].target
+        value = r.value if "value" in r.model_fields_set or prev is None else prev.value  # unsent keeps the amount
         fields[f"results.{iid}"] = ItemResult(
-            done=result_done(items[iid]["item"].kind, r.value, r.done, frozen, prev),
-            value=r.value, target=prev.target if prev else None).model_dump()
+            done=result_done(items[iid]["item"].kind, value, _sent_done(r), frozen, prev),
+            value=value, target=prev.target if prev else None).model_dump()
     if focus is not None:
         fields["focus"] = focus
     year, week_number, _key = app_week_key(_midnight(when))

@@ -203,7 +203,7 @@ def test_goal_progress_sums_counts_and_any_done():
     days = [_day_plan(results={"g": ItemResult(value=2), "h": ItemResult(done=False)}),
             _day_plan(results={"g": ItemResult(value=1.5), "h": ItemResult(done=True)})]
     prog = goal_progress(w, days)
-    assert prog["g"] == {"value": 3.5, "done": False, "target": 5}
+    assert prog["g"] == {"value": 3.5, "done": False, "target": 5, "doneOn": None}
     assert prog["h"]["done"] is True
 
 
