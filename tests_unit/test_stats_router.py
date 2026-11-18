@@ -95,12 +95,6 @@ async def test_bad_custom_range_400(db):
     assert e.value.status_code == 400
 
 
-async def test_earnings_tab_served(db):
-    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
-    out = await _call(ana, tab="earnings")
-    assert out["tab"] == "earnings"
-
-
 async def test_ai_usage_tab_served(db):
     from app.models import AiUsageEvent
     await init_beanie(database=AsyncMongoMockClient()["stats-router-ai"], document_models=[

@@ -296,7 +296,13 @@ async def dashboard_net_monthly(
     userId: Optional[str] = Query(None),
     today: Optional[str] = Query(None),
 ) -> dict:
-    sid = await _subject_id(user, userId)
+    # userId=all (admins): everyone's transactions summed (the Transactions page on "All users").
+    if userId == "all":
+        if user.role != "admin":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
+        who: dict = {}
+    else:
+        who = {"userId": await _subject_id(user, userId)}
     day = _today(today)  # app-timezone "today" — decides which 12 months.
 
     keys = month_keys(day, 12)
@@ -319,7 +325,7 @@ async def dashboard_net_monthly(
     pipeline = [
         {
             "$match": {
-                "userId": sid,
+                **who,
                 "status": "approved",
                 "date": {"$gte": start, "$lt": end},
             }
