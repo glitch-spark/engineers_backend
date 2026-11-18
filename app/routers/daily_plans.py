@@ -82,8 +82,20 @@ async def _find(uid, day: date) -> Optional[DailyPlan]:
 
 
 async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: dict) -> None:
-    """Post or edit the day's follow-up message; remember where it lives."""
-    posted = await sync_daily_plan_message(plan, owner, done=done, rounds=rounds)
+    """Post or edit the day's standup message (only once the day is submitted); remember where it lives."""
+    if not plan.submittedAt:
+        return
+    when = plan.date.date()
+    monday = monday_of(when)
+    weekly = await week_or_draft(owner.id, monday)
+    days = await _week_days(owner.id, monday)
+    held = await _interviews(owner.id, monday, when)
+    target = (weekly.goal.interviewsSelf + weekly.goal.interviewsCaller) if weekly else 0
+    posted = await sync_daily_plan_message(
+        plan, owner, done=done, rounds=rounds, targets=day_targets(plan, weekly, when),
+        items=day_items(weekly, plan, when), progress=goal_progress(weekly, days) if weekly else {},
+        week_interviews=(sum(e["self"] + e["caller"] for e in held.values()), target),
+    )
     if posted and posted != (plan.slackChannel, plan.slackTs):
         plan.slackChannel, plan.slackTs = posted
         await plan.save()

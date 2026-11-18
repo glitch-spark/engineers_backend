@@ -229,3 +229,25 @@ async def test_reports_items_counts(me):
     days = {d["date"]: d for d in (await get_week(WEEK, me, None))["days"]}
     assert (days[TUE.isoformat()]["itemsDone"], days[TUE.isoformat()]["itemsTotal"]) == (1, 3)
     assert days[TUE.isoformat()]["goal"]["bidsSelf"] == 20
+
+
+async def test_real_sync_slack_builds_the_standup(db, me, monkeypatch):
+    """The unpatched _sync_slack loads week data and hands the post its Goal vs Done view."""
+    seen = {}
+
+    async def fake_post(plan, owner, **view):
+        seen.update(view)
+        return "C1", "ts9"
+
+    from app.models.plan_common import Counts
+
+    plan = await DailyPlan(userId=me.id, date=datetime(2026, 11, 12), year=2026, weekNumber=46,
+                           submittedAt=datetime(2026, 11, 12, 20)).insert()
+    await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), startDate=datetime(2026, 11, 9),
+                     endDate=datetime(2026, 11, 15), weekNumber=46, year=2026,
+                     goal=Counts(bidsSelf=100, interviewsSelf=3, interviewsCaller=2)).insert()
+    monkeypatch.undo()  # drop the fixture's fake _sync_slack
+    monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
+    await daily_plans._sync_slack(plan, me, Counts(), {})
+    assert seen["targets"].bidsSelf == 20 and seen["week_interviews"] == (0, 5)
+    assert (plan.slackChannel, plan.slackTs) == ("C1", "ts9")

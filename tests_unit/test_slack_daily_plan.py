@@ -11,8 +11,9 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.config import get_settings
-from app.models.plan_common import ChecklistItem, Counts
+from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem
 from app.slack_bot import (
+    _plan_number,
     daily_plan_text,
     delete_daily_plan_message,
     sync_daily_plan_message,
@@ -25,11 +26,10 @@ DIVIDER = "━" * 30
 def _plan(**kw):
     base = dict(
         id="plan1",
-        date=datetime(2026, 10, 1),
-        goal=Counts(bidsSelf=150, bidsBidder=100),
-        goalItems=[ChecklistItem(text="Seek caller", done=True), ChecklistItem(text="Bidder <review>")],
+        date=datetime(2026, 11, 17),
         done=Counts(bidsSelf=140, bidsBidder=100),
-        notes="Moved review & prep",
+        focus=[],
+        notes="",
         slackChannel=None,
         slackTs=None,
     )
@@ -37,116 +37,134 @@ def _plan(**kw):
     return SimpleNamespace(**base)
 
 
-def _owner():
-    return SimpleNamespace(name="Pedro", email="p@x.com", slackUserId="U123")
+def _owner(slack="U123"):
+    return SimpleNamespace(name="Pedro", email="p@x.com", slackUserId=slack)
 
 
-def test_daily_plan_text_follow_up():
-    done = Counts(bidsSelf=140, bidsBidder=100, interviewsSelf=2, interviewsCaller=1)
-    rounds = {"self": {"tech_round_1": 1, "intro": 1}, "caller": {"system_design": 1}}
-    lines = daily_plan_text(_plan(), _owner(), done=done, rounds=rounds).splitlines()
-    assert lines[:-1] == [
-        ":spiral_note_pad: <@U123> · *Daily Plan* · Thu 10/1",
-        "```",
-        DIVIDER,
+def _e(text, kind, scope, target=None, result=None, iid=None):
+    return {"item": PlanItem(id=iid or text, text=text, kind=kind, target=target), "scope": scope, "result": result}
+
+
+def _body(text):
+    return text.splitlines()[3:-3]  # inside the code block, after the divider
+
+
+def test_goal_vs_done_layout():
+    plan = _plan(focus=["fb", "mail"], notes="Company onboarding: 4h · Discord server: 1.5h")
+    done = DoneCounts(bidsSelf=134, bidsSelfUs=91, bidsSelfLatam=43, bidsBidder=144, interviewsSelf=2, interviewsCaller=1)
+    targets = Counts(bidsSelf=120, bidsSelfUs=80, bidsSelfLatam=40, bidsBidder=150)
+    rounds = {"self": {"tech_round_1": 1, "intro": 1}, "caller": {"intro": 1}}
+    items = [
+        _e("Bidder review", "check", "routine", result=ItemResult(done=True)),
+        _e("Citizen contact", "count", "routine", 50, ItemResult(value=31, target=50)),
+        _e("Interview prep", "hours", "routine", 2, ItemResult(value=1.5, target=2)),
+        _e("Email outreach", "count", "goal", 250, iid="mail"),
+        _e("Company Facebook", "check", "goal", result=ItemResult(done=True), iid="fb"),
+        _e("Untouched goal", "count", "goal", 10, iid="x"),
+    ]
+    progress = {"mail": {"value": 180, "done": False, "target": 250}, "fb": {"value": 0, "done": True, "target": None}}
+    text = daily_plan_text(plan, _owner(), done=done, rounds=rounds, targets=targets, items=items,
+                           progress=progress, week_interviews=(3, 15))
+    lines = text.splitlines()
+    assert lines[0] == "🗒️ <@U123> · Daily standup · Tue 11/17"
+    assert lines[1:3] == ["```", DIVIDER]
+    assert _body(text) == [
+        "                     Done / Goal",
         "1️⃣ Bids",
-        "   Self    : 140 / 150",
-        "   Bidder  : 100 / 100",
-        "",
+        "   Self              134 / 120  ✅  (US 91/80 · LATAM 43/40)",
+        "   Bidder            144 / 150  ⚠️",
         "2️⃣ Interviews",
-        "   Self    : 2   Intro(1) · Tech round 1(1)",
-        "   Caller  : 1   System Design(1)",
-        "",
-        "3️⃣ Seek caller",
-        "   Status  : ✅ Completed",
-        "",
-        "4️⃣ Bidder &lt;review&gt;",
-        "   Status  : ❌ Not Done",
-        "",
+        "   Self              2   Intro(1) · Tech round 1(1)",
+        "   Caller            1   Intro(1)",
+        "   Week              3 / 15",
+        "3️⃣ Routines",
+        "   Bidder review     ✅",
+        "   Citizen contact   31 / 50  ⚠️",
+        "   Interview prep    1.5h / 2h  ⚠️",
+        "4️⃣ Weekly goals (week so far)",
+        "   Email outreach    180 / 250",
+        "   Company Facebook  ✅ done today",
         "5️⃣ Extra",
-        "   Moved review &amp; prep",
-        DIVIDER,
-        "```",
+        "   Company onboarding: 4h · Discord server: 1.5h",
     ]
-    assert lines[-1].startswith(":link: <")
-    assert lines[-1].endswith("/plans?week=2026-09-28|Open Daily plan>")
+    assert lines[-3] == DIVIDER and lines[-2] == "```"
+    assert lines[-1].endswith("/plans?day=2026-11-17|Open Daily plan>")
 
 
-def test_daily_plan_heading():
-    owner = SimpleNamespace(name="Pedro", email="p@x.com", slackUserId="U0OWNER001")
-    assert daily_plan_text(_plan(), owner).splitlines()[0] == ":spiral_note_pad: <@U0OWNER001> · *Daily Plan* · Thu 10/1"
+def test_marks():
+    done = Counts(bidsSelf=120, bidsBidder=3)
+    text = daily_plan_text(_plan(), _owner(), done=done, targets=Counts(bidsSelf=120, bidsBidder=4))
+    assert "   Self              120 / 120  ✅" in text
+    assert "   Bidder            3 / 4  ⚠️" in text
+    text = daily_plan_text(_plan(), _owner(), done=done)  # no target: no mark, no Goal
+    assert "   Self              120" in text.splitlines()
+    assert "✅" not in text and "⚠️" not in text
 
 
-def test_daily_plan_heading_names_an_unlinked_owner():
-    owner = SimpleNamespace(name="Pedro", email="p@x.com", slackUserId=None)
-    assert daily_plan_text(_plan(), owner).splitlines()[0] == ":spiral_note_pad: Pedro · *Daily Plan* · Thu 10/1"
+def test_hours_format():
+    items = [_e("Prep", "hours", "routine", 2, ItemResult(value=1.5, target=2)),
+             _e("Study", "hours", "routine", 2, ItemResult(value=2, target=2))]
+    text = daily_plan_text(_plan(), _owner(), items=items)
+    assert "1.5h / 2h  ⚠️" in text
+    assert "   Study             2h / 2h  ✅" in text
+    assert "2.0" not in text
 
 
-def test_daily_plan_text_minimal():
-    plan = _plan(goal=Counts(), goalItems=[], done=Counts(), notes="")
-    lines = daily_plan_text(plan, _owner(), done=Counts()).splitlines()
+def test_only_touched_goals_listed():
+    items = [
+        _e("In focus", "count", "goal", 10, iid="a"),
+        _e("Has result", "count", "goal", 10, ItemResult(value=2), iid="b"),
+        _e("Untouched", "count", "goal", 10, ItemResult(), iid="c"),
+        _e("Not listed", "count", "goal", 10, iid="d"),
+    ]
+    progress = {k: {"value": 4, "done": False, "target": 10} for k in "abcd"}
+    text = daily_plan_text(_plan(focus=["a"]), _owner(), items=items, progress=progress)
+    assert "In focus" in text and "Has result" in text
+    assert "Untouched" not in text and "Not listed" not in text
+
+
+def test_empty_sections_left_out():
+    lines = daily_plan_text(_plan(), _owner(), done=Counts(), targets=Counts()).splitlines()
     assert lines[1:-1] == [
-        "```",
-        DIVIDER,
-        "1️⃣ Bids",
-        "   Self    : 0 / 0",
-        "   Bidder  : 0 / 0",
-        "",
-        "2️⃣ Interviews",
-        "   Self    : 0",
-        "   Caller  : 0",
-        DIVIDER,
-        "```",
-    ]
+        "```", DIVIDER, "                     Done / Goal",
+        "1️⃣ Bids", "   Self              0", "   Bidder            0",
+        "2️⃣ Interviews", "   Self              0", "   Caller            0",
+        DIVIDER, "```",
+    ]  # no Week without a target, no Routines / Weekly goals / Extra
 
 
-def test_daily_plan_text_splits_self_bids_by_region():
-    plan = _plan(goal=Counts(bidsSelf=150, bidsSelfUs=80, bidsSelfEu=40, bidsSelfLatam=30, bidsBidder=100))
-    done = Counts(bidsSelf=130, bidsSelfUs=70, bidsSelfEu=40, bidsSelfLatam=20, bidsBidder=100)
-    lines = daily_plan_text(plan, _owner(), done=done).splitlines()
-    assert lines[4:7] == [
-        "   Self    : 130 / 150",
-        "             US 70/80 · EU 40/40 · LATAM 20/30",
-        "   Bidder  : 100 / 100",
-    ]
+def test_other_regions_complete_the_self_total():
+    done = DoneCounts(bidsSelf=136, bidsSelfUs=70, bidsSelfEu=40, bidsSelfLatam=20)  # 6 Canada / Asia
+    targets = Counts(bidsSelf=150, bidsSelfUs=80, bidsSelfEu=40, bidsSelfLatam=30)
+    text = daily_plan_text(_plan(), _owner(), done=done, targets=targets)
+    assert "(US 70/80 · EU 40/40 · LATAM 20/30 · Other 6)" in text
 
 
-def test_daily_plan_text_other_regions_complete_the_self_total():
-    plan = _plan(goal=Counts(bidsSelf=150, bidsSelfUs=80, bidsSelfEu=40, bidsSelfLatam=30, bidsBidder=100))
-    done = Counts(bidsSelf=136, bidsSelfUs=70, bidsSelfEu=40, bidsSelfLatam=20, bidsBidder=100)  # 6 Canada / Asia
-    lines = daily_plan_text(plan, _owner(), done=done).splitlines()
-    assert lines[5] == "             US 70/80 · EU 40/40 · LATAM 20/30 · Other 6"
-
-
-def test_daily_plan_text_interview_stages_follow_pipeline_order():
-    done = Counts(interviewsSelf=7)
+def test_interview_stages_follow_pipeline_order():
     rounds = {"self": {"final": 1, "cultural": 2, "tech_round_2": 1, "live_coding": 1, "intro": 1, "panel": 1}}
-    text = daily_plan_text(_plan(), _owner(), done=done, rounds=rounds)
-    assert "   Self    : 7   Intro(1) · Tech round 2(1) · Live Coding(1) · Hiring Manager(2) · Panel(1) · Final(1)" in text
+    text = daily_plan_text(_plan(), _owner(), done=Counts(interviewsSelf=7), rounds=rounds)
+    assert "7   Intro(1) · Tech round 2(1) · Live Coding(1) · Hiring Manager(2) · Panel(1) · Final(1)" in text
 
 
-def test_daily_plan_text_multiline_note_is_indented():
-    lines = daily_plan_text(_plan(notes="Engineer Daily Standup Update\n(Bid details)"), _owner()).splitlines()
-    assert lines[-6:-3] == ["5️⃣ Extra", "   Engineer Daily Standup Update", "   (Bid details)"]
+def test_multiline_note_is_indented_and_escaped():
+    lines = daily_plan_text(_plan(notes="Update & more\n(Bid <details>)"), _owner()).splitlines()
+    assert lines[-6:-3] == ["3️⃣ Extra", "   Update &amp; more", "   (Bid &lt;details&gt;)"]
 
 
-def test_daily_plan_text_backticks_cannot_close_the_code_block():
-    plan = _plan(goalItems=[ChecklistItem(text="Fix ```x```")], notes="see `y` and ```z```")
-    text = daily_plan_text(plan, _owner())
+def test_backticks_cannot_close_the_code_block():
+    items = [_e("Fix ```x```", "check", "routine", result=ItemResult(done=True))]
+    text = daily_plan_text(_plan(notes="see `y` and ```z```"), _owner(), items=items)
     assert text.count("```") == 2
-    assert "`" not in text.replace("```", "")
 
 
-def test_daily_plan_text_numbers_past_ten():
-    items = [ChecklistItem(text=f"Line {n}") for n in range(1, 10)]
-    lines = daily_plan_text(_plan(goalItems=items), _owner()).splitlines()
-    assert "🔟 Line 8" in lines
-    assert "11. Line 9" in lines
-    assert "12. Extra" in lines
+def test_heading_names_an_unlinked_owner():
+    assert daily_plan_text(_plan(), _owner(None)).splitlines()[0] == "🗒️ Pedro · Daily standup · Tue 11/17"
 
 
-def test_daily_plan_text_defaults_done_to_stored_done():
-    assert "   Self    : 140 / 150" in daily_plan_text(_plan(), _owner()).splitlines()
+def test_numbers_past_ten():
+    items = [_e(f"R{n}", "check", "routine", result=ItemResult(done=True)) for n in range(1)]
+    assert _plan_number(10) == "🔟" and _plan_number(11) == "11."
+    assert "3️⃣ Routines" in daily_plan_text(_plan(), _owner(), items=items)
 
 
 @pytest.mark.asyncio
@@ -252,3 +270,13 @@ async def test_delete_without_post_is_noop():
     ):
         await delete_daily_plan_message(_plan())
     api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_post_until_submitted():
+    from app.routers import daily_plans
+
+    plan = SimpleNamespace(submittedAt=None, slackChannel=None, slackTs=None)
+    with patch.object(daily_plans, "sync_daily_plan_message", AsyncMock()) as sync:
+        await daily_plans._sync_slack(plan, _owner(), Counts(), {})
+    sync.assert_not_awaited()

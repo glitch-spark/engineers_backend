@@ -39,6 +39,7 @@ from app.interview_caller import caller_is_on, round_caller_snapshot, round_post
 from app.config import get_settings
 from app.models import Account, Interview, UserExtra
 from app.models.interview import InterviewStageEvent, SlackThread
+from app.models.plan_common import Counts
 from app.models.slack_alert_log import SlackAlertLog
 from app.slack_timezones import (
     format_gmt_offset,
@@ -354,7 +355,6 @@ _ROUND_ORDER = list(_ROUND_LABELS)
 
 _PLAN_DIVIDER = "━" * 30
 _PLAN_INDENT = " " * 3
-_PLAN_VALUE_INDENT = _PLAN_INDENT + " " * 10  # under the value after `Label   : `
 
 
 def _plan_number(n: int) -> str:
@@ -362,10 +362,6 @@ def _plan_number(n: int) -> str:
     if n == 10:
         return "🔟"
     return f"{n}️⃣" if n < 10 else f"{n}."
-
-
-def _plan_row(label: str, value: str) -> str:
-    return f"{_PLAN_INDENT}{label:<8}: {value}"
 
 
 def _plan_block_text(value: Optional[str]) -> str:
@@ -386,68 +382,117 @@ def _rounds_text(count: int, rounds: Optional[dict]) -> str:
     return f"{count}   {stages}"
 
 
-def daily_plan_text(
-    plan: Any, owner: Optional[UserExtra], done: Any = None, rounds: Optional[dict] = None
-) -> str:
-    """The day's follow-up: bids Done / Goal, interviews held, goal lines and notes.
+def _n(x: Optional[float], hours: bool = False) -> str:
+    """`2`, `1.5`; with `hours`, `2h`, `1.5h`."""
+    x = x or 0
+    s = str(int(x)) if float(x).is_integer() else f"{x:g}"
+    return s + "h" if hours else s
 
-    The sections sit in a code block so their colons line up; the heading (with
-    the owner's mention) and the report link stay outside it. `done` is the
-    day's Done with interviews from interview records; it defaults to what the
-    plan stores. `rounds` is {"self": {stage: n}, "caller": {stage: n}}.
+
+def _mark(done: float, target: Optional[float]) -> str:
+    return "" if not target else "  ✅" if done >= target else "  ⚠️"
+
+
+def _plan_line(label: str, value: str) -> str:
+    return f"{_PLAN_INDENT}{_plan_block_text(label):<16}  {value}"
+
+
+def _bids_line(label: str, field: str, done: Any, targets: Any, regions: bool = False) -> str:
+    d, t = getattr(done, field), getattr(targets, field)
+    value = f"{d} / {t}{_mark(d, t)}" if t else str(d)
+    if regions:
+        parts = [f"{lab} {getattr(done, f, 0)}/{getattr(targets, f, 0)}" for f, lab in _REGION_LABELS
+                 if getattr(done, f, 0) or getattr(targets, f, 0)]
+        # Canada, Asia and no-region profiles (or a pre-split total) count in Self only: show them so the parts add up.
+        other = d - sum(getattr(done, f, 0) for f, _ in _REGION_LABELS)
+        if parts and other > 0:
+            parts.append(f"Other {other}")
+        if parts:
+            value += f"  ({' · '.join(parts)})"
+    return _plan_line(label, value)
+
+
+def _item_line(e: dict, progress: dict) -> Optional[str]:
+    item, result = e["item"], e["result"]
+    hours = item.kind == "hours"
+    if e["scope"] == "routine":
+        if result is None:
+            return None
+        if item.kind == "check":
+            return _plan_line(item.text, "✅" if result.done else "⚠️ not done")
+        v = result.value or 0
+        t = result.target if result.target is not None else item.target
+        return _plan_line(item.text, (f"{_n(v, hours)} / {_n(t, hours)}" if t else _n(v, hours)) + _mark(v, t))
+    # weekly goal: the week so far
+    if item.kind == "check":
+        return _plan_line(item.text, "✅ done today" if result and result.done else "in focus")
+    p = progress.get(item.id) or {"value": 0, "target": item.target}
+    return _plan_line(item.text, f"{_n(p['value'], hours)} / {_n(p['target'], hours)}" if p["target"] else _n(p["value"], hours))
+
+
+def daily_plan_text(
+    plan: Any, owner: Optional[UserExtra], *, done: Any = None, rounds: Optional[dict] = None,
+    targets: Any = None, items: Optional[list] = None, progress: Optional[dict] = None,
+    week_interviews: Optional[tuple] = None,
+) -> str:
+    """The day's Goal vs Done standup: bids, interviews, routines, weekly goals (those touched today), extra.
+
+    The sections sit in a code block so the columns line up; the heading (with the owner's mention) and the
+    report link stay outside it. `done` defaults to what the plan stores; `rounds` is {"self": {stage: n},
+    "caller": {stage: n}}; `items` are `plan_auto.day_items` lines; `progress` is `goal_progress`;
+    `week_interviews` is (held Monday..today, week target), the Week line is left out without a target.
     """
-    goal = plan.goal
+    targets = targets if targets is not None else Counts()
     done = done if done is not None else plan.done
     rounds = rounds or {}
+    progress = progress or {}
     day = f"{plan.date.strftime('%a')} {plan.date.month}/{plan.date.day}"
     sections: list[list[str]] = []
 
-    bids = [_plan_row("Self", f"{done.bidsSelf} / {goal.bidsSelf}")]
-    if any(getattr(c, f, 0) for c in (done, goal) for f, _ in _REGION_LABELS):
-        split = " · ".join(f"{label} {getattr(done, f, 0)}/{getattr(goal, f, 0)}" for f, label in _REGION_LABELS)
-        # Canada, Asia and no-region profiles (or a pre-split total) count in Self only: show them so the parts add up.
-        other = done.bidsSelf - sum(getattr(done, f, 0) for f, _ in _REGION_LABELS)
-        if other > 0:
-            split += f" · Other {other}"
-        bids.append(f"{_PLAN_VALUE_INDENT}{split}")
-    bids.append(_plan_row("Bidder", f"{done.bidsBidder} / {goal.bidsBidder}"))
-    sections.append(["Bids", *bids])
+    sections.append(["Bids", _bids_line("Self", "bidsSelf", done, targets, regions=True),
+                     _bids_line("Bidder", "bidsBidder", done, targets)])
 
-    sections.append([
-        "Interviews",
-        _plan_row("Self", _rounds_text(done.interviewsSelf, rounds.get("self"))),
-        _plan_row("Caller", _rounds_text(done.interviewsCaller, rounds.get("caller"))),
-    ])
+    interviews = [
+        _plan_line("Self", _rounds_text(done.interviewsSelf, rounds.get("self"))),
+        _plan_line("Caller", _rounds_text(done.interviewsCaller, rounds.get("caller"))),
+    ]
+    if week_interviews and week_interviews[1]:
+        interviews.append(_plan_line("Week", f"{week_interviews[0]} / {week_interviews[1]}"))
+    sections.append(["Interviews", *interviews])
 
-    for item in plan.goalItems or []:
-        status = "✅ Completed" if item.done else "❌ Not Done"
-        sections.append([_plan_block_text(item.text), _plan_row("Status", status)])
+    routines = [ln for e in items or [] if e["scope"] == "routine" and (ln := _item_line(e, progress))]
+    if routines:
+        sections.append(["Routines", *routines])
+    touched = set(plan.focus or [])
+    goals = [
+        ln for e in items or []
+        if e["scope"] == "goal"
+        and (e["item"].id in touched or (e["result"] and (e["result"].done or e["result"].value)))
+        and (ln := _item_line(e, progress))
+    ]
+    if goals:
+        sections.append(["Weekly goals (week so far)", *goals])
 
     notes = [line.rstrip() for line in _plan_block_text(plan.notes).splitlines()]
     if notes:
         sections.append(["Extra", *(f"{_PLAN_INDENT}{line}" if line else "" for line in notes)])
 
-    body: list[str] = []
+    body: list[str] = [f"{_PLAN_INDENT}{' ' * 18}Done / Goal"]
     for n, (title, *rows) in enumerate(sections, start=1):
-        if body:
-            body.append("")
         body += [f"{_plan_number(n)} {title}", *rows]
 
-    monday = (plan.date - timedelta(days=plan.date.weekday())).date().isoformat()
     return "\n".join([
-        f":spiral_note_pad: {_mention(owner)} · *Daily Plan* · {day}",
+        f"🗒️ {_mention(owner)} · Daily standup · {day}",
         "```",
         _PLAN_DIVIDER,
         *body,
         _PLAN_DIVIDER,
         "```",
-        f":link: <{_frontend_link(f'/plans?week={monday}')}|Open Daily plan>",
+        f"🔗 <{_frontend_link(f'/plans?day={plan.date.date().isoformat()}')}|Open Daily plan>",
     ])
 
 
-async def sync_daily_plan_message(
-    plan: Any, owner: Optional[UserExtra], done: Any = None, rounds: Optional[dict] = None
-) -> Optional[tuple[str, str]]:
+async def sync_daily_plan_message(plan: Any, owner: Optional[UserExtra], **view: Any) -> Optional[tuple[str, str]]:
     """Post the plan to SLACK_DAILY_PLAN_CHANNEL_ID, or edit the existing post
     in place. Never raises. Returns the live post's (channel, ts), or None when
     Slack is off or the call failed.
@@ -455,7 +500,7 @@ async def sync_daily_plan_message(
     try:
         if not slack_bot_configured():
             return None
-        text = daily_plan_text(plan, owner, done=done, rounds=rounds)
+        text = daily_plan_text(plan, owner, **view)
         channel = (plan.slackChannel or "").strip()
         ts = (plan.slackTs or "").strip()
         if channel and ts:
