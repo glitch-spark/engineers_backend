@@ -42,7 +42,7 @@ def test_board_of_examples():
 
 def test_bidder_and_resume_merge_one_row_bidder_wins():
     b, r = bid(at=T0 + timedelta(days=1)), resume(url="https://www.jobs.acme.com/1?utm_source=x")
-    rows = build_rows([b], [r], {ACC: "EU"})
+    rows = build_rows([b], [r], {ACC: {"region": "EU"}})
     assert len(rows) == 1
     row = next(iter(rows.values()))
     assert row["by"] == "bidder" and row["bidderId"] == b["bidderId"] and row["appliedAt"] == T0
@@ -152,3 +152,22 @@ def test_several_resumes_earliest_wins_and_owner_is_earliest():
     o2 = ObjectId()
     early["userId"] = o2
     assert next(iter(build_rows([b], [early], {}).values()))["ownerId"] == o2
+
+
+def test_row_area_prefers_resume_title():
+    b = bid()
+    b["jobKey"] = "f/2026-09-01/p/acme_backend-engineer"
+    r = resume(jobDescription="Frontend Developer | Company: X")
+    row = next(iter(build_rows([b], [r], {}).values()))
+    assert (row["title"], row["area"]) == ("Frontend Developer", "Frontend")
+    row = next(iter(build_rows([b], [], {}).values()))
+    assert (row["title"], row["area"]) == ("backend engineer", "Backend")
+    row = next(iter(build_rows([bid()], [], {}).values()))
+    assert (row["title"], row["area"]) == (None, None)
+
+
+def test_profile_age_days():
+    accounts = {ACC: {"region": "EU", "createdAt": T0 - timedelta(days=10, hours=5)}}
+    assert next(iter(build_rows([bid()], [], accounts).values()))["profileAgeDays"] == 10
+    assert next(iter(build_rows([bid()], [], {ACC: {"region": "EU"}}).values()))["profileAgeDays"] is None
+    assert next(iter(build_rows([bid()], [], {}).values()))["profileAgeDays"] is None

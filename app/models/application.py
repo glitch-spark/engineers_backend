@@ -18,6 +18,9 @@ class Application(TimestampedDocument):
     jobKey: Optional[str] = None
     board: Optional[str] = None  # registrable domain of the job link
     appliedAt: datetime  # earliest source time (naive UTC)
+    title: Optional[str] = None
+    area: Optional[str] = None
+    profileAgeDays: Optional[int] = None  # appliedAt - the profile's createdAt, whole days
     by: Literal["self", "bidder"] = "self"
     bidderId: Optional[PydanticObjectId] = None
     bidStatus: Optional[str] = None

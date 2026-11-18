@@ -1,13 +1,14 @@
 """Pure building of `applications` rows from bids and tailored resumes, and matching interviews to them.
 
 Inputs (what the sync must pass): plain dicts (raw Mongo docs are fine) with naive-UTC datetimes; interviews as
-documents; `resume_row` keyed by str(resume _id) -> row key; `regions` as {accountId: region}."""
+documents; `resume_row` keyed by str(resume _id) -> row key; `accounts` as {accountId: {"region", "createdAt"}}; resumes may carry `jobDescription`, bids `jobKey`."""
 
 import re
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
+from app.applications.area import classify_area, job_title
 from app.caller_stats import round_result
 from app.interview_rounds import _breakdown_group, merged_rounds
 from app.models.resume_application import as_match, job_url_key
@@ -39,15 +40,16 @@ def _key(account_id, url, coll: str, doc_id) -> tuple[str, Optional[str]]:
     return (f"{account_id}:{jk}" if jk else f"src:{coll}:{doc_id}"), jk
 
 
-def build_rows(bids: list[dict], resumes: list[dict], regions: dict) -> dict[str, dict]:
+def build_rows(bids: list[dict], resumes: list[dict], accounts: dict) -> dict[str, dict]:
     """One row per (accountId, job link); a bid and a tailored resume for the same job merge, the bidder wins `by`."""
     rows: dict[str, dict] = {}
+    bid_keys: dict[str, Optional[str]] = {}  # row key -> its earliest bid's jobKey, the title fallback
 
     def row_for(key, jk, account_id, owner_id, url, at):
         r = rows.get(key)
         if r is None:
             r = rows[key] = {
-                "key": key, "accountId": account_id, "ownerId": owner_id, "region": regions.get(account_id),
+                "key": key, "accountId": account_id, "ownerId": owner_id, "region": (accounts.get(account_id) or {}).get("region"),
                 "jobKey": jk, "board": board_of(url), "appliedAt": at, "by": "self", "sources": [],
             }
         elif at < r["appliedAt"]:
@@ -65,6 +67,7 @@ def build_rows(bids: list[dict], resumes: list[dict], regions: dict) -> dict[str
             r["bidStatus"] = st
         if "bid" not in r["sources"]:
             r["sources"].append("bid")
+            bid_keys[key] = b.get("jobKey")
 
     for ra in sorted((x for x in resumes if x.get("countsAsBid") is not False), key=lambda x: x["createdAt"]):
         key, jk = _key(ra.get("accountId"), ra.get("jobUrl"), "resumeapplications", ra["_id"])
@@ -75,7 +78,14 @@ def build_rows(bids: list[dict], resumes: list[dict], regions: dict) -> dict[str
         r["score"], r["scoreBand"] = m.get("total"), m.get("band")
         for f in ("promptId", "promptName", "templateName"):
             r[f] = ra.get(f)
+        r["title"] = job_title(ra.get("jobDescription"), None)
         r["sources"].append("resume")
+
+    for key, r in rows.items():
+        r["title"] = r.get("title") or job_title(None, bid_keys.get(key))
+        r["area"] = classify_area(r["title"])
+        created = (accounts.get(r["accountId"]) or {}).get("createdAt")
+        r["profileAgeDays"] = (r["appliedAt"] - created).days if created else None
     return rows
 
 
