@@ -129,6 +129,22 @@ def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[
     return done, total
 
 
+def routines_tally(weekly: Any, plans: dict, days: list) -> tuple[int, int]:
+    """(done, expected) routine lines over `days`: every routine shown on a day expects one tick or value."""
+    done = expected = 0
+    for d in days:
+        for e in day_items(weekly, plans.get(d), d):
+            if e["scope"] != "routine":
+                continue
+            expected += 1
+            r = e["result"]
+            if r is None:
+                continue
+            target = r.target if r.target is not None else e["item"].target
+            done += bool(r.done or (r.value is not None and target is not None and r.value >= target))
+    return done, expected
+
+
 def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
     """Per weekly goal id: summed values, whether any day marked it done, and its target."""
     out = {}

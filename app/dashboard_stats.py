@@ -116,20 +116,15 @@ def bucket_label(key: date, bucket: Bucket, start: date, end: date) -> str:
     return f"{calendar.month_abbr[key.month]} {key.year % 100:02d}"
 
 
-def pace(actual: int, target: int | None, today: date) -> dict | None:
+def plan_pace(actual: int, target: int | None, expected: int, days_left: int) -> dict | None:
+    """Pace against a plan-derived `expected` by now; None without a target."""
     if not target:
         return None
-    elapsed = min(today.weekday() + 1, 6)
-    expected = round(target * elapsed / 6)
-    behind_by = max(0, expected - actual)
-    on_track = actual >= expected
-    remaining = 6 - elapsed
-    per_day_needed = math.ceil(max(0, target - actual) / remaining) if remaining > 0 else None
     return {
         "expected": expected,
-        "behindBy": behind_by,
-        "perDayNeeded": per_day_needed,
-        "onTrack": on_track,
+        "behindBy": max(0, expected - actual),
+        "perDayNeeded": math.ceil(max(0, target - actual) / days_left) if days_left else None,
+        "onTrack": actual >= expected,
     }
 
 

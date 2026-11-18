@@ -15,7 +15,7 @@ from app.dashboard_stats import (
     bucket_label,
     local_day_start_utc,
     month_keys,
-    pace,
+    plan_pace,
     percentile,
     pick_bucket,
     streak,
@@ -64,21 +64,6 @@ def test_month_labels_same_and_cross_year():
 def test_day_label_weekday_for_week_range():
     assert bucket_label(date(2026, 9, 28), "day", date(2026, 9, 28), date(2026, 10, 4)) == "Mon"
     assert bucket_label(date(2026, 9, 28), "day", date(2026, 9, 1), date(2026, 9, 30)) == "Sep 28"
-
-
-def test_pace_midweek_behind():
-    # Wednesday: elapsed 3 of 6, target 50 -> expected 25
-    assert pace(20, 50, date(2026, 9, 30)) == {"expected": 25, "behindBy": 5, "perDayNeeded": 10, "onTrack": False}
-
-
-def test_pace_saturday_and_sunday_have_no_days_left():
-    assert pace(50, 50, date(2026, 10, 3))["perDayNeeded"] is None
-    assert pace(40, 50, date(2026, 10, 4)) == {"expected": 50, "behindBy": 10, "perDayNeeded": None, "onTrack": False}
-
-
-def test_pace_no_target():
-    assert pace(10, None, date(2026, 9, 30)) is None
-    assert pace(10, 0, date(2026, 9, 30)) is None
 
 
 def test_streak_spans_sunday_and_ignores_missing_today():
@@ -210,3 +195,15 @@ def test_rank_rows_none_ranks_last_together():
 
     rows = rank_rows([("a", "A", None), ("b", "B", 0), ("c", "C", None), ("d", "D", 5)])
     assert [(r["id"], r["rank"]) for r in rows] == [("d", 1), ("b", 2), ("a", 3), ("c", 3)]
+
+
+def test_plan_pace_behind_and_per_day():
+    assert plan_pace(700, 2000, 1200, 2) == {"expected": 1200, "behindBy": 500, "perDayNeeded": 650, "onTrack": False}
+
+
+def test_plan_pace_no_days_left():
+    assert plan_pace(2100, 2000, 2000, 0)["perDayNeeded"] is None
+
+
+def test_plan_pace_no_target():
+    assert plan_pace(5, None, 0, 3) is None
