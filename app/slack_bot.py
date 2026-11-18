@@ -39,7 +39,7 @@ from app.interview_caller import caller_is_on, round_caller_snapshot, round_post
 from app.config import get_settings
 from app.models import Account, Interview, UserExtra
 from app.models.interview import InterviewStageEvent, SlackThread
-from app.models.plan_common import Counts
+from app.models.plan_common import Counts, ItemResult
 from app.models.slack_alert_log import SlackAlertLog
 from app.slack_timezones import (
     format_gmt_offset,
@@ -416,10 +416,9 @@ def _item_line(e: dict, progress: dict) -> Optional[str]:
     item, result = e["item"], e["result"]
     hours = item.kind == "hours"
     if e["scope"] == "routine":
-        if result is None:
-            return None
+        result = result or ItemResult()  # planned but not reported: shows as short
         if item.kind == "check":
-            return _plan_line(item.text, "✅" if result.done else "⚠️ not done")
+            return _plan_line(item.text, "✅" if result.done else "❌ not done")
         v = result.value or 0
         t = result.target if result.target is not None else item.target
         return _plan_line(item.text, (f"{_n(v, hours)} / {_n(t, hours)}" if t else _n(v, hours)) + _mark(v, t))

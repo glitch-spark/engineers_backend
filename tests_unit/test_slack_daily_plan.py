@@ -161,10 +161,16 @@ def test_heading_names_an_unlinked_owner():
     assert daily_plan_text(_plan(), _owner(None)).splitlines()[0] == "🗒️ Pedro · Daily standup · Tue 11/17"
 
 
-def test_numbers_past_ten():
-    items = [_e(f"R{n}", "check", "routine", result=ItemResult(done=True)) for n in range(1)]
-    assert _plan_number(10) == "🔟" and _plan_number(11) == "11."
-    assert "3️⃣ Routines" in daily_plan_text(_plan(), _owner(), items=items)
+def test_plan_number_keycaps():
+    assert _plan_number(3) == "3️⃣" and _plan_number(10) == "🔟" and _plan_number(11) == "11."
+
+
+def test_unreported_routine_shows_as_short():
+    items = [_e("Review", "check", "routine"), _e("Calls", "count", "routine", 50), _e("Goal", "count", "goal", 5)]
+    text = daily_plan_text(_plan(), _owner(), items=items)
+    assert "   Review            ❌ not done" in text
+    assert "   Calls             0 / 50  ⚠️" in text
+    assert "Goal " not in text  # weekly goals still list only when touched
 
 
 @pytest.mark.asyncio

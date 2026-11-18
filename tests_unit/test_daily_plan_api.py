@@ -22,7 +22,7 @@ from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import daily_plans
-from app.routers.daily_plans import get_day, list_week, put_day
+from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
 from app.routers.reports import team_report
 from app.routers.weekly_plans import get_week, put_week
 
@@ -246,7 +246,7 @@ async def test_real_sync_slack_builds_the_standup(db, me, monkeypatch):
     await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), startDate=datetime(2026, 11, 9),
                      endDate=datetime(2026, 11, 15), weekNumber=46, year=2026,
                      goal=Counts(bidsSelf=100, interviewsSelf=3, interviewsCaller=2)).insert()
-    monkeypatch.undo()  # drop the fixture's fake _sync_slack
+    monkeypatch.setattr(daily_plans, "_sync_slack", REAL_SYNC_SLACK)  # the fixture faked it
     monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
     await daily_plans._sync_slack(plan, me, Counts(), {})
     assert seen["targets"].bidsSelf == 20 and seen["week_interviews"] == (0, 5)
