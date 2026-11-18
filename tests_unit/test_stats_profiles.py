@@ -73,7 +73,10 @@ def test_region_gap_zero_worst():
 # ---- view ----
 
 @pytest.fixture
-async def db():
+async def db(monkeypatch):
+    async def _since():
+        return date(2026, 1, 1)
+    monkeypatch.setattr(sp, "since_date", _since)
     await init_beanie(
         database=AsyncMongoMockClient()["stats-profiles"],
         document_models=[UserExtra, Account, DailyPlan, WeeklyPlan, Interview, InterviewQuestion, Bid, Bidder],
@@ -160,14 +163,16 @@ async def test_contract_keys_rowkind_profile_trend_null(db):
     (ana, *_), _ = await _team()
     await _acc(ana, "Idle")  # non-archived, no bids: counts in the total only
     out = await sp.profiles_view(ana, "month", TODAY, "all", None, TODAY)
-    assert set(out) == KEYS and out["tab"] == "profiles" and out["trend"] is None and len(out["definitions"]) == 3
-    assert [h["key"] for h in out["headline"]] == ["best", "rank", "zero", "active"]
-    best, rank, zero, active = out["headline"]
+    assert set(out) == KEYS and out["tab"] == "profiles" and out["trend"] is None and len(out["definitions"]) == 4 and out["definitions"][3] == "Profile numbers start on Jan 1, 2026, when bids began to be typed per profile."
+    assert [h["key"] for h in out["headline"]] == ["best", "rank", "worst", "zero"]
+    best, rank, worst, zero = out["headline"]
     assert best["value"] == 4.0 and best["format"] == "per100" and best["note"] == "Ana EU" and best["team"]["n"] == 4
     assert best["rank"] == 1 and best["of"] == 4 and best["higherIsBetter"] is True
     assert rank["value"] == 1 and rank["note"] == "of 4" and rank["team"] is None
+    assert worst["value"] == 1.0 and worst["label"] == "Weakest profile" and worst["note"] == "Ana US"
+    assert worst["format"] == "per100" and worst["higherIsBetter"] is True and worst["team"]["n"] == 4
     assert zero["value"] == 0 and zero["format"] == "count" and zero["higherIsBetter"] is False
-    assert active["value"] == 2 and active["note"] == "3 in total" and active["team"]["n"] == 4
+    assert zero["note"] == "of 2 active · team 0"
     ev = out["everyone"]
     assert ev["rowKind"] == "profile" and ev["metric"] == "per100"
     rows = {r["name"]: r for r in ev["rows"]}
@@ -196,10 +201,10 @@ async def test_zero_profile_rank_lower_is_better(db):
     dud = await _acc(ben, "Ben dud")
     await _self(ben, dud, 60, d=6)  # Ben: 1 profile with 30+ bids and 0 interviews
     out = await sp.profiles_view(ana, "month", TODAY, "all", None, TODAY)
-    zero = out["headline"][2]
+    zero = out["headline"][3]
     assert zero["value"] == 0 and zero["rank"] == 1 and zero["team"]["max"] == 1
     out = await sp.profiles_view(ben, "month", TODAY, "all", None, TODAY)
-    assert out["headline"][2]["value"] == 1 and out["headline"][2]["rank"] == 4
+    assert out["headline"][3]["value"] == 1 and out["headline"][3]["rank"] == 4
 
 
 async def test_no_profiles_empty_and_tip(db):
@@ -208,9 +213,68 @@ async def test_no_profiles_empty_and_tip(db):
     out = await sp.profiles_view(nobody, "month", TODAY, "all", None, TODAY)
     assert out["everyone"]["rows"] == [] and out["headline"][0]["value"] is None
     assert out["headline"][1]["value"] is None and out["headline"][1]["note"] == "needs a profile with 30 bids"
-    assert out["headline"][3]["value"] == 0 and out["headline"][3]["rank"] == 5 and out["headline"][3]["of"] == 5
+    assert out["headline"][0]["note"] == ""  # the hint lives on the rank cell only
+    assert out["headline"][3]["value"] == 0 and out["headline"][3]["note"] == "of 0 active · team 0"
     assert [t["id"] for t in out["tips"]] == ["profiles.no_profiles"]
-    assert out["tips"][0]["severity"] == "bad" and out["tips"][0]["text"] == "No active profiles this period"
+    assert out["tips"][0]["severity"] == "bad" and out["tips"][0]["text"] == "No active profiles this period."
+    assert out["tips"][0]["detail"] == "Bids need a profile: add one or reactivate an archived one."
+
+
+async def test_no_profiles_tip_when_profiles_exist_but_idle(db):
+    (ana, *_), _ = await _team()
+    zed = await _user("Zed")
+    await _acc(zed, "Z1")
+    await _acc(zed, "Z2")
+    await _acc(zed, "Z3", archived=True)
+    out = await sp.profiles_view(zed, "month", TODAY, "all", None, TODAY)
+    tip = out["tips"][0]
+    assert tip["id"] == "profiles.no_profiles" and tip["text"] == "None of your 2 profiles had a bid this period."
+    assert tip["detail"] == "Bid on them, or archive ones you no longer use."
+
+
+async def test_archived_profile_listed_but_not_ranked(db):
+    (ana, *_), _ = await _team()
+    old = await _acc(ana, "Old2", archived=True)
+    await _self(ana, old, 100, d=7)
+    for _ in range(9):
+        await _iv(ana, old)
+    out = await sp.profiles_view(ana, "month", TODAY, "all", None, TODAY)
+    row = next(r for r in out["everyone"]["rows"] if r["name"] == "Old2")
+    assert row["value"] == 9.0 and row["rank"] is None
+    assert out["headline"][0]["value"] == 4.0 and next(r for r in out["everyone"]["rows"] if r["name"] == "Ana EU")["rank"] == 1
+
+
+async def test_period_starting_before_since_counts_from_since(db, monkeypatch):
+    (ana, *_), _ = await _team()  # Ana EU self bids on Nov 2, US on Nov 3, Old on Nov 4
+
+    async def since():
+        return date(2026, 11, 3)
+    monkeypatch.setattr(sp, "since_date", since)
+    out = await sp.profiles_view(ana, "month", TODAY, "all", None, TODAY)
+    rows = {r["name"]: r for r in out["everyone"]["rows"]}
+    assert rows["Ana US"]["parts"]["self"] == 100 and rows["Ana EU"]["parts"]["self"] == 0  # EU's Nov 2 bids pre-date launch
+    assert "Profile numbers start on Nov 3, 2026" in out["definitions"][3]
+
+
+async def test_period_entirely_before_since_not_enough_data(db, monkeypatch):
+    (ana, *_), _ = await _team()
+
+    async def since():
+        return date(2026, 12, 1)
+    monkeypatch.setattr(sp, "since_date", since)
+    out = await sp.profiles_view(ana, "month", TODAY, "all", None, TODAY)
+    assert out["notEnoughData"] is True and out["tips"] == [] and out["everyone"]["rows"] == []
+    assert out["headline"][0]["value"] is None
+
+
+async def test_not_launched_not_enough_data(db, monkeypatch):
+    (ana, *_), _ = await _team()
+
+    async def since():
+        return None
+    monkeypatch.setattr(sp, "since_date", since)
+    out = await sp.profiles_view(ana, "month", TODAY, "all", None, TODAY)
+    assert out["notEnoughData"] is True and out["everyone"]["rows"] == [] and len(out["definitions"]) == 3
 
 
 async def test_dead_and_region_gap_tips_in_view(db):

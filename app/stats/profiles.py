@@ -2,11 +2,13 @@
 and the rule-based tips. Pure rule functions return a tip dict (with an `impact` for ordering) or None."""
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Optional
 
 from app import interview_rates
+from app.profile_metrics import since_date
 from app.stats import frame
 from app.stats.profile_data import idle_profiles, profile_last_bids
 
@@ -20,6 +22,7 @@ DEFINITIONS = [
     "Profile interviews are the rounds held in the period on the profile's interviews (same rules as the Interviews tab).",
     f"Interviews per 100 bids are shown and ranked only for profiles with at least {MIN_BIDS} bids; an active profile is one with a bid in the period.",
 ]
+SINCE_NOTE = "Profile numbers start on {date}, when bids began to be typed per profile."
 
 
 def _tip(id: str, severity: str, text: str, detail: str, evidence: dict, impact: float) -> dict:
@@ -106,17 +109,29 @@ async def profiles_view(subject, period: str, day: date, region: str, until: Opt
     from app.routers.metrics import _display_name
 
     start, end = interview_rates.window(period, day, until)
+    since = await since_date()  # per-profile self bids exist only from here
+    blind = since is None or since > end
+    if not blind:
+        start = max(start, since)
     users = {u.id: u for u in await UserExtra.find({"role": {"$ne": "admin"}}).to_list()}
     user_ids = list(users) + ([] if subject.id in users else [subject.id])
-    # ponytail: three queries per user; batch across users if the team grows past a few dozen.
-    data = {uid: await profile_counts(uid, start, end, region) for uid in user_ids}
+    # ponytail: three queries per user, run concurrently; batch across users if the team grows past a few hundred.
+    # A period entirely before `since` counts an empty window (end + 1 .. end) so nothing is shown.
+    cstart = end + timedelta(days=1) if blind else start
+    counted = await asyncio.gather(*(profile_counts(uid, cstart, end, region) for uid in user_ids))
+    data = dict(zip(user_ids, counted))
     sid = subject.id
     team_ids = [uid for uid in users if _active(data[uid])]
     in_team = sid in team_ids
 
+    def rates(uid) -> list[float]:
+        return [x for r in _active(data[uid]) if (x := _per100(r)) is not None]
+
     def best(uid) -> Optional[float]:
-        rates = [x for r in _active(data[uid]) if (x := _per100(r)) is not None]
-        return max(rates) if rates else None
+        return max(rates(uid), default=None)
+
+    def worst(uid) -> Optional[float]:
+        return min(rates(uid), default=None)
 
     def zero(uid) -> int:
         return sum(1 for r in _active(data[uid]) if r["bids"] >= MIN_BIDS and not r["interviews"])
@@ -124,30 +139,37 @@ async def profiles_view(subject, period: str, day: date, region: str, until: Opt
     bests = {u: best(u) for u in team_ids}
     rated = [v for v in bests.values() if v is not None]
     best_d = frame.distribution(rated)
+    worsts = [v for u in team_ids if (v := worst(u)) is not None]
+    worst_d = frame.distribution(worsts)
     zero_d = frame.distribution([zero(u) for u in team_ids])
-    active_d = frame.distribution([len(_active(data[u])) for u in team_ids])
-    mine, my_best = data[sid], best(sid)
+    mine, my_best, my_worst = data[sid], best(sid), worst(sid)
     my_active, my_zero = _active(mine), zero(sid)
-    best_name = next((r["name"] for r in my_active if _per100(r) == my_best and my_best is not None), "")
-    rank, of = frame.rank_of(my_best, rated, True, in_team and my_best is not None) if my_best is not None else (None, len(rated))
+
+    def name_of(v):
+        return next((r["name"] for r in my_active if v is not None and _per100(r) == v), "")
+
+    rank, of = frame.rank_of(my_best, rated, True, in_team) if my_best is not None else (None, len(rated))
+    w_rank, w_of = frame.rank_of(my_worst, worsts, True, in_team) if my_worst is not None else (None, len(worsts))
     z_rank, z_of = frame.rank_of(my_zero, [zero(u) for u in team_ids], False, in_team)
-    a_rank, a_of = frame.rank_of(len(my_active), [len(_active(data[u])) for u in team_ids], True, in_team)
+    zm = zero_d["median"]
     headline = [
         {"key": "best", "label": "Best profile", "value": my_best, "format": "per100", "team": best_d, "rank": rank, "of": of,
          "vsMedian": frame.vs_median(my_best, best_d["median"]) if my_best is not None else None, "higherIsBetter": True,
-         "note": best_name if my_best is not None else f"needs a profile with {MIN_BIDS} bids"},
+         "note": name_of(my_best)},
         {"key": "rank", "label": "Your rank", "value": rank, "format": "rank", "team": None, "rank": rank, "of": of,
          "vsMedian": None, "higherIsBetter": False,
-         "note": f"of {of}" if my_best is not None else "needs a profile with 30 bids"},
+         "note": f"of {of}" if my_best is not None else f"needs a profile with {MIN_BIDS} bids"},
+        {"key": "worst", "label": "Weakest profile", "value": my_worst, "format": "per100", "team": worst_d,
+         "rank": w_rank, "of": w_of,
+         "vsMedian": frame.vs_median(my_worst, worst_d["median"]) if my_worst is not None else None,
+         "higherIsBetter": True, "note": name_of(my_worst)},
         {"key": "zero", "label": "Profiles with 0 interviews", "value": my_zero, "format": "count", "team": zero_d,
-         "rank": z_rank, "of": z_of, "vsMedian": frame.vs_median(my_zero, zero_d["median"]), "higherIsBetter": False,
-         "note": f"of {sum(1 for r in my_active if r['bids'] >= MIN_BIDS)} with {MIN_BIDS}+ bids"},
-        {"key": "active", "label": "Active profiles", "value": len(my_active), "format": "count", "team": active_d,
-         "rank": a_rank, "of": a_of, "vsMedian": frame.vs_median(len(my_active), active_d["median"]), "higherIsBetter": True,
-         "note": f"{sum(1 for r in mine.values() if not r['archived'])} in total"},
+         "rank": z_rank, "of": z_of, "vsMedian": frame.vs_median(my_zero, zm), "higherIsBetter": False,
+         "note": f"of {len(my_active)} active · team {'–' if zm is None else format(zm, 'g')}"},
     ]
 
-    ranked = [x for r in mine.values() if (x := _per100(r)) is not None]
+    # Archived profiles are listed (when they had bids) but not ranked.
+    ranked = [x for r in mine.values() if not r["archived"] and (x := _per100(r)) is not None]
     mid = median(ranked) if len(ranked) >= 2 else None
     rows = []
     for pid, r in mine.items():
@@ -156,11 +178,11 @@ async def profiles_view(subject, period: str, day: date, region: str, until: Opt
         v = _per100(r)
         rows.append({"userId": pid, "name": r["name"], "region": r["region"], "value": v,
                      "vsMedian": frame.vs_median(v, mid) if v is not None and mid is not None else None,
-                     "rank": frame.rank_of(v, ranked)[0] if v is not None else None,
+                     "rank": frame.rank_of(v, ranked)[0] if v is not None and not r["archived"] else None,
                      "parts": {"self": r["selfBids"], "bidder": r["bidderBids"]}, "isSubject": False})
     rows.sort(key=lambda r: (r["rank"] is None, -(r["value"] or 0), -(r["parts"]["self"] + r["parts"]["bidder"]), r["name"].lower()))
 
-    not_enough = frame.not_enough_data(len(team_ids), len(frame.working_days(start, end, today)))
+    not_enough = blind or frame.not_enough_data(len(team_ids), len(frame.working_days(start, end, today)))
     tips: list[dict] = []
     if not not_enough:
         by_region: dict = {}
@@ -168,17 +190,18 @@ async def profiles_view(subject, period: str, day: date, region: str, until: Opt
             if r["region"]:
                 b, i = by_region.get(r["region"], (0, 0))
                 by_region[r["region"]] = (b + r["bids"], i + r["interviews"])
-        dead = await profile_counts(sid, today - timedelta(days=DEAD_DAYS), today - timedelta(days=1), region)
+        dead = await profile_counts(sid, max(today - timedelta(days=DEAD_DAYS), since), today - timedelta(days=1), region)
         last, names = await profile_last_bids(sid, region, today)
         candidates = [dead_profile(dead), region_gap(by_region), idle_profiles(last, today, names)]
         if not my_active:
-            candidates.append(_tip("no_profiles", "bad", "No active profiles this period",
-                                   "Bids need a profile: add one or reactivate an archived one.", {}, 0))
+            n = sum(1 for r in mine.values() if not r["archived"])
+            candidates.append(_tip("no_profiles", "bad", f"None of your {n} profiles had a bid this period." if n else "No active profiles this period.",
+                                   "Bid on them, or archive ones you no longer use." if n else "Bids need a profile: add one or reactivate an archived one.", {}, 0))
         tips = frame.order_tips([t for t in candidates if t])
 
     return {
         "tab": "profiles", "label": interview_rates.label(period, start, end),
         "subject": {"userId": str(sid), "name": _display_name(subject)},
         "headline": headline, "tips": tips, "everyone": {"rowKind": "profile", "metric": "per100", "rows": rows},
-        "trend": None, "notEnoughData": not_enough, "definitions": DEFINITIONS,
+        "trend": None, "notEnoughData": not_enough, "definitions": DEFINITIONS + ([SINCE_NOTE.format(date=f"{since:%b} {since.day}, {since.year}")] if since else []),
     }
