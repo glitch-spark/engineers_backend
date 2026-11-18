@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
-from app.db import init_db
+from app.db import fast_start, init_db
 from app import redis_cache, resume_queue
 from app.job_apply import worker as job_apply_worker
 from app.routers import (
@@ -52,14 +52,15 @@ async def lifespan(app: FastAPI):
     # Bridge .env loading into db.py (which still reads os.environ directly).
     os.environ["MONGODB_URI"] = settings.MONGODB_URI
     await init_db()
-    try:
-        from app.bids.folders import backfill_folders
+    if not fast_start():
+        try:
+            from app.bids.folders import backfill_folders
 
-        n = await backfill_folders()
-        if n:
-            log.info("Assigned folders to %d bidders", n)
-    except Exception:
-        log.exception("Bidder folder backfill failed")
+            n = await backfill_folders()
+            if n:
+                log.info("Assigned folders to %d bidders", n)
+        except Exception:
+            log.exception("Bidder folder backfill failed")
     if resume_queue.queue_enabled():  # the deployed backend: local runs share its database and must not record it
         try:
             from app.dashboard_stats import app_tz
