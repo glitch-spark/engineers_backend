@@ -7,9 +7,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 
 from beanie import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
+from app import plan_bidder
 from app.bids.evidence import duration_sec, evidence_for, job_domain
 from app.bids.live_counts import TtlCache
 from app.bids.alerts import bid_alerts, pending_days
@@ -777,7 +778,9 @@ class BulkReviewIn(BaseModel):
 
 
 @router.put("/{bid_id}/review")
-async def review_bid(bid_id: str, body: ReviewIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+async def review_bid(
+    bid_id: str, body: ReviewIn, user: Annotated[UserExtra, Depends(get_current_user)], background: BackgroundTasks
+) -> dict:
     bid, bidder = await _load_reviewable(bid_id, user)
     _check_reason(body.status, body.reason, body.note)
     await Bid.get_motor_collection().update_one(
@@ -788,11 +791,15 @@ async def review_bid(bid_id: str, body: ReviewIn, user: Annotated[UserExtra, Dep
     # finishing together can each count before the other's write, leaving the stored row one decision behind
     # until the next review of that day.
     await refresh_report_rows(bid)
+    background.add_task(plan_bidder.write_through_bidder, bidder.createdBy,
+                        bid_report_day(bid.firstAt, schedule_from_settings()))
     return await _single_bid_out(bid, bidder)
 
 
 @router.post("/review")
-async def review_bids(body: BulkReviewIn, user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+async def review_bids(
+    body: BulkReviewIn, user: Annotated[UserExtra, Depends(get_current_user)], background: BackgroundTasks
+) -> dict:
     """Decide many bids at once: every id is access-checked; foreign, unknown and malformed ids are skipped. With
     onlyComplete (approving only) a bid is also skipped unless it is complete when the write happens."""
     _check_reason(body.status, body.reason, None)  # a bulk decision has no note, so Other is refused
@@ -825,4 +832,6 @@ async def review_bids(body: BulkReviewIn, user: Annotated[UserExtra, Depends(get
             per_period.setdefault(key, b)
         for b in per_period.values():
             await refresh_report_rows(b)
+        for owner_id, day in {(bidders[b.bidderId].createdBy, bid_report_day(b.firstAt, sched)) for b in allowed}:
+            background.add_task(plan_bidder.write_through_bidder, owner_id, day)  # once per owner and report day
     return {"updated": updated, "skipped": len(wanted) - updated}

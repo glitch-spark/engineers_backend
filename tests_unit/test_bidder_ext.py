@@ -704,3 +704,18 @@ async def test_wrong_current_passwords_hit_the_limit(ext):
 async def test_change_password_requires_a_bidder_token(ext):
     r = await ext.post("/ext/password", json={"currentPassword": "password1", "newPassword": "newpass123"})
     assert r.status_code == 401
+
+
+async def test_upload_calls_plan_bidder_write_through(ext, owner, storage, monkeypatch):
+    from app import plan_bidder
+
+    calls = []
+
+    async def spy(owner_id, day):
+        calls.append((owner_id, day))
+
+    monkeypatch.setattr(plan_bidder, "write_through_bidder", spy)
+    _, _, body = await register(ext)
+    r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1 and calls[0][0] == owner.id

@@ -9,12 +9,15 @@ from typing import Annotated, Literal, Optional
 from urllib.parse import urlsplit
 
 from beanie.exceptions import RevisionIdWasChanged
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse
 from pydantic import AwareDatetime, BaseModel, Field, StringConstraints, ValidationInfo, field_validator
 from pymongo.errors import DuplicateKeyError
 
+from app import plan_bidder
 from app.bids import rate_limit
+from app.bids.windows import schedule_from_settings
+from app.profile_metrics import bid_report_day
 from app.bids.folders import folder_url
 from app.bids.invites import hash_code, invite_is_live
 from app.bids.rate_limit import FailureLimiter, client_ip, limiter_keys
@@ -285,7 +288,9 @@ def _job_url(raw: Optional[str]) -> Optional[str]:
 
 
 @router.post("/upload-url")
-async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)]) -> dict:
+async def upload_url(
+    body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_current_bidder)], background: BackgroundTasks
+) -> dict:
     """The backend picks the object path; the extension only PUTs the image to the returned link."""
     bidder = auth.bidder
     job_url = _job_url(body.jobUrl)
@@ -306,6 +311,9 @@ async def upload_url(body: UploadUrlIn, auth: Annotated[BidderAuth, Depends(get_
         (body.jobTitle or "")[:_JOB_TITLE_MAX] or None,
         [Attachment(**a.model_dump()) for a in body.attachments],
     )
+    # The daily plan's bidder count follows Bid Track; off the request path (every screenshot comes here).
+    background.add_task(plan_bidder.write_through_bidder, bidder.createdBy,
+                        bid_report_day(bid.firstAt, schedule_from_settings()))
     try:
         content_type = IMAGE_FORMATS[body.format][1]
         url = await asyncio.to_thread(storage.presign_put, bucket, key, content_type)

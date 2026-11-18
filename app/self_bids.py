@@ -118,17 +118,23 @@ async def _write(owner_id, day: date) -> None:
     await coll.update_one({**key, "loggedAt": None}, {"$set": {"loggedAt": now}})
 
 
+async def resync_slack(owner, day: date, *, need_submitted: bool = False) -> None:
+    """Update the day's Slack post (when it has one) to the plan's current numbers."""
+    from app.plan_auto import effective_daily_done, empty_day
+    from app.routers import daily_plans
+
+    plan = await DailyPlan.find_one({"userId": owner.id, "date": _midnight(day)})
+    if plan is None or not plan.slackTs or (need_submitted and not plan.submittedAt):
+        return
+    auto_day = (await daily_plans._interviews(owner.id, day, day)).get(day, empty_day())
+    await daily_plans._sync_slack(plan, owner, effective_daily_done(plan, auto_day), auto_day["rounds"])
+
+
 async def safe_write_through(owner, day: date) -> None:
     """For an upload: the write-through and, when the day was posted to Slack, the post updated to the new count.
     Never fails the upload (the bid is already recorded; the next upload or a save of the day writes it again)."""
     try:
         await _write(owner.id, day)
-        from app.plan_auto import effective_daily_done, empty_day
-        from app.routers import daily_plans
-
-        plan = await DailyPlan.find_one({"userId": owner.id, "date": _midnight(day)})
-        if plan is not None and plan.slackTs:
-            auto_day = (await daily_plans._interviews(owner.id, day, day)).get(day, empty_day())
-            await daily_plans._sync_slack(plan, owner, effective_daily_done(plan, auto_day), auto_day["rounds"])
+        await resync_slack(owner, day)
     except Exception:
         log.exception("self bids: writing %s's tracked count for %s failed", owner.id, day)
