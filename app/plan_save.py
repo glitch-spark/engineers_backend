@@ -53,10 +53,14 @@ def result_done(kind: str, value: Optional[float], sent_done: Optional[bool], ta
                 old: Optional[ItemResult]) -> bool:
     """`sent_done` None = not sent (Slack form): keep the stored done. Checks follow it; counts / hours are done when
     ticked, or at their frozen target (any value without one)."""
-    base = sent_done if sent_done is not None else bool(old and old.done)
+    def reached(v: Optional[float]) -> bool:
+        return v is not None and (v >= target if target else v > 0)
+
+    # not sent: keep a stored done only when the stored number did not already explain it (else it would stick)
+    base = sent_done if sent_done is not None else bool(old and old.done and (kind == "check" or not reached(old.value)))
     if kind == "check":
         return bool(base)
-    return base or (value is not None and (value >= target if target else value > 0))
+    return base or reached(value)
 
 
 def _midnight(d: date) -> datetime:

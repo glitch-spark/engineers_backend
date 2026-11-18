@@ -297,3 +297,15 @@ def test_done_count_without_value_shows_done():
     assert "   Calls             ✅" in text
     assert "   Prep              ✅" in text
     assert "   Mail              ✅ done today" in text
+
+
+def test_ticked_routine_below_target_shows_done_not_warning():
+    items = [_e("Calls", "count", "routine", 50, ItemResult(done=True, value=31))]
+    text = daily_plan_text(_plan(), _owner(), items=items)
+    assert "   Calls             31 / 50  ✅" in text and "⚠️" not in text
+
+
+def test_done_weekly_count_goal_shows_done_mark():
+    items = [_e("Mail", "count", "goal", 250, ItemResult(value=10), iid="m")]
+    text = daily_plan_text(_plan(), _owner(), items=items, progress={"m": {"value": 140, "done": True, "target": 250}})
+    assert "   Mail              140 / 250  ✅" in text

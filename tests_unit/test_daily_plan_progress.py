@@ -200,3 +200,25 @@ async def test_slack_values_only_submit_keeps_ticked_count(db, me, week):
     await put_day("2026-11-10", me, {"results": {"r2": {"done": True, "value": 31}}}, submit=False)
     await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=31)}))
     assert (await _r2(me)).done is True
+
+
+async def test_value_caused_done_does_not_stick_on_values_only_resubmit(db, me, week):
+    from app.plan_save import DayIn, ItemResultIn, save_day
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=50)}))
+    assert (await _r2(me)).done is True
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn(value=30)}))
+    r = await _r2(me)
+    assert r.done is False and r.value == 30
+
+
+async def test_migrated_tick_without_value_stays_done(db, me, week):
+    from app.plan_save import DayIn, ItemResultIn, save_day
+    await put_day("2026-11-10", me, {"results": {"r2": {"done": True}}}, submit=False)
+    await save_day(me, TUE, DayIn(results={"r2": ItemResultIn()}))
+    assert (await _r2(me)).done is True
+
+
+async def test_explicit_null_value_clears_stored_number(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": 31}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": None}}}, submit=False)
+    assert (await _r2(me)).value is None

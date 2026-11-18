@@ -423,12 +423,13 @@ def _item_line(e: dict, progress: dict) -> Optional[str]:
             return _plan_line(item.text, "✅" if result.done else "❌ not done")
         v = result.value or 0
         t = result.target if result.target is not None else item.target
-        return _plan_line(item.text, (f"{_n(v, hours)} / {_n(t, hours)}" if t else _n(v, hours)) + _mark(v, t))
+        return _plan_line(item.text, (f"{_n(v, hours)} / {_n(t, hours)}" if t else _n(v, hours)) + ("  ✅" if result.done else _mark(v, t)))
     # weekly goal: the week so far
     if item.kind == "check":
         return _plan_line(item.text, "✅ done today" if result and result.done else "in focus")
     p = progress.get(item.id) or {"value": 0, "target": item.target}
-    return _plan_line(item.text, f"{_n(p['value'], hours)} / {_n(p['target'], hours)}" if p["target"] else _n(p["value"], hours))
+    text = f"{_n(p['value'], hours)} / {_n(p['target'], hours)}" if p["target"] else _n(p["value"], hours)
+    return _plan_line(item.text, text + ("  ✅" if p.get("done") else ""))
 
 
 def daily_plan_text(
