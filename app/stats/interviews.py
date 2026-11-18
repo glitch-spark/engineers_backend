@@ -36,13 +36,14 @@ def _rate(passed: int, rejected: int) -> Optional[float]:
 
 def low_conversion(my_rate: Optional[float], team_median_rate: Optional[float], my_bids: int) -> Optional[dict]:
     """Rates are interviews per bid."""
-    if my_bids < MIN_BIDS or my_rate is None or not team_median_rate or my_rate >= LOW_CONVERSION * team_median_rate:
+    if my_bids < MIN_BIDS or not my_rate or not team_median_rate or my_rate >= LOW_CONVERSION * team_median_rate:
         return None
     missing = round((team_median_rate - my_rate) * my_bids)
     return _tip(
         "low_conversion", "bad",
         f"You get {my_rate * 100:.1f} interviews per 100 bids vs {team_median_rate * 100:.1f} for the team.",
-        f"Over {my_bids} bids that is about {missing} interviews fewer than the team median.",
+        f"Over {my_bids} bids" + (f" that is about {missing} interview{'s' * (missing != 1)} fewer than the team median." if missing else
+                                  " you are below the team median."),
         {"per100": my_rate * 100, "teamMedianPer100": team_median_rate * 100, "bids": my_bids}, missing)
 
 
@@ -74,7 +75,7 @@ def caller_vs_self(caller: tuple, self_: tuple) -> Optional[dict]:
         return None
     return _tip(
         "caller_vs_self", "watch",
-        f"Caller-taken rounds pass {c:.0%} vs {s:.0%} when you take them — consider a caller for more of your rounds",
+        f"Caller-taken rounds pass {c:.0%} vs {s:.0%} when you take them — consider a caller for more of your rounds.",
         f"{sum(caller)} caller and {sum(self_)} self rounds with a result.",
         {"callerPassRate": c, "selfPassRate": s, "callerDecided": sum(caller), "selfDecided": sum(self_)}, (c - s) * sum(self_))
 
@@ -146,14 +147,15 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
     r_rank, r_of = frame.rank_of(my_reach, [reach(u) for u in reach_ids], True, in_team) if my_reach is not None else (None, len(reach_ids))
     headline = [
         {"key": "per100", "label": "Interviews per 100 bids", "value": me, "format": "per100", "team": rates_d, "rank": rank,
-         "of": of, "vsMedian": frame.vs_median(me, rates_d["median"]) if me is not None else None, "higherIsBetter": True,
-         "note": f"{ivs[sid]} interviews from {bids[sid]} bids"},
+         "of": of, "vsMedian": frame.vs_median(me, rates_d["median"]) if me is not None and eligible else None, "higherIsBetter": True,
+         "note": (f"{ivs[sid]} interview{'s' * (ivs[sid] != 1)} from {bids[sid]} bids" if bids[sid]
+                  else f"{ivs[sid]} interview{'s' * (ivs[sid] != 1)}, no bids yet")},
         {"key": "rank", "label": "Your rank", "value": rank, "format": "rank", "team": None, "rank": rank, "of": of,
          "vsMedian": None, "higherIsBetter": False, "note": f"of {of}" if eligible else f"needs {MIN_BIDS} bids"},
         {"key": "interviews", "label": "Interviews held", "value": ivs[sid], "format": "count", "team": counts_d,
          "rank": i_rank, "of": i_of, "vsMedian": frame.vs_median(ivs[sid], counts_d["median"]), "higherIsBetter": True,
          "note": f"Self {ivs[sid] - callers[sid]} · caller {callers[sid]}"},
-        {"key": "reach", "label": "Reached tech", "value": my_reach, "format": "pct", "team": reach_d, "rank": r_rank,
+        {"key": "reach", "label": "Reached tech or later", "value": my_reach, "format": "pct", "team": reach_d, "rank": r_rank,
          "of": r_of, "vsMedian": frame.vs_median(my_reach, reach_d["median"]) if my_reach is not None else None,
          "higherIsBetter": True, "note": f"final {round(100 * final[sid] / processes[sid])}%" if processes[sid] else ""},
     ]
@@ -163,7 +165,7 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
         ok = bids[uid] >= MIN_BIDS
         r = frame.rank_of(per100(uid), rates, True, uid in team_ids)[0] if ok else None
         rows.append({"userId": str(uid), "name": _display_name(users.get(uid, subject)), "value": per100(uid),
-                     "vsMedian": frame.vs_median(per100(uid), rates_d["median"]) if per100(uid) is not None else None,
+                     "vsMedian": frame.vs_median(per100(uid), rates_d["median"]) if per100(uid) is not None and ok else None,
                      "rank": r, "parts": {"self": ivs[uid] - callers[uid], "caller": callers[uid]}, "isSubject": uid == sid})
     rows.sort(key=lambda r: (r["rank"] is None, -(r["value"] or 0) if r["rank"] else -(r["parts"]["self"] + r["parts"]["caller"]),
                              r["name"].lower()))
@@ -174,12 +176,14 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
     if not not_enough:
         team_stage = {g: tuple(sum(stage[u][g][i] for u in team_ids if u != sid) for i in (0, 1)) for g in _GROUP_LABEL}
         ps, pe = frame.previous_window(period, start, end, today)
+        today_end = min(end, today)  # rounds scheduled later this period are not "so far"
+        so_far = sum(v[2] + v[3] for (d, u), v in days.items() if u == sid and d <= today_end)
         before = (await interview_rates.counts([sid], ps, pe, region, regions, logged_only=False)).get(sid, (0, 0))[1]
         candidates = [
             low_conversion(ivs[sid] / bids[sid] if bids[sid] else None, rates_d["median"] / 100 if rates_d["median"] else None, bids[sid]),
             stalls_at_stage({g: tuple(v) for g, v in stage[sid].items()}, team_stage),
             caller_vs_self(tuple(who[sid][True]), tuple(who[sid][False])),
-            up_vs_last_period(ivs[sid], before, frame.span_label(ps, pe)),
+            up_vs_last_period(so_far, before, frame.span_label(ps, pe)),
         ]
         if not ivs[sid]:
             candidates.append(_tip("no_interviews", "bad", "No interviews yet this period.",

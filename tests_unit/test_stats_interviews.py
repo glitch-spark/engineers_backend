@@ -242,3 +242,61 @@ async def test_stall_team_pool_excludes_subject(db):
     out = await si.interviews_view(users[0], "month", TODAY, "all", None, TODAY)
     tip = next(t for t in out["tips"] if t["id"] == "interviews.stalls_at_stage")
     assert tip["evidence"]["teamPassRate"] == pytest.approx(0.6)
+
+
+async def test_up_tip_ignores_rounds_scheduled_after_today(db):
+    await _team()
+    zed = await _user("Zed")
+    acc = await Account(name="Z", createdBy=zed.id, region="EU").insert()
+    await _bids(zed, 50)
+    for d in (5, 6):
+        await Interview(accountId=acc.id, createdBy=zed.id, scheduledAt=datetime(2026, 10, d, 12), companyName="Acme",
+                        stageHistory=[{"stage": "intro", "at": datetime(2026, 10, d, 12), "scheduledAt": datetime(2026, 10, d, 12),
+                                       "status": "passed", "caller": None}]).insert()
+    await _iv(zed, acc, ("intro", 3, "passed"), ("tech_round_1", 4, "passed"), ("panel", 25, "scheduled"), ("final", 26, "scheduled"))
+    out = await si.interviews_view(zed, "month", TODAY, "all", None, TODAY)
+    assert out["headline"][2]["value"] == 4  # whole period still shown
+    assert "interviews.up_vs_last_period" not in [t["id"] for t in out["tips"]]
+
+
+async def test_under_30_bids_no_vs_median_on_per100(db):
+    await _team()
+    low = await _user("Low")
+    lacc = await Account(name="Low EU", createdBy=low.id, region="EU").insert()
+    await _bids(low, 10)
+    await _iv(low, lacc, ("intro", 3, "passed"), ("tech_round_1", 4, "passed"))
+    out = await si.interviews_view(low, "month", TODAY, "all", None, TODAY)
+    assert out["headline"][0]["vsMedian"] is None
+    assert out["headline"][1]["note"] == "needs 30 bids"
+    row = next(r for r in out["everyone"]["rows"] if r["isSubject"])
+    assert row["vsMedian"] is None and row["rank"] is None
+
+
+async def test_no_interviews_no_low_conversion(db):
+    await _team()
+    zed = await _user("Zed")
+    await _bids(zed, 50)
+    out = await si.interviews_view(zed, "month", TODAY, "all", None, TODAY)
+    ids = [t["id"] for t in out["tips"]]
+    assert "interviews.no_interviews" in ids and "interviews.low_conversion" not in ids
+
+
+async def test_reach_label_and_note_wording(db):
+    (ana, *_), _ = await _team()
+    out = await si.interviews_view(ana, "month", TODAY, "all", None, TODAY)
+    assert out["headline"][3]["label"] == "Reached tech or later"
+    z = await _user("Zed")
+    acc = await Account(name="Z", createdBy=z.id, region="EU").insert()
+    await _iv(z, acc, ("intro", 3, "passed"))
+    out = await si.interviews_view(z, "month", TODAY, "all", None, TODAY)
+    assert out["headline"][0]["note"] == "1 interview, no bids yet"
+    await _bids(z, 50)
+    out = await si.interviews_view(z, "month", TODAY, "all", None, TODAY)
+    assert out["headline"][0]["note"] == "1 interview from 50 bids"
+
+
+def test_tip_wording():
+    assert si.caller_vs_self((5, 3), (1, 5))["text"].endswith("rounds.")
+    assert "about 0" not in si.low_conversion(0.009, 0.0165, 100)["detail"]
+    assert si.low_conversion(0.009, 0.0165, 100)["detail"] == "Over 100 bids that is about 1 interview fewer than the team median."
+    assert "about 0" not in si.low_conversion(0.009, 0.0165, 30)["detail"]
