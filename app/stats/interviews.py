@@ -9,7 +9,6 @@ from typing import Optional
 
 from app import interview_rates
 from app.stats import frame
-from app.stats.bids import _span
 
 MIN_BIDS = interview_rates.MIN_BIDS
 LOW_CONVERSION = 0.6  # bad when per-100 is under this share of the team median
@@ -75,7 +74,7 @@ def caller_vs_self(caller: tuple, self_: tuple) -> Optional[dict]:
         return None
     return _tip(
         "caller_vs_self", "watch",
-        f"Caller-taken rounds pass {c:.0%} vs {s:.0%} when you take them — consider a caller for tech rounds",
+        f"Caller-taken rounds pass {c:.0%} vs {s:.0%} when you take them — consider a caller for more of your rounds",
         f"{sum(caller)} caller and {sum(self_)} self rounds with a result.",
         {"callerPassRate": c, "selfPassRate": s, "callerDecided": sum(caller), "selfDecided": sum(self_)}, (c - s) * sum(self_))
 
@@ -134,17 +133,17 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
     rated = [uid for uid in team_ids if bids[uid] >= MIN_BIDS]
     rates = [per100(u) for u in rated]
     counts_ = [ivs[u] for u in team_ids]
-    reach = lambda uid: 100 * tech[uid] / processes[uid]  # noqa: E731
+    reach = lambda uid: round(tech[uid] / processes[uid], 3)  # noqa: E731
     reach_ids = [u for u in team_ids if processes[u]]
     rates_d, counts_d = frame.distribution(rates), frame.distribution(counts_)
-    reach_d = frame.distribution([round(reach(u), 1) for u in reach_ids])
+    reach_d = frame.distribution([reach(u) for u in reach_ids])
 
     me, sid = per100(subject.id), subject.id
     eligible = bids[sid] >= MIN_BIDS
     rank, of = frame.rank_of(me, rates, True, in_team) if eligible else (None, len(rates))
     i_rank, i_of = frame.rank_of(ivs[sid], counts_, True, in_team)
-    my_reach = round(reach(sid), 1) if processes[sid] else None
-    r_rank, r_of = frame.rank_of(my_reach, [round(reach(u), 1) for u in reach_ids], True, in_team) if my_reach is not None else (None, len(reach_ids))
+    my_reach = reach(sid) if processes[sid] else None
+    r_rank, r_of = frame.rank_of(my_reach, [reach(u) for u in reach_ids], True, in_team) if my_reach is not None else (None, len(reach_ids))
     headline = [
         {"key": "per100", "label": "Interviews per 100 bids", "value": me, "format": "per100", "team": rates_d, "rank": rank,
          "of": of, "vsMedian": frame.vs_median(me, rates_d["median"]) if me is not None else None, "higherIsBetter": True,
@@ -156,7 +155,7 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
          "note": f"Self {ivs[sid] - callers[sid]} · caller {callers[sid]}"},
         {"key": "reach", "label": "Reached tech", "value": my_reach, "format": "pct", "team": reach_d, "rank": r_rank,
          "of": r_of, "vsMedian": frame.vs_median(my_reach, reach_d["median"]) if my_reach is not None else None,
-         "higherIsBetter": True, "note": f"final {round(100 * final[sid] / processes[sid]) if processes[sid] else 0}%"},
+         "higherIsBetter": True, "note": f"final {round(100 * final[sid] / processes[sid])}%" if processes[sid] else ""},
     ]
 
     rows = []
@@ -173,14 +172,14 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
     not_enough = frame.not_enough_data(len(team_ids), len(frame.working_days(start, end, today)))
     tips: list[dict] = []
     if not not_enough:
-        team_stage = {g: tuple(sum(stage[u][g][i] for u in team_ids) for i in (0, 1)) for g in _GROUP_LABEL}
+        team_stage = {g: tuple(sum(stage[u][g][i] for u in team_ids if u != sid) for i in (0, 1)) for g in _GROUP_LABEL}
         ps, pe = frame.previous_window(period, start, end, today)
         before = (await interview_rates.counts([sid], ps, pe, region, regions, logged_only=False)).get(sid, (0, 0))[1]
         candidates = [
             low_conversion(ivs[sid] / bids[sid] if bids[sid] else None, rates_d["median"] / 100 if rates_d["median"] else None, bids[sid]),
             stalls_at_stage({g: tuple(v) for g, v in stage[sid].items()}, team_stage),
             caller_vs_self(tuple(who[sid][True]), tuple(who[sid][False])),
-            up_vs_last_period(ivs[sid], before, _span(ps, pe)),
+            up_vs_last_period(ivs[sid], before, frame.span_label(ps, pe)),
         ]
         if not ivs[sid]:
             candidates.append(_tip("no_interviews", "bad", "No interviews yet this period.",

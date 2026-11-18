@@ -89,10 +89,6 @@ def up_vs_last_period(now: int, before: int, window: str = "the previous period"
     return frame.up_vs_last_period("bids", "bids", now, before, window)
 
 
-def _span(a: date, b: date) -> str:
-    return f"{a:%b} {a.day}–{b.day}" if a.month == b.month else f"{a:%b} {a.day}–{b:%b} {b.day}"
-
-
 async def _targets(uid, days: list[date]) -> int:
     """Σ day_targets (self + bidder bids) over `days`."""
     from app import plan_auto
@@ -211,7 +207,7 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
             candidates.append(behind_target(sum(mine(d) for d in done_days), target))
         ps, pe = frame.previous_window(period, start, end, today)
         before = (await interview_rates.counts([subject.id], ps, pe, region, regions, logged_only=False)).get(subject.id, (0,))[0]
-        candidates.append(up_vs_last_period(me, before, _span(ps, pe)))
+        candidates.append(up_vs_last_period(me, before, frame.span_label(ps, pe)))
         if not me:
             candidates.append(_tip("no_bids", "bad", "No bids yet this period.",
                                    f"The team median is {round(dist['median'] or 0)} bids so far.", {"teamMedian": dist["median"]}, dist["median"] or 0))

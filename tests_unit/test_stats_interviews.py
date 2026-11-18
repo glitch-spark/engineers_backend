@@ -58,6 +58,7 @@ def test_stall_names_group():
 def test_caller_vs_self_gap():
     tip = si.caller_vs_self((5, 3), (2, 3))  # 62% vs 40%
     assert tip["severity"] == "watch" and "62%" in tip["text"] and "40%" in tip["text"]
+    assert "for tech rounds" not in tip["text"] and "more of your rounds" in tip["text"]
     assert si.caller_vs_self((5, 3), (3, 3)) is None  # 62 vs 50: gap < 15
     assert si.caller_vs_self((3, 0), (1, 2)) is None  # 3 decided
     assert si.caller_vs_self((5, 3), (1, 2)) is None
@@ -180,7 +181,7 @@ async def test_reach_counts_processes_reaching_tech(db):
     # Ana now has 4 intro-only + these 2 = 6 processes; 2 reached tech, 1 reached final
     out = await si.interviews_view(ana, "month", TODAY, "all", None, TODAY)
     reach = out["headline"][3]
-    assert reach["value"] == pytest.approx(100 * 2 / 6, abs=0.1) and reach["note"] == "final 17%"
+    assert reach["value"] == pytest.approx(2 / 6, abs=0.001) and reach["note"] == "final 17%"
     assert out["headline"][2]["value"] == 9  # 4 + 3 + 2 rounds
     assert reach["team"]["n"] == 4
 
@@ -216,3 +217,28 @@ async def test_held_round_results_matches_held_rounds(db):
     assert [(d, g, c is not None) for d, g, c, _ in held] == [(d, g, c) for d, g, c, _ in res]
     assert [r[3] for r in res] == ["passed", "rejected", "awaiting", "scheduled"]
     assert [r[1] for r in res] == ["intro", "tech", "panel", "hiring"]
+
+
+async def test_no_processes_reach_note_empty(db):
+    await _team()
+    zed = await _user("Zed")
+    out = await si.interviews_view(zed, "month", TODAY, "all", None, TODAY)
+    reach = out["headline"][3]
+    assert reach["value"] is None and reach["note"] == ""
+
+
+async def test_stall_team_pool_excludes_subject(db):
+    # Subject 3/10 = 30% tech; the others 3/5 = 60% each. Pool with the subject would be 12/25 = 48% (0.6 * 48% = 28.8%:
+    # no tip); without the subject the baseline is 60% (36%): fires.
+    users = [await _user(n) for n in ("Ana", "Ben", "Cy", "Dee")]
+    for u in users:
+        await _bids(u, 100)
+        acc = await Account(name=f"{u.name} EU", createdBy=u.id, region="EU").insert()
+        passed, rejected = (3, 7) if u is users[0] else (3, 2)
+        for i in range(passed):
+            await _iv(u, acc, ("tech_round_1", 3 + i, "passed"))
+        for i in range(rejected):
+            await _iv(u, acc, ("tech_round_1", 8 + i, "rejected"))
+    out = await si.interviews_view(users[0], "month", TODAY, "all", None, TODAY)
+    tip = next(t for t in out["tips"] if t["id"] == "interviews.stalls_at_stage")
+    assert tip["evidence"]["teamPassRate"] == pytest.approx(0.6)

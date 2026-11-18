@@ -94,3 +94,7 @@ def trend(start: date, end: date, today: date, days: dict, parts: tuple[int, ...
 
 def not_enough_data(team_size: int, n_days: int) -> bool:
     return team_size < 3 or n_days < 3
+
+
+def span_label(a: date, b: date) -> str:
+    return f"{a:%b} {a.day}–{b.day}" if a.month == b.month else f"{a:%b} {a.day}–{b:%b} {b.day}"
