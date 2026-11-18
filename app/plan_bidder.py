@@ -12,7 +12,7 @@ from app.profile_metrics import bid_report_day
 
 log = logging.getLogger(__name__)
 
-RELEASE_DAY = date(2026, 11, 18)  # days before this keep their typed numbers
+RELEASE_DAY = date(2026, 11, 16)  # days before this keep their typed numbers
 
 
 def _midnight(day: date) -> datetime:
