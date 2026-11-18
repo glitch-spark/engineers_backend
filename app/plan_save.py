@@ -109,7 +109,10 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
             log.info("plan save: user=%s day=%s lost the first-save race, saving as an update", user.id, when)
             return await save_day(user, when, body, _retry=False)
     else:
-        await plan.save()
+        # Every field but the Slack post's: a racing save may have just posted, and _sync_slack owns those two.
+        plan.updatedAt = now
+        fields = plan.model_dump(exclude={"id", "revision_id", "slackChannel", "slackTs"})
+        await DailyPlan.get_motor_collection().update_one({"_id": plan.id}, {"$set": fields})
 
     auto_day = (await daily_plans._interviews(user.id, when, when)).get(when, empty_day())
     await daily_plans._sync_slack(plan, user, effective_daily_done(plan, auto_day), auto_day["rounds"])

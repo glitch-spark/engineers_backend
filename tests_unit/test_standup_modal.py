@@ -140,6 +140,8 @@ async def test_view_prefilled_from_draft(me):
     assert "/ 50" in blocks[f"item:{contact}"]["hint"]["text"]
     assert "/ 250" in blocks[f"item:{goal}"]["hint"]["text"]
     assert blocks[f"self:{us.id}"]["element"]["type"] == "number_input"
+    assert blocks[f"item:{contact}"]["element"]["min_value"] == "0"
+    assert blocks[f"item:{contact}"]["element"]["max_value"] == "100000"
     assert blocks["notes"]["element"]["multiline"] is True
     context = " ".join(e["text"] for b in view["blocks"] if b["type"] == "context" for e in b["elements"])
     assert "Bids" in context and "Interviews" in context
@@ -257,3 +259,14 @@ async def test_click_failure_after_open_shows_error_in_modal(me, slack, monkeypa
     await process_standup_click(SLACK_ID, "trig", "2026-11-10", RESPONSE_URL)
     (view_id, view), = slack.modals
     assert view_id == "V1" and "Something went wrong" in json.dumps(view) and "submit" not in view
+
+
+async def test_closed_loading_view_is_log_only(me, slack, monkeypatch):
+    async def api(method, body):
+        if method == "views.update":
+            raise RuntimeError("not_found")  # the person closed the loading view
+        return {"ok": True, "view": {"id": "V1"}}
+
+    monkeypatch.setattr(slack_bot, "_slack_api", api)
+    await process_standup_click(SLACK_ID, "trig", "2026-11-10", RESPONSE_URL)
+    assert slack.replies == []

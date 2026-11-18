@@ -6,6 +6,8 @@ its items are the week's routines and weekly goals with that day's results (`app
 """
 
 import asyncio
+import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Annotated, Any, Optional
 
@@ -24,6 +26,8 @@ from app.plan_profiles import owner_profiles
 from app.plan_save import DayIn, save_day
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
 
@@ -81,10 +85,47 @@ async def _find(uid, day: date) -> Optional[DailyPlan]:
     return await DailyPlan.find_one({"userId": uid, "date": _midnight(day)})
 
 
+# A first post in flight holds `slackTs = "posting:<epoch s>"` so concurrent saves (app, Slack form, write-throughs)
+# don't post twice. Real Slack ts values start with a digit, so they never match the claim prefix.
+POSTING = "posting:"
+CLAIM_STALE_S = 120  # a claim this old belongs to a save that died before posting: take it over
+
+
+def _claim_value() -> str:
+    return f"{POSTING}{int(time.time())}"
+
+
+async def _claim_first_post(plan: DailyPlan) -> Optional[str]:
+    """Claim the day's first post. Returns the claim, or None when another save holds a live claim or has posted
+    (then `plan` gets that post's channel / ts, if any, to edit it)."""
+    coll = DailyPlan.get_motor_collection()
+    claim = _claim_value()
+    stale = f"{POSTING}{int(time.time()) - CLAIM_STALE_S}"
+    free = {"$or": [{"slackTs": None}, {"slackTs": {"$gte": POSTING, "$lt": stale}}]}
+    res = await coll.update_one({"_id": plan.id, **free}, {"$set": {"slackTs": claim}})
+    if res.modified_count:
+        return claim
+    fresh = await coll.find_one({"_id": plan.id}, {"slackChannel": 1, "slackTs": 1}) or {}
+    if not str(fresh.get("slackTs") or "").startswith(POSTING):
+        plan.slackChannel, plan.slackTs = fresh.get("slackChannel"), fresh.get("slackTs")
+    return None
+
+
 async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: dict) -> None:
-    """Post or edit the day's standup message (only once the day is submitted); remember where it lives."""
+    """Post or edit the day's standup message (only once the day is submitted); remember where it lives.
+
+    The first post is claimed atomically: a save racing it skips posting (the winner's post stands and the next save
+    edits it). Only the slack fields are written back, so no other save's fields are touched."""
     if not plan.submittedAt:
         return
+    if str(plan.slackTs or "").startswith(POSTING):
+        plan.slackTs = None
+    claim = None
+    if not plan.slackTs:
+        claim = await _claim_first_post(plan)
+        if claim is None and not plan.slackTs:
+            log.info("daily plan %s: first post in flight elsewhere; skipping", plan.id)
+            return
     when = plan.date.date()
     monday = monday_of(when)
     weekly = await week_or_draft(owner.id, monday)
@@ -96,9 +137,13 @@ async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: d
         items=day_items(weekly, plan, when), progress=goal_progress(weekly, days) if weekly else {},
         week_interviews=(sum(e["self"] + e["caller"] for e in held.values()), target),
     )
+    coll = DailyPlan.get_motor_collection()
+    if claim is not None and not posted:  # the post failed: free the claim for the next save
+        await coll.update_one({"_id": plan.id, "slackTs": claim}, {"$set": {"slackTs": None}})
+        return
     if posted and posted != (plan.slackChannel, plan.slackTs):
         plan.slackChannel, plan.slackTs = posted
-        await plan.save()
+        await coll.update_one({"_id": plan.id}, {"$set": {"slackChannel": posted[0], "slackTs": posted[1]}})
 
 
 @router.get("")

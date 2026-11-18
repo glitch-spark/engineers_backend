@@ -279,3 +279,65 @@ async def test_concurrent_first_save_retries_as_update(me, db, monkeypatch):
     again = await stored(me, TUE)
     assert again.notes == "slack" and again.results[contact].value == 9
     assert again.submittedAt == first.submittedAt and again.slackTs == "ts1"
+
+
+async def test_concurrent_first_saves_post_once(me, db, monkeypatch):
+    """App and Slack saving a new day at once: while the winner's chat.postMessage is in flight, the loser (insert
+    race lost, retried as an update) must neither post a second message nor wipe the winner's post id."""
+    from app import plan_save
+    from app.plan_save import DayIn, save_day
+
+    review, contact, _goal = await saved_week(me)
+    posts, edits = [], []
+    real_find_one = DailyPlan.find_one
+
+    def missing_once(*args, **kw):  # the loser's lookup misses the winner's insert
+        monkeypatch.setattr(plan_save.DailyPlan, "find_one", real_find_one)
+
+        async def none():
+            return None
+        return none()
+
+    async def fake_post(plan, owner, **view):
+        if plan.slackTs:
+            edits.append(plan.slackTs)
+            return plan.slackChannel, plan.slackTs
+        posts.append(plan.notes)
+        if len(posts) == 1:  # the loser saves while the winner's post is still in flight
+            monkeypatch.setattr(plan_save.DailyPlan, "find_one", staticmethod(missing_once))
+            await save_day(me, TUE, DayIn(results={contact: {"value": 9}}, notes="slack"))
+        return "C1", f"ts{len(posts)}"
+
+    monkeypatch.setattr(daily_plans, "_sync_slack", REAL_SYNC_SLACK)
+    monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
+    await save_day(me, TUE, DayIn(results={review: {"done": True}}, notes="app"))
+    assert posts == ["app"] and await DailyPlan.find({"userId": me.id}).count() == 1
+    plan = await stored(me, TUE)
+    assert (plan.slackChannel, plan.slackTs) == ("C1", "ts1") and plan.notes == "slack"
+    await save_day(me, TUE, DayIn(notes="later"))  # the next save edits the one post
+    assert posts == ["app"] and edits == ["ts1"]
+
+
+async def test_first_post_claim_released_on_failure_and_stale_taken_over(me, db, monkeypatch):
+    from app.models.plan_common import Counts
+
+    results = [None, ("C1", "ts7")]
+    posts = []
+
+    async def fake_post(plan, owner, **view):
+        posts.append(plan.slackTs)
+        return results.pop(0)
+
+    monkeypatch.setattr(daily_plans, "_sync_slack", REAL_SYNC_SLACK)
+    monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
+    plan = await DailyPlan(userId=me.id, date=datetime(2026, 11, 12), year=2026, weekNumber=46,
+                           submittedAt=datetime(2026, 11, 12, 20)).insert()
+    await daily_plans._sync_slack(plan, me, Counts(), {})  # Slack down: the claim is freed
+    assert (await DailyPlan.get(plan.id)).slackTs is None
+    await DailyPlan.get_motor_collection().update_one({"_id": plan.id}, {"$set": {"slackTs": "posting:1000"}})
+    await daily_plans._sync_slack(await DailyPlan.get(plan.id), me, Counts(), {})  # a dead save's claim
+    assert posts == [None, None] and (await DailyPlan.get(plan.id)).slackTs == "ts7"
+    live = daily_plans._claim_value()
+    await DailyPlan.get_motor_collection().update_one({"_id": plan.id}, {"$set": {"slackTs": live}})
+    await daily_plans._sync_slack(await DailyPlan.get(plan.id), me, Counts(), {})  # in flight elsewhere: skip
+    assert posts == [None, None] and (await DailyPlan.get(plan.id)).slackTs == live

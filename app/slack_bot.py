@@ -530,7 +530,7 @@ async def delete_daily_plan_message(plan: Any) -> None:
     """Remove the plan's Slack post, if any. Never raises."""
     channel = (plan.slackChannel or "").strip()
     ts = (plan.slackTs or "").strip()
-    if not channel or not ts or not slack_bot_configured():
+    if not channel or not ts or not ts[0].isdigit() or not slack_bot_configured():  # not a first-post claim
         return
     try:
         await _slack_api("chat.delete", {"channel": channel, "ts": ts})

@@ -53,7 +53,8 @@ def _context(text: str) -> dict:
 
 
 def _number_input(block_id: str, label: str, value, hint: str = "", *, decimal: bool = True) -> dict:
-    element = {"type": "number_input", "action_id": "number", "is_decimal_allowed": decimal}
+    element = {"type": "number_input", "action_id": "number", "is_decimal_allowed": decimal, "min_value": "0",
+               "max_value": str(MAX_NUMBER)}
     if value is not None:
         element["initial_value"] = _fmt(value)
     block = {"type": "input", "block_id": block_id, "optional": True, "label": _plain(label[:2000]),
@@ -272,7 +273,12 @@ async def process_standup_click(slack_user_id: str, trigger_id: str, day: str, r
         except Exception as exc:  # noqa: BLE001
             log.exception("standup form for %s on %s failed: %s", slack_user_id, when, exc)
             view = _note_view(FORM_ERROR)
-        await slack_bot._slack_api("views.update", {"view_id": view_id, "view": view})
+        try:
+            await slack_bot._slack_api("views.update", {"view_id": view_id, "view": view})
+        except RuntimeError as exc:
+            if str(exc) != "not_found":
+                raise
+            log.info("standup: %s closed the form before it loaded", slack_user_id)
     except Exception as exc:  # noqa: BLE001
         log.exception("standup click from %s failed: %s", slack_user_id, exc)
         await actions.reply(response_url, actions.TRY_AGAIN)
