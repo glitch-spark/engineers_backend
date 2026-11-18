@@ -79,9 +79,12 @@ async def _profile_regions() -> tuple[dict, int]:
     return regions, sum(1 for r in regions.values() if not r)
 
 
-async def bidder_bids(user_ids: list, start: date, end: date, region: Region, regions: dict) -> dict:
+async def bidder_bids(
+    user_ids: list, start: date, end: date, region: Region, regions: dict, by_profile: Optional[dict] = None,
+) -> dict:
     """(Bid Track day, owner id) → approved + pending bids of the owners' bidders (archived included) over
-    [start, end], in the selected region unless `all` (the bidder's profile region)."""
+    [start, end], in the selected region unless `all` (the bidder's profile region). With `by_profile`, also fills
+    (profile id, Bid Track day) → bids."""
     from app.bids.performance import day_counts
     from app.bids.windows import schedule_from_settings
     from app.models.bidder import Bidder
@@ -90,10 +93,14 @@ async def bidder_bids(user_ids: list, start: date, end: date, region: Region, re
     if region != "all":
         bidders = [b for b in bidders if b.profileId and regions.get(b.profileId) == region]
     owner = {str(b.id): b.createdBy for b in bidders}
+    profile = {str(b.id): b.profileId for b in bidders}
     out: dict = defaultdict(int)
     for (bid, day), (approved, pending, _rejected) in (await day_counts(bidders, start, end, schedule_from_settings())).items():
         if approved + pending:
             out[(day, owner[bid])] += approved + pending
+            if by_profile is not None and profile[bid]:
+                key = (str(profile[bid]), day)
+                by_profile[key] = by_profile.get(key, 0) + approved + pending
     return dict(out)
 
 
