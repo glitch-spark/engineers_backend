@@ -126,6 +126,41 @@ async def test_below_and_above_in_view(db):
     await _tx(ana, 1000, m=10)
     out = await _view(ana)
     assert "earnings.above_own_average" in [t["id"] for t in out["tips"]]
+    ben = await _user("Eve")
+    await _tx(ben, 5000, m=10)
+    await _tx(ben, 100)
+    out = await _view(ben)
+    assert "earnings.below_own_average" in [t["id"] for t in out["tips"]]
+
+
+async def test_history_but_nothing_this_period_only_no_earnings_tip(db):
+    await _team()
+    zed = await _user("Zed")
+    for m in (8, 9, 10):
+        await _tx(zed, 1000, m=m)
+    out = await _view(zed)
+    assert out["headline"][2]["value"] == 1000
+    assert [t["id"] for t in out["tips"]] == ["earnings.no_earnings"]
+
+
+async def test_own_average_january_year_wrap(db):
+    ana, *_ = await _team()
+    for y, m in ((2025, 12), (2025, 11), (2025, 10)):
+        await _tx(ana, 300, y=y, m=m)
+    await _tx(ana, 9999, y=2025, m=9)
+    out = await se.earnings_view(ana, "month", date(2026, 1, 20), "all", None, date(2026, 1, 20))
+    assert out["headline"][2]["value"] == 300
+
+
+async def test_pending_rejected_previous_not_counted_and_zero_avg(db):
+    ana, *_ = await _team()
+    await _tx(ana, 900, m=10, status="pending")
+    await _tx(ana, 900, m=9, status="rejected")
+    assert (await _view(ana))["headline"][2]["value"] is None
+    await _tx(ana, 100, m=10)
+    await _tx(ana, -100, m=9)
+    h = (await _view(ana))["headline"][2]
+    assert h["value"] == 0 and "%" not in h["note"]
 
 
 KEYS = {"tab", "label", "subject", "headline", "tips", "everyone", "trend", "notEnoughData", "definitions"}

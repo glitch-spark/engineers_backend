@@ -90,7 +90,7 @@ async def earnings_view(subject, period: str, day: date, region: str, until: Opt
         "userId": {"$in": ids}, "status": "approved",
         "date": {"$gte": _mid(prev[-1][0]), "$lt": _mid(end + timedelta(days=1))}}).to_list()
 
-    days: dict = defaultdict(lambda: (0.0,))  # (day, uid) → (net,)
+    days: dict = defaultdict(lambda: (0.0,))  # (day, uid) → (net,): a tuple because frame.trend sums values[parts]
     tx_count: dict = defaultdict(int)
     income: dict = defaultdict(float)
     outcome: dict = defaultdict(float)
@@ -117,7 +117,8 @@ async def earnings_view(subject, period: str, day: date, region: str, until: Opt
     rank, of = frame.rank_of(me, nets, True, in_team)
     n_days = len(frame.working_days(start, end, today))
     own_avg = round(sum(own_prev) / 3, 2) if own_prev_n else None
-    avg_note = f"vs this period {(me - own_avg) / abs(own_avg):+.0%}" if own_avg else "no earlier periods"
+    avg_note = ("no earlier periods" if own_avg is None else f"vs this period {(me - own_avg) / abs(own_avg):+.0%}"
+                if own_avg else "average is $0")
     headline = [
         {"key": "net", "label": "Net this period", "value": me, "format": "usd", "team": dist, "rank": rank, "of": of,
          "vsMedian": frame.vs_median(me, dist["median"]), "higherIsBetter": True,
@@ -144,8 +145,9 @@ async def earnings_view(subject, period: str, day: date, region: str, until: Opt
     not_enough = frame.not_enough_data(len(team_ids), n_days)
     tips: list[dict] = []
     if not not_enough:
+        active = bool(tx_count[subject.id])  # no transactions this period: "100% below" would only repeat no_earnings
         tips = frame.order_tips([t for t in (
-            negative_period(me), below_own_average(me, own_avg), above_own_average(me, own_avg),
+            negative_period(me), active and below_own_average(me, own_avg), active and above_own_average(me, own_avg),
             no_earnings(bool(tx_count[subject.id]))) if t])
 
     return {
