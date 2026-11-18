@@ -122,3 +122,52 @@ async def test_idempotent_and_dry_run_writes_nothing():
     counts = await migrate(True, db)
     assert after == [await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({})]
     assert counts["weeklyMigrated"] == counts["dailyMigrated"] == 0
+
+
+async def test_day_without_week_creates_week_and_keeps_numbers():
+    db = await _db()
+    wed = datetime(2026, 11, 11)
+    await db["dailyplans"].insert_many([
+        _day(goal={"bidsSelf": 12}, loggedAt=datetime(2026, 11, 10, 22),
+             goalItems=[{"text": "Bidder Management", "done": True}, {"text": "One off", "done": False}]),
+        _day(date=wed, goalItems=[{"text": "bidder management", "done": False}]),
+    ])
+    await migrate(True, db)
+    week = await db["weeklyplans"].find_one({})
+    assert week["weekStart"] == MON and week["year"] == 2026 and week["goal"] == {}
+    assert [r["text"] for r in week["routines"]] == ["Bidder Management"]
+    assert [g["text"] for g in week["weeklyGoals"]] == ["One off"]
+    day = await db["dailyplans"].find_one({"date": TUE})
+    assert set(day["results"]) == {week["routines"][0]["id"], week["weeklyGoals"][0]["id"]}
+    assert day["submittedAt"] == datetime(2026, 11, 10, 22)
+    plan = DailyPlan.model_validate(day)
+    assert day_targets(plan, WeeklyPlan.model_validate(week), TUE.date()).bidsSelf == 12
+
+
+class _Boom:
+    """Database proxy whose dailyplans writes fail (a crash after the weekly writes)."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def __getitem__(self, name):
+        if name != "dailyplans":
+            return self.db[name]
+        real = self.db[name]
+        boom = type("C", (), {"find": lambda _s, *a, **k: real.find(*a, **k)})()
+
+        async def fail(*a, **k):
+            raise RuntimeError("crash")
+        boom.update_one = fail
+        return boom
+
+
+async def test_crash_after_weekly_writes_then_rerun_keeps_ids_consistent():
+    db = await _db()
+    await _setup(db)
+    with pytest.raises(RuntimeError):
+        await migrate(True, _Boom(db))
+    await migrate(True, db)
+    week, day = await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({})
+    ids = {i["id"] for i in week["routines"] + week["weeklyGoals"]}
+    assert day["results"] and set(day["results"]) <= ids

@@ -20,12 +20,13 @@ import os
 import re
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
 
+from app.alerts import app_week_key  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.models.plan_common import BID_FIELDS, ItemResult, PlanItem, monday_of  # noqa: E402
 from app.models.weekly_plan import fold_legacy_weekly  # noqa: E402
@@ -64,36 +65,66 @@ async def migrate(apply: bool, database=None) -> dict:
     if database is None:
         database = AsyncIOMotorClient(get_settings().MONGODB_URI).get_default_database()
     daily, weekly = database["dailyplans"], database["weeklyplans"]
-    counts = Counter(weeklyMigrated=0, dailyMigrated=0, unmatchedLinesToGoals=0, dailyWithoutWeek=0, skipped=0)
+    counts = Counter(weeklyMigrated=0, dailyMigrated=0, unmatchedLinesToGoals=0, weeksCreated=0, skipped=0,
+                     droppedDoneWeeklyGoals=0)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    weeks: dict[tuple, dict] = {}  # (userId, weekStart) -> {"routines": [...], "goals": [...], "dirty": bool}
+    # (userId, Monday date) -> {"routines", "goals", "dirty", "id" | "new": doc to insert}
+    weeks: dict[tuple, dict] = {}
     async for doc in weekly.find({}):
         start = fold_legacy_weekly(doc).get("weekStart")
+        key = (doc["userId"], start.date() if start else None)
         if "routines" in doc:
             counts["skipped"] += 1
-            weeks.setdefault((doc["userId"], start), {"routines": doc["routines"], "goals": doc.get("weeklyGoals") or [], "id": doc["_id"], "dirty": False})
+            weeks.setdefault(key, {"routines": doc["routines"], "goals": doc.get("weeklyGoals") or [], "id": doc["_id"], "dirty": False})
             continue
         routines = [parse_item(i["text"]).model_dump() for i in _lines(doc, "dailyGoalItems")]
         known = {_key(r["text"]) for r in routines}
         goals = []
         for line in _lines(doc, "goalItems"):
+            counts["droppedDoneWeeklyGoals"] += bool(line.get("done"))
             if _key(line["text"]) not in known:
                 known.add(_key(line["text"]))
                 goals.append(parse_item(line["text"]).model_dump())
         counts["weeklyMigrated"] += 1
-        weeks.setdefault((doc["userId"], start), {"routines": routines, "goals": goals, "id": doc["_id"], "dirty": True})
+        weeks.setdefault(key, {"routines": routines, "goals": goals, "id": doc["_id"], "dirty": True})
 
-    async for doc in daily.find({"results": {"$exists": False}}).sort("date", 1):
-        week = weeks.get((doc["userId"], datetime.combine(monday_of(doc["date"].date()), datetime.min.time())))
-        lines = _lines(doc, "goalItems")
-        if week is None:
-            counts["dailyWithoutWeek"] += 1
-            if lines:
-                log.warning("daily %s has goal lines but no weekly plan: left unmigrated", doc["_id"])
-                continue
+    days = [d async for d in daily.find({"results": {"$exists": False}}).sort("date", 1)]
+
+    # A week with day lines but no weekly plan: create it. Lines on >= 2 of its days are routines, the rest goals.
+    by_week: dict[tuple, list] = {}
+    for doc in days:
+        by_week.setdefault((doc["userId"], monday_of(doc["date"].date())), []).append(doc)
+    for key, docs in by_week.items():
+        if key in weeks:
+            continue
+        seen: dict[str, set] = {}
+        first: dict[str, str] = {}
+        for doc in docs:
+            for line in _lines(doc, "goalItems"):
+                seen.setdefault(_key(line["text"]), set()).add(doc["date"])
+                first.setdefault(_key(line["text"]), line["text"])
+        if not seen:
+            continue
+        items = {k: parse_item(first[k]).model_dump() for k in seen}
+        start = datetime.combine(key[1], datetime.min.time())
+        year, week_number, _k = app_week_key(start)
+        weeks[key] = {
+            "routines": [items[k] for k in seen if len(seen[k]) >= 2],
+            "goals": [items[k] for k in seen if len(seen[k]) < 2],
+            "dirty": True,
+            "new": {"userId": key[0], "weekStart": start, "year": year, "weekNumber": week_number,
+                    "startDate": start, "endDate": start + timedelta(days=7) - timedelta(milliseconds=1),
+                    "goal": {}, "goalItems": [], "dailyGoal": {}, "dailyGoalItems": [], "recapNotes": "",
+                    "createdAt": now},
+        }
+        counts["weeksCreated"] += 1
+
+    day_updates = []
+    for doc in days:
+        week = weeks.get((doc["userId"], monday_of(doc["date"].date())))
         results: dict = {}
-        for line in lines:
+        for line in _lines(doc, "goalItems"):
             match = next((i for i in week["routines"] + week["goals"] if _key(i["text"]) == _key(line["text"])), None)
             if match is None:
                 match = parse_item(line["text"]).model_dump()
@@ -108,15 +139,23 @@ async def migrate(apply: bool, database=None) -> dict:
         if doc.get("loggedAt") and not doc.get("submittedAt"):
             to_set["submittedAt"] = doc["loggedAt"]
         counts["dailyMigrated"] += 1
-        if apply:
-            await daily.update_one({"_id": doc["_id"]}, {"$set": to_set})
+        day_updates.append((doc["_id"], to_set))
 
     if apply:
+        # Weeks first: a crash between the two leaves days unmigrated (a rerun maps them to the stored week ids),
+        # never days whose result ids no week has.
         for week in weeks.values():
-            if week["dirty"]:
-                await weekly.update_one(
-                    {"_id": week["id"]},
-                    {"$set": {"routines": week["routines"], "weeklyGoals": week["goals"], "updatedAt": now}})
+            if not week["dirty"]:
+                continue
+            fields = {"routines": week["routines"], "weeklyGoals": week["goals"], "updatedAt": now}
+            if "new" in week:
+                await weekly.insert_one({**week["new"], **fields})
+            else:
+                await weekly.update_one({"_id": week["id"]}, {"$set": fields})
+        for _id, to_set in day_updates:
+            await daily.update_one({"_id": _id}, {"$set": to_set})
+    if counts["droppedDoneWeeklyGoals"]:
+        log.warning("dropped the done flag of %d weekly goalItems", counts["droppedDoneWeeklyGoals"])
     mode = "applied" if apply else "dry run"
     print(f"[{mode}] " + ", ".join(f"{k} {v}" for k, v in counts.items()))
     return dict(counts)
