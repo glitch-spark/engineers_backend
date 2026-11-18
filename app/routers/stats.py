@@ -14,20 +14,17 @@ from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
-from app.stats.callers import callers_view
 from app.stats.earnings import earnings_view
 from app.stats.interviews import interviews_view
-from app.stats.profiles import profiles_view
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
-VIEWS = {"bids": bids_view, "interviews": interviews_view, "profiles": profiles_view, "callers": callers_view,
-         "earnings": earnings_view, "ai-usage": ai_usage_view}
+VIEWS = {"bids": bids_view, "interviews": interviews_view, "earnings": earnings_view, "ai-usage": ai_usage_view}
 
 
 @router.get("/{tab}")
 async def stats_tab(
-    tab: Literal["bids", "interviews", "profiles", "callers", "earnings", "ai-usage"],
+    tab: Literal["bids", "interviews", "earnings", "ai-usage"],
     user: Annotated[UserExtra, Depends(get_current_user)],
     period: Literal["week", "month", "custom"] = Query("month"),
     date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),

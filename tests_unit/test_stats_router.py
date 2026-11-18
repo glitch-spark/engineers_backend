@@ -95,18 +95,6 @@ async def test_bad_custom_range_400(db):
     assert e.value.status_code == 400
 
 
-async def test_profiles_tab_served(db):
-    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
-    out = await _call(ana, tab="profiles")
-    assert out["tab"] == "profiles" and out["everyone"]["rowKind"] == "profile"
-
-
-async def test_callers_tab_served(db):
-    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
-    out = await _call(ana, tab="callers")
-    assert out["tab"] == "callers" and out["mode"] == "engineer"
-
-
 async def test_earnings_tab_served(db):
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     out = await _call(ana, tab="earnings")
