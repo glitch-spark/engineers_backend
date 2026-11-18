@@ -5,6 +5,7 @@ import time
 from datetime import date, datetime, timezone
 from typing import Optional
 
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
@@ -13,7 +14,9 @@ from app.alerts import app_week_key
 from app.models import UserExtra
 from app.models.daily_plan import DailyPlan
 from app.models.plan_common import BidsIn, Counts, CountsIn, DoneCounts, ItemResult, bids_of, monday_of
-from app.plan_auto import day_items, day_targets, effective_daily_done, empty_day, week_or_draft
+from app.plan_auto import (
+    day_items, day_targets, effective_daily_done, empty_day, week_or_draft, weekly_plans_for,
+)
 from app.plan_profiles import derive_self_bids, owner_profiles, profile_regions
 
 log = logging.getLogger(__name__)
@@ -33,6 +36,24 @@ class DayIn(BaseModel):
     done: BidsIn = Field(default_factory=BidsIn)
     notes: str = Field(default="", max_length=2000)
     targetOverride: Optional[CountsIn] = None
+
+
+class ProgressIn(BaseModel):
+    """A draft save: only the sent item results (and focus, when sent) change."""
+
+    results: dict[str, ItemResultIn] = {}
+    focus: Optional[list[str]] = None
+
+
+def result_done(kind: str, value: Optional[float], sent_done: bool, target: Optional[float],
+                old: Optional[ItemResult]) -> bool:
+    """Checks keep the sent done; counts / hours are done at their frozen target (any value without one). A
+    migrated done line without a value stays done until a value is typed."""
+    if kind == "check":
+        return sent_done
+    if value is None:
+        return bool(old and old.done and old.value is None)
+    return value >= target if target else value > 0
 
 
 def _midnight(d: date) -> datetime:
@@ -60,18 +81,10 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
     def frozen(iid: str) -> Optional[float]:
         return old[iid].target if iid in old and old[iid].target is not None else items[iid]["item"].target
 
-    def done(iid: str, r: ItemResultIn) -> bool:
-        """Checks keep the sent done; counts / hours are done at their frozen target (any value without one). A
-        migrated done line without a value stays done until a value is typed."""
-        if items[iid]["item"].kind == "check":
-            return r.done
-        if r.value is None:
-            return bool(iid in old and old[iid].done and old[iid].value is None)
-        target = frozen(iid)
-        return r.value >= target if target else r.value > 0
-
     plan.results = {
-        iid: ItemResult(done=done(iid, r), value=r.value, target=frozen(iid))
+        iid: ItemResult(
+            done=result_done(items[iid]["item"].kind, r.value, r.done, frozen(iid), old.get(iid)),
+            value=r.value, target=frozen(iid))
         for iid, r in body.results.items() if iid in items
     }
     plan.focus = [i for i in dict.fromkeys(body.focus) if i in items and items[i]["scope"] == "goal"]
@@ -129,3 +142,47 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
     log.info("plan save: user=%s day=%s results=%d ms=%d", user.id, when, len(plan.results),
              (time.monotonic() - started) * 1000)
     return plan
+
+
+async def save_progress(user: UserExtra, when: date, body: ProgressIn) -> None:
+    """Store ticks / values without submitting: no Slack post for an unsubmitted day, no frozen targets, and `done`,
+    `notes` and `targetOverride` stay as they are. A submitted day's post is re-rendered."""
+    started = time.monotonic()
+    weekly = (await weekly_plans_for([user.id], monday_of(when))).get(user.id)
+    if weekly is None:
+        raise HTTPException(status_code=422, detail="Set this week's plan first")
+    key = {"userId": user.id, "date": _midnight(when)}
+    plan = await DailyPlan.find_one(key)
+    items = {e["item"].id: e for e in day_items(weekly, plan, when)}
+    unknown = [i for i in body.results if i not in items]
+    focus = None
+    if body.focus is not None:
+        focus = list(dict.fromkeys(body.focus))
+        unknown += [i for i in focus if i not in items or items[i]["scope"] != "goal"]
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown items: {', '.join(unknown)}")
+
+    old = plan.results if plan else {}
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    fields: dict = {"updatedAt": now}
+    for iid, r in body.results.items():
+        prev = old.get(iid)
+        frozen = prev.target if prev and prev.target is not None else items[iid]["item"].target
+        fields[f"results.{iid}"] = ItemResult(
+            done=result_done(items[iid]["item"].kind, r.value, r.done, frozen, prev),
+            value=r.value, target=prev.target if prev else None).model_dump()
+    if focus is not None:
+        fields["focus"] = focus
+    year, week_number, _key = app_week_key(_midnight(when))
+    update = {"$set": fields,
+              "$setOnInsert": {"year": year, "weekNumber": week_number, "createdAt": now, "loggedAt": None}}
+    coll = DailyPlan.get_motor_collection()
+    try:
+        await coll.update_one(key, update, upsert=True)
+    except DuplicateKeyError:  # a concurrent first write created the day between the upsert's find and insert
+        await coll.update_one(key, update)
+    stored = await DailyPlan.find_one(key)
+    if stored is not None and stored.submittedAt:
+        await self_bids.resync_slack(user, when)
+    log.info("plan progress: user=%s day=%s ids=%d ms=%d", user.id, when, len(body.results),
+             (time.monotonic() - started) * 1000)

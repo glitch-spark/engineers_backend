@@ -23,7 +23,7 @@ from app.plan_auto import (
     day_items, day_targets, effective_daily_done, empty_day, goal_progress, interview_counts, week_or_draft,
 )
 from app.plan_profiles import owner_profiles
-from app.plan_save import DayIn, save_day
+from app.plan_save import DayIn, ProgressIn, save_day, save_progress
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
@@ -64,6 +64,7 @@ def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly, 
         "notes": plan.notes if plan else "",
         "loggedAt": plan.loggedAt.isoformat() if plan and plan.loggedAt else None,
         "submitted": bool(plan and plan.submittedAt),
+        "weekSaved": weekly is not None and weekly.id is not None,  # the carry-over draft has no id
     }
     if profiles is not None:
         out["profiles"] = profiles
@@ -209,14 +210,19 @@ async def put_day(
     day: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
     payload: Annotated[dict[str, Any], Body()] = None,
+    submit: bool = True,
 ) -> dict:
-    """Save the day's update (submits it) and post it to Slack."""
+    """Save the day's update. `submit=true` (default) submits it and posts it to Slack; `submit=false` is a draft
+    save of item results / focus only (a submitted day's post is re-rendered)."""
     require_writer(user)
     when = parse_ymd(day, "date")
-    body = parse_body(DayIn, payload)
+    body = parse_body(DayIn if submit else ProgressIn, payload)
     if when > _today():
         raise HTTPException(status_code=422, detail="A day can be followed up from that day on")
-    await save_day(user, when, body)
+    if submit:
+        await save_day(user, when, body)
+    else:
+        await save_progress(user, when, body)
     return await _view(user.id, when)
 
 

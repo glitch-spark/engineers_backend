@@ -1,0 +1,131 @@
+"""Draft day save (submit=false) and weekSaved; plans API with routines and weekly goals: week items, draft weeks, the day's targets / items / progress and the
+shared day save (mongomock-motor)."""
+import os
+
+os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
+os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
+
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
+
+import pytest
+from beanie import init_beanie
+from fastapi import HTTPException
+from mongomock_motor import AsyncMongoMockClient
+
+from app import plan_bidder
+from app.models import Account, UserExtra
+from app.models.bid import Bid
+from app.models.bidder import Bidder
+from app.models.daily_plan import DailyPlan
+from app.models.interview import Interview
+from app.models.interview_question import InterviewQuestion
+from app.models.weekly_plan import WeeklyPlan
+from app.routers import daily_plans
+from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
+from app.routers.reports import team_report
+from app.routers.weekly_plans import get_week, put_week
+
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
+    pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
+]
+
+CHI = ZoneInfo("America/Chicago")
+WEEK = "2026-11-09"
+MON, TUE, WED = date(2026, 11, 9), date(2026, 11, 10), date(2026, 11, 11)
+
+
+@pytest.fixture
+async def db(monkeypatch):
+    await init_beanie(database=AsyncMongoMockClient()["daily-plan-api-unit"], document_models=[
+        UserExtra, Account, Bidder, Bid, DailyPlan, WeeklyPlan, Interview, InterviewQuestion])
+    monkeypatch.setattr(daily_plans, "_today", lambda: date(2026, 11, 13))
+    monkeypatch.setattr(plan_bidder, "RELEASE_DAY", date(2026, 12, 1))  # typed bidder bids unless a test moves it
+    calls = []
+
+    async def fake_sync(plan, owner, done, rounds):
+        calls.append(plan.slackTs)
+        if plan.slackTs is None:
+            plan.slackChannel, plan.slackTs = "C1", "ts1"
+            await plan.save()
+
+    monkeypatch.setattr(daily_plans, "_sync_slack", fake_sync)
+    return calls
+
+
+@pytest.fixture
+async def me(db):
+    return await UserExtra(name="Ana", email="ana@x.io").insert()
+
+
+def week_body(**kw):
+    body = {
+        "goal": {"bidsSelf": 100, "bidsBidder": 50, "interviewsSelf": 5},
+        "routines": [{"text": "Bidder review"}, {"text": "Citizen contact", "kind": "count", "target": 50}],
+        "weeklyGoals": [{"text": "Email outreach", "kind": "count", "target": 250}],
+        "recapNotes": "",
+    }
+    body.update(kw)
+    return body
+
+
+@pytest.fixture
+async def week(me):
+    await put_week(WEEK, me, week_body())
+    plan = await WeeklyPlan.find_one({"userId": me.id})
+    plan.routines[0].id, plan.routines[1].id, plan.weeklyGoals[0].id = "r1", "r2", "g1"
+    await plan.save()
+
+
+async def test_progress_saves_only_sent_results_without_submitting(db, me, week):
+    out = await put_day("2026-11-10", me, {"results": {"r1": {"done": True}}}, submit=False)
+    plan = await DailyPlan.find_one({"userId": me.id})
+    assert plan.results["r1"].done is True and plan.results["r1"].target is None  # not frozen
+    assert plan.submittedAt is None and plan.loggedAt is None and plan.targetOverride is None
+    assert db == []                      # _sync_slack never called
+    assert out["submitted"] is False and out["weekSaved"] is True
+
+
+async def test_progress_merges_per_item(db, me, week):
+    await put_day("2026-11-10", me, {"results": {"r1": {"done": True}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r2": {"value": 50}}}, submit=False)
+    plan = await DailyPlan.find_one({"userId": me.id})
+    assert plan.results["r1"].done is True and plan.results["r2"].done is True  # 50 >= 50
+
+
+async def test_progress_keeps_done_and_notes(db, me, week):
+    await put_day("2026-11-10", me, {"results": {}, "focus": [], "notes": "hi", "done": {"bidsSelf": 7}})
+    await put_day("2026-11-10", me, {"results": {"r1": {"done": True}}}, submit=False)
+    plan = await DailyPlan.find_one({"userId": me.id})
+    assert plan.notes == "hi" and plan.done.bidsSelf == 7
+
+
+async def test_progress_on_submitted_day_edits_post_keeps_submitted_at(db, me, week):
+    await put_day("2026-11-10", me, {"results": {}, "focus": [], "notes": "", "done": {}})
+    first = (await DailyPlan.find_one({"userId": me.id})).submittedAt
+    await put_day("2026-11-10", me, {"results": {"r1": {"done": True}}}, submit=False)
+    assert len(db) == 2 and (await DailyPlan.find_one({"userId": me.id})).submittedAt == first
+
+
+async def test_progress_unknown_item_is_422(db, me, week):
+    with pytest.raises(HTTPException) as e:
+        await put_day("2026-11-10", me, {"results": {"nope": {"done": True}}}, submit=False)
+    assert e.value.status_code == 422
+
+
+async def test_progress_needs_saved_week(db, me):   # no WeeklyPlan document at all
+    with pytest.raises(HTTPException) as e:
+        await put_day("2026-11-10", me, {"results": {}}, submit=False)
+    assert e.value.status_code == 422
+
+
+async def test_progress_focus_only_when_sent(db, me, week):
+    await put_day("2026-11-10", me, {"focus": ["g1"]}, submit=False)
+    await put_day("2026-11-10", me, {"results": {"r1": {"done": True}}}, submit=False)
+    assert (await DailyPlan.find_one({"userId": me.id})).focus == ["g1"]
+
+
+async def test_progress_future_day_is_422(db, me, week):
+    with pytest.raises(HTTPException):
+        await put_day("2026-11-20", me, {"results": {}}, submit=False)
