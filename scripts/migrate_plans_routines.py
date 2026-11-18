@@ -3,6 +3,7 @@
 Run once after deploying routines:
   python -m scripts.migrate_plans_routines          # dry run (default)
   python -m scripts.migrate_plans_routines --apply
+  python -m scripts.migrate_plans_routines --from 2026-11-16 [--apply]   # only this week onward
 
 Weekly plans: dailyGoalItems -> routines; goalItems that match no routine -> weeklyGoals.
 Daily plans (old shapes folded first): each goalItems line -> results[id] of the matching routine / goal (done kept;
@@ -24,7 +25,7 @@ import os
 import re
 import sys
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -73,7 +74,8 @@ def _result(item: dict, done: bool) -> dict:
     return ItemResult(done=done).model_dump()
 
 
-async def migrate(apply: bool, database=None) -> dict:
+async def migrate(apply: bool, database=None, since: date | None = None) -> dict:
+    """since: only weeks starting on or after this Monday (and their days); earlier plans are left as they are."""
     if database is None:
         database = AsyncIOMotorClient(get_settings().MONGODB_URI).get_default_database()
     daily, weekly = database["dailyplans"], database["weeklyplans"]
@@ -87,6 +89,8 @@ async def migrate(apply: bool, database=None) -> dict:
     for doc in sorted([d async for d in weekly.find({})], key=lambda d: d.get("updatedAt") or datetime.max):
         start = fold_legacy_weekly(doc).get("weekStart")
         key = (doc["userId"], start.date() if start else None)
+        if since and (key[1] is None or key[1] < since):
+            continue
         counts["duplicateWeeks"] += key in chosen
         chosen[key] = doc
 
@@ -110,7 +114,8 @@ async def migrate(apply: bool, database=None) -> dict:
         weeks[key] = {"routines": routines, "goals": goals, "id": doc["_id"], "dirty": dirty,
                       "dailyGoal": doc.get("dailyGoal") or {}}
 
-    days = [fold_legacy_daily(d) async for d in daily.find({}).sort("date", 1)]
+    day_query = {"date": {"$gte": datetime.combine(since, datetime.min.time())}} if since else {}
+    days = [fold_legacy_daily(d) async for d in daily.find(day_query).sort("date", 1)]
 
     # A week with day lines but no weekly plan: create it. Lines on >= 2 of its days are routines, the rest goals.
     by_week: dict[tuple, list] = {}
@@ -194,8 +199,13 @@ async def migrate(apply: bool, database=None) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
+    parser.add_argument("--from", dest="since", type=date.fromisoformat,
+                        help="only weeks starting on/after this Monday, YYYY-MM-DD (default: all)")
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(migrate(apply=parser.parse_args().apply))
+    args = parser.parse_args()
+    if args.since and args.since.weekday() != 0:
+        parser.error("--from must be a Monday")
+    asyncio.run(migrate(apply=args.apply, since=args.since))
 
 
 if __name__ == "__main__":

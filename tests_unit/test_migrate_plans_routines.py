@@ -265,3 +265,20 @@ async def test_empty_day_goal_falls_back_to_week_daily_goal():
     plan = DailyPlan.model_validate(await db["dailyplans"].find_one({}))
     weekly = WeeklyPlan.model_validate(await db["weeklyplans"].find_one({}))
     assert day_targets(plan, weekly, TUE.date()).bidsSelf == 15  # not 50 / 5
+
+
+async def test_since_leaves_earlier_weeks_untouched():
+    from datetime import date
+    db = await _db()
+    await _setup(db)  # week of Mon Nov 9
+    nmon, ntue = datetime(2026, 11, 16), datetime(2026, 11, 17)
+    await _setup(db, _week(weekStart=nmon, startDate=nmon, weekNumber=47, endDate=datetime(2026, 11, 22),
+                           dailyGoalItems=[{"text": "Bidder Management", "done": False}]),
+                 _day(date=ntue, weekNumber=47, goalItems=[{"text": "bidder management", "done": True}]))
+    old = [await db["weeklyplans"].find_one({"weekStart": MON}), await db["dailyplans"].find_one({"date": TUE})]
+    counts = await migrate(True, db, since=date(2026, 11, 16))
+    assert old == [await db["weeklyplans"].find_one({"weekStart": MON}), await db["dailyplans"].find_one({"date": TUE})]
+    week, day = await db["weeklyplans"].find_one({"weekStart": nmon}), await db["dailyplans"].find_one({"date": ntue})
+    assert [r["text"] for r in week["routines"]] == ["Bidder Management"]
+    assert day["results"][week["routines"][0]["id"]]["done"] is True
+    assert counts["weeklyMigrated"] == counts["dailyMigrated"] == 1
