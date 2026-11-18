@@ -30,7 +30,6 @@ from pymongo import UpdateOne
 from app.applications.rows import _key, build_rows, match_interviews
 from app.models import Account, Application, Bid, Interview, ResumeApplication
 from app.models.bidder import Bidder
-from app.models.resume_application import BID_FILTER
 
 log = logging.getLogger("applications_sync")
 
@@ -78,7 +77,7 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     profiles = await _bidder_profiles() if profiles is None else profiles
     since_dt = datetime(since.year, since.month, since.day)
     resume_coll, iv_coll = ResumeApplication.get_motor_collection(), Interview.get_motor_collection()
-    resume_filter = {"createdAt": {"$gte": since_dt}, **BID_FILTER}
+    resume_filter = {"createdAt": {"$gte": since_dt}}  # unapplied Job Applies resumes too: an interview may link one
     dated = {"$or": [{"createdAt": {"$gte": since_dt}}, {"scheduledAt": {"$gte": since_dt}},
                      {"stageHistory.scheduledAt": {"$gte": since_dt}}]}
     accts = None if account_ids is None else set(account_ids) - {None}  # $in [None] would match every accountless doc
@@ -99,6 +98,10 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     bid_scope = {} if accts is None else {"$or": [scope, {"bidderId": {"$in": [b for b, p in profiles.items() if p in accts]}}]}
     bids = [{**b, "accountId": _profile(b, profiles)} async for b in Bid.get_motor_collection().find(
         {**bid_scope, "firstAt": {"$gte": since_dt}}, _proj(_BID_FIELDS))]
+    # countsAsBid False (Job Applies tailoring never marked applied) is not a bid, unless an interview links it
+    proven = {str((d.get("resumeLink") or {}).get("resumeJobId")) for d in iv_docs}
+    resumes = [r for r in resumes if r.get("countsAsBid") is not False or str(r["_id"]) in proven]
+    resumes = [{**r, "countsAsBid": None} if r.get("countsAsBid") is False else r for r in resumes]
     ids = {d["accountId"] for d in bids + resumes if d.get("accountId")}
     accounts = {a["_id"]: {"region": a.get("region"), "createdAt": a.get("createdAt")}
                 async for a in Account.get_motor_collection().find({"_id": {"$in": list(ids)}}, {"region": 1, "createdAt": 1})}

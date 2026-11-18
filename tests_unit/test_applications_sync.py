@@ -299,3 +299,14 @@ async def test_backfill_script_apply_seeds_sync_state(db):
     st = await db["app_settings"].find_one({"_id": "applications_sync"})
     assert st["checkpoint"] == t and st["lastFull"] == t
     assert (await sync.run_applications_tick(t + timedelta(minutes=5))).get("incremental") is True
+
+
+async def test_unapplied_job_applies_resume_counts_only_when_an_interview_links_it(db):
+    """countsAsBid False = Job Applies tailoring never marked applied; an interview linked to it proves the apply."""
+    linked = await add_resume(db, url="https://a.com/1", countsAsBid=False)
+    await add_resume(db, url="https://b.com/2", countsAsBid=False)
+    iv = await add_interview(db, url=None, resume_id=linked["_id"])
+    c = await sync.full_rebuild(SINCE, apply=True)
+    rows = await db["applications"].find({}).to_list(None)
+    assert c["rows"] == 1 and c["matched"] == 1 and c["unmatched"] == 0
+    assert rows[0]["jobKey"] == "a.com/1" and rows[0]["interviewId"] == iv["_id"]
