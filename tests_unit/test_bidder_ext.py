@@ -29,6 +29,16 @@ SHORT_PASSWORD = "Password must be at least 8 characters"
 LONG_PASSWORD = "Password is too long"
 
 
+@pytest.fixture(autouse=True)
+def _no_plan_write_through(monkeypatch):
+    """These tests do not register DailyPlan; the write-through has its own tests (test_plan_bidder.py)."""
+    from unittest.mock import AsyncMock
+
+    from app import plan_bidder
+
+    monkeypatch.setattr(plan_bidder, "write_through_bidder", AsyncMock())
+
+
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["ext-unit"]
@@ -718,4 +728,8 @@ async def test_upload_calls_plan_bidder_write_through(ext, owner, storage, monke
     _, _, body = await register(ext)
     r = await ext.post("/ext/upload-url", json=_shot()[0], headers=auth(body["token"]))
     assert r.status_code == 200, r.text
-    assert len(calls) == 1 and calls[0][0] == owner.id
+    from app.bids.windows import schedule_from_settings
+    from app.profile_metrics import bid_report_day
+
+    bid = await Bid.find_one()
+    assert calls == [(owner.id, bid_report_day(bid.firstAt, schedule_from_settings()))]

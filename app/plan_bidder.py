@@ -52,7 +52,7 @@ async def write_through_bidder(owner_id, day: date) -> None:
                   "$setOnInsert": {"year": year, "weekNumber": week_number, "createdAt": now}}
         try:
             await coll.update_one(key, update, upsert=True)
-        except DuplicateKeyError:  # created between our read and write
+        except DuplicateKeyError:  # a concurrent first write created the plan between the upsert's find and insert
             await coll.update_one(key, update)
         from app.models import UserExtra
         from app.self_bids import resync_slack

@@ -53,6 +53,16 @@ class FakeStorage:
         return f"https://signed/{bucket}/{key}"
 
 
+@pytest.fixture(autouse=True)
+def _no_plan_write_through(monkeypatch):
+    """These tests do not register DailyPlan; the write-through has its own tests (test_plan_bidder.py)."""
+    from unittest.mock import AsyncMock
+
+    from app import plan_bidder
+
+    monkeypatch.setattr(plan_bidder, "write_through_bidder", AsyncMock())
+
+
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["review-unit"]
