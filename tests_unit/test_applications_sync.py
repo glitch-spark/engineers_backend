@@ -1,6 +1,6 @@
 """Applications sync against an in-memory MongoDB (mongomock-motor); no real database."""
 
-import os
+import asyncio
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -31,7 +31,13 @@ async def db(monkeypatch):
         for k, u in ops:
             await coll.update_one({"key": k}, u, upsert=True)
 
-    monkeypatch.setattr(sync, "_bulk_upsert", loop_upsert)
+    database.writes = []  # row counts per bulk write
+
+    async def counting_upsert(coll, ops):
+        database.writes.append(len(ops))
+        await loop_upsert(coll, ops)
+
+    monkeypatch.setattr(sync, "_bulk_upsert", counting_upsert)
     await database["accounts"].insert_one({"_id": ACC, "region": "EU", "createdAt": datetime(2026, 8, 1)})
     return database
 
@@ -144,3 +150,62 @@ async def test_tick_disabled_env(db, monkeypatch):
     monkeypatch.setenv("APPLICATIONS_SYNC_DISABLED", "1")
     assert await sync.run_applications_tick() == {"skipped": "disabled"}
     assert await db["app_settings"].count_documents({}) == 0
+
+
+async def _cross_profile(db):
+    acc_c = ObjectId()
+    await db["accounts"].insert_one({"_id": acc_c, "region": "US", "createdAt": datetime(2026, 8, 1)})
+    await add_bid(db)  # profile A's row for the same job
+    rc = await add_resume(db)
+    await db["resumeapplications"].update_one({"_id": rc["_id"]}, {"$set": {"accountId": acc_c}})
+    await add_interview(db, resume_id=rc["_id"])  # on A, linked to C's resume
+    await sync.full_rebuild(SINCE, apply=True)
+    return acc_c
+
+
+async def _holders(db):
+    return {(r["accountId"]) for r in await db["applications"].find({"interviewId": {"$exists": True}}).to_list(None)}
+
+
+@pytest.mark.parametrize("touch", ["A", "C"])
+async def test_incremental_cross_profile_link_matches_once(db, touch):
+    acc_c = await _cross_profile(db)
+    assert await _holders(db) == {acc_c}
+    cp = datetime(2026, 9, 20)
+    coll, who = ("bids", ACC) if touch == "A" else ("resumeapplications", acc_c)
+    await db[coll].update_many({"accountId": who}, {"$set": {"updatedAt": cp + timedelta(hours=1)}})
+    await sync.incremental(cp)
+    assert await _holders(db) == {acc_c}
+
+
+async def test_second_incremental_writes_nothing(db):
+    await add_bid(db)
+    await add_interview(db)
+    await sync.full_rebuild(SINCE, apply=True)
+    db.writes.clear()
+    await sync.incremental(datetime(2026, 8, 1))
+    await sync.incremental(datetime(2026, 8, 1))
+    assert db.writes == []
+
+
+async def test_full_rebuild_timeout_keeps_last_full_and_retries_after_hour(db, monkeypatch):
+    t0 = datetime(2026, 9, 20, 12)
+    await add_bid(db)
+    await sync.run_applications_tick(t0)
+    real = sync.full_rebuild
+
+    async def slow(*a, **k):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(sync, "full_rebuild", slow)
+    monkeypatch.setattr(sync, "FULL_TIMEOUT", 0.05)
+    t1 = t0 + timedelta(hours=25)
+    assert await sync.run_applications_tick(t1) == {"error": "timeout"}
+    st = await db["app_settings"].find_one({"_id": "applications_sync"})
+    assert st["lastFull"] == t0 and st["lastFullAttempt"] == t1 and st["checkpoint"] == t0
+    assert (await sync.run_applications_tick(t1 + timedelta(minutes=10))).get("incremental") is True
+    monkeypatch.setattr(sync, "full_rebuild", real)
+    out = await sync.run_applications_tick(t1 + timedelta(minutes=70))
+    assert "rows" in out and "incremental" not in out
+    st = await db["app_settings"].find_one({"_id": "applications_sync"})
+    assert st["lastFull"] == t1 + timedelta(minutes=70)

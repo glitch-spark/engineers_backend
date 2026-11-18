@@ -186,4 +186,5 @@ class ResumeApplication(TimestampedDocument):
             IndexModel([("accountId", 1), ("createdAt", -1)], name="account_recent"),
             IndexModel([("status", 1), ("createdAt", 1)], name="queue"),
             IndexModel([("jobApplyRowId", 1)], name="job_apply_row"),
+            IndexModel([("updatedAt", 1)]),
         ]

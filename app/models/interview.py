@@ -244,4 +244,5 @@ class Interview(TimestampedDocument):
             IndexModel([("accountId", 1)]),
             IndexModel([("stage", 1)]),
             IndexModel([("status", 1)]),
+            IndexModel([("updatedAt", 1)]),
         ]
