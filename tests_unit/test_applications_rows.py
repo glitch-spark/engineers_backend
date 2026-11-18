@@ -119,3 +119,36 @@ def test_furthest_and_result():
     i = iv([rnd("intro", T0, "passed"), rnd("final", T0 + timedelta(days=5), "rejected"), rnd("tech", T0, "passed")])
     out = interview_outcome(i)
     assert out == {"firstRoundAt": T0, "furthest": "final", "result": "rejected"}
+
+
+def test_shared_row_best_status_earliest_bidder():
+    early, late = bid(status="rejected", at=T0), bid(status="approved", at=T0 + timedelta(days=1))
+    row = next(iter(build_rows([late, bid(kind="self", status="approved", at=T0 - timedelta(days=1)), early],
+                               [], {}).values()))
+    assert row["bidStatus"] == "approved" and row["bidderId"] == early["bidderId"] and row["by"] == "bidder"
+
+
+def test_legacy_bare_number_match_score():
+    row = next(iter(build_rows([], [resume(matchScore=72)], {}).values()))
+    assert row["score"] == 72 and row["scoreBand"]
+    assert next(iter(build_rows([], [resume(matchScore=None)], {}).values()))["score"] is None
+
+
+def test_account_none_not_merged_across_owners():
+    a, b = resume(acc=None), resume(acc=None)
+    assert len(build_rows([], [a, b], {})) == 2
+    rows = build_rows([bid(acc=None)], [], {})
+    i = iv([rnd("intro", T0)], url="https://jobs.acme.com/1", acc=None)
+    assert match_interviews(rows, [i], {}) == (0, 1)
+
+
+def test_several_resumes_earliest_wins_and_owner_is_earliest():
+    late = resume(at=T0 + timedelta(days=2), promptName="late", matchScore={"total": 10, "band": "weak"})
+    early = resume(at=T0, promptName="early")
+    b = bid(at=T0 + timedelta(days=1))
+    row = next(iter(build_rows([b], [late, early], {}).values()))
+    assert row["promptName"] == "early" and row["score"] == 80 and row["appliedAt"] == T0
+    assert row["ownerId"] == OWN
+    o2 = ObjectId()
+    early["userId"] = o2
+    assert next(iter(build_rows([b], [early], {}).values()))["ownerId"] == o2

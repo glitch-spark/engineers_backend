@@ -1,4 +1,7 @@
-"""Pure building of `applications` rows from bids and tailored resumes, and matching interviews to them."""
+"""Pure building of `applications` rows from bids and tailored resumes, and matching interviews to them.
+
+Inputs (what the sync must pass): plain dicts (raw Mongo docs are fine) with naive-UTC datetimes; interviews as
+documents; `resume_row` keyed by str(resume _id) -> row key; `regions` as {accountId: region}."""
 
 import re
 from datetime import datetime, timezone
@@ -7,12 +10,13 @@ from urllib.parse import urlparse
 
 from app.caller_stats import round_result
 from app.interview_rounds import _breakdown_group, merged_rounds
-from app.models.resume_application import job_url_key
+from app.models.resume_application import as_match, job_url_key
 
 _TWO_PART_SUFFIXES = frozenset({
     "co.uk", "org.uk", "ac.uk", "com.au", "net.au", "co.nz", "co.jp", "co.in", "co.za", "com.br", "com.mx", "com.sg",
 })
 _MAX = datetime.max
+_STATUS_RANK = {"approved": 2, "pending": 1, "rejected": 0}
 _ORDER = ("intro", "tech", "hiring", "panel", "final")
 
 
@@ -31,7 +35,7 @@ def board_of(url: Optional[str]) -> Optional[str]:
 
 
 def _key(account_id, url, coll: str, doc_id) -> tuple[str, Optional[str]]:
-    jk = job_url_key(url)
+    jk = job_url_key(url) if account_id is not None else None  # no profile: never merge across owners
     return (f"{account_id}:{jk}" if jk else f"src:{coll}:{doc_id}"), jk
 
 
@@ -47,23 +51,27 @@ def build_rows(bids: list[dict], resumes: list[dict], regions: dict) -> dict[str
                 "jobKey": jk, "board": board_of(url), "appliedAt": at, "by": "self", "sources": [],
             }
         elif at < r["appliedAt"]:
-            r["appliedAt"] = at
+            r["appliedAt"], r["ownerId"] = at, owner_id  # a shared row belongs to its earliest source's owner
         return r
 
-    for b in bids:
+    for b in sorted(bids, key=lambda b: b["firstAt"]):
         key, jk = _key(b.get("accountId"), b.get("jobUrl"), "bids", b["_id"])
         r = row_for(key, jk, b.get("accountId"), b["ownerId"], b.get("jobUrl"), b["firstAt"])
         if b.get("kind", "bidder") == "bidder":
-            r["by"], r["bidderId"] = "bidder", b.get("bidderId")
-        r["bidStatus"] = b.get("status")
-        r["sources"].append("bid")
+            r["by"] = "bidder"
+            r.setdefault("bidderId", b.get("bidderId"))  # the earliest bidder bid's
+        st = b.get("status")
+        if "bid" not in r["sources"] or _STATUS_RANK.get(st, -1) > _STATUS_RANK.get(r["bidStatus"], -1):
+            r["bidStatus"] = st
+        if "bid" not in r["sources"]:
+            r["sources"].append("bid")
 
-    for ra in resumes:
-        if ra.get("countsAsBid") is False:
-            continue
+    for ra in sorted((x for x in resumes if x.get("countsAsBid") is not False), key=lambda x: x["createdAt"]):
         key, jk = _key(ra.get("accountId"), ra.get("jobUrl"), "resumeapplications", ra["_id"])
         r = row_for(key, jk, ra.get("accountId"), ra["userId"], ra.get("jobUrl"), ra["createdAt"])
-        m = ra.get("matchScore") or {}
+        if "resume" in r["sources"]:
+            continue  # score/prompt/template come from the earliest resume
+        m = as_match(ra.get("matchScore")) or {}
         r["score"], r["scoreBand"] = m.get("total"), m.get("band")
         for f in ("promptId", "promptName", "templateName"):
             r[f] = ra.get(f)
@@ -98,8 +106,9 @@ def match_interviews(rows: dict[str, dict], interviews: list, resume_row: dict[s
         link = getattr(iv, "resumeLink", None)
         key = resume_row.get(str(getattr(link, "resumeJobId", None) or ""))
         if key not in rows:
-            jk = job_url_key(getattr(iv, "jobUrl", None))
-            key = f"{getattr(iv, 'accountId', None)}:{jk}" if jk else None
+            acc = getattr(iv, "accountId", None)
+            jk = job_url_key(getattr(iv, "jobUrl", None)) if acc is not None else None
+            key = f"{acc}:{jk}" if jk else None
         if key not in rows:
             unmatched += 1
             continue
