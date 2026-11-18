@@ -1,17 +1,19 @@
-"""30-minute reminders: one reply per round in today's day post thread, built like the round's block in the post."""
+"""30-minute reminders: one top-level message per round in the daily channel, built like the round's block in the
+day post. The message is the round's home: its later follow-ups reply in its thread (app/interview_day/home.py)."""
 
 from __future__ import annotations
 
 import logging
 import math
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 from beanie import PydanticObjectId
 
 from app import slack_bot
 from app.config import get_settings
 from app.interview_day.blocks import round_blocks
-from app.interview_day.post import _thread_links, parent_ts_for_day
+from app.interview_day.home import record_home
+from app.interview_day.post import _thread_links
 from app.interview_day.rounds import DayRound, load_rounds
 from app.models import Interview
 from app.slack_bot import _stage_label, _text
@@ -33,15 +35,11 @@ def _fallback(r: DayRound, minutes: int) -> str:
     return f"Starting in {minutes} min — {_text(r.company)} · {_stage_label(r.stage)}"
 
 
-async def _send(channel: str, parent: str | None, text: str, blocks: list[dict]) -> None:
+async def _send(channel: str, text: str, blocks: list[dict]) -> str:
+    """Post the reminder top-level; returns its ts."""
     body = {"channel": channel, "text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False}
-    try:
-        await slack_bot._slack_api("chat.postMessage", {**body, "thread_ts": parent} if parent else body)
-    except RuntimeError as exc:
-        # The day post is gone from Slack: remind in the channel instead.
-        if not parent or str(exc) not in slack_bot._MESSAGE_GONE | {"thread_not_found"}:
-            raise
-        await slack_bot._slack_api("chat.postMessage", body)
+    sent = await slack_bot._slack_api("chat.postMessage", body)
+    return str(sent.get("ts") or "")
 
 
 async def rebuild_reminder(iv_id: str, round_id: str, now: datetime) -> tuple[str, list[dict]]:
@@ -72,12 +70,12 @@ async def rebuild_reminder(iv_id: str, round_id: str, now: datetime) -> tuple[st
 async def run_round_reminders(now: datetime) -> dict[str, int]:
     """Remind each round once, when it starts in (now, now + 30 min] (claim first, release on failure).
 
-    Off without the daily channel. Replies under the day post of the round's local day, else posts in the channel."""
+    Off without the daily channel. Each reminder is a top-level message, recorded as the round's home."""
     sent = failed = 0
     cfg = slack_bot._caller_daily_configured()
     if cfg is None:
         return {"sent": sent, "failed": failed}
-    channel, tz = cfg[0], cfg[2]
+    channel = cfg[0]
     now = slack_bot._aware_utc(now)
     # load_rounds' end is exclusive and Mongo keeps milliseconds only, so ask a second further and filter here.
     last = now + slack_bot.CALLER_REMINDER_LEAD
@@ -85,7 +83,6 @@ async def run_round_reminders(now: datetime) -> dict[str, int]:
     if not due:
         return {"sent": sent, "failed": failed}
     managers = await slack_bot.interview_managers()
-    parents: dict[date, str | None] = {}  # by the round's local day: a 00:10 round belongs to the next day's post
     origin = get_settings().FRONTEND_ORIGIN.rstrip("/")
     for r in due:
         key = reminder_key(r)
@@ -93,14 +90,15 @@ async def run_round_reminders(now: datetime) -> dict[str, int]:
             continue
         ok = False
         try:
-            day = r.start.astimezone(tz).date()
-            if day not in parents:
-                parents[day] = await parent_ts_for_day(day)
             await _thread_links([r])
             minutes = _minutes(r, now)
             blocks = round_blocks(r, managers=managers, origin=origin, starting_in=minutes)
-            await _send(channel, parents[day], _fallback(r, minutes), blocks)
+            ts = await _send(channel, _fallback(r, minutes), blocks)
             ok = True
+            try:
+                await record_home(r.round_id, r.interview_id, r.start, channel, ts)
+            except Exception as exc:  # the reminder is out; its first follow-up will make a new home
+                log.warning("interview reminder home record failed for round %s: %s", r.round_id, exc)
         except Exception as exc:
             log.warning("interview reminder failed for round %s: %s", r.round_id, exc)
         if ok:

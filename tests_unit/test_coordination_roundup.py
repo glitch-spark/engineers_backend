@@ -1,8 +1,8 @@
-"""The Friday result roundup: one message listing the caller rounds with no result, edited in place as they are
-answered (Slack faked: `slack_bot._slack_api` is a recorder, `get_settings` is patched, no .env is read)."""
+"""The Friday result roundup is no longer posted (the 1-week reminder in each round's daily-channel thread replaces
+it), but roundups already in Slack keep being edited in place as their rounds are answered (Slack faked: `slack_bot._slack_api` is a recorder, `get_settings` is patched, no .env is read)."""
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from itertools import count
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -73,6 +73,7 @@ def slack(monkeypatch, db):
     fake = Slack()
     monkeypatch.setattr(slack_bot, "_slack_api", fake)
     monkeypatch.setattr(chase, "get_settings", lambda: settings())
+    monkeypatch.setattr(slack_bot, "_caller_daily_configured", lambda: ("C_DAILY", time(5, 0), chase.CHASE_TZ))
     return fake
 
 
@@ -124,83 +125,28 @@ def actions_blocks(post):
     return [b for b in post["blocks"] if b["type"] == "actions"]
 
 
+async def post_roundup(when=None, friday="2026-11-20"):
+    """An existing roundup as the removed Friday post left it: posted in #caller ("C1") and stored."""
+    when = when or FRIDAY
+    cutoff = chase.asks_from()
+    rounds = await chase.ended_rounds("completed", ended_after=cutoff, ended_by=when)
+    text, blocks, refs = chase._roundup_message(rounds, await chase._profiles(rounds), date.fromisoformat(friday))
+    sent = await slack_bot._slack_api("chat.postMessage", {"channel": "C1", "text": text, "blocks": blocks})
+    await ResultRoundupPost(friday=friday, channel="C1", ts=sent["ts"], refs=refs,
+                            rendered=chase._rendered(blocks)).insert()
+
+
 async def seed_open(justin, ana):
-    """Justin 2 and Ana 1 open results, plus three rounds that must not be listed."""
+    """Justin 2 and Ana 1 open results, plus two rounds that must not be listed."""
     ivs = [await add(justin, start=day(12), company="Beta"), await add(justin, start=day(10), company="Alpha"),
            await add(ana, start=day(11), company="Gamma")]
     await add(justin, status="passed")
-    await add(justin, caller=False)
     await add(justin, start=datetime(2026, 11, 1, 19, 0, tzinfo=UTC))  # ends 20:00Z, before the cutoff
     return ivs
 
 
-# --- when it is due ----------------------------------------------------------------------------------
-
-
-def test_roundup_due_only_friday_evening():
-    assert chase.roundup_due(chi(2026, 11, 20, 17, 59)) is None
-    assert chase.roundup_due(chi(2026, 11, 20, 18, 0)) == date(2026, 11, 20)
-    assert chase.roundup_due(chi(2026, 11, 20, 23, 59)) == date(2026, 11, 20)
-    assert chase.roundup_due(chi(2026, 11, 21, 9, 0)) is None
-    assert chase.roundup_due(datetime(2026, 11, 21, 0, 30, tzinfo=UTC)) == date(2026, 11, 20)  # Fri 18:30 Chicago
-
 
 # --- the post ----------------------------------------------------------------------------------------
-
-
-async def test_roundup_lists_open_results_by_owner(slack, justin, ana):
-    ivs = await seed_open(justin, ana)
-    assert await chase.run_result_roundup(FRIDAY) == "posted"
-
-    [post] = slack.of("chat.postMessage")
-    assert post["channel"] == "C1" and "thread_ts" not in post
-    texts = sections(post)
-    assert texts[0] == "*📋 Results still open — Fri Nov 20*"
-    owners = [t for t in texts if " — " in t and "round" in t and "·" not in t]
-    assert owners == ["<@U0ANA00001> — 1 round", "<@U0JUSTIN01> — 2 rounds"]
-    assert texts.index(owners[0]) < texts.index(owners[1])
-    rows = actions_blocks(post)
-    assert len(rows) == 3
-    assert all([e["action_id"] for e in b["elements"]] == ["coord_result_passed", "coord_result_rejected"]
-               for b in rows)
-    assert [b["elements"][0]["style"] for b in rows] == ["primary"] * 3
-    assert [b["elements"][1]["style"] for b in rows] == ["danger"] * 3
-    # Ana's round first, then Justin's by start (Alpha on the 10th, Beta on the 12th)
-    assert [b["elements"][0]["value"] for b in rows] == [ref(ivs[2]), ref(ivs[1]), ref(ivs[0])]
-    assert "Gamma · Intro" in texts[2]
-    assert post["text"] == "📋 Results still open — Fri Nov 20"
-
-    stored = await ResultRoundupPost.find_all().to_list()
-    assert len(stored) == 1
-    assert stored[0].friday == "2026-11-20" and stored[0].channel == "C1" and stored[0].ts == "9.1"
-    assert len(stored[0].refs) == 3 and stored[0].rendered
-    assert [r.kind for r in await SlackAlertLog.find_all().to_list()] == ["result-roundup:2026-11-20"]
-
-
-async def test_roundup_once_per_friday(slack, justin, ana):
-    await seed_open(justin, ana)
-    assert await chase.run_result_roundup(FRIDAY) == "posted"
-    assert await chase.run_result_roundup(chi(2026, 11, 20, 18, 5)) == "skipped"
-    assert len(slack.of("chat.postMessage")) == 1
-    assert await chase.run_result_roundup(chi(2026, 11, 20, 17, 0)) == "skipped"  # not due
-
-
-async def test_nothing_to_list_no_post(slack, justin):
-    await add(justin, status="passed")
-    assert await chase.run_result_roundup(FRIDAY) == "none"
-    assert slack.calls == []
-    assert await ResultRoundupPost.find_all().to_list() == []
-    assert await chase.run_result_roundup(chi(2026, 11, 20, 18, 5)) == "skipped"  # the claim is kept
-
-
-async def test_failed_post_releases_the_claim(slack, justin, ana, monkeypatch):
-    await seed_open(justin, ana)
-    monkeypatch.setattr(slack_bot, "_slack_api", AsyncMock(side_effect=RuntimeError("boom")))
-    assert await chase.run_result_roundup(FRIDAY) == "failed"
-    assert await SlackAlertLog.find_all().to_list() == []
-    assert await ResultRoundupPost.find_all().to_list() == []
-    monkeypatch.setattr(slack_bot, "_slack_api", slack)
-    assert await chase.run_result_roundup(chi(2026, 11, 20, 18, 5)) == "posted"
 
 
 # --- edited in place ---------------------------------------------------------------------------------
@@ -208,7 +154,7 @@ async def test_failed_post_releases_the_claim(slack, justin, ana, monkeypatch):
 
 async def test_answered_round_drops_off(slack, justin, ana):
     ivs = await seed_open(justin, ana)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     await set_status(ivs[0], "passed")
 
     await chase.refresh_latest_roundup()
@@ -225,7 +171,7 @@ async def test_answered_round_drops_off(slack, justin, ana):
 
 async def test_all_answered_says_thanks(slack, justin, ana):
     ivs = await seed_open(justin, ana)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     for iv in ivs:
         await set_status(iv, "rejected")
     await chase.refresh_latest_roundup()
@@ -235,46 +181,29 @@ async def test_all_answered_says_thanks(slack, justin, ana):
     assert sections(upd) == [THANKS]
 
 
-async def test_a_round_that_lost_its_caller_drops_off(slack, justin, ana):
+async def test_a_round_that_lost_its_caller_stays_until_answered(slack, justin, ana):
     ivs = await seed_open(justin, ana)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     raw = ivs[2].model_dump()["stageHistory"]
     raw[-1]["caller"]["enabled"] = False
     await Interview.find_one(Interview.id == ivs[2].id).update({"$set": {"stageHistory": raw}})
+    await set_status(ivs[0], "passed")
     await chase.refresh_latest_roundup()
-    assert len(actions_blocks(slack.of("chat.update")[0])) == 2
+    assert len(actions_blocks(slack.of("chat.update")[0])) == 2  # only the answered one left
 
 
 async def test_a_deleted_interview_drops_off(slack, justin, ana):
     ivs = await seed_open(justin, ana)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     await ivs[0].delete()
     await chase.refresh_latest_roundup()
     assert len(actions_blocks(slack.of("chat.update")[0])) == 2
 
 
-async def test_open_rounds_carry_to_next_friday(slack, justin):
-    iv = await add(justin)
-    assert await chase.run_result_roundup(FRIDAY) == "posted"
-    assert await chase.run_result_roundup(chi(2026, 11, 27, 18, 0)) == "posted"
-    posts = slack.of("chat.postMessage")
-    assert len(posts) == 2
-    assert posts[1]["blocks"][-1]["elements"][0]["value"] == ref(iv)
-    assert sections(posts[1])[0] == "*📋 Results still open — Fri Nov 27*"
-    assert [p.friday for p in await ResultRoundupPost.find_all().sort("friday").to_list()] == [
-        "2026-11-20", "2026-11-27",
-    ]
-    # Only the latest roundup is refreshed
-    await set_status(iv, "passed")
-    await chase.refresh_latest_roundup()
-    [upd] = slack.of("chat.update")
-    assert upd["ts"] == "9.2"
-
-
 async def test_roundup_block_limit(slack, justin):
     for i in range(30):
         await add(justin, start=day(10 + i % 9, 10 + i % 5), company=f"Co{i:02d}")
-    assert await chase.run_result_roundup(FRIDAY) == "posted"
+    await post_roundup()
     [post] = slack.of("chat.postMessage")
     blocks = post["blocks"]
     assert len(blocks) <= 50
@@ -291,7 +220,7 @@ async def test_roundup_block_limit(slack, justin):
 
 async def test_hidden_rounds_surface_when_shown_ones_are_answered(slack, justin):
     ivs = [await add(justin, start=day(10 + i % 9, 10 + i % 5), company=f"Co{i:02d}") for i in range(30)]
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     first = slack.of("chat.postMessage")[0]
     shown = [b["elements"][0]["value"] for b in actions_blocks(first)]
     for iv in ivs:
@@ -306,53 +235,13 @@ async def test_hidden_rounds_surface_when_shown_ones_are_answered(slack, justin)
 # --- off, and the click ------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("off", [
-    dict(SLACK_CALLER_ASKS_FROM=None), dict(SLACK_BOT_TOKEN=""), dict(SLACK_CALLER_CHANNEL_ID=None),
-])
-async def test_roundup_off_without_the_setting(slack, justin, monkeypatch, off):
-    await add(justin)
-    monkeypatch.setattr(chase, "get_settings", lambda: settings(**off))
-    assert await chase.run_result_roundup(FRIDAY) == "off"
-    await chase.refresh_latest_roundup()
-    assert slack.calls == []
-    assert await SlackAlertLog.find_all().to_list() == []
-
-
 async def test_refresh_is_a_no_op_when_off(slack, justin, monkeypatch):
     await add(justin)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     await set_status(await Interview.find_one({}), "passed")
     monkeypatch.setattr(chase, "get_settings", lambda: settings(SLACK_CALLER_ASKS_FROM=None))
     await chase.refresh_latest_roundup()
     assert slack.of("chat.update") == []
-
-
-async def test_the_chase_runs_the_roundup_and_refreshes(slack, justin, monkeypatch):
-    iv = await add(justin)
-    ran = []
-    real_refresh = chase.refresh_latest_roundup
-
-    async def refresh():
-        ran.append(1)
-        await real_refresh()
-
-    monkeypatch.setattr(chase, "refresh_latest_roundup", refresh)
-    out = await chase.run_coordination_chase(FRIDAY)
-    assert out["result_roundup"] == "posted" and ran == [1]
-    assert set(out) == {"after_call_asks", "result_reminders", "result_roundup"}
-    await set_status(iv, "passed")
-    out = await chase.run_coordination_chase(FRIDAY + timedelta(minutes=5))
-    assert out["result_roundup"] == "skipped"
-    assert len(slack.of("chat.update")) == 1
-
-
-async def test_a_crash_in_the_roundup_does_not_stop_the_chase(slack, justin, monkeypatch):
-    monkeypatch.setattr(chase, "run_result_roundup", AsyncMock(side_effect=RuntimeError("boom")))
-    refresh = AsyncMock()
-    monkeypatch.setattr(chase, "refresh_latest_roundup", refresh)
-    out = await chase.run_coordination_chase(FRIDAY)
-    assert out["result_roundup"] == "failed"
-    refresh.assert_awaited_once()
 
 
 async def test_click_on_the_roundup_refreshes_it(slack, justin, ana, monkeypatch):
@@ -364,7 +253,7 @@ async def test_click_on_the_roundup_refreshes_it(slack, justin, ana, monkeypatch
         replies.append((url, payload))
 
     ivs = await seed_open(justin, ana)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     post = await ResultRoundupPost.find_one({})
 
     click = actions.Click("coord_result_passed", ref(ivs[0]), "U0JUSTIN01", RESPONSE_URL, "T.1", "C1", post.ts)
@@ -389,7 +278,7 @@ async def test_a_click_elsewhere_does_not_touch_the_roundup(slack, justin, ana, 
         replies.append((url, payload))
 
     ivs = await seed_open(justin, ana)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     click = actions.Click("coord_result_passed", ref(ivs[0]), "U0JUSTIN01", RESPONSE_URL, "T.1", "C1", "555.5")
     with patch.object(actions, "_post_ephemeral", respond):
         await actions.process_coordination_click(click)
@@ -399,7 +288,7 @@ async def test_a_click_elsewhere_does_not_touch_the_roundup(slack, justin, ana, 
 
 async def test_a_deleted_roundup_stops_being_edited(slack, justin, monkeypatch):
     iv = await add(justin)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     await set_status(iv, "passed")
     calls = []
 
@@ -414,36 +303,13 @@ async def test_a_deleted_roundup_stops_being_edited(slack, justin, monkeypatch):
     await chase.refresh_latest_roundup()  # next tick: nothing to edit
     assert calls == ["chat.update"]
     assert len(slack.of("chat.postMessage")) == 1  # nothing re-posted
-    assert await chase.run_result_roundup(chi(2026, 11, 20, 18, 5)) == "skipped"
 
 
 async def test_other_update_errors_keep_the_roundup(slack, justin, monkeypatch):
     iv = await add(justin)
-    await chase.run_result_roundup(FRIDAY)
+    await post_roundup()
     await set_status(iv, "passed")
     monkeypatch.setattr(slack_bot, "_slack_api", AsyncMock(side_effect=RuntimeError("ratelimited")))
     with pytest.raises(RuntimeError):
         await chase.refresh_latest_roundup()
     assert len(await ResultRoundupPost.find_all().to_list()) == 1
-
-
-async def test_a_failed_save_is_retried_once_and_logs_where_the_post_is(slack, justin, monkeypatch, caplog):
-    await add(justin)
-    real = ResultRoundupPost.insert
-    fails = [RuntimeError("db down")]
-
-    async def flaky(self, *a, **k):
-        if fails:
-            raise fails.pop()
-        return await real(self, *a, **k)
-
-    monkeypatch.setattr(ResultRoundupPost, "insert", flaky)
-    assert await chase.run_result_roundup(FRIDAY) == "posted"
-    assert len(await ResultRoundupPost.find_all().to_list()) == 1
-    assert "channel C1 ts 9.1" in caplog.text
-
-    await ResultRoundupPost.find_all().delete()
-    monkeypatch.setattr(ResultRoundupPost, "insert", AsyncMock(side_effect=RuntimeError("db down")))
-    assert await chase.run_result_roundup(chi(2026, 11, 27, 18, 0)) == "failed"
-    assert "posted at channel C1 ts 9.2" in caplog.text
-    assert len(slack.of("chat.postMessage")) == 2

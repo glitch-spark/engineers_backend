@@ -6,18 +6,19 @@ interview in the private SLACK_CALLER_CHANNEL_ID (the coordination channel), the
 SLACK_CALLER_DAILY_CHANNEL_ID, and each daily plan in SLACK_DAILY_PLAN_CHANNEL_ID (edited/deleted in place as the
 plan changes).
 
-The #caller post is built in app/coordination/blocks.py (Choose caller, Download brief, Open interview). It
-describes the interview's latest round and is rewritten with chat.update whenever the round changes; the thread gets
-no change-log replies.
+The #caller post is built in app/coordination/blocks.py: the Choose caller select while the round is open, with Brief
+and Open as text links, and no buttons once it is settled. It describes the interview's latest round and is rewritten
+with chat.update whenever the round changes; the thread gets no change-log replies.
 
 Each morning (SLACK_CALLER_DAILY_TIME) one day post lists every round of the local day grouped by owner, one compact
 line each with who is on the call and Brief / Open links (assigning a caller confirms the round; old Confirm buttons
-still work); it is edited in place whenever an interview changes. About 30 minutes before a round starts it gets a
-reminder reply in the day post's thread, with Download brief / Open interview / Assign caller buttons.
+still work); it is edited in place whenever an interview changes. About 30 minutes before a round starts it gets its
+own top-level reminder in the daily channel, with Download brief / Open interview / Assign caller buttons; that
+message is the round's home (app/interview_day/home.py) and its follow-ups reply in its thread.
 Dedup rows (SlackAlertLog) use the keys "interview-day:<YYYY-MM-DD>" and "round-reminder:<roundId>:<startEpoch>";
 there are no per-user digest DMs. Once SLACK_CALLER_ASKS_FROM is set, app/coordination/chase.py also replies in each
-interview's #caller thread after a caller round ends (key "after-call:<roundId>:<startEpoch>") and 7 days after a
-completed round with no result (key "result-reminder:<roundId>").
+round's home thread (caller and self rounds) 15 minutes after it ends (key "after-call:<roundId>:<startEpoch>") and
+7 days after a completed round with no result (key "result-reminder:<roundId>").
 The day post and reminders live in app/interview_day/, button clicks in app/interview_day/actions.py, transactions in
 app/slack_transactions.py.
 """
@@ -562,8 +563,7 @@ def _caller_daily_configured() -> Optional[tuple[str, time, ZoneInfo]]:
 
 
 async def run_alert_tick() -> dict[str, Any]:
-    """Cron entrypoint: the day post first (a round starting at 05:00-05:30 is reminded in the same tick and
-    threads under it), then the 30-minute round reminders, then a refresh of today's post so changes no interview
+    """Cron entrypoint: the day post first, then the 30-minute round reminders (each its round's own message), then a refresh of today's post so changes no interview
     write reports (renames, deactivations, Slack ID changes, archives, a refresh that failed) reach it. Each step
     is isolated from the others; the coordination asks (app/coordination/chase.py) come last. Sends no DMs."""
     from app.interview_day.post import refresh_today, run_day_post  # post imports this module

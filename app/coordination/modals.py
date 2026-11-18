@@ -210,7 +210,8 @@ def submission_errors(view: dict, now: datetime) -> dict[str, str]:
         return {"note": FORM_ERROR}
 
 
-_NEEDED_STATUS = {"canceled": "scheduled", "rescheduled": "scheduled", "rejected": "completed"}
+# Rejected comes from a completed round's result buttons, or straight from the after-interview check (still scheduled).
+_NEEDED_STATUS = {"canceled": {"scheduled"}, "rescheduled": {"scheduled"}, "rejected": {"completed", "scheduled"}}
 
 
 async def process_coordination_submission(view: dict, slack_user_id: str) -> None:
@@ -256,10 +257,10 @@ async def process_coordination_submission(view: dict, slack_user_id: str) -> Non
             await tell(actions.UPDATE_REFUSED)
             return
         status = actions.round_status(entry)
-        if status != _NEEDED_STATUS[answer.kind]:
+        if status not in _NEEDED_STATUS[answer.kind]:
             await tell(actions.ALREADY.format(Label=status.capitalize()))
             return
-        if answer.kind in ("canceled", "rescheduled") and entry.scheduledAt is not None:
+        if status == "scheduled" and entry.scheduledAt is not None:
             # A form opened from an old ask must not apply to a round that was moved since and hasn't ended.
             from app.routers.interviews import round_ends_at
 

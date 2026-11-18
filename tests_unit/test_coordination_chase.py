@@ -1,9 +1,10 @@
-"""The release cutoff, the after-call ask and the 7-day result reminder (Slack faked: `slack_bot._slack_api` is a
+"""The release cutoff, the after-interview check and the 7-day result reminder, for caller and self rounds, posted in
+each round's home thread in the daily channel (Slack faked: `slack_bot._slack_api` is a
 recorder, `get_settings` is patched, no test reads a .env or sets the cutoff through the environment)."""
 
 import asyncio
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from itertools import count
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -22,6 +23,8 @@ from app.coordination import chase  # noqa: E402
 from app.models import interview as interview_model  # noqa: E402
 from app.models import Account, Interview, ResultRoundupPost, SlackAlertLog, UserExtra  # noqa: E402
 from app.models.interview import InterviewCaller, InterviewStageEvent, SlackThread  # noqa: E402
+from app.models.round_slack_post import RoundSlackPost  # noqa: E402
+from app.interview_day import home  # noqa: E402
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -32,6 +35,7 @@ UTC = timezone.utc
 START = datetime(2026, 11, 16, 18, 30, tzinfo=UTC)
 END = datetime(2026, 11, 16, 19, 30, tzinfo=UTC)
 CUTOFF = "2026-11-02T00:00"
+DAILY = ("C_DAILY", time(5, 0), chase.CHASE_TZ)
 
 
 def utc(day, hh, mm=0):
@@ -63,7 +67,8 @@ class Slack:
 @pytest.fixture
 async def db():
     database = AsyncMongoMockClient()["coord-chase-unit"]
-    await init_beanie(database=database, document_models=[Interview, UserExtra, Account, SlackAlertLog, ResultRoundupPost])
+    await init_beanie(database=database, document_models=[Interview, UserExtra, Account, SlackAlertLog, ResultRoundupPost,
+                                                         RoundSlackPost])
     return database
 
 
@@ -72,6 +77,7 @@ def slack(monkeypatch, db):
     fake = Slack()
     monkeypatch.setattr(slack_bot, "_slack_api", fake)
     monkeypatch.setattr(chase, "get_settings", lambda: settings())
+    monkeypatch.setattr(slack_bot, "_caller_daily_configured", lambda: DAILY)
     return fake
 
 
@@ -129,36 +135,52 @@ def test_asks_from_parses_and_validates(monkeypatch):
 async def test_asks_off_without_the_setting(slack, justin, monkeypatch):
     await add(justin)
     monkeypatch.setattr(chase, "get_settings", lambda: settings(SLACK_CALLER_ASKS_FROM=None))
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 0}
     assert await chase.run_result_reminders(utc(30, 19, 31)) == {"sent": 0, "failed": 0}
     assert slack.calls == []
     assert await SlackAlertLog.find_all().to_list() == []
 
 
-@pytest.mark.parametrize("off", [dict(SLACK_BOT_TOKEN=""), dict(SLACK_CALLER_CHANNEL_ID=None)])
-async def test_asks_off_without_token_or_channel(slack, justin, monkeypatch, off):
+async def test_asks_off_without_the_token(slack, justin, monkeypatch):
     await add(justin)
-    monkeypatch.setattr(chase, "get_settings", lambda: settings(**off))
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 0, "failed": 0}
+    monkeypatch.setattr(chase, "get_settings", lambda: settings(SLACK_BOT_TOKEN=""))
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 0}
     assert slack.calls == []
+
+
+async def test_off_without_the_daily_channel(slack, justin, monkeypatch):
+    await add(justin)
+    monkeypatch.setattr(slack_bot, "_caller_daily_configured", lambda: None)
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 0}
+    assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 0, "failed": 0}
+    assert slack.calls == []
+
+
+async def test_runs_without_the_caller_channel(slack, justin, monkeypatch):
+    await add(justin)
+    monkeypatch.setattr(chase, "get_settings", lambda: settings(SLACK_CALLER_CHANNEL_ID=None))
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
 
 
 async def test_after_call_ask_once_after_the_end(slack, justin):
     iv = await add(justin)
     rid = iv.stageHistory[0].id
 
-    assert await chase.run_after_call_asks(utc(16, 19, 29)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 44)) == {"sent": 0, "failed": 0}  # 14 min after the end
     assert slack.posts() == []
 
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 1, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
     [post] = slack.posts()
-    assert post["channel"] == "C1" and post["thread_ts"] == "100.1"
-    assert action_ids(post) == ["coord_after_completed", "coord_after_canceled", "coord_after_rescheduled"]
-    assert values(post) == [f"{iv.id}:{rid}"] * 3
+    assert post["channel"] == "C_DAILY" and "thread_ts" not in post  # no home yet: the ask becomes it
+    assert action_ids(post) == ["coord_after_completed", "coord_after_passed", "coord_after_rejected",
+                                "coord_after_rescheduled", "coord_after_canceled"]
+    labels = [e["text"]["text"] for b in post["blocks"] if b["type"] == "actions" for e in b["elements"]]
+    assert labels == ["Completed", "Passed", "Rejected", "Rescheduled…", "Canceled"]
+    assert values(post) == [f"{iv.id}:{rid}"] * 5
     assert post["text"].startswith("<@U0JUSTIN01> — Acme Intro ended at <!date^")
     assert post["text"].endswith(". How did it go?")
 
-    assert await chase.run_after_call_asks(utc(16, 19, 36)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 51)) == {"sent": 0, "failed": 0}
     assert len(slack.posts()) == 1
     rows = await SlackAlertLog.find_all().to_list()
     assert [r.kind for r in rows] == [f"after-call:{rid}:{int(START.timestamp())}"]
@@ -166,18 +188,53 @@ async def test_after_call_ask_once_after_the_end(slack, justin):
 
 async def test_already_sent_rounds_cost_no_insert(slack, justin, monkeypatch):
     await add(justin)
-    await chase.run_after_call_asks(utc(16, 19, 31))
+    await chase.run_after_call_asks(utc(16, 19, 46))
     claim = AsyncMock(return_value=True)
     monkeypatch.setattr(slack_bot, "_reminder_claim", claim)
-    assert await chase.run_after_call_asks(utc(16, 19, 36)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 51)) == {"sent": 0, "failed": 0}
     claim.assert_not_awaited()
 
 
 async def test_no_end_means_one_hour(slack, justin):
     await add(justin, end=None)  # ends at start + 1 h = 19:30Z
-    assert await chase.run_after_call_asks(utc(16, 19, 29)) == {"sent": 0, "failed": 0}
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 1, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 44)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
     assert len(slack.posts()) == 1
+
+
+async def test_ask_threads_under_the_rounds_home(slack, justin):
+    iv = await add(justin)
+    await home.record_home(iv.stageHistory[0].id, str(iv.id), START, "C_DAILY", "42.1")
+    await chase.run_after_call_asks(utc(16, 19, 46))
+    [post] = slack.posts()
+    assert post["channel"] == "C_DAILY" and post["thread_ts"] == "42.1"
+
+
+async def test_round_without_a_home_gets_one_from_its_ask(slack, justin):
+    iv = await add(justin)
+    await chase.run_after_call_asks(utc(16, 19, 46))
+    (h,) = await RoundSlackPost.find_all().to_list()
+    assert (h.roundId, h.startEpoch, h.ts) == (iv.stageHistory[0].id, int(START.timestamp()), "9.1")
+
+
+@pytest.mark.parametrize("kwargs", [dict(caller=False, thread=False), dict(thread=False)],
+                         ids=["self-round", "caller-round-without-a-post"])
+async def test_self_and_unposted_rounds_are_asked(slack, justin, kwargs):
+    await add(justin, **kwargs)
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
+
+
+async def test_rounds_ended_over_two_days_ago_are_not_asked(slack, justin):
+    await add(justin)  # ended Nov 16 19:30Z
+    assert await chase.run_after_call_asks(utc(18, 19, 31)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(18, 19, 29)) == {"sent": 1, "failed": 0}
+
+
+async def test_round_asked_under_the_old_flow_is_not_asked_again(slack, justin):
+    iv = await add(justin)
+    await slack_bot._reminder_claim(f"after-call:{iv.stageHistory[0].id}:{int(START.timestamp())}")
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
 
 
 async def test_a_round_stored_without_a_status_is_asked(slack, justin, db, monkeypatch):
@@ -192,49 +249,46 @@ async def test_a_round_stored_without_a_status_is_asked(slack, justin, db, monke
     monkeypatch.setattr(interview_model, "resolve_interview",
                         lambda doc, *, now: real(doc, now=datetime(2026, 11, 1, tzinfo=UTC)))
     assert (await Interview.get(iv.id)).stageHistory[0].status.value == "scheduled"
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 1, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
 
 
 async def test_a_legacy_rescheduled_round_is_asked(slack, justin):
     await add(justin, status="rescheduled")
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 1, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
 
 
 @pytest.mark.parametrize("kwargs", [
-    pytest.param(dict(caller=False), id="no-caller"),
     pytest.param(dict(status="canceled"), id="canceled"),
     pytest.param(dict(status="completed"), id="completed"),
     pytest.param(dict(start=datetime(2026, 11, 1, 19, 0, tzinfo=UTC), end=datetime(2026, 11, 1, 20, 0, tzinfo=UTC)),
                  id="before-the-cutoff"),
     pytest.param(dict(stage="home_assessment"), id="home-assessment"),
-    pytest.param(dict(thread=False), id="no-thread"),
 ])
 async def test_not_asked(slack, justin, kwargs):
     await add(justin, **kwargs)
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 0}
     assert slack.posts() == []
     assert await SlackAlertLog.find_all().to_list() == []
 
 
-async def test_caller_turned_off_is_not_asked(slack, justin):
+async def test_caller_turned_off_is_still_asked(slack, justin):
     iv = await add(justin)
     raw = iv.model_dump()["stageHistory"]
     raw[0]["caller"]["enabled"] = False
     await Interview.find_one(Interview.id == iv.id).update({"$set": {"stageHistory": raw}})
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 0, "failed": 0}
-    assert slack.posts() == []
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
 
 
 async def test_rescheduled_round_is_asked_again(slack, justin):
     iv = await add(justin)
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 1, "failed": 0}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
     moved = utc(17, 18, 30)
     raw = iv.model_dump()["stageHistory"]
     raw[0]["scheduledAt"], raw[0]["endsAt"] = moved, utc(17, 19, 30)
     await Interview.find_one(Interview.id == iv.id).update({"$set": {"stageHistory": raw}})
 
-    assert await chase.run_after_call_asks(utc(17, 19, 29)) == {"sent": 0, "failed": 0}
-    assert await chase.run_after_call_asks(utc(17, 19, 31)) == {"sent": 1, "failed": 0}
+    assert await chase.run_after_call_asks(utc(17, 19, 44)) == {"sent": 0, "failed": 0}
+    assert await chase.run_after_call_asks(utc(17, 19, 46)) == {"sent": 1, "failed": 0}
     assert len(slack.posts()) == 2
     kinds = sorted(r.kind for r in await SlackAlertLog.find_all().to_list())
     rid = iv.stageHistory[0].id
@@ -244,27 +298,16 @@ async def test_rescheduled_round_is_asked_again(slack, justin):
 async def test_failed_post_releases_the_claim(slack, justin):
     await add(justin)
     slack.errors = ["ratelimited"]
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 0, "failed": 1}
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 1}
     assert await SlackAlertLog.find_all().to_list() == []
-    assert await chase.run_after_call_asks(utc(16, 19, 36)) == {"sent": 1, "failed": 0}
-    assert len(await SlackAlertLog.find_all().to_list()) == 1
-
-
-async def test_gone_thread_posts_in_the_channel(slack, justin):
-    await add(justin)
-    slack.errors = ["thread_not_found"]
-    assert await chase.run_after_call_asks(utc(16, 19, 31)) == {"sent": 1, "failed": 0}
-    first, second = slack.posts()
-    assert first["thread_ts"] == "100.1"
-    assert "thread_ts" not in second and second["channel"] == "C1"
-    assert action_ids(second) == action_ids(first)
+    assert await chase.run_after_call_asks(utc(16, 19, 51)) == {"sent": 1, "failed": 0}
     assert len(await SlackAlertLog.find_all().to_list()) == 1
 
 
 async def test_an_unlinked_owner_is_named_in_plain_text(slack, db):
     owner = await UserExtra(name="Ana", email="ana@x.io", role="staff").insert()
     await add(owner)
-    await chase.run_after_call_asks(utc(16, 19, 31))
+    await chase.run_after_call_asks(utc(16, 19, 46))
     assert slack.posts()[0]["text"].startswith("Ana — Acme Intro ended at ")
 
 
@@ -279,7 +322,7 @@ async def test_result_reminder_seven_days_after(slack, justin):
     assert slack.posts() == []
     assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 1, "failed": 0}
     [post] = slack.posts()
-    assert post["channel"] == "C1" and post["thread_ts"] == "100.1"
+    assert post["channel"] == "C_DAILY" and "thread_ts" not in post
     assert action_ids(post) == ["coord_result_passed", "coord_result_rejected"]
     assert values(post) == [f"{iv.id}:{rid}"] * 2
     assert post["text"].startswith("<@U0JUSTIN01> — Acme Intro on <!date^")
@@ -300,6 +343,19 @@ async def test_a_round_stored_without_a_status_gets_the_reminder(slack, justin, 
     assert await chase.run_result_reminders(utc(23, 19, 29)) == {"sent": 0, "failed": 0}
     assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 1, "failed": 0}
     assert action_ids(slack.posts()[0]) == ["coord_result_passed", "coord_result_rejected"]
+
+
+async def test_result_reminder_covers_self_rounds_in_the_home_thread(slack, justin):
+    iv = await add(justin, status="completed", caller=False, thread=False)
+    await home.record_home(iv.stageHistory[0].id, str(iv.id), START, "C_DAILY", "42.1")
+    assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 1, "failed": 0}
+    assert slack.posts()[0]["thread_ts"] == "42.1"
+
+
+async def test_result_reminder_skips_rounds_past_the_two_day_window(slack, justin):
+    await add(justin, status="completed")  # ended Nov 16 19:30Z: its 7-day mark is Nov 23 19:30Z
+    assert await chase.run_result_reminders(utc(25, 19, 31)) == {"sent": 0, "failed": 0}
+    assert await chase.run_result_reminders(utc(25, 19, 29)) == {"sent": 1, "failed": 0}
 
 
 async def test_a_passed_round_gets_no_reminder(slack, justin):
@@ -333,7 +389,7 @@ async def test_chase_query_is_bounded_below_by_the_cutoff(slack, justin, db, mon
         return real_find(query, *a, **kw)
 
     monkeypatch.setattr(Interview, "find", spy)
-    rounds = await chase.caller_rounds("scheduled", ended_after=cutoff, ended_by=utc(20, 0))
+    rounds = await chase.ended_rounds("scheduled", ended_after=cutoff, ended_by=utc(20, 0))
     assert {c.interview.companyName for c in rounds} == {"EdgeNoEnd", "Long", "Inverted", "Recent"}
 
     [query] = queries
@@ -354,9 +410,15 @@ async def test_failed_reminder_releases_the_claim(slack, justin):
 async def test_chase_parts_are_isolated(slack, justin, monkeypatch):
     monkeypatch.setattr(chase, "run_after_call_asks", AsyncMock(side_effect=RuntimeError("boom")))
     monkeypatch.setattr(chase, "run_result_reminders", AsyncMock(return_value={"sent": 2, "failed": 0}))
-    assert await chase.run_coordination_chase(utc(16, 19, 31)) == {
-        "after_call_asks": 0, "result_reminders": 2, "result_roundup": "skipped",
-    }
+    assert await chase.run_coordination_chase(utc(16, 19, 31)) == {"after_call_asks": 0, "result_reminders": 2}
+
+
+async def test_roundup_is_no_longer_posted(slack, justin):
+    await add(justin, status="completed")
+    friday_evening = datetime(2026, 11, 20, 18, 5, tzinfo=chase.CHASE_TZ)
+    await chase.run_coordination_chase(friday_evening)
+    assert not hasattr(chase, "run_result_roundup")
+    assert await ResultRoundupPost.find_all().to_list() == []
 
 
 def _quiet_tick():

@@ -10,7 +10,7 @@ from app.caller_directory import CallerEntry
 from app.interview_day.blocks import MAX_NAME, _button, _cap, _method_part, _short, _tags, _who
 from app.interview_day.rounds import DayRound
 from app.models import UserExtra
-from app.slack_bot import _stage_label, slack_time
+from app.slack_bot import _mrkdwn_link, _stage_label, slack_time
 
 COORD_CHOOSE_CALLER = "coord_choose_caller"  # static select
 COORD_CONFIRM = "coord_confirm"  # no longer rendered (assigning confirms); old posts still carry it
@@ -19,13 +19,15 @@ COORD_OPEN_INTERVIEW = "coord_open_interview"
 COORD_AFTER_COMPLETED = "coord_after_completed"
 COORD_AFTER_CANCELED = "coord_after_canceled"
 COORD_AFTER_RESCHEDULED = "coord_after_rescheduled"
+COORD_AFTER_PASSED = "coord_after_passed"
+COORD_AFTER_REJECTED = "coord_after_rejected"
 COORD_RESULT_PASSED = "coord_result_passed"
 COORD_RESULT_REJECTED = "coord_result_rejected"
 
 # Every id the server acts on (the two URL buttons are only acknowledged). COORD_CONFIRM stays for old posts.
 COORD_ACTIONS = frozenset({
     COORD_CHOOSE_CALLER, COORD_CONFIRM, COORD_AFTER_COMPLETED, COORD_AFTER_CANCELED, COORD_AFTER_RESCHEDULED,
-    COORD_RESULT_PASSED, COORD_RESULT_REJECTED,
+    COORD_AFTER_PASSED, COORD_AFTER_REJECTED, COORD_RESULT_PASSED, COORD_RESULT_REJECTED,
 })
 
 SELF = "self"  # the last part of the "No caller (Self)" option value
@@ -104,32 +106,19 @@ def post_blocks(
     parts = [company, stage, slack_time(r.start), _short(r.profile, MAX_NAME)]
     head = " · ".join(p for p in parts if p)
     ended = r.status in ("canceled", "rejected")
+    base = origin.rstrip("/")
+    links = (f"{_mrkdwn_link(f'{base}/interview/{r.interview_id}?brief={r.round_id}', 'Brief')} · "
+             f"{_mrkdwn_link(f'{base}/interviews?panel={r.interview_id}', 'Open')}")
     lines = [f"❌ ~{head}~" if ended else f"📞 *{head}*",
-             f"Owner {_who(r.owner, '—')} · {_caller_part(r, managers)}"]
+             f"Owner {_who(r.owner, '—')} · {_caller_part(r, managers)} · {links}"]
+    blocks: list[dict] = []
     if r.status in _STATUS_LINES:
         lines.append(_STATUS_LINES[r.status])
-
-    ref = _ref(r)
-    base = origin.rstrip("/")
-    links = [
-        _button("Download brief", url=f"{base}/interview/{r.interview_id}?brief={r.round_id}",
-                action_id=COORD_OPEN_BRIEF),
-        _button("Open interview", url=f"{base}/interviews?panel={r.interview_id}", action_id=COORD_OPEN_INTERVIEW),
-    ]
-    if r.status == "completed":
-        elements = [
-            _button("Passed", style="primary", action_id=COORD_RESULT_PASSED, value=ref),
-            _button("Rejected", style="danger", action_id=COORD_RESULT_REJECTED, value=ref),
-            *links,
-        ]
-    elif r.status in _STATUS_LINES:  # passed, rejected, canceled: nothing left to do but look
-        elements = links
-    else:
-        elements = [caller_select(r, directory), *links]
-    return f"📞 {company} · {stage}", [
-        {"type": "section", "text": {"type": "mrkdwn", "text": _cap("\n".join(lines))}},
-        {"type": "actions", "elements": elements},
-    ]
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _cap("\n".join(lines))}})
+    # Only the caller is decided here; results and "did it happen?" are asked in the round's daily-channel thread.
+    if r.status not in _STATUS_LINES:
+        blocks.append({"type": "actions", "elements": [caller_select(r, directory)]})
+    return f"📞 {company} · {stage}", blocks
 
 
 def _section(text: str) -> dict:
@@ -139,13 +128,15 @@ def _section(text: str) -> dict:
 def ask_blocks(
     ref: str, *, owner: Optional[UserExtra], company: str, stage: str, end: datetime,
 ) -> tuple[str, list[dict]]:
-    """The after-call ask posted in the interview's thread once a caller round has ended."""
+    """The after-interview check posted in the round's home thread once it has ended: every way it can have gone."""
     text = (f"{_who(owner, 'Owner')} — {_short(company, MAX_NAME, '—')} {_stage_label(stage)} ended at "
             f"{slack_time(end, with_day=False)}. How did it go?")
     return text, [_section(text), {"type": "actions", "elements": [
         _button("Completed", style="primary", action_id=COORD_AFTER_COMPLETED, value=ref),
-        _button("Canceled", action_id=COORD_AFTER_CANCELED, value=ref),
+        _button("Passed", action_id=COORD_AFTER_PASSED, value=ref),
+        _button("Rejected", action_id=COORD_AFTER_REJECTED, value=ref),
         _button("Rescheduled…", action_id=COORD_AFTER_RESCHEDULED, value=ref),
+        _button("Canceled", action_id=COORD_AFTER_CANCELED, value=ref),
     ]}]
 
 

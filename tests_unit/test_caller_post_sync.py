@@ -222,7 +222,8 @@ async def test_main_post_describes_the_latest_round(db):
     assert "Acme" in text
     buttons = {e.get("action_id"): e for e in blocks[1]["elements"]}
     assert "coord_confirm" not in buttons  # assigning confirms: the post has no Confirm button
-    assert buttons["coord_open_brief"]["url"].endswith(f"/interview/{interview.id}?brief={second.id}")
+    assert list(buttons) == ["coord_choose_caller"]  # Brief / Open are text links now
+    assert f"/interview/{interview.id}?brief={second.id}|Brief>" in blocks[0]["text"]["text"]
     select = buttons["coord_choose_caller"]
     values = [o["value"] for g in select["option_groups"] for o in g["options"]]
     assert values and all(v.startswith(f"{interview.id}:{second.id}:") for v in values)

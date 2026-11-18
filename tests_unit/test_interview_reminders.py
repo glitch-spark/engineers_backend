@@ -1,4 +1,5 @@
-"""30-minute reminders: one reply per round in the day post's thread (Slack faked)."""
+"""30-minute reminders: one top-level message per round in the daily channel, recorded as the round's home (Slack
+faked)."""
 
 import os
 from datetime import date, datetime, time, timedelta, timezone
@@ -17,6 +18,7 @@ from app.interview_day import reminders
 from app.models import Account, Interview, SlackAlertLog, UserExtra
 from app.models.interview import InterviewCaller, InterviewStageEvent
 from app.models.interview_day_post import InterviewDayPost
+from app.models.round_slack_post import RoundSlackPost
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -54,7 +56,7 @@ async def db():
     database = AsyncMongoMockClient()["reminders-unit"]
     await init_beanie(
         database=database,
-        document_models=[Interview, UserExtra, Account, SlackAlertLog, InterviewDayPost],
+        document_models=[Interview, UserExtra, Account, SlackAlertLog, InterviewDayPost, RoundSlackPost],
     )
     return database
 
@@ -90,7 +92,7 @@ async def test_self_and_caller_rounds_both_reminded(slack):
     await add("CallerCo", chi(9, 25))
     assert await reminders.run_round_reminders(now) == {"sent": 2, "failed": 0}
     posts = slack.posts()
-    assert [p["thread_ts"] for p in posts] == ["77.1", "77.1"]
+    assert all("thread_ts" not in p for p in posts)  # top-level even though the day post exists
     assert all(p["channel"] == "C_DAILY" for p in posts)
     first = posts[0]["blocks"][0]["text"]["text"]
     assert "Starting in 20 min" in first and "SelfCo" in first
@@ -163,30 +165,39 @@ async def test_off_when_daily_channel_not_configured(slack, monkeypatch):
     assert slack.calls == []
 
 
-async def test_lost_day_post_falls_back_to_top_level(slack):
-    await day_post()
-    await add("Acme", chi(9, 20))
-    slack.errors["chat.postMessage"] = ["thread_not_found"]
+async def test_sent_reminder_is_recorded_as_the_rounds_home(slack):
+    iv = await add("Acme", chi(9, 20))
     assert await reminders.run_round_reminders(chi(9)) == {"sent": 1, "failed": 0}
-    first, second = slack.posts()
-    assert first["thread_ts"] == "77.1" and "thread_ts" not in second
+    (h,) = await RoundSlackPost.find_all().to_list()
+    entry = iv.stageHistory[0]
+    assert (h.roundId, h.interviewId, h.channel, h.ts) == (entry.id, str(iv.id), "C_DAILY", "9.1")
+    assert h.startEpoch == int(chi(9, 20).timestamp())
 
 
-async def test_round_just_after_midnight_threads_under_its_own_days_post(slack):
-    # Reminded at 23:40 for a 00:10 round: today's post is the wrong thread, tomorrow's is the right one.
-    await day_post()
-    tomorrow = DAY + timedelta(days=1)
-    await InterviewDayPost(day=tomorrow.isoformat(), channel="C_DAILY", ts=["88.1"], interviewIds=[]).insert()
-    await add("Night", chi(0, 10).replace(day=tomorrow.day))
-    assert await reminders.run_round_reminders(chi(23, 40)) == {"sent": 1, "failed": 0}
-    assert slack.posts()[0]["thread_ts"] == "88.1"
+async def test_rescheduled_round_gets_a_new_home(slack):
+    iv = await add("Acme", chi(10))
+    await reminders.run_round_reminders(chi(9, 35))
+    iv.stageHistory[0].scheduledAt = chi(11).astimezone(timezone.utc)
+    await iv.save()
+    await reminders.run_round_reminders(chi(10, 31))
+    homes = sorted((h.startEpoch, h.ts) for h in await RoundSlackPost.find_all().to_list())
+    assert homes == [(int(chi(10).timestamp()), "9.1"), (int(chi(11).timestamp()), "9.2")]
 
 
-async def test_round_after_midnight_without_its_post_yet_is_posted_top_level(slack):
-    await day_post()  # only today's post exists; the next one is made at 05:00
-    await add("Night", chi(0, 10).replace(day=DAY.day + 1))
-    assert await reminders.run_round_reminders(chi(23, 40)) == {"sent": 1, "failed": 0}
-    assert "thread_ts" not in slack.posts()[0]
+async def test_failed_post_records_no_home(slack):
+    await add("Acme", chi(9, 20))
+    slack.errors["chat.postMessage"] = ["ratelimited"]
+    await reminders.run_round_reminders(chi(9))
+    assert await RoundSlackPost.find_all().to_list() == []
+
+
+async def test_failing_home_record_still_counts_the_reminder_sent(slack, monkeypatch):
+    async def broken(*a, **k):
+        raise RuntimeError("mongo down")
+
+    monkeypatch.setattr(reminders, "record_home", broken)
+    await add("Acme", chi(9, 20))
+    assert await reminders.run_round_reminders(chi(9)) == {"sent": 1, "failed": 0}
 
 
 async def test_a_failing_release_does_not_skip_the_rest_of_the_tick(slack, monkeypatch):
