@@ -5,13 +5,13 @@ from __future__ import annotations
 from datetime import date as date_cls, datetime
 from typing import Annotated, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 
 from app.applications.rows import interview_outcome
 from app.applications.sync import BACKFILL_SINCE
 from app.applications.window import response_window
 from app.dashboard_stats import app_tz
-from app.deps import get_current_user
+from app.deps import get_current_user, require_admin
 from app.models import Application, Interview, UserExtra
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
@@ -43,12 +43,10 @@ async def stats_tab(
 
 @router.get("/applications/coverage")
 async def applications_coverage(
-    user: Annotated[UserExtra, Depends(get_current_user)],
+    _: Annotated[UserExtra, Depends(require_admin)],
     since: date_cls = Query(BACKFILL_SINCE, description="YYYY-MM-DD: rows applied on or after this day"),
 ) -> dict:
     """Admin debug view of the `applications` table: how much of the data is tied to jobs and interviews."""
-    if user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
     since_dt = datetime(since.year, since.month, since.day)
     apps = Application.get_motor_collection()
     rows = [d async for d in apps.find({"appliedAt": {"$gte": since_dt}}, {"key": 1, "board": 1, "interviewId": 1})]

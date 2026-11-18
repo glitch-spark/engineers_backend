@@ -10,13 +10,14 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.applications import sync
 from app.models import Account, Application, Bid, Interview, ResumeApplication
+from app.models.bidder import Bidder
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
     pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
 ]
 
-ACC, OWN = ObjectId(), ObjectId()
+ACC, OWN, BIDDER = ObjectId(), ObjectId(), ObjectId()
 T0 = datetime(2026, 9, 1, 10)
 SINCE = date(2026, 8, 1)
 URL = "https://jobs.acme.com/1"
@@ -25,7 +26,7 @@ URL = "https://jobs.acme.com/1"
 @pytest.fixture
 async def db(monkeypatch):
     database = AsyncMongoMockClient()["apps-unit"]
-    await init_beanie(database=database, document_models=[Application, Bid, ResumeApplication, Interview, Account])
+    await init_beanie(database=database, document_models=[Application, Bid, ResumeApplication, Interview, Account, Bidder])
 
     async def loop_upsert(coll, ops):  # mongomock cannot bulk_write
         for k, u in ops:
@@ -39,13 +40,16 @@ async def db(monkeypatch):
 
     monkeypatch.setattr(sync, "_bulk_upsert", counting_upsert)
     await database["accounts"].insert_one({"_id": ACC, "region": "EU", "createdAt": datetime(2026, 8, 1)})
+    await database["bidders"].insert_one({"_id": BIDDER, "createdBy": OWN, "name": "B", "profileId": ACC, "rate": 1,
+                                          "screenshotFolderUrl": "f"})
     return database
 
 
 async def add_bid(db, url=URL, at=T0, **kw):
-    doc = {"_id": ObjectId(), "kind": "bidder", "bidderId": ObjectId(), "accountId": ACC, "ownerId": OWN,
-           "jobKey": f"f/2026-09-01/p/{ObjectId()}", "jobUrl": url, "firstAt": at, "status": "approved",
-           "createdAt": at, "updatedAt": at, **kw}
+    """Production shape (app/bids/records.py): a bidder bid has no accountId; its profile is its Bidder's."""
+    doc = {"_id": ObjectId(), "kind": "bidder", "bidderId": BIDDER, "ownerId": OWN,
+           "jobKey": f"f/2026-09-01/p/{ObjectId()}", "jobUrl": url, "firstAt": at, "status": "pending",
+           "createdAt": at, "updatedAt": at, "screenshots": [], **kw}
     await db["bids"].insert_one(doc)
     return doc
 
@@ -172,8 +176,8 @@ async def test_incremental_cross_profile_link_matches_once(db, touch):
     acc_c = await _cross_profile(db)
     assert await _holders(db) == {acc_c}
     cp = datetime(2026, 9, 20)
-    coll, who = ("bids", ACC) if touch == "A" else ("resumeapplications", acc_c)
-    await db[coll].update_many({"accountId": who}, {"$set": {"updatedAt": cp + timedelta(hours=1)}})
+    coll, who = ("bids", {"bidderId": BIDDER}) if touch == "A" else ("resumeapplications", {"accountId": acc_c})
+    await db[coll].update_many(who, {"$set": {"updatedAt": cp + timedelta(hours=1)}})
     await sync.incremental(cp)
     assert await _holders(db) == {acc_c}
 
@@ -209,3 +213,89 @@ async def test_full_rebuild_timeout_keeps_last_full_and_retries_after_hour(db, m
     assert "rows" in out and "incremental" not in out
     st = await db["app_settings"].find_one({"_id": "applications_sync"})
     assert st["lastFull"] == t1 + timedelta(minutes=70)
+
+
+# ---- bidder bids: profile = Bid.accountId, else the Bidder's profileId ----
+
+async def test_bidder_bid_and_tailored_resume_same_profile_one_row(db):
+    b = await add_bid(db, at=T0 + timedelta(hours=1))
+    r = await add_resume(db, url=URL + "?utm_source=li")
+    iv = await add_interview(db)
+    c = await sync.full_rebuild(SINCE, apply=True)
+    assert c == {"rows": 1, "matched": 1, "unmatched": 0, "noLink": 0, "deleted": 0}
+    row = await db["applications"].find_one({})
+    assert row["key"] == f"{ACC}:jobs.acme.com/1" and row["accountId"] == ACC and row["region"] == "EU"
+    assert row["by"] == "bidder" and row["bidderId"] == BIDDER and row["appliedAt"] == T0
+    assert row["interviewId"] == iv["_id"]
+    assert row["sources"] == [f"bid:{b['_id']}", f"resume:{r['_id']}"]
+
+
+async def test_bidder_without_profile_keeps_source_key(db):
+    lone = ObjectId()
+    await db["bidders"].insert_one({"_id": lone, "createdBy": OWN, "name": "L", "rate": 1, "screenshotFolderUrl": "f"})
+    b = await add_bid(db, bidderId=lone)
+    await sync.full_rebuild(SINCE, apply=True)
+    assert [d["key"] for d in await db["applications"].find({}).to_list(None)] == [f"src:bids:{b['_id']}"]
+
+
+async def test_incremental_bidder_bid_rebuilds_only_its_profile(db, monkeypatch):
+    acc2, lone = ObjectId(), ObjectId()
+    await db["accounts"].insert_one({"_id": acc2, "region": "US", "createdAt": datetime(2026, 8, 1)})
+    await db["bidders"].insert_one({"_id": lone, "createdBy": OWN, "name": "L", "rate": 1, "screenshotFolderUrl": "f"})
+    await add_resume(db, url="https://other.com/1", accountId=acc2)
+    await add_bid(db, url="https://jobs.lone.com/1", bidderId=lone)  # no profile: never in the touched set
+    b = await add_bid(db)
+    await add_resume(db)
+    await sync.full_rebuild(SINCE, apply=True)
+    cp = datetime(2026, 9, 20)
+    await db["bids"].update_many({}, {"$set": {"updatedAt": cp + timedelta(hours=1)}})
+    seen, real = [], sync._sync
+
+    async def spy(since, account_ids, **kw):
+        seen.append(account_ids)
+        return await real(since, account_ids, **kw)
+
+    monkeypatch.setattr(sync, "_sync", spy)
+    out = await sync.incremental(cp)
+    assert seen == [[ACC]] and out["rows"] == 1
+    row = await db["applications"].find_one({"accountId": ACC})
+    assert row["by"] == "bidder" and f"bid:{b['_id']}" in row["sources"]
+    assert await db["applications"].count_documents({}) == 3
+
+
+async def test_bid_job_title_used_for_bid_only_rows(db):
+    await add_bid(db, jobKey="f/2026-09-01/p/acme_frontend-dev", jobTitle="Senior Backend Engineer")
+    await sync.full_rebuild(SINCE, apply=True)
+    row = await db["applications"].find_one({})
+    assert row["title"] == "Senior Backend Engineer" and row["area"] == "Backend"
+
+
+async def test_full_rebuild_failure_records_attempt_and_falls_back_to_incremental(db, monkeypatch, caplog):
+    t0 = datetime(2026, 9, 20, 12)
+    await add_bid(db)
+    await sync.run_applications_tick(t0)
+
+    async def boom(*a, **k):
+        raise ValueError("bad interview doc")
+
+    monkeypatch.setattr(sync, "full_rebuild", boom)
+    t1 = t0 + timedelta(hours=25)
+    assert await sync.run_applications_tick(t1) == {"error": "failed"}
+    assert "stage=full_rebuild" in caplog.text and "bad interview doc" in caplog.text
+    st = await db["app_settings"].find_one({"_id": "applications_sync"})
+    assert st["lastFull"] == t0 and st["lastFullAttempt"] == t1 and st["checkpoint"] == t0
+    assert (await sync.run_applications_tick(t1 + timedelta(minutes=5))).get("incremental") is True
+
+
+async def test_backfill_script_apply_seeds_sync_state(db):
+    from scripts.build_applications import build
+
+    await add_bid(db)
+    await build(SINCE, apply=False)
+    assert await db["app_settings"].count_documents({}) == 0
+    t = datetime(2026, 9, 20, 12)
+    counts = await build(SINCE, apply=True, start=t)
+    assert counts["rows"] == 1 and await db["applications"].count_documents({}) == 1
+    st = await db["app_settings"].find_one({"_id": "applications_sync"})
+    assert st["checkpoint"] == t and st["lastFull"] == t
+    assert (await sync.run_applications_tick(t + timedelta(minutes=5))).get("incremental") is True

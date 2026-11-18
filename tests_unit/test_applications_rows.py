@@ -5,6 +5,8 @@ from bson import ObjectId
 
 from app.applications.rows import board_of, build_rows, interview_outcome, match_interviews
 
+# build_rows takes bids with their *resolved* profile in accountId (the sync resolves bidder bids via Bidder.profileId).
+
 ACC, OWN = ObjectId(), ObjectId()
 T0 = datetime(2026, 9, 1, 10)
 
@@ -46,7 +48,7 @@ def test_bidder_and_resume_merge_one_row_bidder_wins():
     assert len(rows) == 1
     row = next(iter(rows.values()))
     assert row["by"] == "bidder" and row["bidderId"] == b["bidderId"] and row["appliedAt"] == T0
-    assert row["score"] == 80 and row["region"] == "EU" and row["sources"] == ["bid", "resume"]
+    assert row["score"] == 80 and row["region"] == "EU" and row["sources"] == [f"bid:{b['_id']}", f"resume:{r['_id']}"]
     assert row["board"] == "acme.com"
 
 
@@ -179,3 +181,22 @@ def test_profile_age_clamped_and_bid_key_fallback():
     b1, b2 = bid(), bid(at=T0 + timedelta(days=1))
     b1["jobKey"], b2["jobKey"] = "f/d/p/halcyon_6252121004", "f/d/p/acme_backend-engineer"
     assert next(iter(build_rows([b1, b2], [], {}).values()))["title"] == "backend engineer"
+
+
+def test_sources_hold_every_merged_id():
+    b1, b2 = bid(), bid(at=T0 + timedelta(days=1))
+    r1, r2 = resume(), resume(at=T0 + timedelta(days=2))
+    row = next(iter(build_rows([b2, b1], [r2, r1], {}).values()))
+    assert row["sources"] == [f"bid:{x['_id']}" for x in (b1, b2)] + [f"resume:{x['_id']}" for x in (r1, r2)]
+
+
+def test_title_priority_resume_then_bid_job_title_then_job_key():
+    b1, b2 = bid(), bid(at=T0 + timedelta(days=1))
+    b1["jobKey"], b1["jobTitle"] = "f/d/p/acme_frontend-dev", "  "
+    b2["jobTitle"] = "Senior Backend Engineer\nAcme"
+    row = next(iter(build_rows([b1, b2], [], {}).values()))
+    assert (row["title"], row["area"]) == ("Senior Backend Engineer", "Backend")
+    row = next(iter(build_rows([b1, b2], [resume(jobDescription="QA Engineer")], {}).values()))
+    assert row["title"] == "QA Engineer"
+    b2["jobTitle"] = None
+    assert next(iter(build_rows([b1, b2], [], {}).values()))["title"] == "frontend dev"

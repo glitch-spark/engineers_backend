@@ -163,3 +163,9 @@ async def test_coverage_counts(db):
     assert out["byBoard"] == [{"board": "greenhouse.io", "rows": 2}]
     assert out["window"]["thin"] is True
     assert out["lastSync"] == {"checkpoint": "2026-09-01T10:00:00", "lastFull": "2026-09-01T10:00:00"}
+
+
+async def test_coverage_non_admin_403_before_query_validation(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io", role="staff").insert()
+    async with await _client(ana) as c:
+        assert (await c.get("/stats/applications/coverage?since=nope")).status_code == 403
