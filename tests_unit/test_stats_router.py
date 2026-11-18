@@ -111,3 +111,12 @@ async def test_earnings_tab_served(db):
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     out = await _call(ana, tab="earnings")
     assert out["tab"] == "earnings"
+
+
+async def test_ai_usage_tab_served(db):
+    from app.models import AiUsageEvent
+    await init_beanie(database=AsyncMongoMockClient()["stats-router-ai"], document_models=[
+        UserExtra, Account, DailyPlan, Interview, InterviewQuestion, Bid, Bidder, WeeklyPlan, AiUsageEvent])
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    out = await _call(ana, tab="ai-usage")
+    assert out["tab"] == "ai-usage"
