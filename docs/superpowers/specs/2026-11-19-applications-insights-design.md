@@ -95,8 +95,11 @@ Header: the existing you-vs-team cards (unchanged). Below, in order:
 3. **What kind of job works** — per-100 by job site, resume score, job area and profile age (the subject's and the
    team's side by side; groups with < 30 matured applications show "too few"; Unknown area shown with its count).
 4. **What to change** — suggestions per profile from the pattern table.
-5. **Winning vs losing profiles** — team top 3 vs bottom 3 by matured per-100 (≥ 100 matured each): region, avg score,
-   prompt / template, top boards, median days, self/bidder mix.
+5. **Winning vs losing profiles** — team's 3 best vs 3 weakest by matured per-100 (≥ 150 matured bids each), **named
+   with their owners, visible to everyone** (user decision 2026-11-19): matured bids · interviews per group; region; avg
+   resume score (with scored-bid count); most-bid job areas as shares (with "area known for N%"); profile age when
+   bidding (median); most-bid job sites as shares; median days to interview (with interview count; "too few" under 10);
+   self / bidder bid mix. A note says these are patterns, not proof.
 6. **When to bid** — per-100 by weekday and by 3-hour block of `appliedAt` (app timezone).
 7. **Bidder quality** (owners and admins) — per bidder: bids, matured per-100, rejected share.
 
