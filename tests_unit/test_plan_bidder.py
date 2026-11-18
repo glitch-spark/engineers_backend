@@ -155,3 +155,16 @@ async def test_review_and_upload_call_it(db, monkeypatch):
         r = await cl.post("/bids/review", json={"ids": [str(x.id) for x in (a, b, c)], "status": "approved"})
         assert r.status_code == 200, r.text
     assert sorted(calls) == [(pedro.id, DAY), (pedro.id, DAY + timedelta(days=1))]
+
+
+async def test_created_plan_is_not_counted_as_logged(db):
+    """A bidder upload's plan stores loggedAt: None, so reports / dashboard don't read it as a legacy logged day."""
+    from app.routers import dashboard, reports
+
+    pedro = await UserExtra(name="P", email="p@x.io").insert()
+    await bid(await bidder_of(pedro), 10)
+    await plan_bidder.write_through_bidder(pedro.id, DAY)
+    p = await plan(pedro)
+    assert "loggedAt" in p and p["loggedAt"] is None
+    assert await reports._last_logged([pedro.id], datetime(2026, 11, 30)) == {}
+    assert await DailyPlan.get_motor_collection().count_documents({"userId": pedro.id, **dashboard._LOGGED_OR_LEGACY}) == 0

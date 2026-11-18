@@ -286,3 +286,14 @@ async def test_no_post_until_submitted():
     with patch.object(daily_plans, "sync_daily_plan_message", AsyncMock()) as sync:
         await daily_plans._sync_slack(plan, _owner(), Counts(), {})
     sync.assert_not_awaited()
+
+
+def test_done_count_without_value_shows_done():
+    """A migrated ticked line with no number to carry over: done, no value."""
+    items = [_e("Calls", "count", "routine", None, ItemResult(done=True)),
+             _e("Prep", "hours", "routine", 2, ItemResult(done=True)),
+             _e("Mail", "count", "goal", None, ItemResult(done=True), iid="m")]
+    text = daily_plan_text(_plan(), _owner(), items=items, progress={"m": {"value": 0, "done": True, "target": None}})
+    assert "   Calls             ✅" in text
+    assert "   Prep              ✅" in text
+    assert "   Mail              ✅ done today" in text

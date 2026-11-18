@@ -415,6 +415,8 @@ def _bids_line(label: str, field: str, done: Any, targets: Any, regions: bool = 
 def _item_line(e: dict, progress: dict) -> Optional[str]:
     item, result = e["item"], e["result"]
     hours = item.kind == "hours"
+    if item.kind != "check" and result and result.done and result.value is None:
+        return _plan_line(item.text, "✅" if e["scope"] == "routine" else "✅ done today")  # migrated, no number
     if e["scope"] == "routine":
         result = result or ItemResult()  # planned but not reported: shows as short
         if item.kind == "check":

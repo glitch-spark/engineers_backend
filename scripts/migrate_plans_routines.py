@@ -5,10 +5,14 @@ Run once after deploying routines:
   python -m scripts.migrate_plans_routines --apply
 
 Weekly plans: dailyGoalItems -> routines; goalItems that match no routine -> weeklyGoals.
-Daily plans: each goalItems line -> results[id] of the matching routine / goal (done kept); an unmatched line is
-appended to that week's weeklyGoals; targetOverride = the day's stored goal when it has bids; submittedAt = loggedAt.
+Daily plans (old shapes folded first): each goalItems line -> results[id] of the matching routine / goal (done kept;
+a ticked count / hours line with a target gets value = target); an unmatched line is appended to that week's
+weeklyGoals; targetOverride = the day's stored goal when it has bids, else the week's legacy dailyGoal when it has
+bids; submittedAt = loggedAt.
 Lines match on casefold + collapsed whitespace + trailing '.' / ':' stripped. Numbers stay in the text.
-Idempotent: weekly plans that have `routines` and daily plans that have `results` are skipped.
+Several weekly plans for one (user, week): the most recently updated one (what the app reads) is migrated.
+Idempotent: lines already in the week (by text) and results the day already has are left as they are, so weeks
+and days saved after deploy still get their legacy lines.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
 from app.alerts import app_week_key  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.models.plan_common import BID_FIELDS, ItemResult, PlanItem, monday_of  # noqa: E402
+from app.models.daily_plan import fold_legacy_daily  # noqa: E402
 from app.models.weekly_plan import fold_legacy_weekly  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -61,35 +66,51 @@ def _lines(doc: dict, field: str) -> list[dict]:
     return [i for i in doc.get(field) or [] if isinstance(i, dict) and str(i.get("text") or "").strip()]
 
 
+def _result(item: dict, done: bool) -> dict:
+    """A ticked count / hours line with a target is done at it (value = target); else just the done flag."""
+    if done and item["kind"] != "check" and item.get("target"):
+        return ItemResult(done=True, value=item["target"], target=item["target"]).model_dump()
+    return ItemResult(done=done).model_dump()
+
+
 async def migrate(apply: bool, database=None) -> dict:
     if database is None:
         database = AsyncIOMotorClient(get_settings().MONGODB_URI).get_default_database()
     daily, weekly = database["dailyplans"], database["weeklyplans"]
     counts = Counter(weeklyMigrated=0, dailyMigrated=0, unmatchedLinesToGoals=0, weeksCreated=0, skipped=0,
-                     droppedDoneWeeklyGoals=0)
+                     droppedDoneWeeklyGoals=0, duplicateWeeks=0)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    # (userId, Monday date) -> {"routines", "goals", "dirty", "id" | "new": doc to insert}
-    weeks: dict[tuple, dict] = {}
-    async for doc in weekly.find({}):
+    # One plan per (userId, Monday date), the one plan_auto.weekly_plans_for reads: the most recently updated
+    # (a document without updatedAt reads as updated now there, so it wins here too).
+    chosen: dict[tuple, dict] = {}
+    for doc in sorted([d async for d in weekly.find({})], key=lambda d: d.get("updatedAt") or datetime.max):
         start = fold_legacy_weekly(doc).get("weekStart")
         key = (doc["userId"], start.date() if start else None)
-        if "routines" in doc:
-            counts["skipped"] += 1
-            weeks.setdefault(key, {"routines": doc["routines"], "goals": doc.get("weeklyGoals") or [], "id": doc["_id"], "dirty": False})
-            continue
-        routines = [parse_item(i["text"]).model_dump() for i in _lines(doc, "dailyGoalItems")]
-        known = {_key(r["text"]) for r in routines}
-        goals = []
-        for line in _lines(doc, "goalItems"):
-            counts["droppedDoneWeeklyGoals"] += bool(line.get("done"))
-            if _key(line["text"]) not in known:
-                known.add(_key(line["text"]))
-                goals.append(parse_item(line["text"]).model_dump())
-        counts["weeklyMigrated"] += 1
-        weeks.setdefault(key, {"routines": routines, "goals": goals, "id": doc["_id"], "dirty": True})
+        counts["duplicateWeeks"] += key in chosen
+        chosen[key] = doc
 
-    days = [d async for d in daily.find({"results": {"$exists": False}}).sort("date", 1)]
+    # key -> {"routines", "goals", "dailyGoal", "dirty", "id" | "new": doc to insert}. Legacy lines are added to
+    # what the week already has (saved after deploy, or migrated before) unless their text is already there.
+    weeks: dict[tuple, dict] = {}
+    for key, doc in chosen.items():
+        routines, goals = list(doc.get("routines") or []), list(doc.get("weeklyGoals") or [])
+        known = {_key(i["text"]) for i in routines + goals}
+        added = 0
+        for field, into in (("dailyGoalItems", routines), ("goalItems", goals)):
+            for line in _lines(doc, field):
+                if field == "goalItems" and "routines" not in doc:
+                    counts["droppedDoneWeeklyGoals"] += bool(line.get("done"))
+                if _key(line["text"]) not in known:
+                    known.add(_key(line["text"]))
+                    into.append(parse_item(line["text"]).model_dump())
+                    added += 1
+        dirty = bool(added) or "routines" not in doc
+        counts["weeklyMigrated" if dirty else "skipped"] += 1
+        weeks[key] = {"routines": routines, "goals": goals, "id": doc["_id"], "dirty": dirty,
+                      "dailyGoal": doc.get("dailyGoal") or {}}
+
+    days = [fold_legacy_daily(d) async for d in daily.find({}).sort("date", 1)]
 
     # A week with day lines but no weekly plan: create it. Lines on >= 2 of its days are routines, the rest goals.
     by_week: dict[tuple, list] = {}
@@ -112,6 +133,7 @@ async def migrate(apply: bool, database=None) -> dict:
         weeks[key] = {
             "routines": [items[k] for k in seen if len(seen[k]) >= 2],
             "goals": [items[k] for k in seen if len(seen[k]) < 2],
+            "dailyGoal": {},
             "dirty": True,
             "new": {"userId": key[0], "weekStart": start, "year": year, "weekNumber": week_number,
                     "startDate": start, "endDate": start + timedelta(days=7) - timedelta(milliseconds=1),
@@ -120,10 +142,12 @@ async def migrate(apply: bool, database=None) -> dict:
         }
         counts["weeksCreated"] += 1
 
+    # Days: each legacy line maps to its routine / goal unless the day already has a result for it (saved after
+    # deploy, or migrated before).
     day_updates = []
     for doc in days:
         week = weeks.get((doc["userId"], monday_of(doc["date"].date())))
-        results: dict = {}
+        results = dict(doc.get("results") or {})
         for line in _lines(doc, "goalItems"):
             match = next((i for i in week["routines"] + week["goals"] if _key(i["text"]) == _key(line["text"])), None)
             if match is None:
@@ -131,15 +155,21 @@ async def migrate(apply: bool, database=None) -> dict:
                 week["goals"].append(match)
                 week["dirty"] = True
                 counts["unmatchedLinesToGoals"] += 1
-            results[match["id"]] = ItemResult(done=bool(line.get("done"))).model_dump()
-        to_set = {"results": results, "updatedAt": now}
-        goal = doc.get("goal") or {}
-        if any(goal.get(f) for f in BID_FIELDS) and not doc.get("targetOverride"):
-            to_set["targetOverride"] = goal
+            results.setdefault(match["id"], _result(match, bool(line.get("done"))))
+        to_set: dict = {}
+        if results != (doc.get("results") or {}) or "results" not in doc:
+            to_set["results"] = results
+        if not doc.get("targetOverride"):
+            # The day's own goal, else the week's legacy daily goal (what the day showed before routines).
+            for goal in (doc.get("goal") or {}, (week or {}).get("dailyGoal") or {}):
+                if any(goal.get(f) for f in BID_FIELDS):
+                    to_set["targetOverride"] = goal
+                    break
         if doc.get("loggedAt") and not doc.get("submittedAt"):
             to_set["submittedAt"] = doc["loggedAt"]
-        counts["dailyMigrated"] += 1
-        day_updates.append((doc["_id"], to_set))
+        if to_set:
+            counts["dailyMigrated"] += 1
+            day_updates.append((doc["_id"], {**to_set, "updatedAt": now}))
 
     if apply:
         # Weeks first: a crash between the two leaves days unmigrated (a rerun maps them to the stored week ids),

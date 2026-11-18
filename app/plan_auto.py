@@ -109,10 +109,18 @@ def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dic
 
 
 def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[int, int]:
-    """(done, total) over the day's items with a result: done = ticked, or value at / over its target."""
+    """(done, total) over the day's routines with a result (done = ticked, or value at / over its target) and its
+    weekly goals touched that day like the standup post lists them (in focus, ticked or a value; done = either)."""
     done = total = 0
+    focus = set(plan.focus) if plan is not None else set()
     for e in day_items(weekly, plan, day):
         r = e["result"]
+        if e["scope"] == "goal":
+            hit = r is not None and (r.done or (r.value or 0) > 0)
+            if hit or e["item"].id in focus:
+                total += 1
+                done += hit
+            continue
         if r is None:
             continue
         target = r.target if r.target is not None else e["item"].target

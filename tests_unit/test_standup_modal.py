@@ -270,3 +270,52 @@ async def test_closed_loading_view_is_log_only(me, slack, monkeypatch):
     monkeypatch.setattr(slack_bot, "_slack_api", api)
     await process_standup_click(SLACK_ID, "trig", "2026-11-10", RESPONSE_URL)
     assert slack.replies == []
+
+
+async def test_count_done_is_computed_by_the_server_same_from_app_and_slack(me, db, slack):
+    (review, contact), (goal,) = await week(me)
+    # The app sends done with values (old client: done derived on its side); the server decides done itself.
+    await put_day("2026-11-10", me, {"results": {review: {"done": True}, contact: {"value": 50, "done": False},
+                                                 goal: {"value": 10, "done": True}}})
+    app = (await stored(me, TUE)).results
+    await DailyPlan.find_one({"userId": me.id}).delete()
+    view = await build_view(me, TUE)
+    await process_standup_submission(state(view, **{f"item:{review}": True, f"item:{contact}": "50",
+                                                    f"item:{goal}": "10"}), SLACK_ID)
+    form = (await stored(me, TUE)).results
+    assert app == form
+    assert form[contact].done is True and form[contact].value == 50  # at its target
+    assert form[goal].done is False  # 10 of 250
+    assert form[review].done is True  # check items keep the sent done
+
+
+async def test_count_without_target_done_when_value_positive(me, db):
+    (_r, _c), (goal,) = await week(me, goals=[{"text": "Calls", "kind": "count"}])
+    await put_day("2026-11-10", me, {"results": {goal: {"value": 3}}})
+    assert (await stored(me, TUE)).results[goal].done is True
+    await put_day("2026-11-10", me, {"results": {goal: {"value": 0, "done": True}}})
+    assert (await stored(me, TUE)).results[goal].done is False
+
+
+async def test_migrated_done_without_value_survives_a_resave(me, db, slack):
+    (review, contact), _ = await week(me)
+    await put_day("2026-11-10", me, {"results": {contact: {"value": 1}}})
+    await DailyPlan.get_motor_collection().update_one(
+        {"userId": me.id}, {"$set": {f"results.{contact}": {"done": True, "value": None, "target": None}}})
+    view = await build_view(me, TUE)
+    await process_standup_submission(state(view, **{f"item:{review}": True}), SLACK_ID)
+    assert (await stored(me, TUE)).results[contact].done is True
+
+
+async def test_archived_item_with_result_is_read_only_and_kept(me, db, slack):
+    (review, contact), (goal,) = await week(me)
+    await put_day("2026-11-10", me, {"results": {contact: {"value": 12}}})
+    await put_week(WEEK, me, {"goal": {"bidsSelf": 100, "bidsBidder": 50},
+                              "routines": [{"id": review, "text": "Bidder review"}],
+                              "weeklyGoals": [{"id": goal, "text": "Email outreach", "kind": "count", "target": 250}],
+                              "recapNotes": ""})
+    view = await build_view(me, TUE)
+    assert f"item:{contact}" not in by_id(view)
+    assert "Citizen contact (removed)" in json.dumps(view["blocks"])
+    await process_standup_submission(state(view), SLACK_ID)
+    assert (await stored(me, TUE)).results[contact].value == 12

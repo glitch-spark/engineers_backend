@@ -49,7 +49,7 @@ async def write_through_bidder(owner_id, day: date) -> None:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         year, week_number, _key = app_week_key(_midnight(day))
         update = {"$set": {"done.bidsBidder": n, "updatedAt": now},
-                  "$setOnInsert": {"year": year, "weekNumber": week_number, "createdAt": now}}
+                  "$setOnInsert": {"year": year, "weekNumber": week_number, "createdAt": now, "loggedAt": None}}
         try:
             await coll.update_one(key, update, upsert=True)
         except DuplicateKeyError:  # a concurrent first write created the plan between the upsert's find and insert

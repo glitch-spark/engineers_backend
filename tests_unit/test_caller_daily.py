@@ -6,6 +6,8 @@ from datetime import date, datetime, time, timezone
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
@@ -19,6 +21,13 @@ DAY = date(2026, 10, 7)
 
 def chi(d, hh, mm=0):
     return datetime(d.year, d.month, d.day, hh, mm, tzinfo=CHI)
+
+
+@pytest.fixture(autouse=True)
+def _no_standup_nudge():
+    """The tick also runs the 6 PM standup nudge: stubbed so these tests never reach Slack or the database."""
+    with patch("app.standup.nudge.run_standup_nudge", AsyncMock(return_value="off")):
+        yield
 
 
 # --- due / bounds ---------------------------------------------------------------------------------
@@ -82,7 +91,8 @@ def test_alert_tick_survives_a_failing_refresh():
         patch("app.interview_day.post.refresh_today", AsyncMock(side_effect=RuntimeError("slack down"))),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 3, "caller_daily": "already_sent", "after_call_asks": 0, "result_reminders": 0}
+    assert out == {"caller_reminders": 3, "caller_daily": "already_sent", "after_call_asks": 0, "result_reminders": 0,
+                   "standup_nudge": "off"}
 
 
 def test_alert_tick_sends_no_dms():
@@ -94,7 +104,8 @@ def test_alert_tick_sends_no_dms():
         patch.object(slack_bot, "send_dm", send),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 2, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0}
+    assert out == {"caller_reminders": 2, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0,
+                   "standup_nudge": "off"}
     send.assert_not_awaited()
 
 
@@ -114,5 +125,6 @@ def test_alert_tick_survives_reminder_crash():
         patch("app.interview_day.post.run_day_post", day_post),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 0, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0}
+    assert out == {"caller_reminders": 0, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0,
+                   "standup_nudge": "off"}
     day_post.assert_awaited_once()

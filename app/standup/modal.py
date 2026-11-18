@@ -67,6 +67,11 @@ def _number_input(block_id: str, label: str, value, hint: str = "", *, decimal: 
 def _item_block(e: dict, progress: dict) -> dict:
     result = e["result"] or {}
     unit = "h" if e["kind"] == "hours" else ""
+    if e["archived"]:  # removed from the week but holds a result: shown, not editable (resent by _keep_unshown)
+        v = result.get("value")
+        shown = f"{_fmt(v)}{unit}" if e["kind"] != "check" and v is not None else \
+            "done" if result.get("done") else "not done"
+        return {"type": "context", "elements": [_plain(_short(f"{e['text']} (removed) · {shown}", 2000))]}
     if e["kind"] == "check":
         option = {"text": _plain("Done today" if e["scope"] == "goal" else "Done"), "value": "done"}
         element = {"type": "checkboxes", "action_id": "check", "options": [option]}

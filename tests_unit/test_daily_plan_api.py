@@ -224,10 +224,10 @@ async def test_reports_items_counts(me):
         review: {"done": False}, contact: {"value": 50}, goal: {"value": 10}}})
     await put_day(WED.isoformat(), me, {"results": {review: {"done": True}}})
     row = (await team_report(me, weekStart=WEEK))["users"][0]
-    assert (row["itemsDone"], row["itemsTotal"]) == (2, 4)
+    assert (row["itemsDone"], row["itemsTotal"]) == (3, 4)  # a touched weekly goal counts as done
     assert row["goal"]["bidsSelf"] == 100  # the week's goal, as before
     days = {d["date"]: d for d in (await get_week(WEEK, me, None))["days"]}
-    assert (days[TUE.isoformat()]["itemsDone"], days[TUE.isoformat()]["itemsTotal"]) == (1, 3)
+    assert (days[TUE.isoformat()]["itemsDone"], days[TUE.isoformat()]["itemsTotal"]) == (2, 3)
     assert days[TUE.isoformat()]["goal"]["bidsSelf"] == 20
 
 

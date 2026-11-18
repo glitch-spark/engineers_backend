@@ -171,3 +171,97 @@ async def test_crash_after_weekly_writes_then_rerun_keeps_ids_consistent():
     week, day = await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({})
     ids = {i["id"] for i in week["routines"] + week["weeklyGoals"]}
     assert day["results"] and set(day["results"]) <= ids
+
+
+async def test_ticked_count_line_gets_its_target_as_value_and_renders_done():
+    from types import SimpleNamespace
+
+    from app.plan_auto import day_items
+    from app.slack_bot import daily_plan_text
+
+    db = await _db()
+    await _setup(db, week=_week(dailyGoalItems=[{"text": "Send 50 emails", "done": False}]),
+                 day=_day(goalItems=[{"text": "Send 50 emails", "done": True}]))
+    await migrate(True, db)
+    week = WeeklyPlan.model_validate(await db["weeklyplans"].find_one({}))
+    plan = DailyPlan.model_validate(await db["dailyplans"].find_one({}))
+    rid = week.routines[0].id
+    assert (plan.results[rid].done, plan.results[rid].value, plan.results[rid].target) == (True, 50, 50)
+    text = daily_plan_text(plan, SimpleNamespace(name="A", email="a@x.io", slackUserId="U1"),
+                           items=day_items(week, plan, TUE.date()))
+    assert "Send 50 emails    50 / 50  ✅" in text
+
+
+async def test_ticked_count_line_without_target_stays_done():
+    db = await _db()
+    await _setup(db, week=_week(routines=[{"id": "r1", "text": "Send emails", "kind": "count", "target": None}],
+                                weeklyGoals=[]),
+                 day=_day(goalItems=[{"text": "send emails", "done": True}]))
+    await migrate(True, db)
+    day = await db["dailyplans"].find_one({})
+    assert day["results"]["r1"]["done"] is True and day["results"]["r1"]["value"] is None
+
+
+async def test_week_and_day_saved_after_deploy_still_get_legacy_lines():
+    db = await _db()
+    await _setup(db, week=_week(routines=[], weeklyGoals=[{"id": "g1", "text": "Ship the thing", "kind": "check"}],
+                                dailyGoalItems=[{"text": "Bidder Management", "done": False}],
+                                goalItems=[{"text": "Ship the thing", "done": False}]),
+                 day=_day(results={}, goalItems=[{"text": "Bidder management", "done": True},
+                                                {"text": "ship the thing", "done": True}]))
+    await migrate(True, db)
+    week, day = await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({})
+    assert [r["text"] for r in week["routines"]] == ["Bidder Management"]
+    assert [g["id"] for g in week["weeklyGoals"]] == ["g1"]  # matched by text, not added twice
+    rid = week["routines"][0]["id"]
+    assert day["results"][rid]["done"] is True and day["results"]["g1"]["done"] is True
+    counts = await migrate(True, db)  # still idempotent
+    assert counts["weeklyMigrated"] == counts["dailyMigrated"] == 0
+    assert (week, day) == (await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({}))
+
+
+async def test_day_result_already_saved_is_kept():
+    db = await _db()
+    await _setup(db, week=_week(routines=[{"id": "r1", "text": "Bidder Management", "kind": "check"}], weeklyGoals=[]),
+                 day=_day(results={"r1": {"done": False}}, goalItems=[{"text": "Bidder Management", "done": True}]))
+    await migrate(True, db)
+    assert (await db["dailyplans"].find_one({}))["results"]["r1"]["done"] is False
+
+
+async def test_duplicate_weeks_pick_the_one_the_app_reads():
+    db = await _db()
+    old, new = datetime(2026, 11, 9, 8), datetime(2026, 11, 9, 9)
+    await db["weeklyplans"].insert_many([
+        _week(dailyGoalItems=[{"text": "Newer", "done": False}], updatedAt=new),
+        _week(dailyGoalItems=[{"text": "Older", "done": False}], updatedAt=old),
+    ])
+    counts = await migrate(False, db)
+    assert counts["duplicateWeeks"] == 1
+    await migrate(True, db)
+    newer = await db["weeklyplans"].find_one({"updatedAt": {"$ne": old}})
+    assert [r["text"] for r in newer["routines"]] == ["Newer"]
+    older = await db["weeklyplans"].find_one({"dailyGoalItems.text": "Older"})
+    assert older["updatedAt"] == old and "routines" not in older
+    from app.plan_auto import weekly_plans_for
+    assert (await weekly_plans_for([USER], MON.date()))[USER].id == newer["_id"]
+
+
+async def test_old_shape_day_is_folded_before_reading_lines():
+    db = await _db()
+    await _setup(db, week=_week(dailyGoalItems=[{"text": "Bidder Management", "done": False}]),
+                 day={"userId": USER, "date": TUE, "year": 2026, "weekNumber": 46, "bidsHandsOn": 3,
+                      "todayItems": ["bidder management"], "createdAt": datetime(2026, 11, 10, 20)})
+    await migrate(True, db)
+    week, day = await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({})
+    assert day["results"] == {week["routines"][0]["id"]: {"done": True, "value": None, "target": None}}
+    assert day["submittedAt"] == datetime(2026, 11, 10, 20)
+
+
+async def test_empty_day_goal_falls_back_to_week_daily_goal():
+    db = await _db()
+    await _setup(db, week=_week(dailyGoal={"bidsSelf": 15, "bidsBidder": 0}, dailyGoalItems=[]),
+                 day=_day(goal={}, goalItems=[]))
+    await migrate(True, db)
+    plan = DailyPlan.model_validate(await db["dailyplans"].find_one({}))
+    weekly = WeeklyPlan.model_validate(await db["weeklyplans"].find_one({}))
+    assert day_targets(plan, weekly, TUE.date()).bidsSelf == 15  # not 50 / 5

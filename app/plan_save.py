@@ -60,8 +60,18 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
     def frozen(iid: str) -> Optional[float]:
         return old[iid].target if iid in old and old[iid].target is not None else items[iid]["item"].target
 
+    def done(iid: str, r: ItemResultIn) -> bool:
+        """Checks keep the sent done; counts / hours are done at their frozen target (any value without one). A
+        migrated done line without a value stays done until a value is typed."""
+        if items[iid]["item"].kind == "check":
+            return r.done
+        if r.value is None:
+            return bool(iid in old and old[iid].done and old[iid].value is None)
+        target = frozen(iid)
+        return r.value >= target if target else r.value > 0
+
     plan.results = {
-        iid: ItemResult(done=r.done, value=r.value, target=frozen(iid))
+        iid: ItemResult(done=done(iid, r), value=r.value, target=frozen(iid))
         for iid, r in body.results.items() if iid in items
     }
     plan.focus = [i for i in dict.fromkeys(body.focus) if i in items and items[i]["scope"] == "goal"]
@@ -71,7 +81,7 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
     elif weekly is not None:
         plan.targetOverride = day_targets(plan, weekly, when)
     if plan.targetOverride is not None:
-        plan.goal = Counts(**bids_of(plan.targetOverride))  # deprecated copy, still read by the standup post
+        plan.goal = Counts(**bids_of(plan.targetOverride))  # deprecated copy of the frozen targets (old-shape readers)
 
     if when >= plan_bidder.RELEASE_DAY:
         bidder = await plan_bidder.bidder_done(user.id, when)

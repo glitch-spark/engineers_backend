@@ -18,7 +18,7 @@ from mongomock_motor import AsyncMongoMockClient  # noqa: E402
 from app.models import DailyPlan, WeeklyPlan  # noqa: E402
 from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem  # noqa: E402
 from app.plan_auto import (  # noqa: E402
-    day_items, day_targets, draft_week, effective_daily_done, goal_progress, weekly_done,
+    day_items, day_targets, draft_week, effective_daily_done, goal_progress, items_tally, weekly_done,
 )
 
 UTC = ZoneInfo("UTC")
@@ -231,3 +231,16 @@ async def test_draft_week_uses_app_week_key(db):
     await _week(monday - timedelta(days=7), uid).insert()
     d = await draft_week(uid, monday)
     assert (d.year, d.weekNumber) == (2027, 2)
+
+
+def test_items_tally_counts_goals_only_when_touched():
+    """Routines with a result always count; weekly goals only when touched that day (in focus, done or value > 0),
+    like the standup post."""
+    r1, r2 = PlanItem(id="r1", text="Review"), PlanItem(id="r2", text="Calls", kind="count", target=5)
+    g = {k: PlanItem(id=k, text=k, kind="count", target=100) for k in ("untouched", "focus", "valued", "ticked")}
+    w = _week(routines=[r1, r2], weeklyGoals=list(g.values()))
+    p = _day_plan(focus=["focus"], results={
+        "r1": ItemResult(done=True), "r2": ItemResult(value=2, target=5),
+        "untouched": ItemResult(), "valued": ItemResult(value=3), "ticked": ItemResult(done=True)})
+    # routines: 1 of 2; goals: focus (not done), valued (done: value > 0), ticked (done); untouched left out
+    assert items_tally(w, p, MON) == (3, 5)
