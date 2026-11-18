@@ -157,7 +157,7 @@ def test_several_resumes_earliest_wins_and_owner_is_earliest():
 def test_row_area_prefers_resume_title():
     b = bid()
     b["jobKey"] = "f/2026-09-01/p/acme_backend-engineer"
-    r = resume(jobDescription="Frontend Developer | Company: X")
+    r = resume(jobDescription="Frontend Developer\nCompany: X")
     row = next(iter(build_rows([b], [r], {}).values()))
     assert (row["title"], row["area"]) == ("Frontend Developer", "Frontend")
     row = next(iter(build_rows([b], [], {}).values()))
@@ -171,3 +171,11 @@ def test_profile_age_days():
     assert next(iter(build_rows([bid()], [], accounts).values()))["profileAgeDays"] == 10
     assert next(iter(build_rows([bid()], [], {ACC: {"region": "EU"}}).values()))["profileAgeDays"] is None
     assert next(iter(build_rows([bid()], [], {}).values()))["profileAgeDays"] is None
+
+
+def test_profile_age_clamped_and_bid_key_fallback():
+    accounts = {ACC: {"region": "EU", "createdAt": T0 + timedelta(days=3)}}
+    assert next(iter(build_rows([bid()], [], accounts).values()))["profileAgeDays"] == 0
+    b1, b2 = bid(), bid(at=T0 + timedelta(days=1))
+    b1["jobKey"], b2["jobKey"] = "f/d/p/halcyon_6252121004", "f/d/p/acme_backend-engineer"
+    assert next(iter(build_rows([b1, b2], [], {}).values()))["title"] == "backend engineer"

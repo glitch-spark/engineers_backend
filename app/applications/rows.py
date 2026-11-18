@@ -43,7 +43,7 @@ def _key(account_id, url, coll: str, doc_id) -> tuple[str, Optional[str]]:
 def build_rows(bids: list[dict], resumes: list[dict], accounts: dict) -> dict[str, dict]:
     """One row per (accountId, job link); a bid and a tailored resume for the same job merge, the bidder wins `by`."""
     rows: dict[str, dict] = {}
-    bid_keys: dict[str, Optional[str]] = {}  # row key -> its earliest bid's jobKey, the title fallback
+    bid_keys: dict[str, list] = {}  # row key -> its bids' jobKeys (earliest first), the title fallback
 
     def row_for(key, jk, account_id, owner_id, url, at):
         r = rows.get(key)
@@ -67,7 +67,7 @@ def build_rows(bids: list[dict], resumes: list[dict], accounts: dict) -> dict[st
             r["bidStatus"] = st
         if "bid" not in r["sources"]:
             r["sources"].append("bid")
-            bid_keys[key] = b.get("jobKey")
+        bid_keys.setdefault(key, []).append(b.get("jobKey"))
 
     for ra in sorted((x for x in resumes if x.get("countsAsBid") is not False), key=lambda x: x["createdAt"]):
         key, jk = _key(ra.get("accountId"), ra.get("jobUrl"), "resumeapplications", ra["_id"])
@@ -82,10 +82,11 @@ def build_rows(bids: list[dict], resumes: list[dict], accounts: dict) -> dict[st
         r["sources"].append("resume")
 
     for key, r in rows.items():
-        r["title"] = r.get("title") or job_title(None, bid_keys.get(key))
+        r["title"] = r.get("title") or next(
+            (t for t in (job_title(None, k) for k in bid_keys.get(key, [])) if t), None)
         r["area"] = classify_area(r["title"])
         created = (accounts.get(r["accountId"]) or {}).get("createdAt")
-        r["profileAgeDays"] = (r["appliedAt"] - created).days if created else None
+        r["profileAgeDays"] = max(0, (r["appliedAt"] - created).days) if created else None
     return rows
 
 
