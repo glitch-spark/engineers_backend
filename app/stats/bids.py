@@ -9,10 +9,10 @@ from typing import Optional
 
 from app import interview_rates
 from app.stats import frame
+from app.stats.profile_data import idle_profiles, profile_last_bids
 
 SELF_SHARE_GAP = 0.15  # bad when the self share is this far below the team median share
 WEAK_DAY_RATIO = 0.6
-IDLE_DAYS = 7
 BEHIND_RATIO = 0.85
 _DAYS = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays"]
 
@@ -59,22 +59,6 @@ def weak_weekdays(per_weekday: dict[int, list[int]]) -> Optional[dict]:
         {"weekdays": sorted(weak), "lowAvg": mean(low), "otherAvg": mean(rest)}, (mean(rest) - mean(low)) * len(weak))
 
 
-def idle_profiles(profile_last_bid: dict[str, Optional[date]], today: date, names: Optional[dict] = None) -> Optional[dict]:
-    """`profile_last_bid` is keyed by profile id; `names` maps id -> display name (default: the id)."""
-    names = names or {}
-    ids = sorted(pid for pid, last in profile_last_bid.items() if last is None or (today - last).days >= IDLE_DAYS)
-    ids.sort(key=lambda pid: (names.get(pid, pid), pid))
-    idle = [names.get(pid, pid) for pid in ids]
-    if not idle:
-        return None
-    shown = ", ".join(idle[:3]) + (f" and {len(idle) - 3} more" if len(idle) > 3 else "")
-    return _tip(
-        "idle_profiles", "watch",
-        f"{len(idle)} profile{'s' if len(idle) > 1 else ''} had no bids in the last {IDLE_DAYS} days: {shown}.",
-        "Idle profiles lose search ranking on most job boards.",
-        {"profileIds": ids, "profiles": idle}, len(idle) * 10)  # rough: ~10 bids a profile a day-ish
-
-
 def behind_target(actual: int, target: int) -> Optional[dict]:
     if not target or actual >= BEHIND_RATIO * target:
         return None
@@ -105,30 +89,6 @@ async def _targets(uid, days: list[date]) -> int:
         t = plan_auto.day_targets(plans.get(d), weekly[d - timedelta(days=d.weekday())], d)
         total += t.bidsSelf + t.bidsBidder
     return total
-
-
-async def _profile_last_bids(uid, region: str, today: date) -> tuple[dict[str, Optional[date]], dict[str, str]]:
-    """Non-archived profiles of `uid` in the region → (profile id → last day, profile id → name); last day with a bid over the IDLE_DAYS ending `today`."""
-    from app.models import DailyPlan
-    from app.plan_profiles import owner_profiles
-
-    profiles = [p for p in await owner_profiles(uid)
-                if not p["archived"] and (region == "all" or p["region"] == region)]
-    if not profiles:
-        return {}, {}
-    first = today - timedelta(days=IDLE_DAYS - 1)
-    last: dict = {}
-    for plan in await DailyPlan.find({"userId": uid, "date": {
-            "$gte": datetime.combine(first, datetime.min.time()), "$lte": datetime.combine(today, datetime.min.time())}}).to_list():
-        for pid, n in plan.done.bidsSelfByProfile.items():
-            if n:
-                last[pid] = max(last.get(pid, plan.date.date()), plan.date.date())
-    by_profile: dict = {}
-    await interview_rates.bidder_bids([uid], first, today, "all", {}, by_profile)
-    for (pid, day), n in by_profile.items():
-        if n:
-            last[pid] = max(last.get(pid, day), day)
-    return {p["id"]: last.get(p["id"]) for p in profiles}, {p["id"]: p["name"] for p in profiles}
 
 
 async def bids_view(subject, period: str, day: date, region: str, until: Optional[date], today: date) -> dict:
@@ -201,7 +161,7 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
             per_weekday[d.weekday()].append(mine(d))
         candidates = [low_self_share(me - bidder[subject.id], me, shares), weak_weekdays(per_weekday)]
         if me:
-            last, names = await _profile_last_bids(subject.id, region, today)
+            last, names = await profile_last_bids(subject.id, region, today)
             candidates.append(idle_profiles(last, today, names))
         if target:
             candidates.append(behind_target(sum(mine(d) for d in done_days), target))
@@ -216,6 +176,6 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
     return {
         "tab": "bids", "label": interview_rates.label(period, start, end),
         "subject": {"userId": str(subject.id), "name": _display_name(subject)},
-        "headline": headline, "tips": tips, "everyone": {"metric": "bids", "rows": rows},
+        "headline": headline, "tips": tips, "everyone": {"rowKind": "person", "metric": "bids", "rows": rows},
         "trend": trend, "notEnoughData": not_enough, "definitions": DEFINITIONS,
     }

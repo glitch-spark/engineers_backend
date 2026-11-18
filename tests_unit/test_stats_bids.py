@@ -120,7 +120,7 @@ async def test_bids_view_contract_keys(db):
     assert h["note"] == "Self 400 · bidder 0"
     per_day = out["headline"][2]
     assert per_day["value"] == 33 and "team" in per_day["note"] and "target" not in per_day["note"]  # 400 / 12 done days
-    assert set(out["everyone"]) == {"metric", "rows"} and out["trend"]["unit"] == "week"
+    assert set(out["everyone"]) == {"rowKind", "metric", "rows"} and out["everyone"]["rowKind"] == "person" and out["trend"]["unit"] == "week"
     assert out["notEnoughData"] is False and len(out["definitions"]) == 3
 
 

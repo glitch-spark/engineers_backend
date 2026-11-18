@@ -132,7 +132,7 @@ async def test_contract_keys_and_headline_order(db):
     assert rank["value"] == 1 and rank["format"] == "rank" and rank["team"] is None and rank["note"] == "of 4"
     assert ivs["value"] == 4 and ivs["format"] == "count" and ivs["note"] == "Self 4 · caller 0"
     assert reach["format"] == "pct" and reach["value"] == 0.0 and reach["note"] == "final 0%"
-    assert out["everyone"]["metric"] == "per100" and out["trend"]["unit"] == "week"
+    assert out["everyone"]["metric"] == "per100" and out["everyone"]["rowKind"] == "person" and out["trend"]["unit"] == "week"
     assert len(out["definitions"]) == 3 and out["notEnoughData"] is False
 
 

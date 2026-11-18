@@ -93,3 +93,9 @@ async def test_bad_custom_range_400(db):
     with pytest.raises(HTTPException) as e:
         await _call(ana, period="custom", date="2026-11-10", to="")
     assert e.value.status_code == 400
+
+
+async def test_profiles_tab_served(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    out = await _call(ana, tab="profiles")
+    assert out["tab"] == "profiles" and out["everyone"]["rowKind"] == "profile"

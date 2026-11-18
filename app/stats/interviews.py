@@ -194,6 +194,6 @@ async def interviews_view(subject, period: str, day: date, region: str, until: O
     return {
         "tab": "interviews", "label": interview_rates.label(period, start, end),
         "subject": {"userId": str(sid), "name": _display_name(subject)},
-        "headline": headline, "tips": tips, "everyone": {"metric": "per100", "rows": rows},
+        "headline": headline, "tips": tips, "everyone": {"rowKind": "person", "metric": "per100", "rows": rows},
         "trend": trend, "notEnoughData": not_enough, "definitions": DEFINITIONS,
     }
