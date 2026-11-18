@@ -119,9 +119,9 @@ async def test_bids_view_contract_keys(db):
     assert h["value"] == 400 and h["rank"] == 3 and h["of"] == 4 and h["team"]["n"] == 4
     assert h["note"] == "Self 400 · bidder 0"
     per_day = out["headline"][2]
-    assert per_day["value"] == 31 and "team" in per_day["note"] and "target" not in per_day["note"]  # 400 / 13
+    assert per_day["value"] == 33 and "team" in per_day["note"] and "target" not in per_day["note"]  # 400 / 12 done days
     assert set(out["everyone"]) == {"metric", "rows"} and out["trend"]["unit"] == "week"
-    assert out["notEnoughData"] is False and len(out["definitions"]) == 2
+    assert out["notEnoughData"] is False and len(out["definitions"]) == 3
 
 
 async def test_unposted_day_self_bids_count(db):
@@ -228,3 +228,61 @@ async def test_idle_profiles_by_id_keeps_duplicate_names_and_region_less_profile
     out = await sb.bids_view(ana, "month", TODAY, "US", None, TODAY)
     tip = next(t for t in out["tips"] if t["id"] == "bids.idle_profiles")
     assert "2 profiles" in tip["text"] and "NoRegion" not in tip["text"] and len(tip["evidence"]["profileIds"]) == 2
+
+
+async def test_per_day_matches_target_over_done_days(db):
+    ana, ben, cy, dee = await _team()
+    await _plan(ana, 14, bidsSelf=999)  # a Saturday bid: not a working day, must not inflate the pace
+    for u in (ana, ben, cy, dee):
+        for d in (16, 17):
+            await _plan(u, d, bidsSelf=40)
+    await WeeklyPlan(userId=ana.id, weekStart=datetime(2026, 11, 16), weekNumber=47, year=2026,
+                     startDate=datetime(2026, 11, 16), endDate=datetime(2026, 11, 22), goal=Counts(bidsSelf=200)).insert()
+    # Ana: (400 + 80) over the 12 working days before today = 40/day; the Saturday 999 is ignored.
+    out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
+    pd = out["headline"][2]
+    assert pd["value"] == 40
+    assert pd["team"]["n"] == 4 and pd["team"]["max"] == pytest.approx(680 / 12)
+
+
+async def test_per_day_equals_target_when_on_pace(db):
+    ana = await _user("Ana")
+    for d in (16, 17):
+        await _plan(ana, d, bidsSelf=100)
+    await _plan(ana, 14, bidsSelf=50)  # weekend
+    await WeeklyPlan(userId=ana.id, weekStart=datetime(2026, 11, 16), weekNumber=47, year=2026,
+                     startDate=datetime(2026, 11, 16), endDate=datetime(2026, 11, 22), goal=Counts(bidsSelf=500)).insert()
+    out = await sb.bids_view(ana, "week", TODAY, "all", None, TODAY)
+    pd = out["headline"][2]
+    assert pd["value"] == 100 and "target 100" in pd["note"]
+
+
+async def test_trend_has_no_future_buckets(db):
+    ana, *_ = await _team()
+    out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
+    assert out["trend"]["buckets"] and out["trend"]["buckets"][-1]["label"] != "Nov 23"
+    assert all(b["label"] not in ("Nov 23", "Nov 30") for b in out["trend"]["buckets"])
+
+
+async def test_no_bids_tip(db):
+    await _team()
+    zed = await _user("Zed")
+    out = await sb.bids_view(zed, "month", TODAY, "all", None, TODAY)
+    tip = next(t for t in out["tips"] if t["id"] == "bids.no_bids")
+    assert tip["severity"] == "bad" and "No bids yet" in tip["text"] and "median" in tip["detail"]
+
+
+def test_up_vs_last_period_names_window():
+    tip = sb.up_vs_last_period(590, 500, "Oct 1–18")
+    assert "vs Oct 1–18" in tip["detail"] and "same number of days" not in tip["detail"]
+
+
+def test_idle_profiles_ids_aligned_with_names():
+    tip = sb.idle_profiles({"a": None, "b": None}, TODAY, {"a": "Zed", "b": "Amy"})
+    assert tip["evidence"]["profiles"] == ["Amy", "Zed"] and tip["evidence"]["profileIds"] == ["b", "a"]
+
+
+async def test_definitions_mention_pre_nov16_bidder_numbers(db):
+    ana, *_ = await _team()
+    out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
+    assert any("Nov 16, 2026" in d for d in out["definitions"])

@@ -20,6 +20,7 @@ _DAYS = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays"]
 DEFINITIONS = [
     "Self bids are the applies you typed in your daily plans, on every saved day (drafts included).",
     "Bidder bids are your bidders' Bid Track approved + pending bids, counted on the Bid Track day.",
+    "Bidder bids are Bid Track counts on every day; before Nov 16, 2026 the Plans page showed typed bidder numbers, so older days can differ.",
 ]
 
 
@@ -64,7 +65,8 @@ def idle_profiles(profile_last_bid: dict[str, Optional[date]], today: date, name
     """`profile_last_bid` is keyed by profile id; `names` maps id -> display name (default: the id)."""
     names = names or {}
     ids = sorted(pid for pid, last in profile_last_bid.items() if last is None or (today - last).days >= IDLE_DAYS)
-    idle = sorted(names.get(pid, pid) for pid in ids)
+    ids.sort(key=lambda pid: (names.get(pid, pid), pid))
+    idle = [names.get(pid, pid) for pid in ids]
     if not idle:
         return None
     shown = ", ".join(idle[:3]) + (f" and {len(idle) - 3} more" if len(idle) > 3 else "")
@@ -85,14 +87,18 @@ def behind_target(actual: int, target: int) -> Optional[dict]:
         {"actual": actual, "target": target}, target - actual)
 
 
-def up_vs_last_period(now: int, before: int) -> Optional[dict]:
+def up_vs_last_period(now: int, before: int, window: str = "the previous period") -> Optional[dict]:
     if not before or now / before - 1 < UP_RATIO:
         return None
     change = now / before - 1
     return _tip(
         "up_vs_last_period", "good", f"Your bids are up {change:+.0%} vs the previous period — keep it.",
-        f"{now} bids vs {before} over the same number of days before.",
+        f"{now} bids vs {window}: {before}.",
         {"now": now, "before": before, "change": change}, now - before)
+
+
+def _span(a: date, b: date) -> str:
+    return f"{a:%b} {a.day}–{b.day}" if a.month == b.month else f"{a:%b} {a.day}–{b:%b} {b.day}"
 
 
 async def _targets(uid, days: list[date]) -> int:
@@ -157,11 +163,17 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
     n_days = len(wdays)
     me = bids[subject.id]
 
-    dist, per_day = frame.distribution(totals), frame.distribution([b / n_days for b in totals] if n_days else [])
-    rank, of = frame.rank_of(me, totals, True, in_team)
-    my_per_day = me / n_days if n_days else 0
-    # Today is still in progress: the pace rules (weak weekdays, behind target) look at the days before it.
+    # Today is still in progress: pace (per day, weak weekdays, behind target) looks at the working days before it.
     done_days = [d for d in wdays if d < today]
+
+    def per_day_of(uid) -> float:
+        if not done_days:
+            return bids[uid] / n_days if n_days else 0
+        return sum(sum(days.get((d, uid), (0, 0))[:2]) for d in done_days) / len(done_days)
+
+    dist, per_day = frame.distribution(totals), frame.distribution([per_day_of(u) for u in team_ids])
+    rank, of = frame.rank_of(me, totals, True, in_team)
+    my_per_day = per_day_of(subject.id)
     # Bidder targets have no region split, so a region view has no target to compare with.
     target = await _targets(subject.id, done_days) if done_days and region == "all" else 0
     note = f"team {round(per_day['median'] or 0)}" + (f" · target {round(target / len(done_days))}" if target else "")
@@ -186,7 +198,7 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
                      "parts": {"self": bids[uid] - bidder[uid], "bidder": bidder[uid]}, "isSubject": uid == subject.id})
     rows.sort(key=lambda r: (-r["value"], r["name"].lower()))
 
-    unit, buckets = frame.trend_buckets(start, end)
+    unit, buckets = frame.trend_buckets(start, min(end, today))
     trend = []
     for s, e, lbl in buckets:
         sums: dict = defaultdict(int)
@@ -215,7 +227,10 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
             candidates.append(behind_target(sum(mine(d) for d in done_days), target))
         ps, pe = frame.previous_window(period, start, end, today)
         before = (await interview_rates.counts([subject.id], ps, pe, region, regions, logged_only=False)).get(subject.id, (0,))[0]
-        candidates.append(up_vs_last_period(me, before))
+        candidates.append(up_vs_last_period(me, before, _span(ps, pe)))
+        if not me:
+            candidates.append(_tip("no_bids", "bad", "No bids yet this period.",
+                                   f"The team median is {round(dist['median'] or 0)} bids so far.", {"teamMedian": dist["median"]}, dist["median"] or 0))
         tips = frame.order_tips([t for t in candidates if t])
 
     return {
