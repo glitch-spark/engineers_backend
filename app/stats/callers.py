@@ -9,12 +9,11 @@ from typing import Optional
 from app import interview_rates
 from app.caller_stats import GROUPS, MIN_DECIDED, _caller_rows, collect_rounds, list_directory, summary
 from app.stats import frame
-from app.stats.interviews import _GROUP_LABEL, caller_vs_self
+from app.stats.interviews import _GROUP_LABEL, _rate, caller_vs_self
 
 CALLER_GAP = 0.15
 BACKLOG_ROUNDS = 5  # more awaiting rounds than this ...
 BACKLOG_DAYS = 7  # ... held longer ago than this is a backlog
-_SHORT = {"intro": "Intro", "tech": "Tech", "hiring": "Hiring", "panel": "Panel", "final": "Final"}
 
 DEFINITIONS = [
     "A held caller round is a round in the period with an external caller or a platform user assigned (canceled rounds, AI interviews and home assessments are not counted), in the interview's profile region under a region filter.",
@@ -25,10 +24,6 @@ DEFINITIONS = [
 
 def _tip(id: str, severity: str, text: str, detail: str, evidence: dict, impact: float) -> dict:
     return frame.tip(f"callers.{id}", severity, text, detail, evidence, impact)
-
-
-def _rate(passed: int, rejected: int) -> Optional[float]:
-    return passed / (passed + rejected) if passed + rejected else None
 
 
 def _pr(rounds: list[dict]) -> tuple[int, int]:
@@ -93,7 +88,7 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
     by_caller: dict = defaultdict(list)
     for r in caller_rounds:
         by_caller[r["callerId"]].append(r)
-    mode = "caller" if sid in by_caller else "engineer"
+    mode = "caller" if _done(by_caller.get(sid, [])) else "engineer"  # a held round: scheduled / canceled don't count
 
     team_summary = summary(caller_rounds)
     rows = _caller_rows(await list_directory(include_archived=True), caller_rounds, team_summary["passRate"])
@@ -133,7 +128,7 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
              "vsMedian": None, "higherIsBetter": False, "note": f"of {of}" if eligible else f"needs {MIN_DECIDED} decided rounds"},
             _row("done", "Rounds done", s["done"], "count", done_d, d_rk, d_of, True, f"{s['counts']['awaiting']} awaiting a result"),
             {"key": "weakest", "label": "Weakest round type", "value": weak[1] if weak else None, "format": "pct", "team": None,
-             "rank": None, "of": 0, "vsMedian": None, "higherIsBetter": True, "note": _SHORT[weak[0]] if weak else ""},
+             "rank": None, "of": 0, "vsMedian": None, "higherIsBetter": True, "note": _GROUP_LABEL[weak[0]] if weak else ""},
         ]
         n_days = len(frame.working_days(start, end, today))
         not_enough = frame.not_enough_data(len(ranked), n_days)
@@ -143,7 +138,7 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
             so_far = _done([r for r in mine if r["day"] <= today_end])
             before = _done([r for r in (await collect_rounds(ps, pe, region))[0] if r["callerId"] == sid])
             tips = frame.order_tips([t for t in (
-                weak_round_type(by_group(mine), by_group(caller_rounds)) if eligible else None,
+                weak_round_type(by_group(mine), by_group([r for r in caller_rounds if r["callerId"] not in (None, sid)])) if eligible else None,
                 awaiting_backlog(mine, today),
                 frame.up_vs_last_period("callers", "rounds done", so_far, before, frame.span_label(ps, pe)),
             ) if t])
@@ -154,21 +149,25 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
                     days[(r["day"], cid)][0] += r["result"] in ("passed", "rejected", "awaiting")
         trend = frame.trend(start, end, today, days, (0,), sid, [c for c, d in done_by.items() if d >= 1])
     else:
+        from app.models import UserExtra
+
+        admins = {u.id for u in await UserExtra.find({"role": "admin"}).to_list()}
         by_eng: dict = defaultdict(lambda: {"self": [], "caller": []})
         for kind, rs in (("self", self_rounds), ("caller", caller_rounds)):
             for r in rs:
                 by_eng[r["engineerId"]][kind].append(r)
         sidx = subject.id
         mine = by_eng[sidx] if sidx in by_eng else {"self": [], "caller": []}
-        self_team = {e: v["self"] for e, v in by_eng.items() if sum(_pr(v["self"])) >= MIN_DECIDED}
+        self_team = {e: v["self"] for e, v in by_eng.items() if e not in admins and sum(_pr(v["self"])) >= MIN_DECIDED}
         self_rates = [_rate(*_pr(rs)) for rs in self_team.values()]
-        caller_rates = [_rate(*_pr(v["caller"])) for v in by_eng.values() if sum(_pr(v["caller"])) >= 1]
-        wait = {e: sum(r["result"] == "awaiting" for r in v["self"] + v["caller"]) for e, v in by_eng.items()}
+        caller_rates = [_rate(*_pr(v["caller"])) for e, v in by_eng.items() if e not in admins and sum(_pr(v["caller"])) >= 1]
+        wait = {e: sum(r["result"] == "awaiting" for r in v["self"] + v["caller"]) for e, v in by_eng.items()
+                if e not in admins and _done(v["self"] + v["caller"])}
         my_self, my_caller = _pr(mine["self"]), _pr(mine["caller"])
         self_rate, caller_rate = _rate(*my_self), _rate(*my_caller)
         sd, cd, wd = frame.distribution(self_rates), frame.distribution(caller_rates), frame.distribution(list(wait.values()))
         s_rk, s_of = _rank(self_rate, self_rates, True, sidx in self_team, sum(my_self) >= MIN_DECIDED)
-        c_rk, c_of = _rank(caller_rate, caller_rates, True, sum(my_caller) >= 1)
+        c_rk, c_of = _rank(caller_rate, caller_rates, True, sum(my_caller) >= 1 and sidx not in admins)
         my_wait = wait.get(sidx, 0)
         w_rk, w_of = frame.rank_of(my_wait, list(wait.values()), False, sidx in wait)
         headline = [
@@ -186,7 +185,7 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
             tips = frame.order_tips([t for t in (
                 caller_vs_self(my_caller, my_self),
                 awaiting_backlog(mine["self"] + mine["caller"], today),
-                no_caller_rounds(sum(my_self), len(mine["caller"])),
+                no_caller_rounds(sum(my_self), _done(mine["caller"])),
             ) if t])
         trend = None
 

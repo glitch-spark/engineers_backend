@@ -115,7 +115,7 @@ async def test_mode_caller_when_subject_called(db):
     assert rate["value"] == 0.5 and rate["note"] == "5 passed · 5 rejected" and rate["team"]["n"] == 3 and rate["rank"] == 3
     assert rank["value"] == 3 and rank["note"] == "of 3"
     assert done["value"] == 10 and done["note"] == "0 awaiting a result" and done["team"]["n"] == 3
-    assert weak["value"] == 0.4 and weak["note"] == "Tech" and weak["team"] is None and weak["vsMedian"] is None and weak["rank"] is None
+    assert weak["value"] == 0.4 and weak["note"] == "Tech rounds" and weak["team"] is None and weak["vsMedian"] is None and weak["rank"] is None
     assert out["everyone"]["rowKind"] == "caller" and out["everyone"]["metric"] == "passRate"
     assert out["notEnoughData"] is False and len(out["definitions"]) == 3
     assert "callers.weak_round_type" in [t["id"] for t in out["tips"]]
@@ -224,3 +224,41 @@ async def test_collect_rounds_unchanged_caller_stats(db):
     seen: dict = {}  # ObjectIds differ per run: number them by first appearance
     text = re.sub(r"[0-9a-f]{24}", lambda m: f"id{seen.setdefault(m.group(0), len(seen))}", text)
     assert json.loads(text) == GOLDEN
+
+
+# ---- review fixes ----
+
+async def test_mode_needs_a_held_caller_round(db):
+    u, acc, ext1, _ = await _world()
+    zed = await _user("Zed")
+    await _round(u["Ana"], acc["Ana"], zed, "canceled", 0)
+    await _round(u["Ana"], acc["Ana"], zed, "scheduled", 0, day=25)  # after TODAY
+    out = await sc.callers_view(zed, "month", TODAY, "all", None, TODAY)
+    assert out["mode"] == "engineer"
+    await _round(u["Ana"], acc["Ana"], zed, "completed", 0)  # awaiting = held
+    assert (await sc.callers_view(zed, "month", TODAY, "all", None, TODAY))["mode"] == "caller"
+
+
+async def test_admin_owners_out_of_engineer_teams(db):
+    u, acc, ext1, _ = await _world()
+    u["Ana"].role = "admin"
+    await u["Ana"].save()
+    ben = await sc.callers_view(u["Ben"], "month", TODAY, "all", None, TODAY)
+    assert ben["mode"] == "engineer" and ben["headline"][0]["team"]["n"] == 2 and ben["headline"][2]["team"]["n"] == 2
+    assert ben["headline"][3]["team"]["n"] == 2  # Ben, Cy (Ana out)
+    ana = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)
+    assert ana["headline"][0]["value"] == 0.2 and ana["headline"][0]["team"]["n"] == 2 and ana["headline"][0]["of"] == 3
+    assert ana["headline"][2]["of"] == 3 and ana["headline"][3]["of"] == 3
+
+
+async def test_weak_pool_excludes_subject_and_unassigned_and_awaiting_team_held_only(db):
+    u, acc, ext1, _ = await _world()
+    for i in range(8):
+        await _round(u["Ana"], acc["Ana"], "TBD", "passed", i, "tech_round_1")
+    out = await sc.callers_view(u["Cal"], "month", TODAY, "all", None, TODAY)
+    tip = next(t for t in out["tips"] if t["id"] == "callers.weak_round_type")
+    assert "40% pass vs 82% for all callers" in tip["text"]
+    dee = await _user("Dee")
+    await _round(dee, acc["Ana"], None, "scheduled", 0)
+    ana = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)
+    assert ana["headline"][3]["team"]["n"] == 3  # Ana, Ben, Cy; Dee has nothing held
