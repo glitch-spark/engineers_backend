@@ -29,6 +29,7 @@ from app.routers import (
     interviews,
     job_applies,
     metrics,
+    stats,
     profile,
     prompt_eval,
     reports,
@@ -128,6 +129,7 @@ def create_app() -> FastAPI:
     app.include_router(ai_review.router)
     app.include_router(ai_usage.router)
     app.include_router(metrics.router)
+    app.include_router(stats.router)
     app.include_router(dashboard.router)
     app.include_router(reports.router)
     app.include_router(resume.router)
