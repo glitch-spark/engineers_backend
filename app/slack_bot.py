@@ -634,7 +634,14 @@ async def run_alert_tick() -> dict[str, Any]:
     except Exception as exc:
         log.exception("slack_bot coordination chase crashed: %s", exc)
         chase = {}
+    try:
+        from app.standup.nudge import run_standup_nudge
+
+        standup_nudge = await run_standup_nudge(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot standup nudge crashed: %s", exc)
+        standup_nudge = "failed"
     return {
-        "caller_reminders": reminders["sent"], "caller_daily": caller_daily,
+        "caller_reminders": reminders["sent"], "caller_daily": caller_daily, "standup_nudge": standup_nudge,
         "after_call_asks": chase.get("after_call_asks", 0), "result_reminders": chase.get("result_reminders", 0),
     }
