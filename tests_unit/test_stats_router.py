@@ -1,4 +1,4 @@
-"""GET /stats/bids route: subject resolution + date validation (mongomock)."""
+"""GET /stats/{tab} route: subject resolution, date validation, tab dispatch (mongomock)."""
 
 import os
 
@@ -15,7 +15,8 @@ from app.models import Account, DailyPlan, Interview, InterviewQuestion, UserExt
 from app.models.bid import Bid
 from app.models.bidder import Bidder
 from app.models.weekly_plan import WeeklyPlan
-from app.routers.stats import stats_bids
+from app.routers import stats
+from app.routers.stats import stats_tab
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -30,9 +31,30 @@ async def db():
         UserExtra, Account, DailyPlan, Interview, InterviewQuestion, Bid, Bidder, WeeklyPlan])
 
 
-async def _call(user, **kw):
+async def _call(user, tab="bids", **kw):
     args = dict(period="month", date="2026-11-18", to="", region="all", user_id=None)
-    return await stats_bids(user, **{**args, **kw})
+    return await stats_tab(tab, user, **{**args, **kw})
+
+
+async def test_interviews_tab_served(db):
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    out = await _call(ana, tab="interviews")
+    assert out["tab"] == "interviews"
+
+
+async def test_unknown_tab_422(db):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.deps import get_current_user
+
+    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
+    app = FastAPI()
+    app.include_router(stats.router)
+    app.dependency_overrides[get_current_user] = lambda: ana
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get("/stats/nope")
+    assert res.status_code == 422
 
 
 async def test_staff_sees_self(db):
@@ -58,7 +80,7 @@ async def test_admin_views_other_user(db, monkeypatch):
         seen["id"] = subject.id
         return {}
 
-    monkeypatch.setattr("app.routers.stats.bids_view", fake)
+    monkeypatch.setitem(stats.VIEWS, "bids", fake)
     await _call(boss, user_id=str(ben.id))
     assert seen["id"] == ben.id
     with pytest.raises(HTTPException) as e:
