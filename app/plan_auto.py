@@ -11,6 +11,7 @@ Nothing here writes to the database.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from math import ceil
 from typing import Any, Optional
 
 from app.dashboard_stats import app_tz, local_day_start_utc
@@ -89,6 +90,57 @@ def day_goal(plan: Optional[Any], weekly: Optional[Any]) -> tuple[Counts, list[C
     has_bids = bool(plan.goal.bidsSelf or plan.goal.bidsBidder)
     goal = Counts(**bids_of(plan.goal)) if has_bids else week_bids
     return goal, list(plan.goalItems) if plan.goalItems else week_items
+
+
+def day_targets(plan: Optional[Any], weekly: Optional[Any], day: date) -> Counts:
+    """A day's bid target: the day's own override, else the week's goal split over Mon-Fri (interviews 0)."""
+    if plan is not None and plan.targetOverride is not None:
+        return plan.targetOverride
+    if weekly is None or day.weekday() >= 5:
+        return Counts()
+    return Counts(**{f: ceil(getattr(weekly.goal, f) / 5) for f in BID_FIELDS})
+
+
+def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dict]:
+    """{item, scope, result} lines for a day: live routines (Mon-Fri) and weekly goals, plus archived
+    ones the day has a result for. A routine's frozen result target replaces the item's."""
+    if weekly is None:
+        return []
+    results = plan.results if plan is not None else {}
+    out = []
+    for scope, items in (("routine", weekly.routines), ("goal", weekly.weeklyGoals)):
+        for item in items:
+            result = results.get(item.id)
+            if item.archived and result is None:
+                continue
+            if scope == "routine" and day.weekday() >= 5 and result is None:
+                continue
+            if scope == "routine" and result is not None and result.target is not None:
+                item = item.model_copy(update={"target": result.target})
+            out.append({"item": item, "scope": scope, "result": result})
+    return out
+
+
+def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
+    """Per weekly goal id: summed values, whether any day marked it done, and its target."""
+    out = {}
+    for g in weekly.weeklyGoals:
+        rs = [r for d in days if (r := d.results.get(g.id)) is not None]
+        out[g.id] = {"value": sum(r.value or 0 for r in rs), "done": any(r.done for r in rs), "target": g.target}
+    return out
+
+
+async def draft_week(uid, monday: date) -> Optional[WeeklyPlan]:
+    """Unsaved plan for `monday` carrying over last week's goal and live routines (no weekly goals)."""
+    prev = (await weekly_plans_for([uid], monday - timedelta(days=7))).get(uid)
+    if prev is None:
+        return None
+    start = _midnight(monday)
+    return WeeklyPlan(
+        userId=uid, weekStart=start, startDate=start, endDate=start + timedelta(days=6),
+        weekNumber=monday.isocalendar()[1], year=monday.isocalendar()[0],
+        goal=prev.goal.model_copy(), routines=[r.model_copy() for r in prev.routines if not r.archived],
+    )
 
 
 def weekly_done(days: list, week_interviews: dict) -> Counts:
