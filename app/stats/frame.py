@@ -36,7 +36,7 @@ def rank_of(value: float, values: list[float], higher_is_better: bool = True, in
 
 
 def vs_median(value: float, median: Optional[float]) -> Optional[float]:
-    return (value - median) / median if median else None
+    return (value - median) / abs(median) if median else None
 
 
 def working_days(start: date, end: date, today: date) -> list[date]:

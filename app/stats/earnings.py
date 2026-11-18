@@ -19,6 +19,8 @@ DEFINITIONS = [
 
 
 def _usd(v: float) -> str:
+    if v and abs(v) < 0.005:
+        return "<$0.01"
     return f"{'-' if v < 0 else ''}${abs(v):,.0f}" if abs(v) >= 10 else f"{'-' if v < 0 else ''}${abs(v):.2f}"
 
 
@@ -96,12 +98,13 @@ async def earnings_view(subject, period: str, day: date, region: str, until: Opt
     outcome: dict = defaultdict(float)
     net: dict = defaultdict(float)
     own_prev = [0.0] * 3
-    own_prev_n = 0
+    first = await Transaction.find({"userId": subject.id, "status": "approved"}).sort("date").limit(1).to_list()
+    since = first[0].date.date() if first else None
+    k = sum(1 for _, pe in prev if since and pe >= since)  # only periods on/after the first transaction count
     for t in txs:
         d = t.date.date()
         if d < start:
             if t.userId == subject.id:
-                own_prev_n += 1
                 own_prev[next(i for i, (a, b) in enumerate(prev) if a <= d <= b)] += t.amount
             continue
         days[(d, t.userId)] = (days[(d, t.userId)][0] + t.amount,)
@@ -116,8 +119,9 @@ async def earnings_view(subject, period: str, day: date, region: str, until: Opt
     dist = frame.distribution(nets)
     rank, of = frame.rank_of(me, nets, True, in_team)
     n_days = len(frame.working_days(start, end, today))
-    own_avg = round(sum(own_prev) / 3, 2) if own_prev_n else None
-    avg_note = ("no earlier periods" if own_avg is None else f"vs this period {(me - own_avg) / abs(own_avg):+.0%}"
+    own_avg = round(sum(own_prev) / k, 2) if k else None
+    avg_note = ("no earlier periods" if own_avg is None else
+                f"this period {((me - own_avg) / abs(own_avg)):+.0%} vs average".replace("-", "\u2212")
                 if own_avg else "average is $0")
     headline = [
         {"key": "net", "label": "Net this period", "value": me, "format": "usd", "team": dist, "rank": rank, "of": of,

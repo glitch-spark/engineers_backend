@@ -41,6 +41,10 @@ def test_vs_median_zero_median_is_none():
     assert vs_median(15, 10) == 0.5
 
 
+def test_vs_median_negative_median_keeps_sign():
+    assert vs_median(200, -100) == 3.0 and vs_median(-150, -100) == -0.5
+
+
 def test_working_days_stop_at_today():
     assert working_days(date(2026, 11, 16), date(2026, 11, 22), TODAY) == [date(2026, 11, d) for d in (16, 17, 18)]
     assert working_days(date(2026, 11, 14), date(2026, 11, 15), TODAY) == []

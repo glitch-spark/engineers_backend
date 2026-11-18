@@ -18,19 +18,22 @@ DEFINITIONS = [
 
 
 def _usd(v: float) -> str:
+    if v and abs(v) < 0.005:
+        return "<$0.01"
     return f"${abs(v):,.0f}" if abs(v) >= 10 else f"${abs(v):.2f}"
 
 
 def expensive_model(my_cpr: Optional[float], team_median_cpr: Optional[float], my_top_model: Optional[str],
-                    team_top: Optional[tuple[str, float]]) -> Optional[dict]:
-    """`team_top` = (the team's most-used resume model, that model's team cost per resume)."""
-    if not my_cpr or not team_median_cpr or not team_top or my_cpr < EXPENSIVE_RATIO * team_median_cpr:
+                    candidates: list[tuple[str, float]]) -> Optional[dict]:
+    """`candidates` = (model, team cost per resume) for the team's top 3 resume models."""
+    if not my_cpr or not team_median_cpr or my_cpr < EXPENSIVE_RATIO * team_median_cpr:
         return None
-    model, model_cpr = team_top
-    if model == my_top_model or model_cpr >= my_cpr:
+    cheaper = [(m, c) for m, c in candidates if m != my_top_model and c < my_cpr]
+    if not cheaper:
         return None
+    model, model_cpr = min(cheaper, key=lambda mc: mc[1])
     return frame.tip("ai_usage.expensive_model", "watch",
-                     f"Your resumes cost {_usd(my_cpr)} each vs {_usd(team_median_cpr)} for the team — most of the team uses {model}.",
+                     f"Your resumes cost {_usd(my_cpr)} each vs {_usd(team_median_cpr)} for the team — the team gets them for less with {model}.",
                      f"{_usd(my_cpr)} per resume with {my_top_model or 'your models'}; {model} costs the team {_usd(model_cpr)} per resume.",
                      {"costPerResume": my_cpr, "teamMedian": team_median_cpr, "model": model}, my_cpr - model_cpr)
 
@@ -58,7 +61,7 @@ async def ai_usage_view(subject, period: str, day: date, region: str, until: Opt
     unpriced: dict = defaultdict(int)
     resume_cost: dict = defaultdict(float)
     refs: dict = defaultdict(set)
-    models: dict = defaultdict(lambda: defaultdict(lambda: [0.0, 0]))  # uid → model → [resume cost, resume events]
+    models: dict = defaultdict(lambda: defaultdict(lambda: [0.0, 0, set()]))  # uid → model → [resume cost, resume events, ok refIds]
     days: dict = defaultdict(lambda: (0.0,))
     for e in events:
         c = e.costUsd or 0.0
@@ -74,6 +77,7 @@ async def ai_usage_view(subject, period: str, day: date, region: str, until: Opt
             m[1] += 1
             if e.ok and e.refId:
                 refs[e.userId].add(e.refId)
+                m[2].add(e.refId)
 
     team_ids = [u for u in members if cost[u] > 0]
     in_team = subject.id in team_ids
@@ -99,10 +103,13 @@ async def ai_usage_view(subject, period: str, day: date, region: str, until: Opt
     headline = [
         cost_h,
         {"key": "rank", "label": "Your rank", "value": cost_h["rank"], "format": "rank", "team": None, "rank": cost_h["rank"],
-         "of": cost_h["of"], "vsMedian": None, "higherIsBetter": False, "note": f"of {cost_h['of']}"},
+         "of": cost_h["of"], "vsMedian": None, "higherIsBetter": False, "note": f"of {cost_h['of']} · cheapest first"},
         block("perResume", "Cost per resume", cpr, f"{len(refs[sid])} resumes", cpr[sid]),
         block("perInterview", "AI cost per interview", cpi, f"{interviews[sid]} interviews", cpi[sid]),
     ]
+    for h in headline[2:]:
+        if h["team"]["median"] is not None:
+            h["note"] += f" · team {_usd(h['team']['median'])}"
 
     dist = cost_h["team"]
     rows = []
@@ -118,26 +125,30 @@ async def ai_usage_view(subject, period: str, day: date, region: str, until: Opt
     for b in trend["buckets"]:
         b["you"], b["median"] = round(b["you"], 4), round(b["median"], 4)
 
-    n_days = len(frame.working_days(start, end, today))
-    not_enough = frame.not_enough_data(len(team_ids), n_days)
+    # a single-day range (Today/Yesterday) is a valid window: only the team size gates the frame
+    not_enough = len(team_ids) < 3
     tips: list[dict] = []
     if not not_enough:
-        by_model: dict = defaultdict(lambda: [0.0, 0])
+        by_model: dict = defaultdict(lambda: [0.0, set()])  # model → [team resume cost, distinct (user, ok refId)]
+        people: dict = defaultdict(int)  # model → how many members use it the most
         for u in team_ids:
-            for name, (c, n) in models[u].items():
+            for name, (c, _, rs) in models[u].items():
                 by_model[name][0] += c
-                by_model[name][1] += n
-        top = max(by_model, key=lambda k: by_model[k][1]) if by_model else None
+                by_model[name][1].update((u, r) for r in rs)
+            if models[u]:
+                people[max(models[u], key=lambda k: (models[u][k][1], k))] += 1
+        top3 = sorted(people, key=lambda k: (-people[k], k))[:3]
         mine = models[sid]
-        my_top = max(mine, key=lambda k: mine[k][1]) if mine else None
+        my_top = max(mine, key=lambda k: (mine[k][1], k)) if mine else None
         team_cprs = [v for u in team_ids if (v := cpr[u]) is not None]
         tips = frame.order_tips([t for t in (expensive_model(
             cpr[sid], median(team_cprs) if team_cprs else None, my_top,
-            (top, by_model[top][0] / by_model[top][1]) if top else None),) if t])
+            [(m, by_model[m][0] / len(by_model[m][1])) for m in top3 if by_model[m][1]]),) if t])
 
     return {
         "tab": "ai-usage", "label": interview_rates.label(period, start, end),
         "subject": {"userId": str(sid), "name": _display_name(subject)},
         "headline": headline, "tips": tips, "everyone": {"rowKind": "person", "metric": "cost", "rows": rows},
-        "trend": trend, "notEnoughData": not_enough, "definitions": DEFINITIONS,
+        "trend": trend, "notEnoughData": not_enough,
+        "definitions": DEFINITIONS + [f"Days are counted in {tz.key}."],
     }

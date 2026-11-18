@@ -53,12 +53,18 @@ async def _view(u, period="month"):
 
 
 def test_expensive_model_tip():
-    tip = sa.expensive_model(1.0, 0.4, "big", ("small", 0.3))
+    tip = sa.expensive_model(1.0, 0.4, "big", [("small", 0.3)])
     assert tip["severity"] == "watch" and "$1.00" in tip["text"] and "$0.40" in tip["text"] and "small" in tip["text"]
-    assert sa.expensive_model(0.7, 0.4, "big", ("small", 0.3)) is None  # < 2x median
-    assert sa.expensive_model(1.0, 0.4, "small", ("small", 0.3)) is None  # same model
-    assert sa.expensive_model(1.0, 0.4, "big", ("pricey", 1.5)) is None  # not cheaper
-    assert sa.expensive_model(None, 0.4, "big", ("small", 0.3)) is None
+    assert sa.expensive_model(0.7, 0.4, "big", [("small", 0.3)]) is None  # < 2x median
+    assert sa.expensive_model(1.0, 0.4, "small", [("small", 0.3)]) is None  # same model
+    assert sa.expensive_model(1.0, 0.4, "big", [("pricey", 1.5)]) is None  # not cheaper
+    assert sa.expensive_model(None, 0.4, "big", [("small", 0.3)]) is None
+    both = sa.expensive_model(1.0, 0.4, "big", [("mid", 0.6), ("small", 0.3), ("pricey", 1.5)])
+    assert "small" in both["text"] and sa.expensive_model(1.0, 0.4, "big", []) is None
+
+
+def test_usd_under_a_cent():
+    assert sa._usd(0.004) == "<$0.01" and sa._usd(0) == "$0.00" and sa._usd(0.42) == "$0.42"
 
 
 async def test_cost_and_unpriced(db):
@@ -80,7 +86,7 @@ async def test_cost_per_resume_distinct_refids_ok_only(db):
     await _ev(ana, 0.4, ref=None)
     out = await _view(ana)
     per = out["headline"][2]
-    assert per["note"] == "2 resumes" and per["value"] == pytest.approx(1.8 / 2)
+    assert per["note"] == "2 resumes · team $0.90" and per["value"] == pytest.approx(1.8 / 2)
     row = next(r for r in out["everyone"]["rows"] if r["isSubject"])
     assert row["parts"]["resume"] == pytest.approx(1.8) and row["parts"]["other"] == pytest.approx(1.0)
 
@@ -119,7 +125,47 @@ async def test_expensive_model_tip_in_view(db):
 async def test_contract_keys(db):
     ana, *_ = await _team()
     out = await _view(ana)
-    assert out["tab"] == "ai-usage" and out["notEnoughData"] is False and len(out["definitions"]) == 3
+    assert out["tab"] == "ai-usage" and out["notEnoughData"] is False and len(out["definitions"]) == 4
     assert [h["key"] for h in out["headline"]] == ["cost", "rank", "perResume", "perInterview"]
     assert set(out) >= {"label", "subject", "headline", "tips", "everyone", "trend", "notEnoughData", "definitions"}
     assert out["trend"]["buckets"]
+
+
+async def test_expensive_model_per_resume_ignores_retries(db):
+    ana, ben, cy, dee = await _team((0, 0, 0, 0))
+    for i, u in enumerate((ben, cy, dee)):
+        await _ev(u, 0.3, model="small", ref=f"r{i}")
+        await _ev(u, 0.3, model="small", ref=f"r{i}")  # retry of the same resume
+    await _ev(ana, 1.5, model="big", ref="a")
+    tip = (await _view(ana))["tips"][0]
+    assert "$0.60" in tip["detail"] and "$0.30" not in tip["detail"]
+
+
+async def test_expensive_model_uses_top3_by_people_not_heavy_user(db):
+    ana, ben, cy, dee = await _team((0, 0, 0, 0))
+    eve, fay = await _user("Eve"), await _user("Fay")
+    for i, u in enumerate((ben, cy, dee)):
+        await _ev(u, 0.2, model="small", ref=f"s{i}")
+    await _ev(ana, 1.0, model="big", ref="a")
+    await _ev(fay, 0.9, model="aaa", ref="f")
+    for j in range(10):  # one heavy user: most events, but only one person
+        await _ev(eve, 0.001, model="tiny", ref=f"e{j}")
+    tip = (await _view(ana))["tips"][0]
+    assert tip["evidence"]["model"] == "small"
+
+
+async def test_single_day_range_with_team_is_enough_data(db):
+    ana, *_ = await _team()
+    out = await sa.ai_usage_view(ana, "custom", date(2026, 11, 5), "all", date(2026, 11, 5), TODAY)
+    assert out["notEnoughData"] is False
+    assert any("Days are counted in" in d for d in out["definitions"])
+
+
+async def test_notes_include_team_median_and_rank_cheapest_first(db):
+    ana, ben, cy, dee = await _team()
+    for u, c in zip((ana, ben, cy, dee), (0.4, 0.8, 1.2, 1.6)):
+        await _ev(u, c, ref=f"x{u.name}")
+    out = await _view(ana)
+    assert out["headline"][1]["note"] == "of 4 · cheapest first"
+    assert out["headline"][2]["note"] == "1 resumes · team $1.00"
+    assert out["headline"][3]["note"] == "0 interviews"  # no median: no "· team"

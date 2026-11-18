@@ -112,7 +112,7 @@ async def test_own_average_three_previous_months(db):
     await _tx(ana, 9999, m=7)  # fourth month back: ignored
     out = await _view(ana)
     avg = out["headline"][2]
-    assert avg["value"] == 1000 and avg["key"] == "ownAvg" and avg["note"] == "vs this period -40%"
+    assert avg["value"] == 1000 and avg["key"] == "ownAvg" and avg["note"] == "this period −40% vs average"
     assert "earnings.below_own_average" in [t["id"] for t in out["tips"]]
 
 
@@ -179,3 +179,22 @@ async def test_not_enough_data(db):
     ana = await _user("Ana")
     await _tx(ana, 100)
     assert (await _view(ana))["notEnoughData"] is True
+
+
+async def test_new_starter_first_month_has_no_average_tip(db):
+    ana, *_ = await _team((1500, 800, 600, 400))
+    out = await _view(ana)  # first ever transaction is this period
+    assert out["headline"][2]["value"] is None
+    assert not [t for t in out["tips"] if t["id"].endswith("own_average")]
+
+
+async def test_average_only_over_periods_since_first_transaction(db):
+    ana, *_ = await _team((1500, 800, 600, 400))
+    await _tx(ana, 1000, m=10)  # first transaction: October; Sep and Aug are before it
+    out = await _view(ana)
+    assert out["headline"][2]["value"] == 1000  # not 1000 / 3
+
+
+def test_usd_under_a_cent():
+    assert se._usd(0.004) == "<$0.01" and se._usd(-0.004) == "<$0.01" and se._usd(0) == "$0.00"
+    assert se._usd(-0.5) == "-$0.50"
