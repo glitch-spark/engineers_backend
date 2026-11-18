@@ -16,8 +16,10 @@ important part.
 2. **Response window** — the team's "half of interviews come within X days, 90% within N days".
 3. **Profile report card** — per profile: bids (self / bidder), matured per-100, speed (first / median / slowest days),
    how far interviews get, region, grade (✅ strong / ⚠ watch / ⛔ dead).
-4. **What kind of job works** — conversion by job board (link domain), by resume score band, by prompt and template;
-   later by role / seniority / location (needs extraction from job descriptions).
+4. **What kind of job works** — four ways (user decision, 2026-11-19): by **job site** (link domain), by **resume score**
+   band, by **job area** (Backend, Full stack, Frontend, AI / ML, DevOps, QA, Data, Mobile, Other / unknown), and by
+   **profile age** when the bid went out (< 2 weeks, 2–6 weeks, 6 weeks – 3 months, 3+ months). Prompt / template is
+   dropped from the page.
 5. **What to change** — suggestions matched to each profile's pattern (table below).
 6. **Winning vs losing profiles** — top 3 vs bottom 3 side by side.
 7. **When to bid** (weekday / hour) and **bidder quality** (per-100 per bidder, rejected share).
@@ -62,7 +64,9 @@ One document per application, keyed by **(profile id, job key)**; when there's n
 | `by` | `"bidder"` (Bid kind bidder; `bidderId`) or `"self"` (tracked self Bid, or a tailored resume with no bidder bid) |
 | `bidStatus` | Bid Track review status when from a bid (approved / pending / rejected); rejected bids are kept but excluded from conversion |
 | `score`, `scoreBand` | ResumeApplication.matchScore total / band (null when no tailored resume) |
-| `promptId/Name`, `templateName` | from the tailored resume |
+| `promptId/Name`, `templateName` | from the tailored resume (kept; not shown on the page for now) |
+| `title`, `area` | job title = first line of the tailored resume's `jobDescription`, else the readable part of the bid's `jobKey` job segment (slug → words; ids give none); `area` = keyword rules on the title (Backend, Full stack, Frontend, AI / ML, DevOps, QA, Data, Mobile, else Other); no title → `null` (shown as Unknown) |
+| `profileAgeDays` | `appliedAt` − the profile's `createdAt`, in whole days |
 | `interviewId`, `firstRoundAt`, `daysToInterview`, `furthest` (intro/tech/hiring/panel/final/offer), `result` | matched interview |
 | `sources` | ids of the bid(s) / resume(s) merged into the row |
 
@@ -88,8 +92,8 @@ Header: the existing you-vs-team cards (unchanged). Below, in order:
 1. **Coverage line** — "Job-level numbers cover 1,240 of 1,410 bids (88%); typed self bids aren't tied to jobs."
 2. **Your profiles** — report card per profile (the subject's; admins can view anyone): bids self / bidder, matured,
    interviews, per-100 vs team, first / median / slowest days, reach (intro → tech → final), grade, still-in-play.
-3. **What kind of job works** — bars of per-100 by board, by score band, by prompt, by template (the subject's and the
-   team's side by side; groups with < 30 matured applications show "too few").
+3. **What kind of job works** — per-100 by job site, resume score, job area and profile age (the subject's and the
+   team's side by side; groups with < 30 matured applications show "too few"; Unknown area shown with its count).
 4. **What to change** — suggestions per profile from the pattern table.
 5. **Winning vs losing profiles** — team top 3 vs bottom 3 by matured per-100 (≥ 100 matured each): region, avg score,
    prompt / template, top boards, median days, self/bidder mix.
@@ -120,7 +124,7 @@ or no interview for 21 days while still bidding.
 3. What kind of job works (board, score band, prompt, template).
 4. What to change suggestions + winning vs losing.
 5. When to bid + bidder quality.
-6. Role / seniority / location extraction from job descriptions → new breakdown columns.
+6. Seniority / location extraction from job descriptions → new breakdown columns.
 
 ## Constraints
 

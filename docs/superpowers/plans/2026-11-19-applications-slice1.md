@@ -53,11 +53,26 @@
 
 ---
 
+### Task 1b: Job title, job area and profile age on rows
+
+**Files:** Create `app/applications/area.py`; Modify `app/applications/rows.py`, `app/models/application.py` (fields `title: Optional[str]`, `area: Optional[str]`, `profileAgeDays: Optional[int]`). Test `tests_unit/test_applications_area.py` (+ rows tests).
+
+**Interfaces:**
+- `job_title(job_description: Optional[str], job_key: Optional[str]) -> Optional[str]` — first non-empty line of the description (trimmed, ≤ 120 chars); else the last `jobKey` segment after its first `_`, as words, only when it contains a letter-word of ≥ 3 letters that isn't an id (uuid / digits / `r-14343`-style); else None.
+- `classify_area(title: Optional[str]) -> Optional[str]` — case-insensitive keyword rules, first match wins in this order: QA (qa, quality, test, sdet) → DevOps (devops, sre, site reliability, platform, infrastructure, cloud) → AI / ML (ai, ml, machine learning, llm, genai, data scien) → Data (data engineer, analytics, etl, bi ) → Mobile (ios, android, mobile, react native, flutter) → Full stack (full stack, fullstack, full-stack) → Frontend (front end, frontend, front-end, react, angular, vue, ui ) → Backend (back end, backend, back-end, python, java, golang, go , node, .net, ruby, php, api) → Other. None title → None.
+- `build_rows(bids, resumes, accounts)` — `accounts` now `{accountId: {"region", "createdAt"}}` (was regions); rows get `title` / `area` (from the earliest resume when one exists, else from the bid's jobKey) and `profileAgeDays`.
+
+- [ ] **Step 1: Failing tests** — `test_job_title_from_description_first_line`; `test_job_title_from_readable_job_key` (`netweb_backend-ai-engineer` → "backend ai engineer"); `test_job_title_none_for_id_keys` (`jobs_eaa48261-…`, `halcyon_6252121004`, `caresource_r-14343`); `test_classify_area_examples` (Senior Backend Developer → Backend; Full Stack Engineer → Full stack; ML Engineer → AI / ML; Site Reliability Engineer → DevOps; QA Automation → QA; React Developer → Frontend; iOS Engineer → Mobile; Product Manager → Other; None → None); `test_row_area_prefers_resume_title`; `test_profile_age_days`.
+- [ ] **Step 2–4:** FAIL → implement → run files + full suite.
+- [ ] **Step 5: Commit** `feat: applications rows carry job title, job area and profile age`
+
+---
+
 ### Task 2: Sync (incremental + daily full rebuild), cron hook, backfill script
 
 **Files:** Create `app/applications/sync.py`, `scripts/build_applications.py`; Modify `app/alerts_tick.py` (call `run_applications_tick()` after the existing ticks, own try/except + log like the others). Test `tests_unit/test_applications_sync.py`.
 
-**Interfaces:**
+**Interfaces:** (accounts map `{id: {region, createdAt}}` from Task 1b)
 - `async def full_rebuild(since: date, *, apply: bool) -> dict` — loads bids (`firstAt ≥ since`), resumes (`createdAt ≥ since`, `countsAsBid != False`), interviews (`createdAt ≥ since` or any round dated ≥ since), builds + matches, upserts every row and deletes rows (with `appliedAt ≥ since`) whose key no longer exists; returns counts `{rows, matched, unmatched, noLink, deleted}`. Dry run returns counts without writing.
 - `async def incremental(checkpoint: datetime) -> dict` — rebuilds only the keys touched by bids / resumes / interviews changed since `checkpoint` (`updatedAt` or creation time), re-matching interviews changed since then; upserts those rows.
 - `async def run_applications_tick(now: Optional[datetime] = None) -> dict` — reads `app_settings` doc `{"_id": "applications_sync"}` (`checkpoint`, `lastFull`); runs `full_rebuild(date(2026, 8, 1), apply=True)` when `lastFull` is missing or > 24 h old, else `incremental(checkpoint)`; saves the new checkpoint (start time of this run). Skips (returns `{"skipped": "disabled"}`) when env `APPLICATIONS_SYNC_DISABLED=1`.
