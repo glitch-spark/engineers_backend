@@ -9,8 +9,17 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
 from app.interview_rounds import split_rounds_by_day  # noqa: E402
-from app.models.plan_common import Counts, DoneCounts  # noqa: E402
-from app.plan_auto import effective_daily_done, weekly_done  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+import pytest  # noqa: E402
+from beanie import PydanticObjectId, init_beanie  # noqa: E402
+from mongomock_motor import AsyncMongoMockClient  # noqa: E402
+
+from app.models import DailyPlan, WeeklyPlan  # noqa: E402
+from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem  # noqa: E402
+from app.plan_auto import (  # noqa: E402
+    day_items, day_targets, draft_week, effective_daily_done, goal_progress, items_tally, weekly_done,
+)
 
 UTC = ZoneInfo("UTC")
 NY = ZoneInfo("America/New_York")
@@ -136,3 +145,102 @@ def test_weekly_done_sums_self_regions_and_keeps_pre_split_totals():
 
 def test_weekly_done_empty_week():
     assert weekly_done([], {"self": 0, "caller": 0}) == Counts()
+
+
+MON, SAT = date(2026, 10, 5), date(2026, 10, 10)
+
+
+def _week(monday=MON, uid=None, **kw):
+    start = datetime(monday.year, monday.month, monday.day)
+    return WeeklyPlan(userId=uid or PydanticObjectId(), weekStart=start, weekNumber=41, year=2026, startDate=start,
+                      endDate=start + timedelta(days=6), **kw)
+
+
+def _day_plan(day=MON, **kw):
+    return DailyPlan(userId=PydanticObjectId(), date=datetime(day.year, day.month, day.day), year=2026, weekNumber=41, **kw)
+
+
+def test_targets_ceil_divide_mon_to_fri():
+    w = _week(goal=Counts(bidsSelf=601, interviewsSelf=9))
+    assert day_targets(None, w, MON).bidsSelf == 121
+    assert day_targets(None, w, MON).interviewsSelf == 0
+    assert day_targets(None, w, SAT).bidsSelf == 0
+
+
+def test_override_wins():
+    w = _week(goal=Counts(bidsSelf=100))
+    p = _day_plan(targetOverride=Counts(bidsSelf=7))
+    assert day_targets(p, w, MON).bidsSelf == 7
+
+
+def test_no_week_is_zero():
+    assert day_targets(None, None, MON) == Counts()
+
+
+def test_archived_routine_kept_where_it_has_a_result():
+    gone = PlanItem(id="a", text="Gym", archived=True)
+    w = _week(routines=[gone, PlanItem(id="b", text="Read")])
+    assert [i["item"].id for i in day_items(w, None, MON)] == ["b"]
+    p = _day_plan(results={"a": ItemResult(done=True)})
+    assert [i["item"].id for i in day_items(w, p, MON)] == ["a", "b"]
+    assert day_items(w, p, MON)[0]["result"].done
+
+
+def test_routines_skip_weekend_goals_do_not():
+    w = _week(routines=[PlanItem(id="r", text="R")], weeklyGoals=[PlanItem(id="g", text="G")])
+    assert [(i["item"].id, i["scope"]) for i in day_items(w, None, SAT)] == [("g", "goal")]
+
+
+def test_frozen_result_target_wins_over_item():
+    w = _week(routines=[PlanItem(id="r", text="Hours", kind="hours", target=2)])
+    p = _day_plan(results={"r": ItemResult(value=1, target=3)})
+    assert day_items(w, p, MON)[0]["item"].target == 3
+    assert w.routines[0].target == 2
+
+
+def test_goal_progress_sums_counts_and_any_done():
+    w = _week(weeklyGoals=[PlanItem(id="g", text="G", kind="count", target=5), PlanItem(id="h", text="H")])
+    days = [_day_plan(results={"g": ItemResult(value=2), "h": ItemResult(done=False)}),
+            _day_plan(results={"g": ItemResult(value=1.5), "h": ItemResult(done=True)})]
+    prog = goal_progress(w, days)
+    assert prog["g"] == {"value": 3.5, "done": False, "target": 5}
+    assert prog["h"]["done"] is True
+
+
+@pytest.fixture(autouse=True)
+async def db():
+    await init_beanie(database=AsyncMongoMockClient()["plan-auto"], document_models=[DailyPlan, WeeklyPlan])
+
+
+async def test_draft_week_copies_goal_and_routines_not_goals(db):
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, goal=Counts(bidsSelf=50),
+                routines=[PlanItem(id="r", text="R"), PlanItem(id="x", text="X", archived=True)],
+                weeklyGoals=[PlanItem(id="g", text="G")]).insert()
+    d = await draft_week(uid, MON)
+    assert d.id is None and d.weekStart == datetime(2026, 10, 5)
+    assert d.goal.bidsSelf == 50 and [r.id for r in d.routines] == ["r"] and d.weeklyGoals == []
+
+
+async def test_draft_week_none_without_previous(db):
+    assert await draft_week(PydanticObjectId(), MON) is None
+
+
+async def test_draft_week_uses_app_week_key(db):
+    uid, monday = PydanticObjectId(), date(2027, 1, 4)  # ISO week 1 of 2027, the app's week 2
+    await _week(monday - timedelta(days=7), uid).insert()
+    d = await draft_week(uid, monday)
+    assert (d.year, d.weekNumber) == (2027, 2)
+
+
+def test_items_tally_counts_goals_only_when_touched():
+    """Routines with a result always count; weekly goals only when touched that day (in focus, done or value > 0),
+    like the standup post."""
+    r1, r2 = PlanItem(id="r1", text="Review"), PlanItem(id="r2", text="Calls", kind="count", target=5)
+    g = {k: PlanItem(id=k, text=k, kind="count", target=100) for k in ("untouched", "focus", "valued", "ticked")}
+    w = _week(routines=[r1, r2], weeklyGoals=list(g.values()))
+    p = _day_plan(focus=["focus"], results={
+        "r1": ItemResult(done=True), "r2": ItemResult(value=2, target=5),
+        "untouched": ItemResult(), "valued": ItemResult(value=3), "ticked": ItemResult(done=True)})
+    # routines: 1 of 2; goals: focus (not done), valued (done: value > 0), ticked (done); untouched left out
+    assert items_tally(w, p, MON) == (3, 5)

@@ -350,3 +350,37 @@ async def test_ephemeral_only_goes_to_slack_hooks(db):
         await st._post_ephemeral("https://evil.example/hooks.slack.com/x", {"text": "x"})
         await st._post_ephemeral(RESPONSE_URL, {"text": "ok"})
     assert calls == [(RESPONSE_URL, {"text": "ok"})]
+
+
+# --- standup form ("Write my update") ---------------------------------------------------------------
+
+
+async def test_standup_click_opens_form_in_background(client, slack):
+    from unittest.mock import AsyncMock
+
+    payload = {"type": "block_actions", "user": {"id": "U0ANA0001"}, "trigger_id": "trig-1",
+               "response_url": RESPONSE_URL, "actions": [{"action_id": "standup_write", "value": "2026-11-10"}]}
+    body = urlencode({"payload": json.dumps(payload)}).encode()
+    with patch.object(slack_router, "process_standup_click", AsyncMock()) as handler:
+        async with client as c:
+            r = await c.post(PATH, content=body, headers=signed(body))
+    assert r.status_code == 200
+    handler.assert_awaited_once_with("U0ANA0001", "trig-1", "2026-11-10", RESPONSE_URL)
+
+
+async def test_standup_submission_errors_inline_else_closes(client, slack):
+    from unittest.mock import AsyncMock
+
+    view = {"callback_id": "standup_update", "private_metadata": '{"day": "2026-11-10"}', "state": {"values": {}}}
+    payload = {"type": "view_submission", "user": {"id": "U0ANA0001"}, "view": view}
+    body = urlencode({"payload": json.dumps(payload)}).encode()
+    with patch.object(slack_router, "process_standup_submission", AsyncMock()) as handler:
+        async with client as c:
+            with patch.object(slack_router, "standup_errors", lambda v: {"notes": "Too long."}):
+                r1 = await c.post(PATH, content=body, headers=signed(body))
+            assert r1.json() == {"response_action": "errors", "errors": {"notes": "Too long."}}
+            handler.assert_not_awaited()
+            with patch.object(slack_router, "standup_errors", lambda v: {}):
+                r2 = await c.post(PATH, content=body, headers=signed(body))
+    assert r2.status_code == 200 and r2.content == b""
+    handler.assert_awaited_once_with(view, "U0ANA0001")

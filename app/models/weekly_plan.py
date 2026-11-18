@@ -6,7 +6,7 @@ from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItems, Counts, monday_of
+from app.models.plan_common import ChecklistItems, Counts, PlanItem, monday_of
 
 _LEGACY_KEYS = ("metrics", "nextInterviewTarget", "status", "content", "result")
 
@@ -58,11 +58,13 @@ class WeeklyPlan(TimestampedDocument):
     startDate: datetime
     endDate: datetime
     goal: Counts = Field(default_factory=Counts)
-    goalItems: ChecklistItems = []
+    goalItems: ChecklistItems = []  # deprecated: replaced by weeklyGoals (removed after the migration)
     # The goal for every working day of the week (bids + goal lines), set
     # once with the week; a day keeps its own copy once followed up.
-    dailyGoal: Counts = Field(default_factory=Counts)
-    dailyGoalItems: ChecklistItems = []
+    dailyGoal: Counts = Field(default_factory=Counts)  # deprecated: replaced by routines
+    dailyGoalItems: ChecklistItems = []  # deprecated: replaced by routines
+    routines: list[PlanItem] = []
+    weeklyGoals: list[PlanItem] = []
     recapNotes: str = Field(default="", max_length=4000)
 
     @model_validator(mode="before")

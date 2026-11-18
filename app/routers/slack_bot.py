@@ -31,6 +31,9 @@ from app.slack_bot import (
     validate_timezone,
 )
 from app.slack_timezones import slack_timezone_catalog
+from app.standup.modal import STANDUP_VIEW, process_standup_click, process_standup_submission
+from app.standup.modal import submission_errors as standup_errors
+from app.standup.nudge import STANDUP_WRITE
 from app.slack_transactions import is_transaction_action, process_transaction_click, verify_slack_signature
 
 
@@ -128,7 +131,7 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> A
     """Slack button clicks and form submissions. No app login: Slack signs the request with SLACK_SIGNING_SECRET,
     checked over the raw body before anything is parsed. Handled clicks are acknowledged at once and applied in the
     background (Slack wants an answer within 3 seconds); refusals reach the clicker as ephemeral text. A submitted
-    coordination form is checked inline (field errors go back to the form); otherwise it is closed with an empty 200
+    coordination or standup form is checked inline (field errors go back to the form); otherwise it is closed with an empty 200
     and applied in the background."""
     secret = (get_settings().SLACK_SIGNING_SECRET or "").strip()
     if not secret:
@@ -152,13 +155,16 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> A
         return {"ok": True}
     if payload.get("type") == "view_submission":
         view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
-        if view.get("callback_id") not in COORD_VIEWS:
+        submitter = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        if view.get("callback_id") == STANDUP_VIEW:
+            errors, process = standup_errors(view), process_standup_submission
+        elif view.get("callback_id") in COORD_VIEWS:
+            errors, process = submission_errors(view, datetime.now(timezone.utc)), process_coordination_submission
+        else:
             return {"ok": True}
-        errors = submission_errors(view, datetime.now(timezone.utc))
         if errors:
             return JSONResponse({"response_action": "errors", "errors": errors})
-        submitter = payload.get("user") if isinstance(payload.get("user"), dict) else {}
-        background.add_task(process_coordination_submission, view, str(submitter.get("id") or ""))
+        background.add_task(process, view, str(submitter.get("id") or ""))
         return Response(status_code=200)
     if payload.get("type") != "block_actions":
         return {"ok": True}
@@ -172,6 +178,9 @@ async def slack_interactions(request: Request, background: BackgroundTasks) -> A
     message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
     if action_id in COORD_ACTIONS:
         background.add_task(process_coordination_click, click_from_payload(payload))
+    elif action_id == STANDUP_WRITE:
+        background.add_task(process_standup_click, slack_user_id, str(payload.get("trigger_id") or ""), value,
+                            response_url)
     elif action_id == CONFIRM_ACTION_ID:
         background.add_task(process_confirm_click, value, slack_user_id, response_url, str(message.get("ts") or ""))
     elif is_transaction_action(action_id):

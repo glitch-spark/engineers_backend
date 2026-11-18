@@ -1,37 +1,35 @@
 """Daily plans: each day is followed up with what was done.
 
-The day's goal comes from the weekly plan's daily goal (set once a week); a
-day keeps its own copy of that goal once it is followed up.
+The day's targets are derived from the weekly plan (or its carry-over draft) unless the day stored its own on submit;
+its items are the week's routines and weekly goals with that day's results (`app.plan_auto`). Saving goes through
+`app.plan_save.save_day`, shared with the Slack standup form.
 """
 
-from datetime import date, datetime, timedelta, timezone
+import asyncio
+import logging
+import time
+from datetime import date, datetime, timedelta
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
 
-from app.alerts import app_week_key
+from app import plan_bidder, self_bids
+from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.daily_plan import DailyPlan
-from app.models.plan_common import BidsIn, ChecklistItems, Counts, DoneCounts, bids_of
-from app.dashboard_stats import app_tz
-from app.models.plan_common import monday_of
-from app.plan_auto import day_goal, effective_daily_done, empty_day, interview_counts, weekly_plans_for
-from app.plan_profiles import derive_self_bids, owner_profiles, profile_regions
-from app import self_bids
+from app.models.plan_common import Counts, monday_of
+from app.plan_auto import (
+    day_items, day_targets, effective_daily_done, empty_day, goal_progress, interview_counts, week_or_draft,
+)
+from app.plan_profiles import owner_profiles
+from app.plan_save import DayIn, save_day
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
-
-
-class DayIn(BaseModel):
-    """A follow-up: bids done, the daily goal lines with ticks, and notes."""
-
-    goalItems: ChecklistItems = []
-    done: BidsIn = Field(default_factory=BidsIn)
-    notes: str = Field(default="", max_length=2000)
 
 
 def _today() -> date:
@@ -42,43 +40,110 @@ def _midnight(d: date) -> datetime:
     return datetime(d.year, d.month, d.day)
 
 
-def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly, profiles: Optional[list] = None) -> dict:
-    """`profiles` is the owner's; the week view sends them once, so it passes None and the key is left out."""
-    goal, items = day_goal(plan, weekly)
+def _item_out(e: dict) -> dict:
+    item, result = e["item"], e["result"]
+    return {"id": item.id, "text": item.text, "kind": item.kind, "scope": e["scope"], "target": item.target,
+            "archived": item.archived, "result": result.model_dump() if result else None}
+
+
+def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly, week_days: list,
+             bidder_auto: int, profiles: Optional[list] = None) -> dict:
+    """`week_days` are the week's saved days (for weekly goal progress); `profiles` is the owner's — the week view
+    sends them once, so it passes None and the key is left out."""
     out = {
         "date": day.isoformat(),
         "exists": plan is not None,
         "userId": str(uid),
-        "goal": goal.model_dump(),
-        "goalItems": [i.model_dump() for i in items],
+        "targets": day_targets(plan, weekly, day).model_dump(),
+        "items": [_item_out(e) for e in day_items(weekly, plan, day)],
+        "progress": goal_progress(weekly, week_days) if weekly else {},
+        "focus": plan.focus if plan else [],
         "done": effective_daily_done(plan, auto_day).model_dump(),
+        "bidsBidderAuto": bidder_auto,
         "interviews": {"self": auto_day["self"], "caller": auto_day["caller"], "stages": auto_day["stages"]},
         "notes": plan.notes if plan else "",
         "loggedAt": plan.loggedAt.isoformat() if plan and plan.loggedAt else None,
+        "submitted": bool(plan and plan.submittedAt),
     }
     if profiles is not None:
         out["profiles"] = profiles
     return out
 
 
+async def _week_days(uid, monday: date) -> list[DailyPlan]:
+    return await DailyPlan.find({
+        "userId": uid,
+        "date": {"$gte": _midnight(monday), "$lte": _midnight(monday + timedelta(days=6))},
+    }).to_list()
+
+
 async def _interviews(uid, start: date, end: date) -> dict:
     return (await interview_counts([uid], start, end)).get(uid, {})
-
-
-async def _weekly(uid, day: date):
-    return (await weekly_plans_for([uid], monday_of(day))).get(uid)
 
 
 async def _find(uid, day: date) -> Optional[DailyPlan]:
     return await DailyPlan.find_one({"userId": uid, "date": _midnight(day)})
 
 
+# A first post in flight holds `slackTs = "posting:<epoch s>"` so concurrent saves (app, Slack form, write-throughs)
+# don't post twice. Real Slack ts values start with a digit, so they never match the claim prefix.
+POSTING = "posting:"
+CLAIM_STALE_S = 120  # a claim this old belongs to a save that died before posting: take it over
+
+
+def _claim_value() -> str:
+    return f"{POSTING}{int(time.time())}"
+
+
+async def _claim_first_post(plan: DailyPlan) -> Optional[str]:
+    """Claim the day's first post. Returns the claim, or None when another save holds a live claim or has posted
+    (then `plan` gets that post's channel / ts, if any, to edit it)."""
+    coll = DailyPlan.get_motor_collection()
+    claim = _claim_value()
+    stale = f"{POSTING}{int(time.time()) - CLAIM_STALE_S}"
+    free = {"$or": [{"slackTs": None}, {"slackTs": {"$gte": POSTING, "$lt": stale}}]}
+    res = await coll.update_one({"_id": plan.id, **free}, {"$set": {"slackTs": claim}})
+    if res.modified_count:
+        return claim
+    fresh = await coll.find_one({"_id": plan.id}, {"slackChannel": 1, "slackTs": 1}) or {}
+    if not str(fresh.get("slackTs") or "").startswith(POSTING):
+        plan.slackChannel, plan.slackTs = fresh.get("slackChannel"), fresh.get("slackTs")
+    return None
+
+
 async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: dict) -> None:
-    """Post or edit the day's follow-up message; remember where it lives."""
-    posted = await sync_daily_plan_message(plan, owner, done=done, rounds=rounds)
+    """Post or edit the day's standup message (only once the day is submitted); remember where it lives.
+
+    The first post is claimed atomically: a save racing it skips posting (the winner's post stands and the next save
+    edits it). Only the slack fields are written back, so no other save's fields are touched."""
+    if not plan.submittedAt:
+        return
+    if str(plan.slackTs or "").startswith(POSTING):
+        plan.slackTs = None
+    claim = None
+    if not plan.slackTs:
+        claim = await _claim_first_post(plan)
+        if claim is None and not plan.slackTs:
+            log.info("daily plan %s: first post in flight elsewhere; skipping", plan.id)
+            return
+    when = plan.date.date()
+    monday = monday_of(when)
+    weekly = await week_or_draft(owner.id, monday)
+    days = await _week_days(owner.id, monday)
+    held = await _interviews(owner.id, monday, when)
+    target = (weekly.goal.interviewsSelf + weekly.goal.interviewsCaller) if weekly else 0
+    posted = await sync_daily_plan_message(
+        plan, owner, done=done, rounds=rounds, targets=day_targets(plan, weekly, when),
+        items=day_items(weekly, plan, when), progress=goal_progress(weekly, days) if weekly else {},
+        week_interviews=(sum(e["self"] + e["caller"] for e in held.values()), target),
+    )
+    coll = DailyPlan.get_motor_collection()
+    if claim is not None and not posted:  # the post failed: free the claim for the next save
+        await coll.update_one({"_id": plan.id, "slackTs": claim}, {"$set": {"slackTs": None}})
+        return
     if posted and posted != (plan.slackChannel, plan.slackTs):
         plan.slackChannel, plan.slackTs = posted
-        await plan.save()
+        await coll.update_one({"_id": plan.id}, {"$set": {"slackChannel": posted[0], "slackTs": posted[1]}})
 
 
 @router.get("")
@@ -91,20 +156,21 @@ async def list_week(
     monday = parse_monday(weekStart)
     uid = await read_subject(user, userId)
     sunday = monday + timedelta(days=6)
-    plans = await DailyPlan.find({
-        "userId": uid,
-        "date": {"$gte": _midnight(monday), "$lte": _midnight(sunday)},
-    }).to_list()
+    plans = await _week_days(uid, monday)
     by_date = {p.date.date(): p for p in plans}
     interviews = await _interviews(uid, monday, sunday)
-    weekly = await _weekly(uid, monday)
+    weekly = await week_or_draft(uid, monday)
     days = [monday + timedelta(days=n) for n in range(6)]
     if sunday in by_date:
         days.append(sunday)
+    bidder = await asyncio.gather(*(plan_bidder.bidder_done(uid, d) for d in days))
     return {
         "weekStart": monday.isoformat(),
         "profiles": await owner_profiles(uid),
-        "days": [_day_out(uid, d, by_date.get(d), interviews.get(d, empty_day()), weekly) for d in days],
+        "days": [
+            _day_out(uid, d, by_date.get(d), interviews.get(d, empty_day()), weekly, plans, n)
+            for d, n in zip(days, bidder)
+        ],
     }
 
 
@@ -115,12 +181,16 @@ async def get_day(
     userId: Optional[str] = Query(None),
 ) -> dict:
     when = parse_ymd(day, "date")
-    uid = await read_subject(user, userId)
-    interviews = await _interviews(uid, when, when)
-    out = _day_out(
-        uid, when, await _find(uid, when), interviews.get(when, empty_day()), await _weekly(uid, when),
-        await owner_profiles(uid),
-    )
+    return await _view(await read_subject(user, userId), when)
+
+
+async def _view(uid, when: date) -> dict:
+    monday = monday_of(when)
+    plans = await _week_days(uid, monday)
+    plan = next((p for p in plans if p.date.date() == when), None)
+    auto_day = (await _interviews(uid, when, when)).get(when, empty_day())
+    out = _day_out(uid, when, plan, auto_day, await week_or_draft(uid, monday), plans,
+                   await plan_bidder.bidder_done(uid, when), await owner_profiles(uid))
     return await _with_tracked(out, uid, when)
 
 
@@ -140,45 +210,14 @@ async def put_day(
     user: Annotated[UserExtra, Depends(get_current_user)],
     payload: Annotated[dict[str, Any], Body()] = None,
 ) -> dict:
-    """Save the day's follow-up (what was done) and post it to Slack."""
+    """Save the day's update (submits it) and post it to Slack."""
     require_writer(user)
     when = parse_ymd(day, "date")
     body = parse_body(DayIn, payload)
     if when > _today():
         raise HTTPException(status_code=422, detail="A day can be followed up from that day on")
-    plan = await _find(user.id, when)
-    weekly = await _weekly(user.id, when)
-    if plan is None:
-        year, week_number, _key = app_week_key(_midnight(when))
-        plan = DailyPlan(userId=user.id, date=_midnight(when), year=year, weekNumber=week_number)
-    # Keep the goal this day was followed up against, even if the week's daily goal changes later.
-    goal, _items = day_goal(plan, weekly)
-    plan.goal = Counts(**bids_of(goal))
-    plan.goalItems = body.goalItems
-    profiles = await owner_profiles(user.id)  # one read: validation and the response
-    typed = {pid: n for pid, n in body.done.bidsSelfByProfile.items() if n}
-    # Profiles on tracked self bids: the typed number is "other applies", added to the tracked count.
-    switched = await self_bids.switched_profiles(user.id, when)
-    other = {pid: n for pid, n in typed.items() if pid in switched}
-    by = await self_bids.day_self_bids(user.id, when, typed, other) if switched else typed
-    if by:
-        regions = await profile_regions(profiles, by)
-        by = {pid: by[pid] for pid in regions}
-        plan.done = DoneCounts(**{**bids_of(body.done), **derive_self_bids(by, regions)}, bidsSelfByProfile=by,
-                               bidsSelfOtherByProfile=other)
-    else:
-        plan.done = DoneCounts(**bids_of(body.done), bidsSelfOtherByProfile=other)
-    plan.notes = body.notes
-    if plan.loggedAt is None:
-        plan.loggedAt = datetime.now(timezone.utc).replace(tzinfo=None)
-    if plan.id is None:
-        await plan.insert()
-    else:
-        await plan.save()
-
-    auto_day = (await _interviews(user.id, when, when)).get(when, empty_day())
-    await _sync_slack(plan, user, effective_daily_done(plan, auto_day), auto_day["rounds"])
-    return await _with_tracked(_day_out(user.id, when, plan, auto_day, weekly, profiles), user.id, when)
+    await save_day(user, when, body)
+    return await _view(user.id, when)
 
 
 @router.delete("/{day}")

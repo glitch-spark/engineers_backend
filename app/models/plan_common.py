@@ -8,7 +8,8 @@ is typed per day; interviews Done always comes from the Interviews page
 """
 
 from datetime import date, timedelta
-from typing import Annotated, Dict
+from typing import Annotated, Dict, Literal, Optional
+from uuid import uuid4
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
@@ -85,6 +86,29 @@ class ChecklistItem(BaseModel):
         if len(v) > MAX_ITEM_LENGTH:
             raise ValueError(f"checklist items are limited to {MAX_ITEM_LENGTH} characters")
         return v
+
+
+class PlanItem(BaseModel):
+    """A routine (every working day) or weekly goal line; `target` is ignored for kind "check"."""
+
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    text: str
+    kind: Literal["check", "count", "hours"] = "check"
+    target: Optional[float] = Field(default=None, ge=0)
+    archived: bool = False
+
+    @field_validator("text")
+    @classmethod
+    def _text(cls, v: str) -> str:
+        return ChecklistItem._text(v)
+
+
+class ItemResult(BaseModel):
+    """A day's result for one plan item (by PlanItem.id): done for checks, value for counts/hours."""
+
+    done: bool = False
+    value: Optional[float] = Field(default=None, ge=0)
+    target: Optional[float] = Field(default=None, ge=0)
 
 
 def check_items(items: list) -> list:

@@ -79,12 +79,6 @@ def monday_morning_window(local_dt: datetime, window_hours: int = WEEKLY_PLAN_WI
     return local_dt.weekday() == 0 and 0 <= local_dt.hour < window_hours
 
 
-def daily_bids_target(weekly_bids_target: int) -> int:
-    if weekly_bids_target <= 0:
-        return 0
-    return math.ceil(weekly_bids_target / 5)
-
-
 def local_now(tz: ZoneInfo, now: Optional[datetime] = None) -> datetime:
     base = now or datetime.now(timezone.utc)
     if base.tzinfo is None:

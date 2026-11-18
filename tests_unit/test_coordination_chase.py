@@ -426,22 +426,23 @@ def _quiet_tick():
         patch("app.interview_day.post.run_day_post", AsyncMock(return_value="already_sent")),
         patch("app.interview_day.reminders.run_round_reminders", AsyncMock(return_value={"sent": 0, "failed": 0})),
         patch("app.interview_day.post.refresh_today", AsyncMock(return_value=False)),
+        patch("app.standup.nudge.run_standup_nudge", AsyncMock(return_value="skipped")),
     )
 
 
 def test_tick_reports_the_chase():
-    a, b, c = _quiet_tick()
+    a, b, c, d = _quiet_tick()
     run = AsyncMock(return_value={"after_call_asks": 2, "result_reminders": 1})
-    with a, b, c, patch("app.coordination.chase.run_coordination_chase", run):
+    with a, b, c, d, patch("app.coordination.chase.run_coordination_chase", run):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 0, "caller_daily": "already_sent", "after_call_asks": 2, "result_reminders": 1}
+    assert out == {"caller_reminders": 0, "caller_daily": "already_sent", "standup_nudge": "skipped", "after_call_asks": 2, "result_reminders": 1}
     run.assert_awaited_once()
     assert run.await_args.args[0].tzinfo is not None
 
 
 def test_tick_survives_a_chase_crash():
-    a, b, c = _quiet_tick()
-    with a, b, c, patch("app.coordination.chase.run_coordination_chase", AsyncMock(side_effect=RuntimeError("boom"))):
+    a, b, c, d = _quiet_tick()
+    with a, b, c, d, patch("app.coordination.chase.run_coordination_chase", AsyncMock(side_effect=RuntimeError("boom"))):
         out = asyncio.run(slack_bot.run_alert_tick())
     assert out["after_call_asks"] == 0 and out["result_reminders"] == 0
     assert out["caller_daily"] == "already_sent"

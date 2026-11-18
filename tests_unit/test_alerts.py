@@ -10,7 +10,6 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from app.alerts import (
     charge_title,
     clamp_billing_date,
-    daily_bids_target,
     due_phrase,
     in_reminder_window,
     app_week_key,
@@ -63,12 +62,6 @@ def test_due_phrase():
     assert due_phrase(0) == "today"
     assert due_phrase(1) == "tomorrow"
     assert due_phrase(3) == "in 3 days"
-
-
-def test_daily_bids_target_from_weekly():
-    assert daily_bids_target(0) == 0
-    assert daily_bids_target(10) == 2
-    assert daily_bids_target(11) == 3
 
 
 def test_monday_morning_window():

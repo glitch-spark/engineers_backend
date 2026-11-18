@@ -23,11 +23,13 @@ async def test_team_requires_monday(client, admin_user, auth_header):
 
 
 async def test_team_rows_include_users_without_plans(client, staff_user, staff_user_2, admin_user, auth_header):
+    week = await client.put(f"/weekly-plans/{WEEK}", headers=auth_header(staff_user),
+                            json={"goal": {"bidsSelf": 30},
+                                  "weeklyGoals": [{"text": "Profile update"}, {"text": "LinkedIn"}]})
+    profile, linkedin = week.json()["weeklyGoals"]
     await client.put("/daily-plans/2026-09-30", headers=auth_header(staff_user),
-                     json={"goal": {}, "done": {"bidsSelf": 5, "bidsBidder": 1}})
-    await client.put(f"/weekly-plans/{WEEK}", headers=auth_header(staff_user),
-                     json={"goal": {"bidsSelf": 30},
-                           "goalItems": [{"text": "Profile update", "done": True}, {"text": "LinkedIn"}]})
+                     json={"done": {"bidsSelf": 5, "bidsBidder": 1},
+                           "results": {profile["id"]: {"done": True}, linkedin["id"]: {"done": False}}})
 
     r = await client.get(f"/reports/team?weekStart={WEEK}", headers=auth_header(admin_user))
     assert r.status_code == 200

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from app.deps import get_current_user
 from app.models import DailyPlan, UserExtra
 from app.models.plan_common import Counts
-from app.plan_auto import week_snapshot
+from app.plan_auto import items_tally, week_snapshot
 from app.routers._plan_access import parse_monday, require_active
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -48,14 +48,16 @@ async def team_report(
     for u in users:
         snap = snaps[u.id]
         plan = snap["plan"]
+        tallies = [items_tally(plan, d, d.date.date()) for d in snap["days"]]
         rows.append({
             "userId": str(u.id),
             "name": u.name,
             "email": u.email,
             "goal": (plan.goal if plan else Counts()).model_dump(),
             "done": snap["done"].model_dump(),
-            "itemsDone": sum(1 for i in plan.goalItems if i.done) if plan else 0,
-            "itemsTotal": len(plan.goalItems) if plan else 0,
+            # Routines and weekly goals with a result on the week's days.
+            "itemsDone": sum(t[0] for t in tallies),
+            "itemsTotal": sum(t[1] for t in tallies),
             "lastLoggedDate": last_logged[u.id].isoformat() if u.id in last_logged else None,
             "hasWeeklyPlan": plan is not None,
         })

@@ -13,7 +13,6 @@ from app.alerts import (
     LEAD_DAYS,
     card_renewal_href,
     charge_title,
-    daily_bids_target,
     days_until,
     due_phrase,
     format_amount,
@@ -26,10 +25,10 @@ from app.alerts import (
     paid_for_period,
     period_key_for_due,
 )
-from app.models import Notification, RecurringCharge, ResumeApplication, Transaction, UserExtra, WeeklyPlan
+from app.models import DailyPlan, Notification, RecurringCharge, ResumeApplication, Transaction, UserExtra, WeeklyPlan
 from app.models.plan_common import monday_of
 from app.models.resume_application import BID_FILTER
-from app.plan_auto import weekly_plans_for
+from app.plan_auto import day_targets, weekly_plans_for
 from app.slack_bot import resolve_user_tz
 
 log = logging.getLogger(__name__)
@@ -249,7 +248,10 @@ async def _tick_daily_bids(users: list[UserExtra], *, now: datetime) -> int:
         plan = (await weekly_plans_for([user.id], monday_of(local.date()))).get(user.id)
         if plan is None:
             continue
-        target = daily_bids_target(plan.goal.bidsSelf + plan.goal.bidsBidder)
+        day = local.date()
+        today = await DailyPlan.find_one({"userId": user.id, "date": datetime(day.year, day.month, day.day)})
+        targets = day_targets(today, plan, day)  # the day's own target, else the week's split over Mon-Fri
+        target = targets.bidsSelf + targets.bidsBidder
         if target <= 0:
             continue
         start, end = local_day_bounds_utc(local)

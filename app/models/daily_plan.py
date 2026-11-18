@@ -6,7 +6,7 @@ from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItems, Counts, DoneCounts
+from app.models.plan_common import ChecklistItems, Counts, DoneCounts, ItemResult
 
 # Fields of the pre Goal-vs-Done shape. `planBids*` / `planInterviewsScheduled`
 # / `tomorrowItems` describe the NEXT day, so the fold drops them here and
@@ -74,10 +74,14 @@ class DailyPlan(TimestampedDocument):
     year: int
     weekNumber: int
     goal: Counts = Field(default_factory=Counts)
-    goalItems: ChecklistItems = []
+    goalItems: ChecklistItems = []  # deprecated: replaced by results
     done: DoneCounts = Field(default_factory=DoneCounts)
     notes: str = Field(default="", max_length=2000)
     loggedAt: Optional[datetime] = None
+    targetOverride: Optional[Counts] = None  # this day's own bid/interview target, else derived from the week
+    results: dict[str, ItemResult] = {}  # by PlanItem.id
+    focus: list[str] = []  # PlanItem ids picked as the day's focus
+    submittedAt: Optional[datetime] = None  # set when the standup is submitted
     # Bot post in SLACK_DAILY_PLAN_CHANNEL_ID, kept so edits update it in place.
     slackChannel: Optional[str] = None
     slackTs: Optional[str] = None
