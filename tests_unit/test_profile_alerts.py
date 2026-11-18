@@ -139,3 +139,20 @@ async def test_all_users_tailor_average_comes_from_the_cache_or_is_null(db, toda
 async def test_admin_viewing_everyone_gets_no_alerts(db, today):
     await _setup()
     assert await _alerts(await _user("boss", role="admin")) is None
+
+
+async def test_flags_say_how_long_since_the_last_interview_or_apply(db, today):
+    al = await _alerts(await _setup())
+    red = {x["name"]: (x["idleDays"], x["capped"]) for x in al["noInterviews"]}
+    assert red["V"] == (15, False)        # last round Oct 30 → Nov 14
+    assert red["U"] == (44, False)        # never had one: since created Oct 1
+    assert red["New21"] == (19, False)    # since created Oct 26
+    grey = {x["name"]: (x["idleDays"], x["capped"]) for x in al["noApplies"]}
+    assert grey["T"] == (22, False)       # last bids Oct 23
+
+
+async def test_idle_count_is_capped_by_the_lookback(db, today):
+    bo = await _user("bo")
+    await _profile(bo, "Old", created=datetime(2025, 1, 1, 15))
+    (old,) = (await _alerts(bo))["noApplies"]
+    assert old["capped"] is True and old["idleDays"] == 181
