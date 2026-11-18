@@ -89,6 +89,10 @@ async def _user(name, role="staff"):
 
 
 async def _plan(user, d, logged=False, **done):
+    if existing := await DailyPlan.find_one(DailyPlan.userId == user.id, DailyPlan.date == datetime(2026, 11, d)):
+        existing.done = existing.done.model_copy(update=done)  # a day is one plan: add to its Done
+        await existing.save()
+        return
     await DailyPlan(userId=user.id, date=datetime(2026, 11, d), year=2026, weekNumber=47, done=done,
                     loggedAt=datetime(2026, 11, d, 20) if logged else None).insert()
 
@@ -179,3 +183,48 @@ async def test_idle_profiles_ignores_archived(db):
     out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
     tip = next(t for t in out["tips"] if t["id"] == "bids.idle_profiles")
     assert "Ana-EU" in tip["text"] and "Old-US" not in tip["text"]
+
+
+async def test_region_filter_skips_behind_target_and_target_note(db):
+    ana, ben, cy, dee = await _team()
+    await Account(name="Ana US", createdBy=ana.id, region="US").insert()
+    for u in (ana, ben, cy):
+        for d in (2, 3, 4, 5, 6, 9, 10, 11, 12, 13):
+            await _plan(u, d, bidsSelfUs=5)
+    await WeeklyPlan(userId=ana.id, weekStart=datetime(2026, 11, 2), weekNumber=45, year=2026,
+                     startDate=datetime(2026, 11, 2), endDate=datetime(2026, 11, 8), goal=Counts(bidsSelf=1000)).insert()
+    out = await sb.bids_view(ana, "month", TODAY, "US", None, TODAY)
+    assert not out["notEnoughData"]
+    assert "bids.behind_target" not in [t["id"] for t in out["tips"]]
+    assert "target" not in out["headline"][2]["note"]
+
+
+async def test_rank_headline_has_no_team_or_vs_median(db):
+    ana, *_ = await _team()
+    h = (await sb.bids_view(ana, "month", TODAY, "all", None, TODAY))["headline"]
+    assert h[1]["team"] is None and h[1]["vsMedian"] is None and h[0]["team"]["n"] == 4
+
+
+async def test_today_is_not_a_sample(db):
+    ana, ben, cy, dee = await _team()
+    for u in (ana, ben, cy, dee):  # same pace on every earlier day; today (Wed Nov 18) has nothing yet
+        for d in (16, 17):
+            await _plan(u, d, bidsSelf=40)
+    await WeeklyPlan(userId=ana.id, weekStart=datetime(2026, 11, 16), weekNumber=47, year=2026,
+                     startDate=datetime(2026, 11, 16), endDate=datetime(2026, 11, 22), goal=Counts(bidsSelf=200)).insert()
+    out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
+    ids = [t["id"] for t in out["tips"]]
+    assert "bids.weak_weekdays" not in ids  # Wednesday has samples Nov 4 and 11 only; Nov 18 = 0 would flag it
+    assert "bids.behind_target" not in ids  # target 80 over Nov 16-17, actual 80; today's zero ignored
+
+
+async def test_idle_profiles_by_id_keeps_duplicate_names_and_region_less_profiles(db):
+    ana, ben, cy, dee = await _team()
+    await Account(name="Dup", createdBy=ana.id, region="US").insert()
+    await Account(name="Dup", createdBy=ana.id, region="US").insert()
+    await Account(name="NoRegion", createdBy=ana.id).insert()
+    for u in (ana, ben, cy):
+        await _plan(u, 12, bidsSelfUs=5)
+    out = await sb.bids_view(ana, "month", TODAY, "US", None, TODAY)
+    tip = next(t for t in out["tips"] if t["id"] == "bids.idle_profiles")
+    assert "2 profiles" in tip["text"] and "NoRegion" not in tip["text"] and len(tip["evidence"]["profileIds"]) == 2

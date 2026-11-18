@@ -52,8 +52,6 @@ def weak_weekdays(per_weekday: dict[int, list[int]]) -> Optional[dict]:
         return None
     low = [x for d in weak for x in per_weekday[d]]
     rest = [x for d, v in per_weekday.items() if d not in weak for x in v]
-    if not rest:
-        return None
     names = " and ".join(_DAYS[d] for d in sorted(weak))
     return _tip(
         "weak_weekdays", "watch",
@@ -62,8 +60,11 @@ def weak_weekdays(per_weekday: dict[int, list[int]]) -> Optional[dict]:
         {"weekdays": sorted(weak), "lowAvg": mean(low), "otherAvg": mean(rest)}, (mean(rest) - mean(low)) * len(weak))
 
 
-def idle_profiles(profile_last_bid: dict[str, Optional[date]], today: date) -> Optional[dict]:
-    idle = sorted(n for n, last in profile_last_bid.items() if last is None or (today - last).days >= IDLE_DAYS)
+def idle_profiles(profile_last_bid: dict[str, Optional[date]], today: date, names: Optional[dict] = None) -> Optional[dict]:
+    """`profile_last_bid` is keyed by profile id; `names` maps id -> display name (default: the id)."""
+    names = names or {}
+    ids = sorted(pid for pid, last in profile_last_bid.items() if last is None or (today - last).days >= IDLE_DAYS)
+    idle = sorted(names.get(pid, pid) for pid in ids)
     if not idle:
         return None
     shown = ", ".join(idle[:3]) + (f" and {len(idle) - 3} more" if len(idle) > 3 else "")
@@ -71,7 +72,7 @@ def idle_profiles(profile_last_bid: dict[str, Optional[date]], today: date) -> O
         "idle_profiles", "watch",
         f"{len(idle)} profile{'s' if len(idle) > 1 else ''} had no bids in the last {IDLE_DAYS} days: {shown}.",
         "Idle profiles lose search ranking on most job boards.",
-        {"profiles": idle}, len(idle) * 10)  # rough: ~10 bids a profile a day-ish
+        {"profileIds": ids, "profiles": idle}, len(idle) * 10)  # rough: ~10 bids a profile a day-ish
 
 
 def behind_target(actual: int, target: int) -> Optional[dict]:
@@ -112,15 +113,15 @@ async def _targets(uid, days: list[date]) -> int:
     return total
 
 
-async def _profile_last_bids(uid, region: str, today: date) -> dict[str, Optional[date]]:
-    """Non-archived profiles of `uid` in the region → last day with a bid over the IDLE_DAYS ending `today`."""
+async def _profile_last_bids(uid, region: str, today: date) -> tuple[dict[str, Optional[date]], dict[str, str]]:
+    """Non-archived profiles of `uid` in the region → (profile id → last day, profile id → name); last day with a bid over the IDLE_DAYS ending `today`."""
     from app.models import DailyPlan
     from app.plan_profiles import owner_profiles
 
     profiles = [p for p in await owner_profiles(uid)
                 if not p["archived"] and (region == "all" or p["region"] == region)]
     if not profiles:
-        return {}
+        return {}, {}
     first = today - timedelta(days=IDLE_DAYS - 1)
     last: dict = {}
     for plan in await DailyPlan.find({"userId": uid, "date": {
@@ -133,11 +134,7 @@ async def _profile_last_bids(uid, region: str, today: date) -> dict[str, Optiona
     for (pid, day), n in by_profile.items():
         if n:
             last[pid] = max(last.get(pid, day), day)
-    return {p["name"]: last.get(p["id"]) for p in profiles}
-
-
-def _dist(values: list[float]) -> dict:
-    return frame.distribution(values)
+    return {p["id"]: last.get(p["id"]) for p in profiles}, {p["id"]: p["name"] for p in profiles}
 
 
 async def bids_view(subject, period: str, day: date, region: str, until: Optional[date], today: date) -> dict:
@@ -160,17 +157,20 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
     n_days = len(wdays)
     me = bids[subject.id]
 
-    dist, per_day = _dist(totals), _dist([b / n_days for b in totals] if n_days else [])
+    dist, per_day = frame.distribution(totals), frame.distribution([b / n_days for b in totals] if n_days else [])
     rank, of = frame.rank_of(me, totals, True, in_team)
     my_per_day = me / n_days if n_days else 0
-    target = await _targets(subject.id, wdays) if wdays else 0
-    note = f"team {round(per_day['median'] or 0)}" + (f" · target {round(target / n_days)}" if target else "")
+    # Today is still in progress: the pace rules (weak weekdays, behind target) look at the days before it.
+    done_days = [d for d in wdays if d < today]
+    # Bidder targets have no region split, so a region view has no target to compare with.
+    target = await _targets(subject.id, done_days) if done_days and region == "all" else 0
+    note = f"team {round(per_day['median'] or 0)}" + (f" · target {round(target / len(done_days))}" if target else "")
     headline = [
         {"key": "bids", "label": "Your bids", "value": me, "format": "count", "team": dist, "rank": rank, "of": of,
          "vsMedian": frame.vs_median(me, dist["median"]), "higherIsBetter": True,
          "note": f"Self {me - bidder[subject.id]} · bidder {bidder[subject.id]}"},
-        {"key": "rank", "label": "Your rank", "value": rank, "format": "rank", "team": dist, "rank": rank, "of": of,
-         "vsMedian": frame.vs_median(me, dist["median"]), "higherIsBetter": False, "note": f"of {of}"},
+        {"key": "rank", "label": "Your rank", "value": rank, "format": "rank", "team": None, "rank": rank, "of": of,
+         "vsMedian": None, "higherIsBetter": False, "note": f"of {of}"},
         {"key": "perDay", "label": "Per working day", "value": round(my_per_day), "format": "count", "team": per_day,
          "rank": rank, "of": of, "vsMedian": frame.vs_median(my_per_day, per_day["median"]), "higherIsBetter": True,
          "note": note},
@@ -200,16 +200,19 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
     tips: list[dict] = []
     if not not_enough:
         shares = [(bids[u] - bidder[u]) / bids[u] for u in team_ids]
-        per_weekday: dict = defaultdict(list)
-        for d in wdays:
+        def mine(d: date) -> int:
             v = days.get((d, subject.id), (0, 0))
-            per_weekday[d.weekday()].append(v[0] + v[1])
+            return v[0] + v[1]
+
+        per_weekday: dict = defaultdict(list)
+        for d in done_days:
+            per_weekday[d.weekday()].append(mine(d))
         candidates = [low_self_share(me - bidder[subject.id], me, shares), weak_weekdays(per_weekday)]
         if me:
-            candidates.append(idle_profiles(await _profile_last_bids(subject.id, region, today), today))
+            last, names = await _profile_last_bids(subject.id, region, today)
+            candidates.append(idle_profiles(last, today, names))
         if target:
-            candidates.append(behind_target(sum(days.get((d, subject.id), (0, 0))[0] + days.get((d, subject.id), (0, 0))[1]
-                                                for d in wdays), target))
+            candidates.append(behind_target(sum(mine(d) for d in done_days), target))
         ps, pe = frame.previous_window(period, start, end, today)
         before = (await interview_rates.counts([subject.id], ps, pe, region, regions, logged_only=False)).get(subject.id, (0,))[0]
         candidates.append(up_vs_last_period(me, before))
