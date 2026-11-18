@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from pymongo.errors import DuplicateKeyError
 
 from app import plan_bidder, self_bids
 from app.alerts import app_week_key
@@ -38,8 +39,11 @@ def _midnight(d: date) -> datetime:
     return datetime(d.year, d.month, d.day)
 
 
-async def save_day(user: UserExtra, when: date, body: DayIn) -> DailyPlan:
-    """Save the owner's day (any day, weekends too) as submitted, then post / edit the standup post."""
+async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = True) -> DailyPlan:
+    """Save the owner's day (any day, weekends too) as submitted, then post / edit the standup post.
+
+    Two first saves at once (app and Slack form) race on the unique (userId, date) index: the loser saves again over
+    the winner's document."""
     from app.routers import daily_plans  # holds _sync_slack / _interviews (self_bids and tests use them there)
 
     started = time.monotonic()
@@ -97,7 +101,13 @@ async def save_day(user: UserExtra, when: date, body: DayIn) -> DailyPlan:
     if plan.submittedAt is None:
         plan.submittedAt = now
     if plan.id is None:
-        await plan.insert()
+        try:
+            await plan.insert()
+        except DuplicateKeyError:
+            if not _retry:
+                raise
+            log.info("plan save: user=%s day=%s lost the first-save race, saving as an update", user.id, when)
+            return await save_day(user, when, body, _retry=False)
     else:
         await plan.save()
 

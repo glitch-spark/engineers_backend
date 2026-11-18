@@ -251,3 +251,31 @@ async def test_real_sync_slack_builds_the_standup(db, me, monkeypatch):
     await daily_plans._sync_slack(plan, me, Counts(), {})
     assert seen["targets"].bidsSelf == 20 and seen["week_interviews"] == (0, 5)
     assert (plan.slackChannel, plan.slackTs) == ("C1", "ts9")
+
+
+async def test_concurrent_first_save_retries_as_update(me, db, monkeypatch):
+    """App and Slack both saving a new day: the loser of the insert race hits the unique (userId, date) index and
+    applies its save to the winner's document instead of failing."""
+    from app import plan_save
+    from app.plan_save import DayIn, save_day
+
+    review, contact, _goal = await saved_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {review: {"done": True}}, "notes": "app"})
+    first = await stored(me, TUE)
+    real_find_one, misses = DailyPlan.find_one, []
+
+    def racing_find_one(*args, **kw):  # the first lookup misses the other save's insert
+        if not misses:
+            misses.append(1)
+
+            async def none():
+                return None
+            return none()
+        return real_find_one(*args, **kw)
+
+    monkeypatch.setattr(plan_save.DailyPlan, "find_one", staticmethod(racing_find_one))
+    await save_day(me, TUE, DayIn(results={contact: {"value": 9}}, notes="slack"))
+    assert misses == [1] and await DailyPlan.find({"userId": me.id}).count() == 1
+    again = await stored(me, TUE)
+    assert again.notes == "slack" and again.results[contact].value == 9
+    assert again.submittedAt == first.submittedAt and again.slackTs == "ts1"
