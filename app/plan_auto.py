@@ -14,10 +14,11 @@ from datetime import date, datetime, timedelta
 from math import ceil
 from typing import Any, Optional
 
+from app.alerts import app_week_key
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
 from app.models import DailyPlan, WeeklyPlan
-from app.models.plan_common import BID_FIELDS, ChecklistItem, Counts, DoneCounts, bids_of
+from app.models.plan_common import BID_FIELDS, Counts, DoneCounts, bids_of
 
 
 def empty_day() -> dict:
@@ -78,20 +79,6 @@ def effective_daily_done(plan: Optional[Any], auto_day: dict) -> DoneCounts:
     )
 
 
-def day_goal(plan: Optional[Any], weekly: Optional[Any]) -> tuple[Counts, list[ChecklistItem]]:
-    """A day's goal: the bids and lines the day keeps its own copy of (once
-    followed up, or carried over from older data), otherwise the week's daily
-    goal. An empty copy — e.g. followed up before the week had a daily goal —
-    falls back to the week's, so the day isn't compared against 0."""
-    week_bids = Counts(**bids_of(weekly.dailyGoal)) if weekly else Counts()
-    week_items = [ChecklistItem(text=i.text) for i in weekly.dailyGoalItems] if weekly else []
-    if plan is None:
-        return week_bids, week_items
-    has_bids = bool(plan.goal.bidsSelf or plan.goal.bidsBidder)
-    goal = Counts(**bids_of(plan.goal)) if has_bids else week_bids
-    return goal, list(plan.goalItems) if plan.goalItems else week_items
-
-
 def day_targets(plan: Optional[Any], weekly: Optional[Any], day: date) -> Counts:
     """A day's bid target: the day's own override, else the week's goal split over Mon-Fri (interviews 0)."""
     if plan is not None and plan.targetOverride is not None:
@@ -121,6 +108,19 @@ def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dic
     return out
 
 
+def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[int, int]:
+    """(done, total) over the day's items with a result: done = ticked, or value at / over its target."""
+    done = total = 0
+    for e in day_items(weekly, plan, day):
+        r = e["result"]
+        if r is None:
+            continue
+        target = r.target if r.target is not None else e["item"].target
+        total += 1
+        done += r.done or (r.value is not None and target is not None and r.value >= target)
+    return done, total
+
+
 def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
     """Per weekly goal id: summed values, whether any day marked it done, and its target."""
     out = {}
@@ -136,11 +136,17 @@ async def draft_week(uid, monday: date) -> Optional[WeeklyPlan]:
     if prev is None:
         return None
     start = _midnight(monday)
+    year, week_number, _key = app_week_key(start)
     return WeeklyPlan(
-        userId=uid, weekStart=start, startDate=start, endDate=start + timedelta(days=6),
-        weekNumber=monday.isocalendar()[1], year=monday.isocalendar()[0],
+        userId=uid, weekStart=start, startDate=start, endDate=start + timedelta(days=7) - timedelta(milliseconds=1),
+        weekNumber=week_number, year=year,
         goal=prev.goal.model_copy(), routines=[r.model_copy() for r in prev.routines if not r.archived],
     )
+
+
+async def week_or_draft(uid, monday: date) -> Optional[WeeklyPlan]:
+    """The saved plan for `monday`, else the carry-over draft (None without either)."""
+    return (await weekly_plans_for([uid], monday)).get(uid) or await draft_week(uid, monday)
 
 
 def weekly_done(days: list, week_interviews: dict) -> Counts:

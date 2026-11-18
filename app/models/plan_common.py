@@ -108,7 +108,7 @@ class ItemResult(BaseModel):
 
     done: bool = False
     value: Optional[float] = Field(default=None, ge=0)
-    target: Optional[float] = None
+    target: Optional[float] = Field(default=None, ge=0)
 
 
 def check_items(items: list) -> list:

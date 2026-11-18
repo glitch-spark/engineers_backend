@@ -224,3 +224,10 @@ async def test_draft_week_copies_goal_and_routines_not_goals(db):
 
 async def test_draft_week_none_without_previous(db):
     assert await draft_week(PydanticObjectId(), MON) is None
+
+
+async def test_draft_week_uses_app_week_key(db):
+    uid, monday = PydanticObjectId(), date(2027, 1, 4)  # ISO week 1 of 2027, the app's week 2
+    await _week(monday - timedelta(days=7), uid).insert()
+    d = await draft_week(uid, monday)
+    assert (d.year, d.weekNumber) == (2027, 2)
