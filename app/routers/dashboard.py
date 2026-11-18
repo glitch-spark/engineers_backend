@@ -10,6 +10,7 @@ the same grouping `app.routers.metrics` uses).
 from __future__ import annotations
 
 import re
+from math import ceil
 from datetime import date, datetime, timedelta
 from typing import Annotated, Optional
 
@@ -26,9 +27,9 @@ from app.dashboard_stats import (
     local_day_start_utc,
     logging_ratio,
     month_keys,
-    pace,
     percent,
     percentile,
+    plan_pace,
     pick_bucket,
     prorated_goal,
     rank_rows,
@@ -43,7 +44,14 @@ from app.interview_rounds import (
     load_interviews_for_window,
 )
 from app.models import DailyPlan, Transaction, UserExtra
-from app.plan_auto import interviews_by_day, interviews_split, weekly_plans_for
+from app.plan_auto import (
+    day_targets,
+    goal_progress,
+    interviews_by_day,
+    interviews_split,
+    routines_tally,
+    weekly_plans_for,
+)
 from app.routers._util import to_object_id
 from app.routers.metrics import _display_name
 from app.routers.transactions import _TOTALS_GROUP
@@ -128,15 +136,32 @@ async def dashboard_week(
     tz = app_tz()
     monday, saturday, sunday = week_window(day)
 
-    # Actuals: logged daily plans over the counting window (Mon-Sun);
+    # Actuals: every stored daily plan over the counting window (Mon-Sun), drafts included;
     # interviews come from interview records.
-    plans = await _logged_plans([sid], monday, sunday)
+    plans = await DailyPlan.find(
+        {"userId": sid, "date": {"$gte": _midnight(monday), "$lte": _midnight(sunday)}}
+    ).to_list()
+    plans_by_day = {p.date.date(): p for p in plans}
     self_sum = sum(p.done.bidsSelf for p in plans)
     bidder_sum = sum(p.done.bidsBidder for p in plans)
     bids_total = self_sum + bidder_sum
 
     # This week's weekly plan Goal is the target (0 means none set).
     weekly_plan = (await weekly_plans_for([sid], monday)).get(sid)
+    workdays = [monday + timedelta(days=i) for i in range(5)]
+    elapsed = [d for d in workdays if d <= day]
+    days_left = len(workdays) - len(elapsed)
+    bids_expected = 0
+    for d in elapsed:
+        t = day_targets(plans_by_day.get(d), weekly_plan, d)
+        bids_expected += t.bidsSelf + t.bidsBidder
+    routines_done, routines_expected = routines_tally(weekly_plan, plans_by_day, elapsed) if weekly_plan else (0, 0)
+    weekly_goals = []
+    if weekly_plan:
+        progress = goal_progress(weekly_plan, plans)
+        weekly_goals = [
+            {"id": g.id, "text": g.text, "kind": g.kind, **progress[g.id]} for g in weekly_plan.weeklyGoals if not g.archived
+        ]
     goal = weekly_plan.goal if weekly_plan else None
     bids_target = _target(goal.bidsSelf + goal.bidsBidder) if goal else None
     interviews_target = _target(goal.interviewsSelf + goal.interviewsCaller) if goal else None
@@ -193,20 +218,22 @@ async def dashboard_week(
             "bidder": bidder_sum,
             "total": bids_total,
             "target": bids_target,
-            "pace": pace(bids_total, bids_target, day),
-            "percentile": percentile(bids_total, list(bids_scores.values())),
+            "pace": plan_pace(bids_total, bids_target, bids_expected, days_left),
+            "percentile": percentile(bids_scores[sid], list(bids_scores.values())),
         },
         "interviews": {
             "done": interviews_done,
             "self": interviews[sid]["self"],
             "caller": interviews[sid]["caller"],
             "target": interviews_target,
-            "pace": pace(interviews_done, interviews_target, day),
+            "pace": plan_pace(interviews_done, interviews_target, ceil((interviews_target or 0) * len(elapsed) / 5), days_left),
             "percentile": percentile(interviews_done, list(iv_scores.values())),
         },
         "stages": stages,
         "streak": streak_value,
         "hasWeeklyPlan": weekly_plan is not None,
+        "routines": {"done": routines_done, "expected": routines_expected},
+        "weeklyGoals": weekly_goals,
     }
 
 
