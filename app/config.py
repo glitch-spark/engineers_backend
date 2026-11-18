@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     SLACK_BOT_TOKEN: Optional[str] = None
     SLACK_BOT_CRON_SECRET: Optional[str] = None
     SLACK_CALLER_CHANNEL_ID: Optional[str] = None
-    # Release cutoff of the coordination channel's chasers (after-call ask, 7-day result reminder, Friday roundup):
+    # Release cutoff of the interview follow-ups in the daily channel (after-interview check, 7-day result reminder):
     # only rounds that END after this local time (America/Chicago, "YYYY-MM-DDTHH:MM") are chased. Unset = all off.
     SLACK_CALLER_ASKS_FROM: Optional[str] = None
     # Daily list of the day's caller interviews (e.g. #engineer-caller-test); unset = off.

@@ -4,7 +4,7 @@ One Slack App bot (`SLACK_BOT_TOKEN`) sends every Slack message the app posts, i
 
 | Category | Messages | Where |
 |---|---|---|
-| **Reminders** | 30-minute reminder, daily caller list | #caller thread, `SLACK_CALLER_DAILY_CHANNEL_ID` |
+| **Reminders** | 30-minute reminder, daily list, after-interview check, 7-day result reminder | `SLACK_CALLER_DAILY_CHANNEL_ID` |
 | **Action items** | #caller thread (main post and replies), Daily Plan | `SLACK_CALLER_CHANNEL_ID`, `SLACK_DAILY_PLAN_CHANNEL_ID` |
 | **Transactions** | New transaction with Approve / Reject buttons | `SLACK_TRANSACTIONS_CHANNEL_ID` |
 
@@ -127,7 +127,17 @@ colons line up. Each daily goal line is its own section, and *Extra* (the note) 
 
 ## 5. Reminders
 
-**30-minute reminder** — a reply in the interview's #caller thread, ~30 min before each caller round starts:
+**30-minute reminder** — its own top-level message in `SLACK_CALLER_DAILY_CHANNEL_ID`, ~30 min before each round
+(caller or self) starts. It is the round's home: every follow-up for the round replies in its thread.
+
+**After-interview check** — 15 min after a round ends (only rounds that ended in the last 2 days and after
+`SLACK_CALLER_ASKS_FROM`), a reply in the round's home thread tags the owner: Completed / Passed / Rejected /
+Rescheduled… / Canceled. A round with no home (added too late for a reminder) gets one from this message.
+
+**7-day result reminder** — a completed round with no result 7 days after it, a Passed / Rejected reply in the same
+thread. The Friday roundup is no longer posted.
+
+Old example of the reminder text:
 
 ```
 :alarm_clock: *Starting in 28 min* — 10:30 AM · Intro · Acme

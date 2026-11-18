@@ -40,6 +40,16 @@ NICK_ENTRY = {"_id": NICK.id, "kind": "user", "name": "Nicholas", "color": "blue
 JUSTIN_ENTRY = {"_id": JUSTIN.id, "kind": "user", "name": "Justin", "color": "blue", "archived": False}
 
 
+LINKS = f"<https://app.x/interview/{IV}?brief={R}|Brief> · <https://app.x/interviews?panel={IV}|Open>"
+
+
+def test_no_download_or_open_buttons_anywhere():
+    for status in ("scheduled", "completed", "passed", "rejected", "canceled"):
+        _, bs = build(rnd(status=status))
+        labels = [e.get("text", {}).get("text") for b in bs for e in b.get("elements", [])]
+        assert "Download brief" not in labels and "Open interview" not in labels
+
+
 def build(r, **kw):
     kw.setdefault("directory", [NICK_ENTRY])
     kw.setdefault("managers", [PUMA])
@@ -60,12 +70,10 @@ def test_post_reads_like_the_sketch():
     assert [b["type"] for b in bs] == ["section", "actions"]
     assert lines(bs) == [
         f"📞 *Lumin Digital · Intro · {slack_time(START)} · Brandon Mayer*",
-        "Owner <@U0JUSTIN01> · Caller: <@U0NICK0001> · Video meeting (<https://meet.x/abc|link>)",
+        "Owner <@U0JUSTIN01> · Caller: <@U0NICK0001> · Video meeting (<https://meet.x/abc|link>) · "
+        f"<https://app.x/interview/{IV}?brief={R}|Brief> · <https://app.x/interviews?panel={IV}|Open>",
     ]
-    assert ids(bs) == ["coord_choose_caller", "coord_open_brief", "coord_open_interview"]
-    by = {e["action_id"]: e for e in bs[1]["elements"]}
-    assert by["coord_open_brief"]["url"] == f"https://app.x/interview/{IV}?brief={R}"
-    assert by["coord_open_interview"]["url"] == f"https://app.x/interviews?panel={IV}"
+    assert ids(bs) == ["coord_choose_caller"]
 
 
 @pytest.mark.parametrize("confirmed", [False, True])
@@ -73,22 +81,22 @@ def test_no_confirm_button_and_no_confirmed_wording(confirmed):
     """Assigning a caller confirms the round: the post has no Confirm step, whatever the stored flag says."""
     _, bs = build(rnd(confirmed=confirmed))
     assert "confirmed" not in lines(bs)[1]
-    assert ids(bs) == ["coord_choose_caller", "coord_open_brief", "coord_open_interview"]
+    assert ids(bs) == ["coord_choose_caller"]
     ext = rnd(caller="external", caller_name="Pietro", caller_user=None, caller_id="e1", confirmed=confirmed)
     assert "coord_confirm" not in ids(build(ext)[1])
 
 
 def test_tbd_tags_managers():
     _, bs = build(rnd(caller="tbd", caller_name="TBD", caller_user=None, caller_id="", method="", link=""))
-    assert lines(bs)[1] == "Owner <@U0JUSTIN01> · ⚠️ No caller yet — <@U0PUMA0001>"
+    assert lines(bs)[1].startswith("Owner <@U0JUSTIN01> · ⚠️ No caller yet — <@U0PUMA0001> · <")
     _, bs = build(rnd(caller="tbd", caller_user=None, caller_id="", method="", link=""), managers=[])
-    assert lines(bs)[1] == "Owner <@U0JUSTIN01> · ⚠️ No caller yet"
+    assert lines(bs)[1] == f"Owner <@U0JUSTIN01> · ⚠️ No caller yet · {LINKS}"
     assert "coord_confirm" not in ids(bs)
 
 
 def test_self_round():
     _, bs = build(rnd(caller="self", caller_name="Self", caller_user=None, caller_id="", method="", link=""))
-    assert lines(bs)[1] == "Owner <@U0JUSTIN01> · No caller (Self)"
+    assert lines(bs)[1] == f"Owner <@U0JUSTIN01> · No caller (Self) · {LINKS}"
     assert bs[1]["elements"][0]["initial_option"]["value"] == f"{IV}:{R}:self"
     assert "coord_confirm" not in ids(bs)
 
@@ -110,21 +118,15 @@ def test_unlisted_caller_has_no_initial_option():
     assert "initial_option" not in bs[1]["elements"][0]
 
 
-def test_completed_offers_the_result():
-    _, bs = build(rnd(status="completed"))
-    assert lines(bs)[2] == "Completed · waiting for the result"
-    assert ids(bs) == ["coord_result_passed", "coord_result_rejected", "coord_open_brief", "coord_open_interview"]
-    passed, rejected = bs[1]["elements"][:2]
-    assert (passed["style"], rejected["style"]) == ("primary", "danger")
-    assert passed["value"] == rejected["value"] == f"{IV}:{R}"
-
-
-@pytest.mark.parametrize("status,line", [("passed", "🎉 Passed"), ("rejected", "❌ Rejected"),
+@pytest.mark.parametrize("status,line", [("completed", "Completed · waiting for the result"),
+                                          ("passed", "🎉 Passed"), ("rejected", "❌ Rejected"),
                                           ("canceled", "❌ Canceled")])
-def test_ended_round_has_only_links(status, line):
+def test_settled_round_has_no_actions_block(status, line):
+    """Results are asked in the daily channel now: no Passed / Rejected, no buttons at all once settled."""
     _, bs = build(rnd(status=status))
     assert lines(bs)[2] == line
-    assert ids(bs) == ["coord_open_brief", "coord_open_interview"]
+    assert [b["type"] for b in bs] == ["section"]
+    assert lines(bs)[1].endswith(LINKS)
     if status in ("canceled", "rejected"):
         assert lines(bs)[0].startswith("❌ ~") and lines(bs)[0].endswith("~")
     else:

@@ -1,9 +1,13 @@
-"""The coordination channel's chasers: the after-call ask and the 7-day result reminder (thread replies under the
-interview's post) and the Friday result roundup (one channel message, edited in place). Off until
-SLACK_CALLER_ASKS_FROM is set; only caller rounds that END after it are chased.
+"""The interview follow-ups (spec 2026-11-17-interview-followups-daily-channel-design.md): the after-interview check
+(15 minutes after a round ends) and the 7-day result reminder, for caller and self rounds, each a reply in the round's
+home thread in the daily channel (app/interview_day/home.py). Off until SLACK_CALLER_ASKS_FROM is set; only rounds
+that END after it, and at most 2 days before the check is due, are chased.
+
+The Friday result roundup is no longer posted; a roundup already in Slack is still edited in place as its rounds are
+answered (`refresh_latest_roundup`).
 
 Claims reuse SlackAlertLog (`slack_bot._reminder_claim`, claim before posting, release on failure):
-"after-call:<roundId>:<startEpoch>", "result-reminder:<roundId>" and "result-roundup:<YYYY-MM-DD>"."""
+"after-call:<roundId>:<startEpoch>" and "result-reminder:<roundId>"."""
 
 from __future__ import annotations
 
@@ -11,7 +15,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -20,6 +24,7 @@ from beanie import PydanticObjectId
 from app import slack_bot
 from app.config import get_settings
 from app.coordination.blocks import RoundupRow, ask_blocks, result_reminder_blocks, roundup_blocks
+from app.interview_day.home import post_in_home
 from app.interview_normalize import interview_status_value, normalize_stage
 from app.models import Account, Interview, ResultRoundupPost, SlackAlertLog, UserExtra
 from app.models.interview import InterviewStage, InterviewStageEvent
@@ -29,9 +34,10 @@ log = logging.getLogger(__name__)
 
 CHASE_TZ = ZoneInfo("America/Chicago")
 RESULT_REMINDER_AFTER = timedelta(days=7)
+ASK_DELAY = timedelta(minutes=15)
+# Rounds that ended (for the reminder: whose 7-day mark passed) longer ago are skipped: no backlog on deploy day.
+MAX_AGE = timedelta(days=2)
 _ASKS_FROM_FORMAT = "%Y-%m-%dT%H:%M"
-ROUNDUP_WEEKDAY = 4  # Friday
-ROUNDUP_AT = time(18, 0)
 
 
 def asks_from() -> Optional[datetime]:
@@ -58,14 +64,13 @@ def _status_query(status: str) -> Any:
     return {"$in": ["scheduled", "rescheduled", None]} if status == "scheduled" else {"$in": [status, None]}
 
 
-async def caller_rounds(status: str, *, ended_after: datetime, ended_by: datetime) -> list[ChaseRound]:
-    """Caller rounds (caller on, not a home assessment, the interview has a post) whose normalized status is
-    `status` and whose end is in (ended_after, ended_by]."""
+async def ended_rounds(status: str, *, ended_after: datetime, ended_by: datetime) -> list[ChaseRound]:
+    """Rounds, caller or self (not home assessments), whose normalized status is `status` and whose end is in
+    (ended_after, ended_by]."""
     ended_after, ended_by = slack_bot._aware_utc(ended_after), slack_bot._aware_utc(ended_by)
     found = await Interview.find({
-        "slackThread": {"$ne": None},
         "stageHistory": {"$elemMatch": {
-            "caller.enabled": True, "status": _status_query(status),
+            "status": _status_query(status),
             "scheduledAt": {"$lte": ended_by.replace(tzinfo=None)},
             # Bound below so the set does not grow with every round ever called. A round's end is endsAt when that is
             # after the start, else start + 1 h, so it ends after `ended_after` only if it starts within the hour
@@ -79,7 +84,7 @@ async def caller_rounds(status: str, *, ended_after: datetime, ended_by: datetim
     rows: list[tuple[Interview, InterviewStageEvent, datetime, datetime]] = []
     for iv in found:
         for entry in iv.stageHistory:
-            if entry.scheduledAt is None or not (entry.caller and entry.caller.enabled):
+            if entry.scheduledAt is None:
                 continue
             if normalize_stage(entry.stage) == InterviewStage.home_assessment.value:
                 continue
@@ -105,23 +110,16 @@ def result_reminder_key(c: ChaseRound) -> str:
     return f"result-reminder:{c.entry.id}"
 
 
+def _daily_channel() -> Optional[str]:
+    cfg = slack_bot._caller_daily_configured()
+    return cfg[0] if cfg is not None else None
+
+
 def _active_cutoff() -> Optional[datetime]:
-    """The cutoff when the chasers are on (a channel, a bot token and a cutoff are all set), else None."""
-    s = get_settings()
-    if not (s.SLACK_CALLER_CHANNEL_ID or "").strip() or not (s.SLACK_BOT_TOKEN or "").strip():
+    """The cutoff when the chasers are on (the daily channel, a bot token and a cutoff are all set), else None."""
+    if _daily_channel() is None or not (get_settings().SLACK_BOT_TOKEN or "").strip():
         return None
     return asks_from()
-
-
-async def _post(channel: str, thread_ts: str, text: str, blocks: list[dict]) -> None:
-    body = {"channel": channel, "text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False}
-    try:
-        await slack_bot._slack_api("chat.postMessage", {**body, "thread_ts": thread_ts})
-    except RuntimeError as exc:
-        # The interview's post is gone from Slack: ask in the channel instead.
-        if str(exc) not in slack_bot._MESSAGE_GONE | {"thread_not_found"}:
-            raise
-        await slack_bot._slack_api("chat.postMessage", body)
 
 
 async def _chase(
@@ -141,8 +139,7 @@ async def _chase(
         ok = False
         try:
             text, blocks = build(c)
-            thread = c.interview.slackThread
-            await _post(thread.channel, thread.ts, text, blocks)
+            await post_in_home(str(c.entry.id), str(c.interview.id), c.start, _daily_channel() or "", text, blocks)
             ok = True
         except Exception as exc:
             log.warning("coordination chase %s failed: %s", k, exc)
@@ -172,11 +169,13 @@ def _reminder(c: ChaseRound) -> tuple[str, list[dict]]:
 
 
 async def run_after_call_asks(now: datetime) -> dict[str, int]:
-    """Ask the owner how a round went, once, after the round has ended."""
+    """Ask the owner how a round went, once, 15 minutes after the round has ended."""
     cutoff = _active_cutoff()
     if cutoff is None:
         return {"sent": 0, "failed": 0}
-    rounds = await caller_rounds("scheduled", ended_after=cutoff, ended_by=now)
+    now = slack_bot._aware_utc(now)
+    rounds = await ended_rounds("scheduled", ended_after=max(cutoff, now - MAX_AGE),
+                                ended_by=now - ASK_DELAY)
     return await _chase(rounds, after_call_key, _ask)
 
 
@@ -185,16 +184,10 @@ async def run_result_reminders(now: datetime) -> dict[str, int]:
     cutoff = _active_cutoff()
     if cutoff is None:
         return {"sent": 0, "failed": 0}
-    rounds = await caller_rounds("completed", ended_after=cutoff, ended_by=now - RESULT_REMINDER_AFTER)
+    now = slack_bot._aware_utc(now)
+    rounds = await ended_rounds("completed", ended_after=max(cutoff, now - RESULT_REMINDER_AFTER - MAX_AGE),
+                                ended_by=now - RESULT_REMINDER_AFTER)
     return await _chase(rounds, result_reminder_key, _reminder)
-
-
-def roundup_due(now: datetime) -> Optional[date]:
-    """The local Friday's date when `now` (America/Chicago) is a Friday at or after 18:00; else None."""
-    local = slack_bot._aware_utc(now).astimezone(CHASE_TZ)
-    if local.weekday() == ROUNDUP_WEEKDAY and local.time() >= ROUNDUP_AT:
-        return local.date()
-    return None
 
 
 def _roundup_message(
@@ -232,54 +225,8 @@ def _rendered(blocks: list[dict]) -> str:
     return hashlib.sha1(json.dumps(blocks, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-async def run_result_roundup(now: datetime) -> str:
-    """Post the Friday roundup once: every completed caller round with no result yet, by owner.
-    "off", "skipped" (not due or already claimed), "none" (nothing to list; the claim stays), "posted" or "failed"."""
-    cutoff = _active_cutoff()
-    if cutoff is None:
-        return "off"
-    friday = roundup_due(now)
-    if friday is None:
-        return "skipped"
-    key = f"result-roundup:{friday.isoformat()}"
-    if not await slack_bot._reminder_claim(key):
-        return "skipped"
-    posted = False
-    where = ""
-    try:
-        rounds = await caller_rounds("completed", ended_after=cutoff, ended_by=now)
-        if not rounds:
-            return "none"
-        text, blocks, refs = _roundup_message(rounds, await _profiles(rounds), friday)
-        channel = (get_settings().SLACK_CALLER_CHANNEL_ID or "").strip()
-        sent = await slack_bot._slack_api("chat.postMessage", {
-            "channel": channel, "text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False,
-        })
-        posted = True
-        where = f"channel {channel} ts {sent.get('ts')}"
-        record = ResultRoundupPost(
-            friday=friday.isoformat(), channel=channel, ts=str(sent.get("ts") or ""), refs=refs,
-            rendered=_rendered(blocks),
-        )
-        try:
-            await record.insert()
-        except Exception as first:
-            log.warning("coordination result roundup %s save failed (%s), retrying once: %s", key, where, first)
-            await record.insert()
-        return "posted"
-    except Exception as exc:
-        log.warning("coordination result roundup %s failed%s: %s", key, f" (posted at {where})" if posted else "", exc)
-        if posted:
-            return "failed"  # it is in the channel: keep the claim, so it is not posted twice
-        try:
-            await slack_bot._reminder_release(key)
-        except Exception as inner:
-            log.warning("coordination result roundup release of %s failed: %s", key, inner)
-        return "failed"
-
-
 async def _open_rounds(refs: list[str]) -> list[ChaseRound]:
-    """The rounds of `refs` that still exist, still have their caller on and are still completed."""
+    """The rounds of `refs` that still exist and are still completed."""
     ids = []
     for r in refs:
         try:
@@ -292,7 +239,7 @@ async def _open_rounds(refs: list[str]) -> list[ChaseRound]:
         iv_id, _, round_id = r.partition(":")
         iv = found.get(iv_id)
         entry = next((e for e in iv.stageHistory if e.id == round_id), None) if iv else None
-        if entry is None or entry.scheduledAt is None or not (entry.caller and entry.caller.enabled):
+        if entry is None or entry.scheduledAt is None:
             continue
         if (interview_status_value(entry.status) or "scheduled") != "completed":
             continue
@@ -354,11 +301,6 @@ async def run_coordination_chase(now: datetime) -> dict[str, Any]:
         except Exception as exc:
             log.exception("coordination chase %s crashed: %s", name, exc)
             out[name] = 0
-    try:
-        out["result_roundup"] = await run_result_roundup(now)
-    except Exception as exc:
-        log.exception("coordination chase result_roundup crashed: %s", exc)
-        out["result_roundup"] = "failed"
     try:
         await refresh_latest_roundup()
     except Exception as exc:

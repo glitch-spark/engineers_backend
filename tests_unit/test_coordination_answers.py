@@ -33,6 +33,8 @@ from app.models.caller import Caller  # noqa: E402
 from app.models.interview import Interview, InterviewCaller, InterviewStageEvent, SlackThread  # noqa: E402
 from app.models.interview_day_post import InterviewDayPost  # noqa: E402
 from app.models.interview_question import InterviewQuestion  # noqa: E402
+from app.models.round_slack_post import RoundSlackPost  # noqa: E402
+from app.interview_day import home  # noqa: E402
 from app.routers import interviews  # noqa: E402
 from app.slack_bot import slack_time  # noqa: E402
 
@@ -54,7 +56,8 @@ async def db():
     database = AsyncMongoMockClient()["coord-answers-unit"]
     await init_beanie(
         database=database,
-        document_models=[Interview, UserExtra, Account, InterviewQuestion, InterviewDayPost, Caller, ResultRoundupPost],
+        document_models=[Interview, UserExtra, Account, InterviewQuestion, InterviewDayPost, Caller, ResultRoundupPost,
+                         RoundSlackPost],
     )
     return database
 
@@ -170,6 +173,7 @@ def test_constants():
     for action_id, name in [
         ("coord_after_completed", "after_completed"), ("coord_after_canceled", "after_canceled"),
         ("coord_after_rescheduled", "after_rescheduled"), ("coord_result_passed", "result_passed"),
+        ("coord_after_passed", "after_passed"), ("coord_after_rejected", "after_rejected"),
         ("coord_result_rejected", "result_rejected"),
     ]:
         assert actions.HANDLERS[action_id] is getattr(actions, name)
@@ -245,6 +249,73 @@ async def test_round_gone(slack, cast):
     bad = Click("coord_after_completed", f"{iv.id}:{'f' * 32}", "U0JUSTIN01", RESPONSE_URL, "T.1", "C1", ASK_TS)
     await actions.process_coordination_click(bad)
     assert ephemeral_texts(slack) == [ROUND_GONE]
+
+
+async def test_answering_a_home_message_keeps_which_round_it_was(slack, cast):
+    """An ask that is the round's home is top-level in the channel: its answer still names the round."""
+    iv = await make_interview(cast)
+    await home.record_home(iv.stageHistory[-1].id, str(iv.id), START, "C1", ASK_TS)
+    await actions.process_coordination_click(click("coord_after_completed", iv, "U0JUSTIN01"))
+    assert [p["text"] for p in replaced(slack)] == [f"Acme · Intro · {slack_time(START)} — ✅ Completed — by <@U0JUSTIN01>"]
+
+
+async def test_answering_a_home_from_a_form_keeps_which_round_it_was(slack, cast):
+    iv = await make_interview(cast, status="completed")
+    await home.record_home(iv.stageHistory[-1].id, str(iv.id), START, "C1", ASK_TS)
+    view = submission(modals.reject_view(origin(iv), "Acme · Intro"), note="No fit")
+    await modals.process_coordination_submission(view, "U0JUSTIN01")
+    assert [b["text"] for b in slack.of("chat.update")] == [
+        f"Acme · Intro · {slack_time(START)} — ❌ Rejected — by <@U0JUSTIN01>"]
+
+
+# --- after-call ask: Passed / Rejected straight from a scheduled round -------------------------------------
+
+
+async def test_after_passed_writes_passed_on_an_ended_scheduled_round(slack, cast):
+    iv = await make_interview(cast)
+    await actions.process_coordination_click(click("coord_after_passed", iv, "U0JUSTIN01"))
+    assert status_of(await tip(iv)) == "passed"
+    assert [p["text"] for p in replaced(slack)] == ["🎉 Passed — by <@U0JUSTIN01>"]
+
+
+async def test_after_passed_refuses_a_round_not_ended_yet(slack, cast):
+    later = datetime.now(UTC).replace(microsecond=0) + timedelta(days=2)
+    iv = await make_interview(cast, start=later)
+    await actions.process_coordination_click(click("coord_after_passed", iv, "U0JUSTIN01"))
+    assert ephemeral_texts(slack) == [MOVED]
+    assert status_of(await tip(iv)) == "scheduled"
+
+
+async def test_after_passed_refuses_strangers(slack, cast):
+    iv = await make_interview(cast)
+    await actions.process_coordination_click(click("coord_after_passed", iv, "U0BOB00001"))
+    assert ephemeral_texts(slack) == [UPDATE_REFUSED]
+    assert status_of(await tip(iv)) == "scheduled"
+
+
+async def test_after_rejected_opens_the_reject_form(slack, cast):
+    iv = await make_interview(cast)
+    await actions.process_coordination_click(click("coord_after_rejected", iv, "U0JUSTIN01"))
+    view = slack.of("views.open")[0]["view"]
+    assert view["callback_id"] == "coord_reject"
+    assert Origin.from_metadata(view["private_metadata"]).ts == ASK_TS
+
+
+async def test_reject_form_accepts_an_ended_scheduled_round(slack, cast):
+    iv = await make_interview(cast)
+    view = submission(modals.reject_view(origin(iv), "Acme · Intro"), note="No fit")
+    await modals.process_coordination_submission(view, "U0JUSTIN01")
+    entry = await tip(iv)
+    assert status_of(entry) == "rejected" and entry.statusNote == "No fit"
+
+
+async def test_reject_form_refuses_a_scheduled_round_not_ended(slack, cast):
+    later = datetime.now(UTC).replace(microsecond=0) + timedelta(days=2)
+    iv = await make_interview(cast, start=later)
+    view = submission(modals.reject_view(origin(iv), "Acme · Intro"))
+    await modals.process_coordination_submission(view, "U0JUSTIN01")
+    assert slack.of("chat.postEphemeral") == [{"channel": "C1", "user": "U0JUSTIN01", "text": MOVED}]
+    assert status_of(await tip(iv)) == "scheduled"
 
 
 # --- after-call ask: the two forms ------------------------------------------------------------------------

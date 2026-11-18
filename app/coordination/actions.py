@@ -15,6 +15,8 @@ from app.caller_access import can_update_round
 from app.coordination.blocks import (
     COORD_AFTER_CANCELED,
     COORD_AFTER_COMPLETED,
+    COORD_AFTER_PASSED,
+    COORD_AFTER_REJECTED,
     COORD_AFTER_RESCHEDULED,
     COORD_CHOOSE_CALLER,
     COORD_CONFIRM,
@@ -23,9 +25,10 @@ from app.coordination.blocks import (
     answered_blocks,
 )
 from app.coordination.modals import Origin, cancel_view, reject_view, reschedule_view
-from app.interview_day.blocks import _short, _who
+from app.interview_day.blocks import MAX_NAME, _short, _who
 from app.interview_normalize import interview_status_value
 from app.models import Interview, ResultRoundupPost, UserExtra
+from app.models.round_slack_post import RoundSlackPost
 from app.models.interview import InterviewStageEvent
 from app.interview_caller import CallerIn
 from app.round_confirm import ConfirmError, confirm_round
@@ -267,6 +270,7 @@ async def show_answer(iv: Interview, *, channel: str, ts: str, response_url: str
         thread = iv.slackThread
         if thread is not None and ts and ts == thread.ts:
             return
+        line = await _with_round_context(iv, ts, line)
         if response_url:
             await replace(response_url, line, answered_blocks(line))
         elif channel and ts:
@@ -275,6 +279,18 @@ async def show_answer(iv: Interview, *, channel: str, ts: str, response_url: str
             )
     except Exception as exc:
         log.warning("coordination: showing the answer on %s failed: %s", ts, exc)
+
+
+async def _with_round_context(iv: Interview, ts: str, line: str) -> str:
+    """An answered message that is a round's home sits top-level in the daily channel: keep which round it was."""
+    found = await RoundSlackPost.find_one({"ts": ts, "interviewId": str(iv.id)}) if ts else None
+    if found is None:
+        return line
+    entry = next((e for e in iv.stageHistory if e.id == found.roundId), None)
+    start = datetime.fromtimestamp(found.startEpoch, timezone.utc)
+    parts = [_short(iv.companyName or "", MAX_NAME, "—"), slack_bot._stage_label(entry.stage) if entry else "",
+             slack_bot.slack_time(start)]
+    return f"{' · '.join(p for p in parts if p)} — {line}"
 
 
 async def _clicked_round(
@@ -354,6 +370,21 @@ async def after_rescheduled(click: Click, user: UserExtra) -> None:
     await _open_form(click, iv, entry, reschedule_view, start=entry.scheduledAt or datetime.now(timezone.utc))
 
 
+async def after_passed(click: Click, user: UserExtra) -> None:
+    """Passed straight from the check: the round went ahead and its result is already known."""
+    found = await _clicked_round(click, user)
+    if found is None or not await _ask_still_open(click, *found):
+        return
+    await _write_and_show(click, user, *found, "passed")
+
+
+async def after_rejected(click: Click, user: UserExtra) -> None:
+    found = await _clicked_round(click, user)
+    if found is None or not await _ask_still_open(click, *found):
+        return
+    await _open_form(click, *found, reject_view)
+
+
 async def _result_open(click: Click, iv: Interview, entry: InterviewStageEvent) -> bool:
     """A result can be set only on a completed round without one. Replies and returns False otherwise."""
     status = round_status(entry)
@@ -386,6 +417,8 @@ async def result_rejected(click: Click, user: UserExtra) -> None:
 HANDLERS[COORD_AFTER_COMPLETED] = after_completed
 HANDLERS[COORD_AFTER_CANCELED] = after_canceled
 HANDLERS[COORD_AFTER_RESCHEDULED] = after_rescheduled
+HANDLERS[COORD_AFTER_PASSED] = after_passed
+HANDLERS[COORD_AFTER_REJECTED] = after_rejected
 HANDLERS[COORD_RESULT_PASSED] = result_passed
 HANDLERS[COORD_RESULT_REJECTED] = result_rejected
 
