@@ -207,3 +207,8 @@ def test_plan_pace_no_days_left():
 
 def test_plan_pace_no_target():
     assert plan_pace(5, None, 0, 3) is None
+
+
+def test_plan_pace_expected_clamped_to_target():
+    p = plan_pace(1001, 1001, 1005, 0)
+    assert p["expected"] == 1001 and p["behindBy"] == 0 and p["onTrack"] is True

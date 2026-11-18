@@ -120,6 +120,7 @@ def plan_pace(actual: int, target: int | None, expected: int, days_left: int) ->
     """Pace against a plan-derived `expected` by now; None without a target."""
     if not target:
         return None
+    expected = min(expected, target)  # per-day ceil / overrides can overshoot the weekly target
     return {
         "expected": expected,
         "behindBy": max(0, expected - actual),

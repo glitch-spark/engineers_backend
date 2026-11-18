@@ -219,7 +219,7 @@ async def dashboard_week(
             "total": bids_total,
             "target": bids_target,
             "pace": plan_pace(bids_total, bids_target, bids_expected, days_left),
-            "percentile": percentile(bids_total, list(bids_scores.values())),
+            "percentile": percentile(bids_scores[sid], list(bids_scores.values())),
         },
         "interviews": {
             "done": interviews_done,

@@ -19,6 +19,7 @@ from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
 from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem
 from app.models.weekly_plan import WeeklyPlan
+from app.dashboard_stats import percentile
 from app.routers.dashboard import dashboard_week
 
 pytestmark = pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning")
@@ -106,3 +107,14 @@ async def test_no_saved_week(db):
     out = await dashboard_week(user, None, TODAY)
     assert out["weeklyGoals"] == [] and out["routines"] == {"done": 0, "expected": 0}
     assert out["bids"]["pace"] is None
+
+
+async def test_bids_percentile_ranks_logged_score_not_drafts(me):
+    await day(me, 16, logged=True, done=DoneCounts(bidsBidder=5))
+    await day(me, 17, done=DoneCounts(bidsBidder=80))              # draft: in total, not in rank
+    for n, bids in (("bo", 10), ("cy", 20)):
+        other = await UserExtra(name=n, email=f"{n}@x.io").insert()
+        await day(other, 16, logged=True, done=DoneCounts(bidsBidder=bids))
+    out = await dashboard_week(me, None, TODAY)
+    assert out["bids"]["total"] == 85
+    assert out["bids"]["percentile"] == percentile(5, [5, 10, 20])  # last of 3

@@ -1,11 +1,10 @@
-"""Draft day save (submit=false) and weekSaved; plans API with routines and weekly goals: week items, draft weeks, the day's targets / items / progress and the
-shared day save (mongomock-motor)."""
+"""Draft day save (submit=false) and weekSaved: progress-only saves, saved-week guard and the shared day save (mongomock-motor)."""
 import os
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 
-from datetime import date, datetime, timezone
+from datetime import date
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -22,9 +21,8 @@ from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import daily_plans
-from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
-from app.routers.reports import team_report
-from app.routers.weekly_plans import get_week, put_week
+from app.routers.daily_plans import get_day, put_day
+from app.routers.weekly_plans import put_week
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -127,5 +125,14 @@ async def test_progress_focus_only_when_sent(db, me, week):
 
 
 async def test_progress_future_day_is_422(db, me, week):
-    with pytest.raises(HTTPException):
+    with pytest.raises(HTTPException) as e:
         await put_day("2026-11-20", me, {"results": {}}, submit=False)
+    assert e.value.status_code == 422
+
+
+async def test_carry_over_draft_is_not_a_saved_week(db, me):
+    await put_week("2026-11-02", me, week_body())   # last week saved; this week only a carry-over draft
+    assert (await get_day("2026-11-10", me, None))["weekSaved"] is False
+    with pytest.raises(HTTPException) as e:
+        await put_day("2026-11-10", me, {"results": {}}, submit=False)
+    assert e.value.status_code == 422
