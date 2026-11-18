@@ -35,7 +35,7 @@ TODAY = date(2026, 11, 18)
 def test_weak_round_type_fires():
     tip = sc.weak_round_type({"tech": (2, 3), "intro": (4, 1)}, {"tech": (11, 5), "intro": (8, 7)})
     assert tip["severity"] == "bad" and tip["id"] == "callers.weak_round_type" and tip["impact"] > 0
-    assert "Tech rounds: 40% pass vs 69% for all callers" in tip["text"] and tip["evidence"]["group"] == "tech"
+    assert "Tech rounds: 40% pass vs 69% for other callers" in tip["text"] and tip["evidence"]["group"] == "tech"
     assert sc.weak_round_type({"tech": (2, 2)}, {"tech": (11, 5)}) is None  # 4 decided
     assert sc.weak_round_type({"tech": (2, 3)}, {"tech": (2, 2)}) is None  # team thin
     assert sc.weak_round_type({"tech": (3, 2)}, {"tech": (11, 5)}) is None  # 60 vs 69: gap < 15
@@ -130,7 +130,8 @@ async def test_mode_engineer_otherwise(db):
     self_, rank, caller, wait = out["headline"]
     assert self_["value"] == 0.2 and self_["format"] == "pct" and self_["team"]["n"] == 3 and self_["rank"] == 3
     assert rank["value"] == 3 and wait["value"] == 0 and wait["format"] == "count" and wait["higherIsBetter"] is False
-    assert caller["format"] == "pct" and caller["note"].endswith(" rounds") and caller["team"]["n"] == 3
+    assert rank["note"] == "of 3 among people who take their own rounds"
+    assert caller["format"] == "pct" and caller["note"].endswith(" decided rounds") and caller["team"]["n"] == 3
     assert not any(r["isSubject"] for r in out["everyone"]["rows"])
 
 
@@ -182,7 +183,7 @@ async def test_region_scopes_both_modes(db):
     ben = await sc.callers_view(u["Ben"], "month", TODAY, "US", None, TODAY)
     assert ben["mode"] == "engineer" and ben["headline"][0]["value"] is None
     ana = await sc.callers_view(u["Ana"], "month", TODAY, "US", None, TODAY)
-    assert ana["mode"] == "engineer" and ana["headline"][2]["value"] == 1.0 and ana["headline"][2]["note"] == "3 rounds"
+    assert ana["mode"] == "engineer" and ana["headline"][2]["value"] == 1.0 and ana["headline"][2]["note"] == "3 decided rounds"
     eu = await sc.callers_view(u["Cal"], "month", TODAY, "EU", None, TODAY)
     assert eu["headline"][0]["value"] == 0.5
 
@@ -205,6 +206,53 @@ async def test_no_caller_rounds_tip_in_view(db):
             await _round(owner, acc[owner.name], None, "passed" if ch == "p" else "rejected", i)
     out = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)
     assert "callers.no_caller_rounds" in [t["id"] for t in out["tips"]]
+
+
+async def test_unranked_subject_has_no_vs_median_both_modes(db):
+    u, acc, *_ = await _world()
+    nia = await _user("Nia")
+    for i in range(3):
+        await _round(u["Ana"], acc["Ana"], nia, "rejected", i, "tech_round_1")
+    out = await sc.callers_view(nia, "month", TODAY, "all", None, TODAY)
+    assert out["headline"][0]["value"] == 0.0 and out["headline"][0]["vsMedian"] is None
+    zed = await _user("Zed")  # engineer with 3 decided self rounds: unranked
+    for i in range(3):
+        await _round(zed, await Account(name="Zed EU", createdBy=zed.id, region="EU").insert(), None, "rejected", i)
+    out = await sc.callers_view(zed, "month", TODAY, "all", None, TODAY)
+    assert out["mode"] == "engineer" and out["headline"][0]["value"] == 0.0 and out["headline"][0]["vsMedian"] is None
+    assert out["headline"][1]["note"] == "needs 5 decided rounds"
+    ana = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)
+    assert ana["headline"][0]["vsMedian"] is not None  # ranked: still shown
+
+
+async def test_engineer_no_rounds_tip(db):
+    u, *_ = await _world()
+    zed = await _user("Zed")
+    out = await sc.callers_view(zed, "month", TODAY, "all", None, TODAY)
+    tip = next(t for t in out["tips"] if t["id"] == "callers.no_rounds")
+    assert tip["severity"] == "watch" and tip["text"] == "No interview rounds this period."
+    assert tip["detail"] == "Rounds you or a caller take on your interviews show up here."
+    ana = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)
+    assert "callers.no_rounds" not in [t["id"] for t in ana["tips"]]
+
+
+async def test_engineer_not_enough_data_uses_either_team(db):
+    u, acc, ext1, _ = await _world()
+    await Interview.find_all().delete()
+    for owner in (u["Ana"], u["Ben"], u["Cy"]):  # only caller rounds: self team empty, caller team 3
+        await _round(owner, acc[owner.name], ext1, "passed", 0)
+    out = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)
+    assert out["mode"] == "engineer" and out["notEnoughData"] is False
+
+
+async def test_weakest_needs_two_round_types(db):
+    u, acc, ext1, _ = await _world()
+    kim = await _user("Kim")
+    for i in range(5):
+        await _round(u["Ana"], acc["Ana"], kim, "rejected", i, "tech_round_1")
+    out = await sc.callers_view(kim, "month", TODAY, "all", None, TODAY)
+    weak = out["headline"][3]
+    assert weak["value"] is None and weak["note"] == ""
 
 
 # ---- collect_rounds: caller_stats unchanged ----
@@ -257,7 +305,7 @@ async def test_weak_pool_excludes_subject_and_unassigned_and_awaiting_team_held_
         await _round(u["Ana"], acc["Ana"], "TBD", "passed", i, "tech_round_1")
     out = await sc.callers_view(u["Cal"], "month", TODAY, "all", None, TODAY)
     tip = next(t for t in out["tips"] if t["id"] == "callers.weak_round_type")
-    assert "40% pass vs 82% for all callers" in tip["text"]
+    assert "40% pass vs 82% for other callers" in tip["text"]
     dee = await _user("Dee")
     await _round(dee, acc["Ana"], None, "scheduled", 0)
     ana = await sc.callers_view(u["Ana"], "month", TODAY, "all", None, TODAY)

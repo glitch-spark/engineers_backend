@@ -49,7 +49,7 @@ def weak_round_type(mine: dict, team: dict) -> Optional[dict]:
         return None
     gap, group, me, them, decided = best
     label = _GROUP_LABEL.get(group, group)
-    return _tip("weak_round_type", "bad", f"{label}: {me:.0%} pass vs {them:.0%} for all callers",
+    return _tip("weak_round_type", "bad", f"{label}: {me:.0%} pass vs {them:.0%} for other callers",
                 f"{decided} decided {label.lower()}; this is your weakest round type.",
                 {"group": group, "myPassRate": me, "teamPassRate": them, "decided": decided}, gap * decided)
 
@@ -62,6 +62,11 @@ def awaiting_backlog(rounds: list[dict], today: date) -> Optional[dict]:
                 "Rounds held more than 7 days ago with no result recorded.", {"awaiting": n}, n)
 
 
+def no_rounds() -> dict:
+    return _tip("no_rounds", "watch", "No interview rounds this period.",
+                "Rounds you or a caller take on your interviews show up here.", {}, 0)
+
+
 def no_caller_rounds(self_decided: int, caller_rounds: int) -> Optional[dict]:
     if caller_rounds or self_decided < MIN_DECIDED:
         return None
@@ -69,9 +74,9 @@ def no_caller_rounds(self_decided: int, caller_rounds: int) -> Optional[dict]:
                 f"You took {self_decided} rounds yourself with a result.", {"selfDecided": self_decided}, 0)
 
 
-def _row(key: str, label: str, value, fmt: str, team: Optional[dict], rank, of, hib: bool, note: str) -> dict:
+def _row(key: str, label: str, value, fmt: str, team: Optional[dict], rank, of, hib: bool, note: str, eligible: bool = True) -> dict:
     return {"key": key, "label": label, "value": value, "format": fmt, "team": team, "rank": rank, "of": of,
-            "vsMedian": frame.vs_median(value, team["median"]) if team and value is not None else None,
+            "vsMedian": frame.vs_median(value, team["median"]) if team and value is not None and eligible else None,
             "higherIsBetter": hib, "note": note}
 
 
@@ -118,12 +123,13 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
         done_by = {cid: _done(rs) for cid, rs in by_caller.items() if cid is not None}
         done_team = [d for d in done_by.values() if d >= 1]
         done_d = frame.distribution(done_team)
-        weak = min(((g, s["byType"][g]["passRate"]) for g in GROUPS
-                    if s["byType"][g]["passed"] + s["byType"][g]["rejected"] >= MIN_DECIDED), key=lambda x: x[1], default=None)
+        types = [(g, s["byType"][g]["passRate"]) for g in GROUPS
+                 if s["byType"][g]["passed"] + s["byType"][g]["rejected"] >= MIN_DECIDED]
+        weak = min(types, key=lambda x: x[1]) if len(types) >= 2 else None
         rk, of = _rank(s["passRate"], rates, True, eligible, eligible)
         d_rk, d_of = _rank(s["done"], done_team, True, s["done"] >= 1)
         headline = [
-            _row("passRate", "Your pass rate as a caller", s["passRate"], "pct", rate_d, rk, of, True, f"{p} passed · {rej} rejected"),
+            _row("passRate", "Your pass rate as a caller", s["passRate"], "pct", rate_d, rk, of, True, f"{p} passed · {rej} rejected", eligible),
             {"key": "rank", "label": "Your rank", "value": rk, "format": "rank", "team": None, "rank": rk, "of": of,
              "vsMedian": None, "higherIsBetter": False, "note": f"of {of}" if eligible else f"needs {MIN_DECIDED} decided rounds"},
             _row("done", "Rounds done", s["done"], "count", done_d, d_rk, d_of, True, f"{s['counts']['awaiting']} awaiting a result"),
@@ -172,20 +178,21 @@ async def callers_view(subject, period: str, day: date, region: str, until: Opti
         w_rk, w_of = frame.rank_of(my_wait, list(wait.values()), False, sidx in wait)
         headline = [
             _row("selfRate", "Pass rate when you take the round", self_rate, "pct", sd, s_rk, s_of, True,
-                 f"{my_self[0]} passed · {my_self[1]} rejected"),
+                 f"{my_self[0]} passed · {my_self[1]} rejected", sum(my_self) >= MIN_DECIDED),
             {"key": "rank", "label": "Your rank", "value": s_rk, "format": "rank", "team": None, "rank": s_rk, "of": s_of,
              "vsMedian": None, "higherIsBetter": False,
-             "note": f"of {s_of}" if sum(my_self) >= MIN_DECIDED else f"needs {MIN_DECIDED} decided rounds"},
+             "note": f"of {s_of} among people who take their own rounds" if sum(my_self) >= MIN_DECIDED else f"needs {MIN_DECIDED} decided rounds"},
             _row("callerRate", "Caller rounds on your interviews", caller_rate, "pct", cd, c_rk, c_of, True,
-                 f"{_done(mine['caller'])} rounds"),
+                 f"{sum(my_caller)} decided rounds"),
             _row("awaiting", "Awaiting a result", my_wait, "count", wd, w_rk, w_of, False, ""),
         ]
-        not_enough = frame.not_enough_data(len(self_team), len(frame.working_days(start, end, today)))
+        not_enough = frame.not_enough_data(max(len(self_team), len(caller_rates)), len(frame.working_days(start, end, today)))
         if not not_enough:
             tips = frame.order_tips([t for t in (
                 caller_vs_self(my_caller, my_self),
                 awaiting_backlog(mine["self"] + mine["caller"], today),
                 no_caller_rounds(sum(my_self), _done(mine["caller"])),
+                no_rounds() if not _done(mine["self"] + mine["caller"]) else None,
             ) if t])
         trend = None
 
