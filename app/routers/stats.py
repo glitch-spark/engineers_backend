@@ -17,7 +17,7 @@ from app.models import Account, Application, UserExtra
 from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
-from app.stats import changes, leaders
+from app.stats import changes, leaders, timing
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.frame import previous_window
@@ -235,3 +235,25 @@ async def applications_leaders(
                      "region": a.get("region"), "matured": s["matured"], "interviews": s["maturedInterviews"],
                      "per100": s["per100"], "rows": by_acct.get(str(a["_id"]), [])})
     return {"label": sc["label"], "window": sc["win"], **leaders.pick(team), "note": "These are patterns, not proof."}
+
+
+@router.get("/applications/timing")
+async def applications_timing(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+    user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+) -> dict:
+    """"When to bid" (weekday, 3-hour blocks) and bidder quality; the loader returns rejected rows too, each count drops them."""
+    sc = await _scope(user, period, date, to, user_id)
+    rows = await load_period_rows(sc["start"], sc["end"], region)
+    mine = {p["id"] for p in await owner_profiles(sc["sid"])}
+    you = [r for r in rows if str(r.get("accountId")) in mine]
+    cutoff = sc["now"] - timedelta(days=sc["win"]["matured_days"])
+    tz = app_tz()
+    names = {d["_id"]: d["name"] async for d in Bidder.get_motor_collection().find(
+        {"createdBy": sc["sid"]}, {"name": 1})}
+    return {"label": sc["label"], "subject": sc["subject"], "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
+            "bidders": timing.bidders(you, names, cutoff), "teamBidderPer100": timing.team_bidder_per100(rows, cutoff)}
