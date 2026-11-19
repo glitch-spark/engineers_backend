@@ -43,6 +43,12 @@ def test_site_groups_top8_other_and_no_link():
     assert g(out, "bySite", "none")["team"]["bids"] == 2
 
 
+def test_sites_rank_by_team_bids_even_with_zero_matured():
+    team = row(5, at=NOW, board="a.com") + row(3, at=NOW, board="b.com") + row(3, at=NOW, board="c.com")
+    out = job_fit.breakdown([], team, CUT)
+    assert [x["key"] for x in out["bySite"]] == ["a.com", "b.com", "c.com", "other", "none"]
+
+
 def test_site_labels():
     boards = ["ashbyhq.com", "greenhouse.io", "myworkdayjobs.com", "workable.com", "lever.co", "bamboohr.com",
               "rippling.com", "applytojob.com"]

@@ -262,5 +262,6 @@ async def applications_timing(
     tz = app_tz()
     names = {d["_id"]: d["name"] async for d in Bidder.get_motor_collection().find(
         {"createdBy": sc["sid"]}, {"name": 1})}
-    return {"label": sc["label"], "subject": sc["subject"], "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
+    return {"label": sc["label"], "subject": sc["subject"], "window": sc["win"],
+            "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
             "bidders": timing.bidders(you, names, cutoff), "teamBidder": timing.team_bidder(rows, cutoff)}

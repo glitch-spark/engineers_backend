@@ -50,9 +50,9 @@ def breakdown(you: list[dict], team: list[dict], matured_before: datetime) -> di
     team = [r for r in team if r.get("bidStatus") != "rejected"]
     counts: dict[str, int] = {}
     for r in team:
-        if r.get("board") and r["appliedAt"] <= matured_before:
+        if r.get("board"):
             counts[r["board"]] = counts.get(r["board"], 0) + 1
-    # ties on matured rows fall back to the domain so the order is stable; boards with no matured team rows are "Other"
+    # ranked by team bids (not matured, so a fresh period still lists boards); ties fall back to the domain
     top = sorted(counts, key=lambda b: (-counts[b], b))[:TOP_SITES]
 
     def site(r: dict) -> Optional[str]:

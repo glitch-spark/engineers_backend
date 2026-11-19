@@ -147,7 +147,7 @@ async def test_timing_endpoint_shape_and_subject_rule(db):
     await _seed(ana, bid.id, 30, rejected=10, tag="a")
     await _seed(ben, bid2.id, 30, tag="b")
     out = (await _get(ana)).json()
-    assert set(out) == {"label", "subject", "timezone", "weekday", "hours", "bidders", "teamBidder"}
+    assert set(out) == {"label", "subject", "window", "timezone", "weekday", "hours", "bidders", "teamBidder"}
     assert out["subject"] == {"userId": str(ana.id), "name": "Ana"} and out["timezone"]
     assert sum(g["you"]["bids"] for g in out["weekday"]) == 30
     assert sum(g["team"]["bids"] for g in out["weekday"]) == 60
