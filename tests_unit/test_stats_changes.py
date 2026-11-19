@@ -16,9 +16,14 @@ def _s(matured=600, iv=1, interviews=None, tech=0, median=None):
             "days": {"first": median, "median": median, "slowest": median} if median is not None else None}
 
 
+ASHBY = {"label": "Ashby", "interviews": 9, "matured": 900}
+LEVER = {"label": "Lever", "interviews": 6, "matured": 1000}
+BAND = {"label": "80+", "interviews": 5, "matured": 250}
+
+
 def _ctx(**kw):
-    base = {"team": {"per100": 0.5, "medianDays": 5, "avgScore": 70}, "bestSites": ["Ashby", "Lever"],
-            "bestBand": "80+", "matured_days": 30, "scores": {"avg": None, "n": 0},
+    base = {"team": {"per100": 0.5, "medianDays": 5, "avgScore": 70}, "bestSites": [ASHBY, LEVER],
+            "bestBand": BAND, "matured_days": 30, "scores": {"avg": None, "n": 0},
             "split": {"self": {"matured": 0, "interviews": 0, "per100": None},
                       "bidder": {"matured": 0, "interviews": 0, "per100": None}},
             "bidder": None, "deadSites": [], "prev": None, "quietNow": False, "reasons": []}
@@ -67,8 +72,8 @@ def test_low_scores_edges():
 def test_wrong_sites_two_sites_and_drop():
     out = changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=[{"label": "Workday", "matured": 600}]))
     assert out[0]["pattern"] == "wrong_sites"
-    assert out[0]["text"] == ("Wrong places — move bids to Ashby and Lever, where the team converts best; "
-                              "drop Workday.")
+    assert out[0]["text"] == ("Wrong places — move bids to Ashby (9 interviews from 900 matured bids) and Lever "
+                              "(6 from 1,000), where the team converts best; drop Workday.")
 
 
 def test_wrong_sites_drop_only_beyond_chance():
@@ -86,16 +91,17 @@ def test_wrong_sites_never_drops_a_best_site():
 
 
 def test_wrong_sites_one_site_no_drop():
-    out = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=["Ashby"]))
-    assert out[0]["text"] == "Wrong places — move bids to Ashby, where the team converts best."
+    out = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=[ASHBY]))
+    assert out[0]["text"] == ("Wrong places — move bids to Ashby (9 interviews from 900 matured bids), where the team "
+                              "converts best.")
 
 
 def test_wrong_sites_good_resumes_only_with_ten_scored_at_or_above_team():
     """I1: "Good resumes" needs >= 10 scored rows averaging at least the team's."""
-    good = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=["Ashby"], scores={"avg": 70, "n": 10}))
-    assert good[0]["text"] == "Good resumes, wrong places — move bids to Ashby, where the team converts best."
+    good = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=[ASHBY], scores={"avg": 70, "n": 10}))
+    assert good[0]["text"].startswith("Good resumes, wrong places — move bids to Ashby (9 interviews from 900")
     for sc in ({"avg": 90, "n": 9}, {"avg": 69.9, "n": 10}, {"avg": None, "n": 0}):
-        out = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=["Ashby"], scores=sc))
+        out = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=[ASHBY], scores=sc))
         assert out[0]["text"].startswith("Wrong places — move bids to Ashby"), sc
 
 
@@ -163,7 +169,7 @@ def test_bidder_gap_zero_bidder_rate_text():
 
 
 # 7. volume_up_rate_down (team 1.0: expected 4 and 5)
-def _vol(matured, iv, prev_matured=400, prev_iv=4, band="80+"):
+def _vol(matured, iv, prev_matured=400, prev_iv=4, band=BAND):
     return changes.suggest({}, _s(matured=matured, iv=iv), "watch",
                            _ctx(team={"per100": 1.0, "medianDays": 5, "avgScore": 70}, bestSites=[], bestBand=band,
                                 prev=_s(matured=prev_matured, iv=prev_iv)))
@@ -175,7 +181,7 @@ def test_volume_up_rate_down_fires_at_edge():
     out = _vol(500, 3)  # +25%; 0.6 vs 1.0 -> -40%
     assert out[0]["pattern"] == "volume_up_rate_down"
     assert out[0]["text"] == ("More bids, fewer interviews per bid — fewer, better-matched applies (score 80+ converts "
-                              "best for the team).")
+                              "best for the team: 5 interviews from 250).")
     assert _vol(500, 3, band=None)[0]["text"] == "More bids, fewer interviews per bid — fewer, better-matched applies."
 
 
@@ -234,9 +240,30 @@ def test_team_context_best_sites_and_band():
     for r in rows[:30]:
         r["scoreBand"] = "strong"
     ctx = changes.team_context(rows, CUTOFF, {"per100": 0.5, "medianDays": 5})
-    assert ctx["bestSites"] == ["Ashby", "Lever"]
-    assert ctx["bestBand"] == "80+"
+    assert ctx["bestSites"] == [{"label": "Ashby", "interviews": 6, "matured": 30},
+                                {"label": "Lever", "interviews": 3, "matured": 30}]
+    assert ctx["bestBand"] == {"label": "80+", "interviews": 6, "matured": 30}
     assert ctx["team"] == {"per100": 0.5, "medianDays": 5, "avgScore": 85.0}
+
+
+def test_team_context_no_best_pick_on_sparse_data():
+    """I3: at a realistic 0.5 per 100 a site or band with 1-2 interviews out-rates the big ones by chance; a "best"
+    pick needs 3+ team interviews (and 30+ matured bids)."""
+    def rows(board, n, iv, band=None):
+        return [_row(board=board, iv=i < iv) | {"scoreBand": band} for i in range(n)]
+    team = (rows("greenhouse.io", 1900, 9, "good") + rows("teamtailor.com", 35, 1, "strong")
+            + rows("breezy.hr", 60, 2) + rows("lever.co", 600, 3) + rows("ashbyhq.com", 400, 0)
+            + rows("bamboohr.com", 20, 1))
+    ctx = changes.team_context(team, CUTOFF, {"per100": 0.5, "medianDays": 5})
+    assert ctx["bestSites"] == [{"label": "Lever", "interviews": 3, "matured": 600},
+                                {"label": "Greenhouse", "interviews": 9, "matured": 1900}]
+    assert ctx["bestBand"] == {"label": "65–79", "interviews": 9, "matured": 1900}
+    assert all(s["interviews"] >= 3 for s in ctx["bestSites"])
+    sparse = rows("teamtailor.com", 35, 1, "strong") + rows("greenhouse.io", 1000, 2)
+    ctx = changes.team_context(sparse, CUTOFF, {"per100": 0.3, "medianDays": 5})
+    assert ctx["bestSites"] == [] and ctx["bestBand"] is None
+    out = changes.suggest({}, _s(iv=1), "watch", _ctx(**{k: ctx[k] for k in ("bestSites", "bestBand")}))
+    assert "wrong_sites" not in [x["pattern"] for x in out]
 
 
 def test_quiet_candidate():

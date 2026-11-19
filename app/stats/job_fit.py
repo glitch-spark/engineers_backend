@@ -11,7 +11,7 @@ BOARD_LABELS = {
     "zohorecruit.com": "Zoho Recruit", "icims.com": "iCIMS", "teamtailor.com": "Teamtailor", "linkedin.com": "LinkedIn",
 }
 TOP_SITES = 8
-_SCORES = [("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), (None, "No tailored resume")]
+_SCORES = [("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), (None, "No score")]
 _AREAS = ["Backend", "Full stack", "Frontend", "AI / ML", "Data", "DevOps", "QA", "Mobile", "Other", None]
 _AGES = [("<2w", "Under 2 weeks"), ("2-6w", "2–6 weeks"), ("6w-3m", "6 weeks – 3 months"), ("3m+", "3+ months"),
          (None, "Unknown")]

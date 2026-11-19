@@ -67,7 +67,7 @@ def test_score_bands_and_no_resume():
     team = [r for b in ("strong", "good", "fair", "weak", None) for r in row(1, scoreBand=b)]
     out = job_fit.breakdown([], team, CUT)
     assert [(x["key"], x["label"]) for x in out["byScore"]] == [
-        ("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), (None, "No tailored resume")]
+        ("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), (None, "No score")]
 
 
 def test_area_unknown_and_empty_groups_omitted():

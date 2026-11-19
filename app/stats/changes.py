@@ -18,17 +18,21 @@ def _avg(xs: list) -> Optional[float]:
     return round(sum(xs) / len(xs), 1) if xs else None
 
 
-def _best_label(groups: list[dict], skip: set) -> list[str]:
-    ok = [g for g in groups if g["key"] not in skip and not g["team"]["tooFew"] and g["team"]["per100"] is not None]
-    return [g["label"] for g in sorted(ok, key=lambda g: -g["team"]["per100"])]
+def _best(groups: list[dict], skip: set) -> list[dict]:
+    """Groups by team rate, best first, with their evidence; only those with 30+ matured bids and 3+ team interviews
+    (at ~0.5 per 100 a group with 1-2 interviews tops the list by chance)."""
+    ok = [g for g in groups if g["key"] not in skip and not g["team"]["tooFew"]
+          and g["team"]["interviews"] >= EXPECTED_MIN]
+    return [{"label": g["label"], "interviews": g["team"]["interviews"], "matured": g["team"]["matured"]}
+            for g in sorted(ok, key=lambda g: -g["team"]["interviews"] / g["team"]["matured"])]
 
 
 def team_context(rows: list[dict], matured_before: datetime, team: dict) -> dict:
     """Team numbers every profile's suggestions compare against: avg score, best 2 sites, best score band."""
     b = breakdown([], rows, matured_before)
     scores = [r["score"] for r in rows if r.get("bidStatus") != "rejected" and r.get("score") is not None]
-    bands = _best_label(b["byScore"], {None})
-    return {"team": {**team, "avgScore": _avg(scores)}, "bestSites": _best_label(b["bySite"], {"other", "none"})[:2],
+    bands = _best(b["byScore"], {None})
+    return {"team": {**team, "avgScore": _avg(scores)}, "bestSites": _best(b["bySite"], {"other", "none"})[:2],
             "bestBand": bands[0] if bands else None}
 
 
@@ -101,13 +105,15 @@ def wrong_sites(s, g, ctx):
     if not sites or not _below(s, ctx) or _low_scores(ctx):
         return None
     # drop a site only when the team rate would have given it 3+ interviews and it got none
-    worst = next((d for d in ctx["deadSites"] if d["label"] not in sites
+    worst = next((d for d in ctx["deadSites"] if d["label"] not in {s["label"] for s in sites}
                   and _expected(d["matured"], ctx["team"]["per100"]) >= EXPECTED_MIN), None)
     drop = f"; drop {worst['label']}" if worst else ""
     sc, team_avg = ctx["scores"], ctx["team"].get("avgScore")
     good = sc["n"] >= MIN_SCORED and team_avg is not None and sc["avg"] >= team_avg
     lead = "Good resumes, wrong places" if good else "Wrong places"
-    return _out("wrong_sites", f"{lead} — move bids to {' and '.join(sites)}, where the team "
+    where = [f"{s['label']} ({s['interviews']:,} interviews from {s['matured']:,} matured bids)" if i == 0
+             else f"{s['label']} ({s['interviews']:,} from {s['matured']:,})" for i, s in enumerate(sites)]
+    return _out("wrong_sites", f"{lead} — move bids to {' and '.join(where)}, where the team "
                                f"converts best{drop}.", bestSites=sites, worstSite=worst)
 
 
@@ -144,7 +150,9 @@ def volume_up_rate_down(s, g, ctx):
         return None
     if s["matured"] < (1 + VOLUME_STEP) * prev["matured"] or s["per100"] > (1 - VOLUME_STEP) * prev["per100"]:
         return None
-    band = f" (score {ctx['bestBand']} converts best for the team)" if ctx["bestBand"] else ""
+    bb = ctx["bestBand"]
+    band = (f" (score {bb['label']} converts best for the team: {bb['interviews']:,} interviews from "
+            f"{bb['matured']:,})") if bb else ""
     return _out("volume_up_rate_down", f"More bids, fewer interviews per bid — fewer, better-matched applies{band}.",
                 matured=s["matured"], per100=s["per100"], prevMatured=prev["matured"], prevPer100=prev["per100"])
 

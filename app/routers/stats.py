@@ -48,8 +48,9 @@ async def conversion_report(
     owners = list({a["ownerId"] for a in sc["accounts"].values()})
     names = {} if scope == "team" or not owners else {d["_id"]: d.get("name") async for d in Bidder.get_motor_collection(
     ).find({"createdBy": {"$in": owners}}, {"name": 1})}
-    rep = conversion.report(sc["rows"], sc["now"] - timedelta(days=win["matured_days"]),
-                            {k: v for k, v in names.items() if v}, scope != "team")
+    cutoff = sc["now"] - timedelta(days=win["matured_days"])
+    team_rate = team_baseline(summarize(sc["teamRows"], cutoff), sc["teamRows"])["rate"]
+    rep = conversion.report(sc["rows"], cutoff, {k: v for k, v in names.items() if v}, scope != "team", team_rate)
     return {"label": sc["label"], "startClamped": sc["startClamped"], "window": win, "scope": scope,
             "subject": sc["subject"], **({"profile": profile} if scope == "profile" else {}), **rep}
 

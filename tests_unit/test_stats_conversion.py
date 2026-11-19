@@ -54,13 +54,26 @@ def test_few_at_29_and_30():
     for n, few in ((29, True), (30, False)):
         g = conversion.report([_r(board="x.io") for _ in range(n)], CUT, {}, False)["bySite"][0]
         assert g["matured"] == n and g["few"] is few
+        assert g["fewReason"] == ("matured" if few else None)
+
+
+def test_few_by_expected_interviews_at_team_rate():
+    """I2: few also when matured x team rate / 100 < 3 (expected interviews), the grades' EXPECTED_MIN rule."""
+    def site(n, rate):
+        return conversion.report([_r(board="x.io") for _ in range(n)], CUT, {}, False, rate)["bySite"][0]
+    assert (site(600, 0.5)["few"], site(600, 0.5)["fewReason"]) == (False, None)        # 3.0 expected
+    assert (site(300, 0.5)["few"], site(300, 0.5)["fewReason"]) == (True, "expected")   # 1.5 expected
+    assert (site(29, 0.5)["few"], site(29, 0.5)["fewReason"]) == (True, "matured")
+    assert (site(300, None)["few"], site(300, 0.0)["few"]) == (False, False)            # no team rate: matured only
+    assert conversion.report([], CUT, {}, False, 0.54)["teamRate"] == 0.5
+    assert conversion.report([], CUT, {}, False)["teamRate"] is None
 
 
 def test_score_bands_and_other_groups():
     rows = [_r(iv=True, scoreBand="strong", area="Backend", profileAgeDays=3, board="lever.co"),
             _r(scoreBand="weak", profileAgeDays=100), _r(), _r(board="zz.io")]
     out = conversion.report(rows, CUT, {}, False)
-    assert [g["label"] for g in out["byScore"]] == ["80+", "65–79", "50–64", "Under 50", "No tailored resume"]
+    assert [g["label"] for g in out["byScore"]] == ["80+", "65–79", "50–64", "Under 50", "No score"]
     assert _g(out["byScore"], "strong")["rate"] == 100.0 and _g(out["byScore"], None)["bids"] == 2
     assert [g["key"] for g in out["byArea"]] == ["Backend", None]
     assert _g(out["byAge"], "<2w")["bids"] == 1 and _g(out["byAge"], "3m+")["bids"] == 1
@@ -127,7 +140,8 @@ async def test_response_shape_and_bidders(db):
     assert out["startClamped"] is False and out["window"] == WIN and out["scope"] == "me"
     assert out["totals"]["bids"] == 6 and out["totals"]["interviews"] == 1 and out["totals"]["rate"] == 16.7
     assert [(g["label"], g["bids"]) for g in out["byBidder"]] == [("Self", 4), ("Bob", 2)]
-    print(out)
+    # team rate = the team rows' pooled matured rate (Ana 1 of 6, Ben 0 of 5); 11 matured < 30: few by "matured"
+    assert out["teamRate"] == 9.1 and out["byBidder"][0]["fewReason"] == "matured"
 
 
 async def test_team_scope_has_no_bidder_table(db):

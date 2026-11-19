@@ -41,8 +41,8 @@ breakdown tables over a period long enough to mean something.
 - Replace the Bids and Interviews tabs. Name: **Conversion** (controller proposal, accepted implicitly; easy to change).
 - Scope switch as above; Team total skips the Bidder table.
 - Data starts Oct 6, 2026.
-- Rate always shown; when matured < 30 a ⚠ with tooltip `Only {n} matured bids — this rate can swing a lot.`
-- Resume score = score bands + a "No tailored resume" row.
+- Rate always shown; a ⚠ when the rate is `few` (final review I2): matured < 30 → tooltip `Only {matured} matured bids — this rate can swing a lot.`; else when the team rate would expect < 3 interviews (matured × teamRate / 100) → `Only about {expected:.1f} interviews expected from {matured} matured bids at the team rate — this rate can swing a lot.`
+- Resume score = score bands + a "No score" row (no tailored resume, or an unscored one).
 - Keep "What to change" (correct suggestions), drop "Winning vs weakest".
 - Approach A (one new endpoint + new tab).
 
@@ -82,17 +82,18 @@ Params: `period, date, to, region` (as other stats endpoints) + `scope=me|profil
 - `me`: rows on the subject's **non-archived** profiles in the region. `profile`: one of those (403/404 if not the
   subject's, admins any). `team`: rows on all non-archived profiles in the region.
 - Response: `{label, startClamped, window, scope, totals: {bids, matured, interviews, interviewsAll, inPlay, rate},
-  byBidder (omitted for team), bySite, byScore, byArea, byAge}`; each group `{key, label, bids, matured, interviews,
-  rate, few}` (`few` = matured < 30). Group labels/order as `app/stats/job_fit.py` (sites ranked by bids); Bidder:
+  teamRate, byBidder (omitted for team), bySite, byScore, byArea, byAge}`; each group `{key, label, bids, matured,
+  interviews, rate, few, fewReason}`: `few` when matured < 30 (`fewReason: "matured"`) or matured × teamRate / 100 < 3
+  (`"expected"`; teamRate = the team rows' pooled matured rate, as grades use; None/0 → the matured rule only). Group labels/order as `app/stats/job_fit.py` (sites ranked by bids); Bidder:
   "Self" then each bidder by bids (name from Bidder; null → "Unnamed bidder"); Score: 80+, 65–79, 50–64, Under 50,
-  No tailored resume.
+  No score.
 - Uses the cached `load_period_rows`; one Account query for archived/region.
 
 ## Page (app)
 
 ```
 Conversion   Region [US ▾]  Period [Since Oct 6 ▾]  [My profiles | Profile ▾ | Team total]
-Oct 6 – Nov 19 · 9,840 bids · 6,120 matured · 41 interviews · 0.7% · 3,720 in play
+Oct 6 – Nov 19 · 9,840 bids · 6,120 matured · 41 interviews from matured bids (58 in all) · 0.7% · 3,720 in play
 By bidder   By job site   By resume score   By job area   By profile age      (Bids · Matured · Interviews · Rate)
 Your profiles (report card)      What to change      When to bid (+ Bidder quality)
 ```
