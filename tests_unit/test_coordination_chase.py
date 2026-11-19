@@ -259,7 +259,7 @@ async def test_a_legacy_rescheduled_round_is_asked(slack, justin):
 
 @pytest.mark.parametrize("kwargs", [
     pytest.param(dict(status="canceled"), id="canceled"),
-    pytest.param(dict(status="completed"), id="completed"),
+    pytest.param(dict(status="passed"), id="passed"),
     pytest.param(dict(start=datetime(2026, 11, 1, 19, 0, tzinfo=UTC), end=datetime(2026, 11, 1, 20, 0, tzinfo=UTC)),
                  id="before-the-cutoff"),
     pytest.param(dict(stage="home_assessment"), id="home-assessment"),
@@ -269,6 +269,19 @@ async def test_not_asked(slack, justin, kwargs):
     assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 0, "failed": 0}
     assert slack.posts() == []
     assert await SlackAlertLog.find_all().to_list() == []
+
+
+async def test_a_round_marked_completed_before_the_check_is_asked_for_its_result(slack, justin):
+    """Marked completed early with no result: the check still asks, with the result buttons only."""
+    iv = await add(justin, status="completed")
+    rid = iv.stageHistory[0].id
+    assert await chase.run_after_call_asks(utc(16, 19, 46)) == {"sent": 1, "failed": 0}
+    [post] = slack.posts()
+    assert action_ids(post) == ["coord_result_passed", "coord_result_rejected"]
+    assert values(post) == [f"{iv.id}:{rid}"] * 2
+    assert post["text"].endswith("has no result yet. How did it end?")
+    assert await chase.run_after_call_asks(utc(16, 19, 51)) == {"sent": 0, "failed": 0}
+    assert [r.kind for r in await SlackAlertLog.find_all().to_list()] == [f"after-call:{rid}:{int(START.timestamp())}"]
 
 
 async def test_caller_turned_off_is_still_asked(slack, justin):

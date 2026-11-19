@@ -169,14 +169,16 @@ def _reminder(c: ChaseRound) -> tuple[str, list[dict]]:
 
 
 async def run_after_call_asks(now: datetime) -> dict[str, int]:
-    """Ask the owner how a round went, once, 15 minutes after the round has ended."""
+    """Ask the owner how a round went, once, 15 minutes after the round has ended. A round already marked completed
+    (no result yet) is asked for its result instead, under the same key."""
     cutoff = _active_cutoff()
     if cutoff is None:
         return {"sent": 0, "failed": 0}
     now = slack_bot._aware_utc(now)
-    rounds = await ended_rounds("scheduled", ended_after=max(cutoff, now - MAX_AGE),
-                                ended_by=now - ASK_DELAY)
-    return await _chase(rounds, after_call_key, _ask)
+    window = dict(ended_after=max(cutoff, now - MAX_AGE), ended_by=now - ASK_DELAY)
+    asked = await _chase(await ended_rounds("scheduled", **window), after_call_key, _ask)
+    results = await _chase(await ended_rounds("completed", **window), after_call_key, _reminder)
+    return {k: asked[k] + results[k] for k in asked}
 
 
 async def run_result_reminders(now: datetime) -> dict[str, int]:
