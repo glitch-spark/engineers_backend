@@ -23,6 +23,7 @@ from app.models.bid import Bid
 from app.models.bidder import Bidder
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import stats
+from app.stats import profile_loader
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -30,6 +31,13 @@ pytestmark = [
 ]
 NOW = datetime.utcnow()
 Q = f"?period=custom&date={(NOW - timedelta(days=200)).date()}&to={(NOW + timedelta(days=1)).date()}"  # covers every fixture row
+
+
+@pytest.fixture(autouse=True)
+def _clear_loader_cache():
+    profile_loader.clear_cache()
+    yield
+    profile_loader.clear_cache()
 
 
 @pytest.fixture

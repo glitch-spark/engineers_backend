@@ -18,6 +18,7 @@ from app.routers.metrics import _stats_days
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.interviews import interviews_view
+from app.stats.job_fit import breakdown
 from app.stats.profile_loader import count_unmatched_interviews, load_period_rows
 from app.stats.profile_report import grade, summarize, team_baseline
 from app.plan_profiles import owner_profiles
@@ -73,6 +74,19 @@ async def applications_coverage(
 _GRADE_ORDER = {"strong": 0, "watch": 1, "dead": 2, "early": 3}
 
 
+async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Optional[str]) -> dict:
+    """Shared by the applications cards: query params -> subject, naive-UTC period bounds, label, now, response window."""
+    day, until = _stats_days(period, date, to)
+    sid = user.id if user_id and user_id == str(user.id) else await _subject_id(user, user_id)
+    subject = user if sid == user.id else await UserExtra.get(sid)
+    start_d, end_d = interview_rates.window(period, day, until)
+    tz = app_tz()
+    return {"sid": sid, "subject": {"userId": str(sid), "name": subject.name}, "start_d": start_d, "end_d": end_d,
+            "start": local_day_start_utc(start_d, tz), "end": local_day_start_utc(end_d + timedelta(days=1), tz),
+            "label": interview_rates.label(period, start_d, end_d), "now": datetime.utcnow(),
+            "today": datetime.now(tz).date(), "win": await response_window(datetime.now(tz).date())}
+
+
 @router.get("/applications/profiles")
 async def applications_profiles(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -83,14 +97,8 @@ async def applications_profiles(
     user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
 ) -> dict:
     """The "Your profiles" report (cohort = rows applied in the period) and the coverage numbers."""
-    day, until = _stats_days(period, date, to)
-    sid = user.id if user_id and user_id == str(user.id) else await _subject_id(user, user_id)
-    subject = user if sid == user.id else await UserExtra.get(sid)
-    start_d, end_d = interview_rates.window(period, day, until)
-    tz = app_tz()
-    start, end = local_day_start_utc(start_d, tz), local_day_start_utc(end_d + timedelta(days=1), tz)
-    now = datetime.utcnow()
-    win = await response_window(datetime.now(tz).date())
+    sc = await _scope(user, period, date, to, user_id)
+    sid, start_d, end_d, start, end, now, win = (sc[k] for k in ("sid", "start_d", "end_d", "start", "end", "now", "win"))
     rows = await load_period_rows(start, end, region)
     summaries = summarize(rows, now - timedelta(days=win["matured_days"]))
     team = team_baseline(summaries, rows)
@@ -106,11 +114,29 @@ async def applications_profiles(
     regions, _ = await interview_rates._profile_regions()
     header = (await interview_rates.counts([sid], start_d, end_d, region, regions, {}, logged_only=False)).get(sid, (0,))[0]
     return {
-        "label": interview_rates.label(period, start_d, end_d),
-        "subject": {"userId": str(sid), "name": subject.name},
+        "label": sc["label"],
+        "subject": sc["subject"],
         "window": win,
         "coverage": {"rows": len(own), "headerBids": header, "noLink": sum(1 for r in own if r["key"].startswith("src:")),
                      "unmatchedInterviews": await count_unmatched_interviews(start, end, sid, region, regions)},
         "team": team,
         "profiles": profiles,
     }
+
+
+@router.get("/applications/jobs")
+async def applications_jobs(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+    user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+) -> dict:
+    """"What kind of job works": interviews per 100 matured bids by site, score, area and profile age."""
+    sc = await _scope(user, period, date, to, user_id)
+    rows = await load_period_rows(sc["start"], sc["end"], region)
+    mine = {p["id"] for p in await owner_profiles(sc["sid"])}
+    you = [r for r in rows if str(r.get("accountId")) in mine]
+    cutoff = sc["now"] - timedelta(days=sc["win"]["matured_days"])
+    return {"label": sc["label"], "subject": sc["subject"], "window": sc["win"], **breakdown(you, rows, cutoff)}

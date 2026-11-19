@@ -19,12 +19,20 @@ from app.models.bid import Bid
 from app.models.bidder import Bidder
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import stats
+from app.stats import profile_loader
 from app.routers.stats import stats_tab
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
     pytest.mark.filterwarnings("ignore:Accessing the .model_fields. attribute on the instance:DeprecationWarning"),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _clear_loader_cache():
+    profile_loader.clear_cache()
+    yield
+    profile_loader.clear_cache()
 
 
 @pytest.fixture
