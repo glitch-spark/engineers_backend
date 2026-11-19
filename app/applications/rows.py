@@ -42,8 +42,11 @@ def _key(account_id, url, coll: str, doc_id) -> tuple[str, Optional[str]]:
     return (f"{account_id}:{jk}" if jk else f"src:{coll}:{doc_id}"), jk
 
 
-def build_rows(bids: list[dict], resumes: list[dict], accounts: dict) -> dict[str, dict]:
-    """One row per (accountId, job link); a bid and a tailored resume for the same job merge, the bidder wins `by`."""
+def build_rows(bids: list[dict], resumes: list[dict], accounts: dict,
+               tailored: Optional[list[dict]] = None) -> dict[str, dict]:
+    """One row per (accountId, job link); a bid and a tailored resume for the same job merge, the bidder wins `by`.
+    `tailored` = unapplied resumes that are not row sources: the earliest one per job fills a bid row's missing
+    score/prompt/template/title and sets `tailoredResumeId`; it never adds a row or a source."""
     rows: dict[str, dict] = {}
     bid_titles: dict[str, list] = {}  # row key -> its bids' (jobTitle, jobKey), earliest first: the title fallbacks
 
@@ -82,6 +85,21 @@ def build_rows(bids: list[dict], resumes: list[dict], accounts: dict) -> dict[st
         for f in ("promptId", "promptName", "templateName"):
             r[f] = ra.get(f)
         r["title"] = job_title(ra.get("jobDescription"), None)
+
+    earliest: dict[str, dict] = {}  # bid row key -> its earliest tailored resume
+    for ra in sorted(tailored or [], key=lambda x: x["createdAt"]):
+        key = _key(ra.get("accountId"), ra.get("jobUrl"), "resumeapplications", ra["_id"])[0]
+        if key in bid_titles:
+            earliest.setdefault(key, ra)
+    for key, ra in earliest.items():
+        r = rows[key]
+        m = as_match(ra.get("matchScore")) or {}
+        for f, v in (("score", m.get("total")), ("scoreBand", m.get("band")), ("promptId", ra.get("promptId")),
+                     ("promptName", ra.get("promptName")), ("templateName", ra.get("templateName")),
+                     ("title", job_title(ra.get("jobDescription"), None))):
+            if r.get(f) is None:
+                r[f] = v
+        r["tailoredResumeId"] = str(ra["_id"])
 
     for key, r in rows.items():
         ts = bid_titles.get(key, [])  # resume title, else a bid's saved jobTitle, else a readable jobKey

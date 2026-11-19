@@ -27,6 +27,7 @@ from typing import Optional
 
 from pymongo import UpdateOne
 
+from app.applications.area import job_title
 from app.applications.rows import _key, build_rows, match_interviews
 from app.models import Account, Application, Bid, Interview, ResumeApplication
 from app.models.bidder import Bidder
@@ -83,7 +84,9 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     accts = None if account_ids is None else set(account_ids) - {None}  # $in [None] would match every accountless doc
     while True:  # scoped: grow the account set until every cross-profile resume link resolves as in a full rebuild
         scope = {} if accts is None else {"accountId": {"$in": list(accts)}}
-        resumes = await resume_coll.find({**scope, **resume_filter}, _proj(_RESUME_FIELDS)).to_list(None)
+        # keep only the first line of jobDescription (the title): ~64k unapplied resumes, full text not held
+        resumes = [{**r, "jobDescription": job_title(r.get("jobDescription"), None)} async for r in
+                   resume_coll.find({**scope, **resume_filter}, _proj(_RESUME_FIELDS))]
         iv_filter = dated if accts is None else {"$and": [dated, {"$or": [
             scope, {"resumeLink.resumeJobId": {"$in": [r["_id"] for r in resumes]}}]}]}  # a link can cross profiles
         iv_docs = await iv_coll.find(iv_filter, _proj(_IV_FIELDS)).to_list(None)
@@ -100,6 +103,7 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
         {**bid_scope, "firstAt": {"$gte": since_dt}}, _proj(_BID_FIELDS))]
     # countsAsBid False (Job Applies tailoring never marked applied) is not a bid, unless an interview links it
     proven = {str((d.get("resumeLink") or {}).get("resumeJobId")) for d in iv_docs}
+    tailored = [r for r in resumes if r.get("countsAsBid") is False and str(r["_id"]) not in proven]  # enrich only
     resumes = [r for r in resumes if r.get("countsAsBid") is not False or str(r["_id"]) in proven]
     # a row whose every source is such a resume exists only because it got an interview: flagged, stats drop it
     unapplied = {f"resume:{r['_id']}" for r in resumes if r.get("countsAsBid") is False}
@@ -107,7 +111,7 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     ids = {d["accountId"] for d in bids + resumes if d.get("accountId")}
     accounts = {a["_id"]: {"region": a.get("region"), "createdAt": a.get("createdAt")}
                 async for a in Account.get_motor_collection().find({"_id": {"$in": list(ids)}}, {"region": 1, "createdAt": 1})}
-    rows = build_rows(bids, resumes, accounts)
+    rows = build_rows(bids, resumes, accounts, tailored)
     for r in rows.values():
         if r["sources"] and set(r["sources"]) <= unapplied:
             r["byInterviewOnly"] = True

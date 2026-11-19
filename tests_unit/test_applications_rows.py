@@ -200,3 +200,55 @@ def test_title_priority_resume_then_bid_job_title_then_job_key():
     assert row["title"] == "QA Engineer"
     b2["jobTitle"] = None
     assert next(iter(build_rows([b1, b2], [], {}).values()))["title"] == "frontend dev"
+
+
+# ---- tailored (unapplied Job Applies) resumes enrich bid rows; never a source ----
+
+def tailored(url="https://jobs.acme.com/1", at=T0, **kw):
+    return resume(url=url, at=at, countsAsBid=False, jobDescription="Senior QA Engineer\nAcme", **kw)
+
+
+def test_tailored_resume_enriches_bid_row():
+    b, t = bid(), tailored(matchScore={"total": 66, "band": "fair"})
+    b["jobTitle"] = "Backend Engineer"
+    row = next(iter(build_rows([b], [], {}, tailored=[t]).values()))
+    assert (row["score"], row["scoreBand"], row["promptName"], row["templateName"]) == (66, "fair", "P", "T")
+    assert (row["title"], row["area"]) == ("Senior QA Engineer", "QA")
+    assert row["tailoredResumeId"] == str(t["_id"])
+
+
+def test_tailored_resume_not_counted():
+    b = bid()
+    rows = build_rows([b], [], {}, tailored=[tailored(), tailored(url="https://other.com/9")])
+    assert list(rows) == [f"{ACC}:jobs.acme.com/1"]
+    assert rows[f"{ACC}:jobs.acme.com/1"]["sources"] == [f"bid:{b['_id']}"]
+    assert build_rows([], [], {}, tailored=[tailored()]) == {}
+    # a resume-only row (no bid source) is not enriched
+    row = next(iter(build_rows([], [resume(url="https://jobs.acme.com/1", matchScore=None)], {},
+                               tailored=[tailored()]).values()))
+    assert row["score"] is None and "tailoredResumeId" not in row
+
+
+def test_applied_resume_wins_tailored_fills_gaps():
+    applied = resume(promptName=None, jobDescription="Frontend Developer")
+    t = tailored(matchScore={"total": 50, "band": "weak"}, promptName="TP")
+    row = next(iter(build_rows([bid()], [applied], {}, tailored=[t]).values()))
+    assert (row["score"], row["scoreBand"], row["title"], row["area"]) == (80, "strong", "Frontend Developer", "Frontend")
+    assert row["promptName"] == "TP" and row["tailoredResumeId"] == str(t["_id"])
+
+
+def test_earliest_tailored_wins():
+    late = tailored(at=T0 + timedelta(hours=1), matchScore={"total": 10, "band": "weak"})
+    early = tailored(at=T0 + timedelta(days=5), matchScore={"total": 90, "band": "strong"})
+    early["createdAt"], late["createdAt"] = T0 - timedelta(days=1), T0 + timedelta(hours=1)
+    row = next(iter(build_rows([bid()], [], {}, tailored=[late, early]).values()))
+    assert row["score"] == 90 and row["tailoredResumeId"] == str(early["_id"])
+
+
+def test_interview_linked_to_tailored_resume_matches_bid_row():
+    t = tailored()
+    rows = build_rows([bid()], [], {}, tailored=[t])
+    key = next(iter(rows))
+    i = iv([rnd("intro", T0 + timedelta(days=2))], url="https://elsewhere.com/x", resume_id=str(t["_id"]))
+    assert match_interviews(rows, [i], {str(t["_id"]): key}) == (1, 0)
+    assert rows[key]["interviewId"] == i.id

@@ -341,3 +341,22 @@ async def test_by_interview_only_flag_unset_when_resume_later_marked_applied(db)
     await db["resumeapplications"].update_one({"_id": linked["_id"]}, {"$set": {"countsAsBid": True}})
     await sync.full_rebuild(SINCE, apply=True)
     assert "byInterviewOnly" not in await db["applications"].find_one({})
+
+
+async def test_full_rebuild_enriches_and_unsets_when_tailored_removed(db):
+    b = await add_bid(db, jobTitle="Backend Engineer")
+    t = await add_resume(db, countsAsBid=False, matchScore={"total": 70, "band": "good"}, promptName="P",
+                         jobDescription="Data Engineer\n" + "x" * 5000)
+    c = await sync.full_rebuild(SINCE, apply=True)
+    assert c["rows"] == 1
+    row = await db["applications"].find_one({})
+    assert row["sources"] == [f"bid:{b['_id']}"] and "byInterviewOnly" not in row
+    assert (row["score"], row["scoreBand"], row["promptName"], row["title"], row["area"]) == (
+        70, "good", "P", "Data Engineer", "Data")
+    assert row["tailoredResumeId"] == str(t["_id"])
+    await db["resumeapplications"].delete_one({"_id": t["_id"]})
+    await sync.full_rebuild(SINCE, apply=True)
+    row = await db["applications"].find_one({})
+    for f in ("tailoredResumeId", "score", "scoreBand", "promptName"):
+        assert f not in row
+    assert (row["title"], row["area"]) == ("Backend Engineer", "Backend")

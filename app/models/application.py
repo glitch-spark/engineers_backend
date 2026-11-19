@@ -29,6 +29,7 @@ class Application(TimestampedDocument):
     promptId: Optional[str] = None
     promptName: Optional[str] = None
     templateName: Optional[str] = None
+    tailoredResumeId: Optional[str] = None  # the unapplied (Job Applies) resume whose fields filled this bid row
     interviewId: Optional[PydanticObjectId] = None
     firstRoundAt: Optional[datetime] = None
     daysToInterview: Optional[int] = None
