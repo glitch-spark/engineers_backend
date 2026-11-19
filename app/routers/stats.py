@@ -11,15 +11,16 @@ from fastapi import APIRouter, Depends, Query
 from app.applications.sync import BACKFILL_SINCE
 from app.applications.window import response_window
 from app import interview_rates
-from app.dashboard_stats import app_tz, local_day_start_utc
+from app.dashboard_stats import app_tz
 from app.deps import get_current_user, require_admin
 from app.models import Account, Application, UserExtra
 from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
-from app.stats import changes, leaders, timing
+from app.stats import changes, conversion_scope as cs, leaders, timing
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
+from app.stats.conversion_scope import bounds as _bounds
 from app.stats.frame import previous_window
 from app.stats.interviews import interviews_view
 from app.stats.job_fit import breakdown
@@ -78,12 +79,6 @@ async def applications_coverage(
 _GRADE_ORDER = {"strong": 0, "watch": 1, "dead": 2, "early": 3}
 
 
-def _bounds(start_d: date_cls, end_d: date_cls) -> tuple[datetime, datetime]:
-    """Local days [start_d, end_d] -> naive-UTC [start, end)."""
-    tz = app_tz()
-    return local_day_start_utc(start_d, tz), local_day_start_utc(end_d + timedelta(days=1), tz)
-
-
 async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Optional[str]) -> dict:
     """Shared by the applications cards: query params -> subject, naive-UTC period bounds, label, now, response window."""
     day, until = _stats_days(period, date, to)
@@ -97,16 +92,17 @@ async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Opti
             "today": datetime.now(tz).date(), "win": await response_window(datetime.now(tz).date())}
 
 
-async def _graded_profiles(sid, summaries: dict, team: dict, start: datetime) -> list[dict]:
-    """The subject's profiles with rows in the cohort, graded, in the profiles card order. A profile with an
-    interview round since `start` is never dead: its interviews may sit on byInterviewOnly or unmatched rows."""
+async def _graded_profiles(accounts: dict, summaries: dict, team: dict, start: datetime) -> list[dict]:
+    """The scope's profiles (conversion_scope `accounts`) with rows in the cohort, graded, in the profiles card order.
+    A profile with an interview round since `start` is never dead: its interviews may sit on byInterviewOnly or
+    unmatched rows."""
     profiles = []
-    for p in await owner_profiles(sid):
-        if p["id"] not in summaries:
+    for pid, a in accounts.items():
+        if pid not in summaries:
             continue
-        s = summaries[p["id"]]
+        s = summaries[pid]
         g, reasons = grade(s, team)
-        profiles.append({"accountId": p["id"], "name": p["name"], "region": p["region"], "archived": p["archived"],
+        profiles.append({"accountId": pid, "name": a["name"], "region": a["region"], "archived": a["archived"],
                          **s, "grade": g, "reasons": reasons})
     dead = [p for p in profiles if p["grade"] == "dead"]
     busy = await accounts_with_rounds_since([PydanticObjectId(p["accountId"]) for p in dead], start)
@@ -134,15 +130,19 @@ async def applications_profiles(
     to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
     user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+    scope: Literal["me", "profile", "team"] = Query("me", description="me: the subject's profiles; team: every profile"),
+    profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
 ) -> dict:
-    """The "Your profiles" report (cohort = rows applied in the period) and the coverage numbers."""
-    sc = await _scope(user, period, date, to, user_id)
-    sid, start_d, end_d, start, end, now, win = (sc[k] for k in ("sid", "start_d", "end_d", "start", "end", "now", "win"))
-    rows = await load_period_rows(start, end, region)
-    summaries = summarize(rows, now - timedelta(days=win["matured_days"]))
-    team = team_baseline(summaries, rows)
-    profiles = await _graded_profiles(sid, summaries, team, start)
-    own = [r for r in rows if r["ownerId"] == sid and r.get("bidStatus") != "rejected"]
+    """The "Your profiles" report (cohort = rows applied in the period) and the coverage numbers. Grades compare
+    against the team = every active profile of the region; `scope=team` has no per-profile list."""
+    sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
+    sid, start_d, end_d, start, end, now = (sc[k] for k in ("sid", "start_d", "end_d", "start", "end", "now"))
+    win = await response_window(sc["today"])
+    cutoff = now - timedelta(days=win["matured_days"])
+    team = team_baseline(summarize(sc["teamRows"], cutoff), sc["teamRows"])
+    profiles = [] if scope == "team" else await _graded_profiles(
+        sc["accounts"], summarize(sc["rows"], cutoff), team, start)
+    own = [r for r in sc["rows"] if r.get("bidStatus") != "rejected"]
     regions, _ = await interview_rates._profile_regions()
     header = (await interview_rates.counts([sid], start_d, end_d, region, regions, {}, logged_only=False)).get(sid, (0,))[0]
     return {
@@ -182,19 +182,25 @@ async def applications_changes(
     to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
     user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+    scope: Literal["me", "profile", "team"] = Query("me", description="me: the subject's profiles; team: every profile"),
+    profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
 ) -> dict:
-    """"What to change": up to 3 suggestions per profile of the subject, from the pattern each profile shows."""
-    sc = await _scope(user, period, date, to, user_id)
-    now, today, md = sc["now"], sc["today"], sc["win"]["matured_days"]
+    """"What to change": up to 3 suggestions per profile of the scope (none for `scope=team`), from the pattern each
+    profile shows; team numbers from every active profile of the region."""
+    sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
+    if scope == "team":
+        return {"label": sc["label"], "subject": sc["subject"], "profiles": []}
+    now, today = sc["now"], sc["today"]
+    md = (await response_window(today))["matured_days"]
     cutoff = now - timedelta(days=md)
-    rows = await load_period_rows(sc["start"], sc["end"], region)
-    summaries = summarize(rows, cutoff)
-    team = team_baseline(summaries, rows)
-    profiles = [p for p in await _graded_profiles(sc["sid"], summaries, team, sc["start"]) if not p["archived"]]
-    prev = summarize(await load_period_rows(
-        *_bounds(*previous_window(period, sc["start_d"], sc["end_d"], today)), region), cutoff)
-    tctx = changes.team_context(rows, cutoff, team)
-    by_acct = _by_account(rows)
+    team_rows = sc["teamRows"]
+    team = team_baseline(summarize(team_rows, cutoff), team_rows)
+    profiles = await _graded_profiles(sc["accounts"], summarize(sc["rows"], cutoff), team, sc["start"])
+    # volume_up_rate_down compares with the previous window: off when that window reaches before the data starts
+    ps, pe = previous_window(period, sc["start_d"], sc["end_d"], today)
+    prev = summarize(await load_period_rows(*_bounds(ps, pe), "all"), cutoff) if ps >= cs.DATA_START else {}
+    tctx = changes.team_context(team_rows, cutoff, team)
+    by_acct = _by_account(sc["rows"])
     pctx = {p["accountId"]: changes.profile_context(by_acct[p["accountId"]], cutoff) for p in profiles}
     quiet: set[str] = set()
     if sc["start_d"] <= today <= sc["end_d"]:
@@ -252,16 +258,19 @@ async def applications_timing(
     to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
     region: Literal["all", "Latam", "EU", "US"] = Query("all"),
     user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+    scope: Literal["me", "profile", "team"] = Query("me", description="me: the subject's profiles; team: every profile"),
+    profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
 ) -> dict:
-    """"When to bid" (weekday, 3-hour blocks) and bidder quality; the loader returns rejected rows too, each count drops them."""
-    sc = await _scope(user, period, date, to, user_id)
-    rows = await load_period_rows(sc["start"], sc["end"], region)
-    mine = {p["id"] for p in await owner_profiles(sc["sid"])}
-    you = [r for r in rows if str(r.get("accountId")) in mine]
-    cutoff = sc["now"] - timedelta(days=sc["win"]["matured_days"])
+    """"When to bid" (weekday, 3-hour blocks) and bidder quality; the loader returns rejected rows too, each count
+    drops them. `scope=team`: you == team and no bidder table."""
+    sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
+    you, rows = sc["rows"], sc["teamRows"]
+    win = await response_window(sc["today"])
+    cutoff = sc["now"] - timedelta(days=win["matured_days"])
     tz = app_tz()
-    names = {d["_id"]: d["name"] async for d in Bidder.get_motor_collection().find(
-        {"createdBy": sc["sid"]}, {"name": 1})}
-    return {"label": sc["label"], "subject": sc["subject"], "window": sc["win"],
+    owners = list({a["ownerId"] for a in sc["accounts"].values()})  # an admin's scope=profile: that profile's owner
+    names = {} if scope == "team" or not owners else {d["_id"]: d["name"] async for d in Bidder.get_motor_collection(
+    ).find({"createdBy": {"$in": owners}}, {"name": 1})}
+    return {"label": sc["label"], "subject": sc["subject"], "window": win,
             "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
             "bidders": timing.bidders(you, names, cutoff), "teamBidder": timing.team_bidder(rows, cutoff)}

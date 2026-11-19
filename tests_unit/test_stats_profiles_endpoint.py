@@ -6,7 +6,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 os.environ["RESUME_QUEUE_DISABLED"] = "1"
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from beanie import init_beanie
@@ -23,7 +23,7 @@ from app.models.bid import Bid
 from app.models.bidder import Bidder
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import stats
-from app.stats import profile_loader
+from app.stats import conversion_scope, profile_loader
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -53,6 +53,7 @@ async def db(monkeypatch):
         return {u: (40, 0, 0) for u in user_ids}
 
     monkeypatch.setattr(interview_rates, "_profile_regions", regions)
+    monkeypatch.setattr(conversion_scope, "DATA_START", date(2000, 1, 1))  # fixture rows predate the real one
     monkeypatch.setattr(interview_rates, "counts", counts)
 
 
