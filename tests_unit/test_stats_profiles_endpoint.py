@@ -230,3 +230,43 @@ async def test_profile_with_rounds_in_period_never_dead(db):
     await _flagged(a, ana, 2)
     p = (await _get(ana)).json()["profiles"][0]
     assert p["grade"] == "watch" and any("not marked as bids" in r for r in p["reasons"])
+
+
+# ---- coverage under the conversion scope (fix round 1) ----
+async def test_coverage_header_and_unmatched_null_unless_me(db):
+    ana, ben = await _users()
+    a = await _acct(ana, "Alpha")
+    await _rows(a, ana, 3)
+    for scope in (f"scope=profile&profile={a.id}", "scope=team"):
+        cov = (await _get(ana, Q + "&" + scope)).json()["coverage"]
+        assert cov["headerBids"] is None and cov["unmatchedInterviews"] is None
+    cov = (await _get(ana)).json()["coverage"]
+    assert cov["headerBids"] == 40 and cov["unmatchedInterviews"] == 0
+
+
+async def test_coverage_counts_from_data_start(db, monkeypatch):
+    from datetime import date
+    monkeypatch.setattr(conversion_scope, "DATA_START", date(2026, 10, 6))
+    seen = []
+
+    async def counts(user_ids, start_d, end_d, *a, **k):
+        seen.append(start_d)
+        return {u: (40, 0, 0) for u in user_ids}
+
+    monkeypatch.setattr(interview_rates, "counts", counts)
+    ana, _ = await _users()
+    for day in (20, 25):  # Sep 20 (before Oct 6, not counted) and Oct 25
+        at = datetime(2026, 9 if day == 20 else 10, day, 15)
+        await Interview.get_motor_collection().insert_one({
+            "accountId": ObjectId(), "createdBy": ana.id, "scheduledAt": at, "stage": "intro", "status": "completed",
+            "stageHistory": [], "createdAt": at, "updatedAt": at})
+    cov = (await _get(ana, "?period=custom&date=2026-09-01&to=2026-10-31")).json()["coverage"]
+    assert seen == [date(2026, 10, 6)] and cov["headerBids"] == 40 and cov["unmatchedInterviews"] == 1
+    before = (await _get(ana, "?period=custom&date=2026-09-01&to=2026-09-30")).json()["coverage"]
+    assert before["headerBids"] == 0 and before["unmatchedInterviews"] == 0
+
+
+async def test_profile_scope_other_users_profile_is_403(db):
+    ana, ben = await _users()
+    bens = await _acct(ben, "Bens")
+    assert (await _get(ana, Q + f"&scope=profile&profile={bens.id}")).status_code == 403

@@ -143,14 +143,21 @@ async def applications_profiles(
     profiles = [] if scope == "team" else await _graded_profiles(
         sc["accounts"], summarize(sc["rows"], cutoff), team, start)
     own = [r for r in sc["rows"] if r.get("bidStatus") != "rejected"]
-    regions, _ = await interview_rates._profile_regions()
-    header = (await interview_rates.counts([sid], start_d, end_d, region, regions, {}, logged_only=False)).get(sid, (0,))[0]
+    # header / unmatched count the subject's whole bid set: shown only for `me`, over the clamped period
+    header = unmatched = None
+    if scope == "me":
+        header = unmatched = 0
+        if end_d >= cs.DATA_START:
+            regions, _ = await interview_rates._profile_regions()
+            header = (await interview_rates.counts([sid], start_d, end_d, region, regions, {},
+                                                   logged_only=False)).get(sid, (0,))[0]
+            unmatched = await count_unmatched_interviews(start, end, sid, region, regions)
     return {
         "label": sc["label"],
         "subject": sc["subject"],
         "window": win,
         "coverage": {"rows": len(own), "headerBids": header, "noLink": sum(1 for r in own if r["key"].startswith("src:")),
-                     "unmatchedInterviews": await count_unmatched_interviews(start, end, sid, region, regions)},
+                     "unmatchedInterviews": unmatched},
         "team": team,
         "profiles": profiles,
     }
