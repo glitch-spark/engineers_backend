@@ -12,7 +12,8 @@ _ROW_FIELDS = ("key", "accountId", "ownerId", "appliedAt", "by", "bidStatus", "i
                "furthest", "firstRoundAt", "board", "scoreBand", "score", "area", "profileAgeDays", "bidderId",
                "templateName")
 _TTL = 300  # seconds
-_cache: dict[tuple, tuple[float, list[dict]]] = {}  # ponytail: per-process, unbounded keys; fine for a few periods
+_MAX = 16
+_cache: dict[tuple, tuple[float, list[dict]]] = {}  # cached lists are shared between callers: read-only
 
 
 def clear_cache() -> None:
@@ -28,7 +29,12 @@ async def load_period_rows(start: datetime, end: datetime, region: str) -> list[
     if region != "all":
         q["region"] = region
     rows = await Application.get_motor_collection().find(q, {f: 1 for f in _ROW_FIELDS}).to_list(None)
-    _cache[ck] = (time.monotonic(), rows)
+    now = time.monotonic()
+    for k in [k for k, (t, _) in _cache.items() if now - t >= _TTL]:
+        del _cache[k]
+    while len(_cache) >= _MAX:
+        del _cache[min(_cache, key=lambda k: _cache[k][0])]
+    _cache[ck] = (now, rows)
     return rows
 
 

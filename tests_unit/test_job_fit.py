@@ -118,3 +118,37 @@ async def test_loader_cache_reused_and_clearable():
     profile_loader.clear_cache()
     assert len(await profile_loader.load_period_rows(*a, "all")) == 2
     profile_loader.clear_cache()
+
+
+async def test_loader_cache_expires_after_ttl(monkeypatch):
+    await init_beanie(database=AsyncMongoMockClient()["job-fit-ttl"], document_models=[Application])
+    profile_loader.clear_cache()
+    clock = [1000.0]
+    monkeypatch.setattr(profile_loader.time, "monotonic", lambda: clock[0])
+    a = NOW - timedelta(days=90), NOW
+    await Application(key="k1", ownerId=ObjectId(), appliedAt=OLD, syncedAt=NOW).insert()
+    await profile_loader.load_period_rows(*a, "all")
+    await Application(key="k2", ownerId=ObjectId(), appliedAt=OLD, syncedAt=NOW).insert()
+    clock[0] += profile_loader._TTL - 1
+    assert len(await profile_loader.load_period_rows(*a, "all")) == 1
+    clock[0] += 2
+    assert len(await profile_loader.load_period_rows(*a, "all")) == 2
+    await profile_loader.load_period_rows(*a, "EU")
+    clock[0] += profile_loader._TTL + 1
+    await profile_loader.load_period_rows(*a, "US")  # a miss drops the expired entries
+    assert list(profile_loader._cache) == [(*a, "US")]
+    profile_loader.clear_cache()
+
+
+async def test_loader_cache_capped(monkeypatch):
+    await init_beanie(database=AsyncMongoMockClient()["job-fit-cap"], document_models=[Application])
+    profile_loader.clear_cache()
+    clock = [0.0]
+    monkeypatch.setattr(profile_loader.time, "monotonic", lambda: clock[0])
+    for i in range(20):
+        clock[0] += 1
+        await profile_loader.load_period_rows(NOW - timedelta(days=i + 1), NOW, "all")
+    assert len(profile_loader._cache) == 16
+    assert (NOW - timedelta(days=1), NOW, "all") not in profile_loader._cache  # oldest evicted
+    assert (NOW - timedelta(days=20), NOW, "all") in profile_loader._cache
+    profile_loader.clear_cache()
