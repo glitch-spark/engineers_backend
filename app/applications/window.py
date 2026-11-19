@@ -32,7 +32,8 @@ async def response_window(today: date) -> dict:
     since = datetime(today.year, today.month, today.day) - timedelta(days=WINDOW_DAYS)
     # Bounded: only matched rows of the last 90 days, one integer each (index: interviewId / appliedAt).
     days = sorted([d["daysToInterview"] async for d in Application.get_motor_collection().find(
-        {"interviewId": {"$ne": None}, "appliedAt": {"$gte": since}, "daysToInterview": {"$ne": None}},
+        {"interviewId": {"$ne": None}, "appliedAt": {"$gte": since}, "daysToInterview": {"$ne": None},
+         "byInterviewOnly": {"$ne": True}},
         {"daysToInterview": 1})])
     n = len(days)
     if n < MIN_MATCHED:

@@ -186,3 +186,46 @@ async def test_unmatched_interviews_respect_region(db, monkeypatch):
 def test_application_has_applied_at_index():
     keys = [list(i.document["key"].items()) for i in Application.Settings.indexes]
     assert [("appliedAt", 1)] in keys
+
+
+async def _flagged(acct, owner, n, days_ago=60):
+    """Rows that exist only because an interview linked an unapplied resume (byInterviewOnly), each with one."""
+    ivs = []
+    for i in range(n):
+        at = NOW - timedelta(days=days_ago - 5)
+        iv = await Interview.get_motor_collection().insert_one({
+            "accountId": acct.id, "createdBy": owner.id, "scheduledAt": at, "stage": "intro", "status": "completed",
+            "stageHistory": [], "createdAt": at, "updatedAt": at})
+        ivs.append(iv.inserted_id)
+        await Application(key=f"{acct.id}:flag{i}", accountId=acct.id, ownerId=owner.id, region="EU",
+                          appliedAt=NOW - timedelta(days=days_ago), interviewId=iv.inserted_id, daysToInterview=5,
+                          furthest="tech", firstRoundAt=at, byInterviewOnly=True, syncedAt=NOW).insert()
+    return ivs
+
+
+async def test_loader_excludes_by_interview_only_rows_coverage_still_matched(db):
+    """C1: flagged rows leave numerator and denominator; their interviews still count as matched."""
+    ana, _ = await _users()
+    a = await _acct(ana, "Alpha")
+    await _rows(a, ana, 40, iv=2)
+    await _flagged(a, ana, 5)
+    rows = await profile_loader.load_period_rows(NOW - timedelta(days=200), NOW + timedelta(days=1), "all")
+    assert len(rows) == 40 and not any(r.get("byInterviewOnly") for r in rows)
+    out = (await _get(ana)).json()
+    p = out["profiles"][0]
+    assert p["matured"] == 40 and p["per100"] == 5.0
+    assert out["coverage"]["rows"] == 40 and out["coverage"]["unmatchedInterviews"] == 0
+
+
+async def test_profile_with_rounds_in_period_never_dead(db):
+    """C1 follow-on: interviews that come only from flagged rows must not leave the profile graded dead."""
+    ana, ben = await _users()
+    a, other = await _acct(ana, "Alpha"), await _acct(ben, "Other")
+    await _rows(other, ben, 40, iv=8)
+    await _rows(a, ana, 40)  # 0 counted interviews; expected at the team rate >= 3
+    dead = (await _get(ana)).json()["profiles"][0]
+    assert dead["grade"] == "dead"
+    profile_loader.clear_cache()
+    await _flagged(a, ana, 2)
+    p = (await _get(ana)).json()["profiles"][0]
+    assert p["grade"] == "watch" and any("not marked as bids" in r for r in p["reasons"])

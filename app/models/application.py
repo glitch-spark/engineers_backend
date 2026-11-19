@@ -35,6 +35,7 @@ class Application(TimestampedDocument):
     furthest: Optional[str] = None
     result: Optional[str] = None
     sources: list[str] = []
+    byInterviewOnly: Optional[bool] = None  # every source an unapplied resume an interview links: not a real bid
     syncedAt: datetime
 
     class Settings:

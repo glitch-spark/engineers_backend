@@ -310,3 +310,34 @@ async def test_unapplied_job_applies_resume_counts_only_when_an_interview_links_
     rows = await db["applications"].find({}).to_list(None)
     assert c["rows"] == 1 and c["matched"] == 1 and c["unmatched"] == 0
     assert rows[0]["jobKey"] == "a.com/1" and rows[0]["interviewId"] == iv["_id"]
+
+
+async def test_interview_proven_unapplied_resume_row_flagged_by_interview_only(db):
+    """C1: such a row exists only because it got an interview; flagged so stats can drop it from both sides."""
+    linked = await add_resume(db, url="https://a.com/1", countsAsBid=False)
+    await add_interview(db, url=None, resume_id=linked["_id"])
+    await sync.full_rebuild(SINCE, apply=True)
+    row = await db["applications"].find_one({})
+    assert row["byInterviewOnly"] is True and "countsAsBid" not in row
+
+
+async def test_proven_unapplied_resume_with_bid_or_applied_resume_not_flagged(db):
+    linked = await add_resume(db, url="https://a.com/1", countsAsBid=False)
+    await add_bid(db, url="https://a.com/1")
+    await add_interview(db, url=None, resume_id=linked["_id"])
+    linked2 = await add_resume(db, url="https://b.com/2", countsAsBid=False)
+    await add_resume(db, url="https://b.com/2", at=T0 + timedelta(hours=1))  # an applied resume, same job
+    await add_interview(db, url=None, resume_id=linked2["_id"])
+    await sync.full_rebuild(SINCE, apply=True)
+    rows = await db["applications"].find({}).to_list(None)
+    assert len(rows) == 2 and all("byInterviewOnly" not in r for r in rows)
+
+
+async def test_by_interview_only_flag_unset_when_resume_later_marked_applied(db):
+    linked = await add_resume(db, url="https://a.com/1", countsAsBid=False)
+    await add_interview(db, url=None, resume_id=linked["_id"])
+    await sync.full_rebuild(SINCE, apply=True)
+    assert (await db["applications"].find_one({}))["byInterviewOnly"] is True
+    await db["resumeapplications"].update_one({"_id": linked["_id"]}, {"$set": {"countsAsBid": True}})
+    await sync.full_rebuild(SINCE, apply=True)
+    assert "byInterviewOnly" not in await db["applications"].find_one({})

@@ -83,9 +83,11 @@ def test_team_bidder_baseline():
     rows = []
     for i, p in zip(ids[:3], (3, 6, 9)):  # 30 matured each -> per100 10, 20, 30
         rows += [_r(bidderId=i, iv=k < p) for k in range(30)]
-    rows += [_r(bidderId=ids[3]) for _ in range(5)]  # too few: ignored
-    assert timing.team_bidder_per100(rows, CUT) == 20.0
-    assert timing.team_bidder_per100(rows[:10], CUT) is None
+    rows += [_r(bidderId=ids[3]) for _ in range(5)]  # small bidders count too: pooled, not a median of rates
+    rows += [_r(bidderId=ids[0], iv=True, bidStatus="rejected"), _r(iv=True)]  # rejected / not a bidder: ignored
+    assert timing.team_bidder(rows, CUT) == {"per100": 18.9, "matured": 95, "interviews": 18}
+    assert timing.team_bidder(rows, TUE_0100 - timedelta(days=1)) == {"per100": None, "matured": 0, "interviews": 0}
+    assert timing.team_bidder([], CUT) == {"per100": None, "matured": 0, "interviews": 0}
 
 
 def test_no_bidders_empty():
@@ -145,17 +147,17 @@ async def test_timing_endpoint_shape_and_subject_rule(db):
     await _seed(ana, bid.id, 30, rejected=10, tag="a")
     await _seed(ben, bid2.id, 30, tag="b")
     out = (await _get(ana)).json()
-    assert set(out) == {"label", "subject", "timezone", "weekday", "hours", "bidders", "teamBidderPer100"}
+    assert set(out) == {"label", "subject", "timezone", "weekday", "hours", "bidders", "teamBidder"}
     assert out["subject"] == {"userId": str(ana.id), "name": "Ana"} and out["timezone"]
     assert sum(g["you"]["bids"] for g in out["weekday"]) == 30
     assert sum(g["team"]["bids"] for g in out["weekday"]) == 60
     assert out["bidders"] == [{"bidderId": str(bid.id), "name": "Al", "bids": 30, "matured": 30, "interviews": 2,
                                "per100": 6.7, "tooFew": False, "rejectedShare": 25}]
-    assert out["teamBidderPer100"] == 6.7
+    assert out["teamBidder"] == {"per100": 6.7, "matured": 60, "interviews": 4}
     assert (await _get(ana, Q + f"&user={ben.id}")).status_code == 403
 
 
 async def test_timing_no_bidders(db):
     ana = await UserExtra(name="Ana", email="ana@x.io").insert()
     out = (await _get(ana)).json()
-    assert out["bidders"] == [] and out["teamBidderPer100"] is None
+    assert out["bidders"] == [] and out["teamBidder"] == {"per100": None, "matured": 0, "interviews": 0}

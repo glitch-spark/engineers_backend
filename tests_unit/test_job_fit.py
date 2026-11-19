@@ -1,4 +1,5 @@
 """job_fit.breakdown: groupings, labels, too-few, rejected, known share; loader cache (pure / mongomock)."""
+import asyncio
 import os
 
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
@@ -151,4 +152,51 @@ async def test_loader_cache_capped(monkeypatch):
     assert len(profile_loader._cache) == 16
     assert (NOW - timedelta(days=1), NOW, "all") not in profile_loader._cache  # oldest evicted
     assert (NOW - timedelta(days=20), NOW, "all") in profile_loader._cache
+    profile_loader.clear_cache()
+
+
+def _count_queries(monkeypatch, fail_first=False):
+    """Count loader queries; each query yields to the loop, as a real DB round trip does."""
+    real, calls = Application.get_motor_collection, []
+
+    class Cursor:
+        def __init__(self, cur):
+            self.cur = cur
+
+        async def to_list(self, n):
+            calls.append(1)
+            await asyncio.sleep(0)
+            if fail_first and len(calls) == 1:
+                raise RuntimeError("db down")
+            return await self.cur.to_list(n)
+
+    class Coll:
+        def find(self, *a, **k):
+            return Cursor(real().find(*a, **k))
+
+    monkeypatch.setattr(Application, "get_motor_collection", classmethod(lambda cls: Coll()))
+    return calls
+
+
+async def test_loader_single_flight_concurrent_misses_share_one_query(monkeypatch):
+    """M2: cards mount together; a cold key runs one query, every caller awaits it."""
+    await init_beanie(database=AsyncMongoMockClient()["job-fit-sf"], document_models=[Application])
+    profile_loader.clear_cache()
+    await Application(key="k1", ownerId=ObjectId(), appliedAt=OLD, syncedAt=NOW).insert()
+    calls = _count_queries(monkeypatch)
+    a = NOW - timedelta(days=90), NOW
+    r1, r2 = await asyncio.gather(profile_loader.load_period_rows(*a, "all"), profile_loader.load_period_rows(*a, "all"))
+    assert len(calls) == 1 and len(r1) == 1 and r1 is r2
+    profile_loader.clear_cache()
+
+
+async def test_loader_errors_not_cached(monkeypatch):
+    await init_beanie(database=AsyncMongoMockClient()["job-fit-err"], document_models=[Application])
+    profile_loader.clear_cache()
+    await Application(key="k1", ownerId=ObjectId(), appliedAt=OLD, syncedAt=NOW).insert()
+    calls = _count_queries(monkeypatch, fail_first=True)
+    a = NOW - timedelta(days=90), NOW
+    with pytest.raises(RuntimeError):
+        await profile_loader.load_period_rows(*a, "all")
+    assert len(await profile_loader.load_period_rows(*a, "all")) == 1 and len(calls) == 2
     profile_loader.clear_cache()

@@ -37,6 +37,13 @@ def test_dead_fires_with_matured_days():
                               "42 days.")
 
 
+def test_dead_profile_gets_only_the_dead_suggestion():
+    """I1: no "wrong places" / low scores / quiet next to "Archive it"."""
+    ctx = dict(scores={"avg": 50, "n": 10}, deadSites=[{"label": "Workday", "matured": 600}], quietNow=True,
+               reasons=["intros don't reach tech"])
+    assert _patterns(_s(iv=0, median=20), "dead", **ctx) == ["dead"]
+
+
 def test_dead_not_on_other_grades():
     assert "dead" not in _patterns(_s(iv=0), "watch")
 
@@ -60,7 +67,7 @@ def test_low_scores_edges():
 def test_wrong_sites_two_sites_and_drop():
     out = changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=[{"label": "Workday", "matured": 600}]))
     assert out[0]["pattern"] == "wrong_sites"
-    assert out[0]["text"] == ("Good resumes, wrong places — move bids to Ashby and Lever, where the team converts best; "
+    assert out[0]["text"] == ("Wrong places — move bids to Ashby and Lever, where the team converts best; "
                               "drop Workday.")
 
 
@@ -80,7 +87,16 @@ def test_wrong_sites_never_drops_a_best_site():
 
 def test_wrong_sites_one_site_no_drop():
     out = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=["Ashby"]))
-    assert out[0]["text"] == "Good resumes, wrong places — move bids to Ashby, where the team converts best."
+    assert out[0]["text"] == "Wrong places — move bids to Ashby, where the team converts best."
+
+
+def test_wrong_sites_good_resumes_only_with_ten_scored_at_or_above_team():
+    """I1: "Good resumes" needs >= 10 scored rows averaging at least the team's."""
+    good = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=["Ashby"], scores={"avg": 70, "n": 10}))
+    assert good[0]["text"] == "Good resumes, wrong places — move bids to Ashby, where the team converts best."
+    for sc in ({"avg": 90, "n": 9}, {"avg": 69.9, "n": 10}, {"avg": None, "n": 0}):
+        out = changes.suggest({}, _s(iv=1), "watch", _ctx(bestSites=["Ashby"], scores=sc))
+        assert out[0]["text"].startswith("Wrong places — move bids to Ashby"), sc
 
 
 def test_wrong_sites_skipped():
@@ -100,10 +116,17 @@ def test_stuck_intro_from_grade_reason():
 # 5. slow
 def test_slow_edges():
     out = changes.suggest({}, _s(iv=3, median=10), "watch", _ctx())
-    assert out[0]["text"] == ("Interviews come slowly (10 days vs team 5) — sharpen the summary; try a winning "
-                              "profile's template.")
+    assert out[0]["text"] == ("Interviews come slowly (10 days vs team 5, from 3 interviews) — sharpen the summary; "
+                              "try a winning profile's template.")
     assert "slow" not in _patterns(_s(iv=3, median=9))
     assert "slow" not in _patterns(_s(iv=3, median=10), team={"per100": 0.5, "medianDays": 0, "avgScore": 70})
+
+
+def test_slow_needs_three_interviews():
+    """I3: no advice from one or two data points."""
+    assert "slow" not in _patterns(_s(iv=2, median=20))
+    assert "slow" not in _patterns(_s(iv=1, interviews=1, median=20))
+    assert "slow" in _patterns(_s(iv=1, interviews=3, median=20))
 
 
 # 6. bidder_gap

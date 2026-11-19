@@ -1,6 +1,7 @@
 """DB reads for the Statistics "Your profiles" report and the coverage line (the `applications` table)."""
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Optional
@@ -13,29 +14,39 @@ _ROW_FIELDS = ("key", "accountId", "ownerId", "appliedAt", "by", "bidStatus", "i
                "templateName")
 _TTL = 300  # seconds
 _MAX = 16
-_cache: dict[tuple, tuple[float, list[dict]]] = {}  # cached lists are shared between callers: read-only
+# cached lists are shared between callers: read-only. Entries hold the load's task, so concurrent misses for one
+# key (cards mount together) await a single query; a failed load is dropped, not cached.
+_cache: dict[tuple, tuple[float, asyncio.Task]] = {}
 
 
 def clear_cache() -> None:
     _cache.clear()
 
 
-async def load_period_rows(start: datetime, end: datetime, region: str) -> list[dict]:
-    ck = (start, end, region)
-    hit = _cache.get(ck)
-    if hit and time.monotonic() - hit[0] < _TTL:
-        return hit[1]
-    q: dict = {"appliedAt": {"$gte": start, "$lt": end}}
+async def _fetch(start: datetime, end: datetime, region: str) -> list[dict]:
+    # byInterviewOnly rows exist only because they got an interview (survivor bias): out of every rate, both sides
+    q: dict = {"appliedAt": {"$gte": start, "$lt": end}, "byInterviewOnly": {"$ne": True}}
     if region != "all":
         q["region"] = region
-    rows = await Application.get_motor_collection().find(q, {f: 1 for f in _ROW_FIELDS}).to_list(None)
+    return await Application.get_motor_collection().find(q, {f: 1 for f in _ROW_FIELDS}).to_list(None)
+
+
+async def load_period_rows(start: datetime, end: datetime, region: str) -> list[dict]:
+    ck = (start, end, region)
     now = time.monotonic()
-    for k in [k for k, (t, _) in _cache.items() if now - t >= _TTL]:
-        del _cache[k]
-    while len(_cache) >= _MAX:
-        del _cache[min(_cache, key=lambda k: _cache[k][0])]
-    _cache[ck] = (now, rows)
-    return rows
+    entry = _cache.get(ck)
+    if not entry or now - entry[0] >= _TTL:
+        for k in [k for k, (t, _) in _cache.items() if now - t >= _TTL]:
+            del _cache[k]
+        while len(_cache) >= _MAX:
+            del _cache[min(_cache, key=lambda k: _cache[k][0])]
+        entry = _cache[ck] = (now, asyncio.ensure_future(_fetch(start, end, region)))
+    try:
+        return await asyncio.shield(entry[1])  # one caller cancelled (client gone) must not cancel the others
+    except Exception:
+        if _cache.get(ck) is entry:
+            del _cache[ck]
+        raise
 
 
 async def count_unmatched_interviews(since: datetime, until: Optional[datetime] = None, owner_id=None,

@@ -61,3 +61,14 @@ async def test_cache_reused_within_10_minutes(db):
     assert await window.response_window(TODAY) == first
     window.clear_cache()
     assert (await window.response_window(TODAY))["p90"] == 50
+
+
+async def test_window_excludes_by_interview_only_rows(db):
+    """C1: rows that exist only because they got an interview are dropped here too."""
+    await add_rows(db, [1] * 30)
+    at = datetime(2026, 11, 8)
+    await db["applications"].insert_many([
+        {"key": f"f{ObjectId()}", "ownerId": ObjectId(), "appliedAt": at, "interviewId": ObjectId(),
+         "daysToInterview": 50, "sources": [], "byInterviewOnly": True} for _ in range(30)])
+    w = await window.response_window(TODAY)
+    assert w["n"] == 30 and w["median"] == 1

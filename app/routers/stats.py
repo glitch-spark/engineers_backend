@@ -97,8 +97,9 @@ async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Opti
             "today": datetime.now(tz).date(), "win": await response_window(datetime.now(tz).date())}
 
 
-async def _graded_profiles(sid, summaries: dict, team: dict) -> list[dict]:
-    """The subject's profiles with rows in the cohort, graded, in the profiles card order."""
+async def _graded_profiles(sid, summaries: dict, team: dict, start: datetime) -> list[dict]:
+    """The subject's profiles with rows in the cohort, graded, in the profiles card order. A profile with an
+    interview round since `start` is never dead: its interviews may sit on byInterviewOnly or unmatched rows."""
     profiles = []
     for p in await owner_profiles(sid):
         if p["id"] not in summaries:
@@ -107,6 +108,12 @@ async def _graded_profiles(sid, summaries: dict, team: dict) -> list[dict]:
         g, reasons = grade(s, team)
         profiles.append({"accountId": p["id"], "name": p["name"], "region": p["region"], "archived": p["archived"],
                          **s, "grade": g, "reasons": reasons})
+    dead = [p for p in profiles if p["grade"] == "dead"]
+    busy = await accounts_with_rounds_since([PydanticObjectId(p["accountId"]) for p in dead], start)
+    for p in dead:
+        if p["accountId"] in busy:
+            p["grade"], p["reasons"] = "watch", p["reasons"] + [
+                "but it has interviews in the period, from applies not marked as bids or not tied to a job"]
     profiles.sort(key=lambda x: (_GRADE_ORDER[x["grade"]], -(x["per100"] if x["per100"] is not None else -1), x["name"]))
     return profiles
 
@@ -134,7 +141,7 @@ async def applications_profiles(
     rows = await load_period_rows(start, end, region)
     summaries = summarize(rows, now - timedelta(days=win["matured_days"]))
     team = team_baseline(summaries, rows)
-    profiles = await _graded_profiles(sid, summaries, team)
+    profiles = await _graded_profiles(sid, summaries, team, start)
     own = [r for r in rows if r["ownerId"] == sid and r.get("bidStatus") != "rejected"]
     regions, _ = await interview_rates._profile_regions()
     header = (await interview_rates.counts([sid], start_d, end_d, region, regions, {}, logged_only=False)).get(sid, (0,))[0]
@@ -183,7 +190,7 @@ async def applications_changes(
     rows = await load_period_rows(sc["start"], sc["end"], region)
     summaries = summarize(rows, cutoff)
     team = team_baseline(summaries, rows)
-    profiles = [p for p in await _graded_profiles(sc["sid"], summaries, team) if not p["archived"]]
+    profiles = [p for p in await _graded_profiles(sc["sid"], summaries, team, sc["start"]) if not p["archived"]]
     prev = summarize(await load_period_rows(
         *_bounds(*previous_window(period, sc["start_d"], sc["end_d"], today)), region), cutoff)
     tctx = changes.team_context(rows, cutoff, team)
@@ -256,4 +263,4 @@ async def applications_timing(
     names = {d["_id"]: d["name"] async for d in Bidder.get_motor_collection().find(
         {"createdBy": sc["sid"]}, {"name": 1})}
     return {"label": sc["label"], "subject": sc["subject"], "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
-            "bidders": timing.bidders(you, names, cutoff), "teamBidderPer100": timing.team_bidder_per100(rows, cutoff)}
+            "bidders": timing.bidders(you, names, cutoff), "teamBidder": timing.team_bidder(rows, cutoff)}

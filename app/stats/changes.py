@@ -11,6 +11,7 @@ RECENT_DAYS = 7
 LOW_SCORE_GAP = 5
 MIN_SCORED = 10
 VOLUME_STEP = 0.25
+MIN_SLOW = 3  # interviews: no speed advice from one or two data points
 
 
 def _avg(xs: list) -> Optional[float]:
@@ -103,7 +104,10 @@ def wrong_sites(s, g, ctx):
     worst = next((d for d in ctx["deadSites"] if d["label"] not in sites
                   and _expected(d["matured"], ctx["team"]["per100"]) >= EXPECTED_MIN), None)
     drop = f"; drop {worst['label']}" if worst else ""
-    return _out("wrong_sites", f"Good resumes, wrong places — move bids to {' and '.join(sites)}, where the team "
+    sc, team_avg = ctx["scores"], ctx["team"].get("avgScore")
+    good = sc["n"] >= MIN_SCORED and team_avg is not None and sc["avg"] >= team_avg
+    lead = "Good resumes, wrong places" if good else "Wrong places"
+    return _out("wrong_sites", f"{lead} — move bids to {' and '.join(sites)}, where the team "
                                f"converts best{drop}.", bestSites=sites, worstSite=worst)
 
 
@@ -115,9 +119,10 @@ def stuck_intro(s, g, ctx):
 
 def slow(s, g, ctx):
     med, tmed = (s["days"] or {}).get("median"), ctx["team"]["medianDays"]
-    if tmed is not None and tmed >= 1 and med is not None and med >= SLOW_RATIO * tmed:
-        return _out("slow", f"Interviews come slowly ({med} days vs team {tmed}) — sharpen the summary; try a winning "
-                            f"profile's template.", medianDays=med, teamMedianDays=tmed, interviews=s["interviews"])
+    n = s["interviews"]
+    if n >= MIN_SLOW and tmed is not None and tmed >= 1 and med is not None and med >= SLOW_RATIO * tmed:
+        return _out("slow", f"Interviews come slowly ({med} days vs team {tmed}, from {n} interviews) — sharpen the "
+                            f"summary; try a winning profile's template.", medianDays=med, teamMedianDays=tmed, interviews=n)
 
 
 def bidder_gap(s, g, ctx):
@@ -155,6 +160,8 @@ NEGATIVE = {low_scores, wrong_sites, slow, bidder_gap, volume_up_rate_down}
 
 
 def suggest(profile: dict, summary: dict, grade: str, ctx: dict) -> list[dict]:
+    if grade == "dead":  # archive or rebuild: any other advice would contradict it
+        return [dead(summary, grade, ctx)]
     out = []
     for p in PATTERNS:
         if grade == "early" and p in NEGATIVE:

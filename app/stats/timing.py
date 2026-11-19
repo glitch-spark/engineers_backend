@@ -1,10 +1,7 @@
 """When to bid (weekday / 3-hour block in the app time zone) and per-bidder quality (pure, no DB)."""
 from datetime import datetime, timezone
-from statistics import median
-from typing import Optional
 
 from app.stats.job_fit import _groups, _stats
-from app.stats.profile_report import MIN_MATURED
 
 _DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _HOURS = [f"{h:02d}–{h + 3:02d}" for h in range(0, 24, 3)]
@@ -23,14 +20,11 @@ def by_time(you: list[dict], team: list[dict], matured_before: datetime, tz) -> 
     }
 
 
-def team_bidder_per100(rows: list[dict], matured_before: datetime) -> Optional[float]:
-    by: dict = {}
-    for r in rows:
-        if r.get("bidderId") is not None and r.get("bidStatus") != "rejected":
-            by.setdefault(r["bidderId"], []).append(r)
-    rates = [s["per100"] for s in (_stats(v, matured_before) for v in by.values())
-             if s["matured"] >= MIN_MATURED and s["per100"] is not None]
-    return round(median(rates), 1) if rates else None
+def team_bidder(rows: list[dict], matured_before: datetime) -> dict:
+    """Pooled over every team bidder row (non-rejected): {per100, matured, interviews}. Pooled, not a median of
+    per-bidder rates: at real rates most bidders have 0 interviews, so that median is 0 almost always."""
+    s = _stats([r for r in rows if r.get("bidderId") is not None and r.get("bidStatus") != "rejected"], matured_before)
+    return {k: s[k] for k in ("per100", "matured", "interviews")}
 
 
 def bidders(rows: list[dict], bidder_names: dict, matured_before: datetime) -> list[dict]:

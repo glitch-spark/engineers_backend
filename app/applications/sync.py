@@ -101,11 +101,16 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     # countsAsBid False (Job Applies tailoring never marked applied) is not a bid, unless an interview links it
     proven = {str((d.get("resumeLink") or {}).get("resumeJobId")) for d in iv_docs}
     resumes = [r for r in resumes if r.get("countsAsBid") is not False or str(r["_id"]) in proven]
+    # a row whose every source is such a resume exists only because it got an interview: flagged, stats drop it
+    unapplied = {f"resume:{r['_id']}" for r in resumes if r.get("countsAsBid") is False}
     resumes = [{**r, "countsAsBid": None} if r.get("countsAsBid") is False else r for r in resumes]
     ids = {d["accountId"] for d in bids + resumes if d.get("accountId")}
     accounts = {a["_id"]: {"region": a.get("region"), "createdAt": a.get("createdAt")}
                 async for a in Account.get_motor_collection().find({"_id": {"$in": list(ids)}}, {"region": 1, "createdAt": 1})}
     rows = build_rows(bids, resumes, accounts)
+    for r in rows.values():
+        if r["sources"] and set(r["sources"]) <= unapplied:
+            r["byInterviewOnly"] = True
     resume_row = {str(r["_id"]): _key(r.get("accountId"), r.get("jobUrl"), "resumeapplications", r["_id"])[0] for r in resumes}
     matched, unmatched = match_interviews(rows, [Interview.model_validate(d) for d in iv_docs], resume_row)
 
