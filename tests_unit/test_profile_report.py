@@ -92,7 +92,7 @@ def test_grade_not_dead_when_new_profile():
 
 
 def test_young_cohort_is_early_not_judged():
-    assert grade(_s(10), TEAM, None, 14, NOW) == ("early", ["too early to judge"])
+    assert grade(_s(10), TEAM, None, 14, NOW) == ("early", ["too early to judge (10 of 30 matured bids)"])
     assert grade(_s(50, 1, 2.0), {"per100": None, "medianDays": None, "profiles": 0}, None, 14, NOW)[0] == "early"
 
 
@@ -105,3 +105,15 @@ def test_grade_watch_reasons():
     g, why = grade(_s(80, 1, 1.2, (3, 0, 0), median=14), TEAM, None, 14, NOW)
     assert g == "watch"
     assert why == ["below team (1.2 vs 2.6 per 100)", "slow (median 14 days vs team 6)", "intros don't reach tech"]
+
+
+def test_grade_watch_always_has_a_reason():
+    assert grade(_s(50, 1, 3.0, (1, 0, 0)), TEAM, None, 14, NOW) == ("watch", ["no interview has reached tech yet"])
+    zero = {"per100": 0.0, "medianDays": None, "profiles": 1}
+    assert grade(_s(50, 0, 0.0), zero, None, 14, NOW) == ("watch", ["no interviews yet"])
+
+
+def test_early_reasons_distinguish_young_profile_from_missing_baseline():
+    none_team = {"per100": None, "medianDays": None, "profiles": 0}
+    assert grade(_s(50, 1, 2.0), none_team, None, 14, NOW) == (
+        "early", ["no team baseline yet (fewer than 30 matured bids on every profile)"])

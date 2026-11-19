@@ -65,8 +65,10 @@ def grade(summary: dict, team: dict, activity: Optional[dict], matured_days: int
         old = activity["firstAt"] < now - timedelta(days=matured_days + SILENT_DAYS)
         if bidding and silent and old:
             return "dead", [f"no interview for {SILENT_DAYS}+ days"]
-    if summary["matured"] < MIN_MATURED or team["per100"] is None:
-        return "early", ["too early to judge"]
+    if summary["matured"] < MIN_MATURED:
+        return "early", [f"too early to judge ({summary['matured']} of {MIN_MATURED} matured bids)"]
+    if team["per100"] is None:
+        return "early", [f"no team baseline yet (fewer than {MIN_MATURED} matured bids on every profile)"]
     per100 = summary["per100"] or 0.0
     reach = summary["reach"]
     if per100 >= team["per100"] and reach["tech"] > 0:
@@ -79,4 +81,6 @@ def grade(summary: dict, team: dict, activity: Optional[dict], matured_days: int
         why.append(f"slow (median {med} days vs team {tmed})")
     if summary["interviews"] >= STUCK_INTERVIEWS and reach["tech"] == 0:
         why.append("intros don't reach tech")
+    if not why:
+        why.append("no interview has reached tech yet" if summary["interviews"] else "no interviews yet")
     return "watch", why
