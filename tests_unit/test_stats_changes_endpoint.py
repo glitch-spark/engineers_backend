@@ -6,7 +6,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/unit-test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 os.environ["RESUME_QUEUE_DISABLED"] = "1"
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from beanie import init_beanie
@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from mongomock_motor import AsyncMongoMockClient
 
 from app import interview_rates
+from app.dashboard_stats import app_tz
 from app.deps import get_current_user
 from app.models import Account, Application, DailyPlan, Interview, InterviewQuestion, UserExtra
 from app.models.bid import Bid
@@ -164,11 +165,27 @@ async def test_quiet_now_counts_unmatched_interviews(db):
     assert (await _get(ana)).json()["profiles"] == []
 
 
-async def test_quiet_now_fires_in_month_view(db):
+EDGE = datetime(2026, 12, 1, 3)  # UTC Dec 1, still Nov 30 in the app timezone
+
+
+async def test_quiet_now_fires_in_month_view(db, monkeypatch):
+    class Clock(datetime):  # the router's clock, frozen at the month edge
+        @classmethod
+        def utcnow(cls):
+            return EDGE
+
+        @classmethod
+        def now(cls, tz=None):
+            return EDGE.replace(tzinfo=timezone.utc).astimezone(tz) if tz else EDGE
+
+    monkeypatch.setattr(stats, "datetime", Clock)
+    today = Clock.now(app_tz()).date()
+    assert today != EDGE.date()  # pins the UTC-vs-app-timezone edge
     ana, _ = await _users()
     acct = await _acct(ana, "Old")
-    await _rows(acct, ana, 1, days_ago=0, profileAgeDays=120)  # profile ~4 months old, bidding this month
-    qs = f"?period=month&date={NOW.date()}"
+    await Application(key=f"{acct.id}:edge", accountId=acct.id, ownerId=ana.id, region="EU", appliedAt=EDGE,
+                      profileAgeDays=120, syncedAt=EDGE).insert()  # profile ~4 months old, bidding today
+    qs = f"?period=month&date={today}"
     sug = (await _get(ana, qs=qs)).json()["profiles"][0]["suggestions"]
     assert [s["pattern"] for s in sug] == ["quiet_now"]
 
