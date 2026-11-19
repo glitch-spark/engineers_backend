@@ -101,7 +101,7 @@ async def test_profiles_report_shape(db):
     out = res.json()
     assert [p["name"] for p in out["profiles"]] == ["Alpha", "Beta"]
     assert [p["grade"] for p in out["profiles"]] == ["strong", "watch"]
-    assert out["team"]["per100"] == 10.0 and out["team"]["profiles"] == 3
+    assert out["team"]["per100"] == 11.7 and out["team"]["profiles"] == 3  # pooled 14 of 120
     assert out["subject"] == {"userId": str(ana.id), "name": "Ana"}
     assert out["coverage"] == {"rows": 80, "headerBids": 40, "noLink": 0, "unmatchedInterviews": 0}
     assert out["profiles"][1]["reasons"] and out["profiles"][0]["per100"] == 20.0

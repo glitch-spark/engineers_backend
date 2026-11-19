@@ -1,6 +1,6 @@
 """Per-profile application summaries, team baseline and grades for the Statistics "Your profiles" card (pure, no DB)."""
 from datetime import datetime
-from statistics import median, median_low
+from statistics import median_low
 from typing import Optional
 
 MIN_MATURED = 30
@@ -46,11 +46,15 @@ def summarize(rows: list[dict], matured_before: datetime) -> dict[str, dict]:
 
 
 def team_baseline(summaries: dict[str, dict], rows: list[dict]) -> dict:
-    rates = [s["per100"] for s in summaries.values() if s["matured"] >= MIN_MATURED and s["per100"] is not None]
+    # pooled team rate (changed 2026-11-18 after real data: the median of profiles collapsed to 0);
+    # "rate" stays unrounded for expected-interview maths, "per100" is the rounded display value
+    total = sum(s["matured"] for s in summaries.values())
+    rate = sum(s["maturedInterviews"] for s in summaries.values()) / total * 100 if total else None
     d = [r["daysToInterview"] for r in rows
          if r.get("bidStatus") != "rejected" and r.get("interviewId") and r.get("daysToInterview") is not None]
-    return {"per100": round(median(rates), 1) if rates else None, "medianDays": median_low(d) if d else None,
-            "profiles": len(rates)}
+    return {"per100": round(rate, 1) if rate is not None else None, "rate": rate,
+            "medianDays": median_low(d) if d else None,
+            "profiles": sum(1 for s in summaries.values() if s["matured"] >= MIN_MATURED)}
 
 
 def grade(summary: dict, team: dict) -> tuple[str, list[str]]:
@@ -60,22 +64,23 @@ def grade(summary: dict, team: dict) -> tuple[str, list[str]]:
         return "early", [f"too early to judge ({matured} of {MIN_MATURED} matured bids)"]
     if team["per100"] is None:
         return "early", [f"no team baseline yet (fewer than {MIN_MATURED} matured bids on every profile)"]
-    expected = matured * team["per100"] / 100
+    rate = team.get("rate", team["per100"])
+    expected = matured * rate / 100
     if expected >= EXPECTED_MIN and summary["maturedInterviews"] == 0:
         return "dead", [f"no interview from {matured} matured bids (the team rate would give about {round(expected)})"]
     per100 = summary["per100"] or 0.0
     reach = summary["reach"]
-    if per100 >= team["per100"] and reach["tech"] > 0:
+    if per100 >= rate and reach["tech"] > 0:
         return "strong", []
     why = []
-    if expected >= EXPECTED_MIN and per100 < team["per100"]:
+    if expected >= EXPECTED_MIN and per100 < rate:
         why.append(f"below team ({per100} vs {team['per100']} per 100)")
     med, tmed = (summary["days"] or {}).get("median"), team.get("medianDays")
     if tmed is not None and tmed >= 1 and med is not None and med >= SLOW_RATIO * tmed:
         why.append(f"slow (median {med} days vs team {tmed})")
     if summary["interviews"] >= STUCK_INTERVIEWS and reach["tech"] == 0:
         why.append("intros don't reach tech")
-    elif per100 >= team["per100"] and summary["interviews"] and reach["tech"] == 0:
+    elif per100 >= rate and summary["interviews"] and reach["tech"] == 0:
         why.append("no interview has reached tech yet")
     if why:
         return "watch", why

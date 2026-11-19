@@ -69,7 +69,7 @@ def _expected(matured: int, team_per100: Optional[float]) -> float:
 
 
 def _below(s: dict, ctx: dict) -> bool:
-    t = ctx["team"]["per100"]
+    t = ctx["team"].get("rate", ctx["team"]["per100"])
     return t is not None and _expected(s["matured"], t) >= EXPECTED_MIN and (s["per100"] or 0) < t
 
 

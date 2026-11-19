@@ -104,7 +104,7 @@ Header: the existing you-vs-team cards (unchanged). Below, in order:
 7. **Bidder quality** (owners and admins) — per bidder: bids, matured per-100, rejected share.
 
 Grades (user decision 2026-11-18; the team rate is ~0.5 per 100, so fixed thresholds graded by chance): expected =
-matured × team per-100 / 100. ⏳ fewer than 30 matured bids or no team baseline; ⛔ expected ≥ 3 and 0 matured interviews;
+matured × team per-100 / 100, where team per-100 is the pooled rate (total matured interviews ÷ total matured × 100, unrounded for this maths; changed 2026-11-18 after real data: the median of profiles collapsed to 0). ⏳ fewer than 30 matured bids or no team baseline; ⛔ expected ≥ 3 and 0 matured interviews;
 ✅ per-100 ≥ team and an interview reached tech; ⚠ below team (only when expected ≥ 3), slow (median days ≥ 2× team's,
 team median ≥ 1 day), intros that never reach tech (≥ 3 interviews), or at/above team with no tech yet; otherwise ⏳
 "too few to tell". No "silent for 21 days" rule.

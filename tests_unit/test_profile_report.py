@@ -55,15 +55,29 @@ def _prof(acc, n, ivs):
     return [row(acc=acc, iv=i < ivs, furthest="intro", days=4) for i in range(n)]
 
 
-def test_team_baseline_median_over_profiles_with_30_matured():
+def test_team_baseline_is_pooled_rate_over_all_matured_rows():
     rows = _prof(A, 30, 3) + _prof(B, 30, 1) + _prof(ObjectId(), 10, 9)
     t = team_baseline(summarize(rows, CUT), rows)
-    assert t == {"per100": 6.7, "medianDays": 4, "profiles": 2}
+    assert (t["per100"], t["medianDays"], t["profiles"]) == (18.6, 4, 2)  # 13 / 70, small profiles pooled too
 
 
-def test_team_baseline_none_when_no_profile_qualifies():
-    rows = _prof(A, 10, 1)
-    assert team_baseline(summarize(rows, CUT), rows) == {"per100": None, "medianDays": 4, "profiles": 0}
+def test_team_baseline_pooled_not_collapsed_by_zero_profiles():
+    rows = _prof(A, 40, 2) + _prof(B, 40, 0) + _prof(ObjectId(), 40, 0)
+    assert team_baseline(summarize(rows, CUT), rows)["per100"] == 1.7  # median of profiles would be 0.0
+
+
+def test_team_baseline_none_when_nothing_matured():
+    rows = [row(age=3, iv=True, furthest="intro", days=1)]
+    t = team_baseline(summarize(rows, CUT), rows)
+    assert (t["per100"], t["profiles"]) == (None, 0)
+
+
+def test_expected_not_zeroed_by_display_rounding():
+    team_rows = _prof(A, 5000, 2)  # pooled 0.04 per 100 -> displays 0.0
+    team = team_baseline(summarize(team_rows, CUT), team_rows)
+    assert team["per100"] == 0.0 and team["rate"] == 0.04
+    g, why = grade(summarize(_prof(B, 10000, 0), CUT)[str(B)], team)
+    assert g == "dead" and "about 4" in why[0]
 
 
 TEAM = {"per100": 2.6, "medianDays": 6, "profiles": 3}
