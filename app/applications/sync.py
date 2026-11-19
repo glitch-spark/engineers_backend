@@ -44,6 +44,7 @@ _VOLATILE = frozenset({"_id", "createdAt", "updatedAt", "syncedAt"})
 _BID_FIELDS = ("kind", "bidderId", "accountId", "ownerId", "jobKey", "jobTitle", "jobUrl", "firstAt", "status")
 _RESUME_FIELDS = ("userId", "accountId", "jobUrl", "createdAt", "countsAsBid", "matchScore", "promptId",
                   "promptName", "templateName", "jobDescription")
+_TITLE_LINES = 5  # lines of jobDescription fetched for the title (leading blank lines are skipped)
 _IV_FIELDS = ("accountId", "createdBy", "scheduledAt", "stage", "status", "jobUrl", "stageHistory", "resumeLink",
               "createdAt", "updatedAt")
 
@@ -84,9 +85,13 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     accts = None if account_ids is None else set(account_ids) - {None}  # $in [None] would match every accountless doc
     while True:  # scoped: grow the account set until every cross-profile resume link resolves as in a full rebuild
         scope = {} if accts is None else {"accountId": {"$in": list(accts)}}
-        # keep only the first line of jobDescription (the title): ~64k unapplied resumes, full text not held
-        resumes = [{**r, "jobDescription": job_title(r.get("jobDescription"), None)} async for r in
-                   resume_coll.find({**scope, **resume_filter}, _proj(_RESUME_FIELDS))]
+        # only the first few lines of jobDescription leave the database (the title is the first non-empty one):
+        # ~64k unapplied resumes with ~5 KB descriptions made a full rebuild take minutes over the wire
+        resumes = [{**r, "jobDescription": job_title("\n".join(r.get("jobDescription") or []), None)}
+                   async for r in resume_coll.aggregate([{"$match": {**scope, **resume_filter}}, {"$project": {
+                       **_proj(f for f in _RESUME_FIELDS if f != "jobDescription"),
+                       "jobDescription": {"$slice": [{"$split": [{"$ifNull": ["$jobDescription", ""]}, "\n"]},
+                                                     _TITLE_LINES]}}}])]
         iv_filter = dated if accts is None else {"$and": [dated, {"$or": [
             scope, {"resumeLink.resumeJobId": {"$in": [r["_id"] for r in resumes]}}]}]}  # a link can cross profiles
         iv_docs = await iv_coll.find(iv_filter, _proj(_IV_FIELDS)).to_list(None)

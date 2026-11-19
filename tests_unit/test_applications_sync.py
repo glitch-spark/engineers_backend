@@ -360,3 +360,12 @@ async def test_full_rebuild_enriches_and_unsets_when_tailored_removed(db):
     for f in ("tailoredResumeId", "score", "scoreBand", "promptName"):
         assert f not in row
     assert (row["title"], row["area"]) == ("Backend Engineer", "Backend")
+
+
+async def test_title_from_a_long_description_with_leading_blank_lines(db):
+    """Only the first lines of jobDescription are fetched; the title is the first non-empty one."""
+    await add_bid(db)
+    await add_resume(db, jobDescription="\n  \nSenior Backend Engineer\n" + "details " * 5000)
+    await sync.full_rebuild(SINCE, apply=True)
+    [row] = await db["applications"].find({}).to_list(None)
+    assert row["title"] == "Senior Backend Engineer" and row["area"] == "Backend"
