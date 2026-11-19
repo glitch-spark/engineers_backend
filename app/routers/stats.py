@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import date as date_cls, datetime, timedelta
 from typing import Annotated, Literal, Optional
 
-from bson import ObjectId
 from fastapi import APIRouter, Depends, Query
 
 from app.applications.sync import BACKFILL_SINCE
@@ -19,7 +18,7 @@ from app.routers.metrics import _stats_days
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.interviews import interviews_view
-from app.stats.profile_loader import count_unmatched_interviews, load_period_rows, profile_activity, subject_unmatched_interviews
+from app.stats.profile_loader import count_unmatched_interviews, load_period_rows
 from app.stats.profile_report import grade, summarize, team_baseline
 from app.plan_profiles import owner_profiles
 
@@ -96,11 +95,10 @@ async def applications_profiles(
     summaries = summarize(rows, now - timedelta(days=win["matured_days"]))
     team = team_baseline(summaries, rows)
     mine = [p for p in await owner_profiles(sid) if p["id"] in summaries]
-    activity = await profile_activity([ObjectId(p["id"]) for p in mine])
     profiles = []
     for p in mine:
         s = summaries[p["id"]]
-        g, reasons = grade(s, team, activity.get(p["id"]), win["matured_days"], now)
+        g, reasons = grade(s, team)
         profiles.append({"accountId": p["id"], "name": p["name"], "region": p["region"], "archived": p["archived"],
                          **s, "grade": g, "reasons": reasons})
     profiles.sort(key=lambda x: (_GRADE_ORDER[x["grade"]], -(x["per100"] if x["per100"] is not None else -1), x["name"]))
@@ -112,7 +110,7 @@ async def applications_profiles(
         "subject": {"userId": str(sid), "name": subject.name},
         "window": win,
         "coverage": {"rows": len(own), "headerBids": header, "noLink": sum(1 for r in own if r["key"].startswith("src:")),
-                     "unmatchedInterviews": await subject_unmatched_interviews(sid, start, end)},
+                     "unmatchedInterviews": await count_unmatched_interviews(start, end, sid, region, regions)},
         "team": team,
         "profiles": profiles,
     }

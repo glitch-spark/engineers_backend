@@ -1,12 +1,10 @@
 """Per-profile application summaries, team baseline and grades for the Statistics "Your profiles" card (pure, no DB)."""
-from datetime import datetime, timedelta
+from datetime import datetime
 from statistics import median, median_low
 from typing import Optional
 
 MIN_MATURED = 30
-DEAD_MATURED = 150
-SILENT_DAYS = 21
-STILL_BIDDING_DAYS = 7
+EXPECTED_MIN = 3  # judge a shortfall only when the team rate would give 3+ interviews (P(0 by chance) < 5%)
 SLOW_RATIO = 2
 STUCK_INTERVIEWS = 3
 _TECH = {"tech", "hiring", "panel", "final", "offer"}
@@ -55,32 +53,30 @@ def team_baseline(summaries: dict[str, dict], rows: list[dict]) -> dict:
             "profiles": len(rates)}
 
 
-def grade(summary: dict, team: dict, activity: Optional[dict], matured_days: int, now: datetime) -> tuple[str, list[str]]:
-    """dead -> early -> strong -> watch. `activity` = {firstAt, lastAt, lastRoundAt} over all the profile's rows."""
-    if summary["matured"] >= DEAD_MATURED and summary["maturedInterviews"] == 0:
-        return "dead", [f"{DEAD_MATURED}+ matured bids, no interview"]
-    if activity and activity.get("firstAt") and activity.get("lastAt"):
-        bidding = activity["lastAt"] >= now - timedelta(days=STILL_BIDDING_DAYS)
-        silent = not activity.get("lastRoundAt") or activity["lastRoundAt"] < now - timedelta(days=SILENT_DAYS)
-        old = activity["firstAt"] < now - timedelta(days=matured_days + SILENT_DAYS)
-        if bidding and silent and old:
-            return "dead", [f"no interview for {SILENT_DAYS}+ days"]
-    if summary["matured"] < MIN_MATURED:
-        return "early", [f"too early to judge ({summary['matured']} of {MIN_MATURED} matured bids)"]
+def grade(summary: dict, team: dict) -> tuple[str, list[str]]:
+    """early -> dead -> strong -> watch -> early (too few to tell). User decision 2026-11-18."""
+    matured = summary["matured"]
+    if matured < MIN_MATURED:
+        return "early", [f"too early to judge ({matured} of {MIN_MATURED} matured bids)"]
     if team["per100"] is None:
         return "early", [f"no team baseline yet (fewer than {MIN_MATURED} matured bids on every profile)"]
+    expected = matured * team["per100"] / 100
+    if expected >= EXPECTED_MIN and summary["maturedInterviews"] == 0:
+        return "dead", [f"no interview from {matured} matured bids (the team rate would give about {round(expected)})"]
     per100 = summary["per100"] or 0.0
     reach = summary["reach"]
     if per100 >= team["per100"] and reach["tech"] > 0:
         return "strong", []
     why = []
-    if per100 < team["per100"]:
+    if expected >= EXPECTED_MIN and per100 < team["per100"]:
         why.append(f"below team ({per100} vs {team['per100']} per 100)")
     med, tmed = (summary["days"] or {}).get("median"), team.get("medianDays")
-    if med and tmed and med >= SLOW_RATIO * tmed:
+    if tmed is not None and tmed >= 1 and med is not None and med >= SLOW_RATIO * tmed:
         why.append(f"slow (median {med} days vs team {tmed})")
     if summary["interviews"] >= STUCK_INTERVIEWS and reach["tech"] == 0:
         why.append("intros don't reach tech")
-    if not why:
-        why.append("no interview has reached tech yet" if summary["interviews"] else "no interviews yet")
-    return "watch", why
+    elif per100 >= team["per100"] and summary["interviews"] and reach["tech"] == 0:
+        why.append("no interview has reached tech yet")
+    if why:
+        return "watch", why
+    return "early", [f"too few to tell ({matured} matured bids; about {expected:.1f} interviews expected at the team rate)"]

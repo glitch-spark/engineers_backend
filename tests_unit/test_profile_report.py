@@ -67,53 +67,65 @@ def test_team_baseline_none_when_no_profile_qualifies():
 
 
 TEAM = {"per100": 2.6, "medianDays": 6, "profiles": 3}
+REAL = {"per100": 0.5, "medianDays": 6, "profiles": 9}  # the real team rate: ~0.5 interviews per 100 matured bids
 
 
 def _s(matured, mi=0, per100=None, reach=(0, 0, 0), median=None):
     return {"matured": matured, "maturedInterviews": mi, "interviews": reach[0], "per100": per100,
-            "days": {"first": 1, "median": median, "slowest": 30} if median else None,
+            "days": {"first": 1, "median": median, "slowest": 30} if median is not None else None,
             "reach": dict(zip(("intro", "tech", "final"), reach))}
 
 
-def test_grade_dead_150_matured_no_interview():
-    assert grade(_s(150), TEAM, None, 14, NOW) == ("dead", ["150+ matured bids, no interview"])
+def test_grade_dead_when_team_rate_expects_3_or_more():
+    assert grade(_s(600, 0, 0.0), REAL) == (
+        "dead", ["no interview from 600 matured bids (the team rate would give about 3)"])
 
 
-def test_grade_dead_silent_while_bidding():
-    act = {"firstAt": NOW - timedelta(days=100), "lastAt": NOW - timedelta(days=2), "lastRoundAt": NOW - timedelta(days=30)}
-    assert grade(_s(40, 1, 2.5), TEAM, act, 14, NOW) == ("dead", ["no interview for 21+ days"])
-    act["lastRoundAt"] = None
-    assert grade(_s(40), TEAM, act, 14, NOW)[0] == "dead"
+def test_grade_not_dead_when_expected_below_3():
+    assert grade(_s(150, 0, 0.0), REAL) == (
+        "early", ["too few to tell (150 matured bids; about 0.8 interviews expected at the team rate)"])
 
 
-def test_grade_not_dead_when_new_profile():
-    act = {"firstAt": NOW - timedelta(days=30), "lastAt": NOW, "lastRoundAt": None}
-    assert grade(_s(40, 1, 2.5), TEAM, act, 14, NOW)[0] != "dead"
+def test_below_team_suppressed_when_expected_below_3():
+    assert grade(_s(300, 1, 0.3, (1, 0, 0)), REAL) == (
+        "early", ["too few to tell (300 matured bids; about 1.5 interviews expected at the team rate)"])
+
+
+def test_below_team_shown_when_expected_3_or_more():
+    assert grade(_s(800, 1, 0.1, (1, 0, 0)), REAL) == ("watch", ["below team (0.1 vs 0.5 per 100)"])
+
+
+def test_strong_with_small_sample():
+    assert grade(_s(50, 2, 4.0, (2, 1, 0)), REAL) == ("strong", [])
+
+
+def test_slow_needs_team_median_of_at_least_1_day():
+    zero = {**REAL, "medianDays": 0}
+    assert grade(_s(50, 1, 2.0, (1, 1, 0), median=5), zero) == ("strong", [])
+    assert grade(_s(50, 1, 2.0, (1, 0, 0), median=5), zero) == ("watch", ["no interview has reached tech yet"])
+    one = {**REAL, "medianDays": 1}
+    assert grade(_s(50, 1, 2.0, (1, 0, 0), median=2), one) == (
+        "watch", ["slow (median 2 days vs team 1)", "no interview has reached tech yet"])
+    assert grade(_s(50, 0, 0.0, (1, 0, 0), median=2), {**one, "medianDays": None})[0] == "early"
 
 
 def test_young_cohort_is_early_not_judged():
-    assert grade(_s(10), TEAM, None, 14, NOW) == ("early", ["too early to judge (10 of 30 matured bids)"])
-    assert grade(_s(50, 1, 2.0), {"per100": None, "medianDays": None, "profiles": 0}, None, 14, NOW)[0] == "early"
+    assert grade(_s(10), TEAM) == ("early", ["too early to judge (10 of 30 matured bids)"])
+    assert grade(_s(50, 1, 2.0), {"per100": None, "medianDays": None, "profiles": 0})[0] == "early"
 
 
 def test_grade_strong_needs_tech():
-    assert grade(_s(50, 2, 4.0, (2, 1, 0)), TEAM, None, 14, NOW) == ("strong", [])
-    assert grade(_s(50, 2, 4.0, (2, 0, 0)), TEAM, None, 14, NOW)[0] == "watch"
+    assert grade(_s(50, 2, 4.0, (2, 1, 0)), TEAM) == ("strong", [])
+    assert grade(_s(50, 2, 4.0, (2, 0, 0)), TEAM) == ("watch", ["no interview has reached tech yet"])
 
 
 def test_grade_watch_reasons():
-    g, why = grade(_s(80, 1, 1.2, (3, 0, 0), median=14), TEAM, None, 14, NOW)
+    g, why = grade(_s(200, 2, 1.0, (3, 0, 0), median=14), TEAM)
     assert g == "watch"
-    assert why == ["below team (1.2 vs 2.6 per 100)", "slow (median 14 days vs team 6)", "intros don't reach tech"]
-
-
-def test_grade_watch_always_has_a_reason():
-    assert grade(_s(50, 1, 3.0, (1, 0, 0)), TEAM, None, 14, NOW) == ("watch", ["no interview has reached tech yet"])
-    zero = {"per100": 0.0, "medianDays": None, "profiles": 1}
-    assert grade(_s(50, 0, 0.0), zero, None, 14, NOW) == ("watch", ["no interviews yet"])
+    assert why == ["below team (1.0 vs 2.6 per 100)", "slow (median 14 days vs team 6)", "intros don't reach tech"]
 
 
 def test_early_reasons_distinguish_young_profile_from_missing_baseline():
     none_team = {"per100": None, "medianDays": None, "profiles": 0}
-    assert grade(_s(50, 1, 2.0), none_team, None, 14, NOW) == (
+    assert grade(_s(50, 1, 2.0), none_team) == (
         "early", ["no team baseline yet (fewer than 30 matured bids on every profile)"])

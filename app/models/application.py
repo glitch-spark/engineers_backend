@@ -45,4 +45,5 @@ class Application(TimestampedDocument):
             IndexModel([("ownerId", 1), ("appliedAt", 1)]),
             IndexModel([("accountId", 1), ("appliedAt", 1)]),
             IndexModel([("interviewId", 1)]),
+            IndexModel([("appliedAt", 1)]),
         ]

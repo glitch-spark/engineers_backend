@@ -18,11 +18,12 @@
 - Rows with `bidStatus == "rejected"` are excluded from every count on the card and the coverage line.
 - The matured cutoff uses the team window for every profile; the spec's per-profile window (≥ 5 matched) is left for a later slice.
 - Matured = `appliedAt <= now_utc - timedelta(days=window["matured_days"])` (window from `app.applications.window.response_window(today)`). Per-100 divides interviews among matured rows by matured rows (× 100, one decimal). Rows younger than that are "still in play" when they have no interview yet.
-- Grades (constants in `profile_report.py`): `MIN_MATURED = 30`, `DEAD_MATURED = 150`, `SILENT_DAYS = 21`, `STILL_BIDDING_DAYS = 7`, `SLOW_RATIO = 2`, `STUCK_INTERVIEWS = 3`. Order of evaluation: dead → early → strong → watch.
-  - `dead`: matured ≥ 150 and 0 interviews among matured; or still bidding (a row in the last 7 days) and no first round in the last 21 days while its first row is older than `matured_days + 21` days.
+- Grades (user decision 2026-11-18, replaces the fixed thresholds; constants in `profile_report.py`): `MIN_MATURED = 30`, `EXPECTED_MIN = 3`, `SLOW_RATIO = 2`, `STUCK_INTERVIEWS = 3`. expected = matured × team per-100 / 100. Order: early → dead → strong → watch → early (too few to tell).
   - `early`: matured < 30, or the team per-100 is None.
+  - `dead`: expected ≥ 3 and 0 interviews among matured.
   - `strong`: per-100 ≥ team per-100 and at least one interview reached tech or later.
-  - `watch`: everything else; `reasons` say why (below team, slow: median days ≥ 2 × team median days, stuck: ≥ 3 interviews and none reached tech).
+  - `watch`: any of: below team (only when expected ≥ 3); slow (team median days ≥ 1 and median ≥ 2 × team); stuck (≥ 3 interviews, none reached tech); at/above team with interviews but none reached tech.
+  - otherwise `early` ("too few to tell"). The "no interview for 21+ days while still bidding" rule is removed.
 - Reach buckets from `furthest`: `intro` = interviews; `tech` = furthest in {tech, hiring, panel, final, offer}; `final` = furthest in {final, offer}.
 - Team baseline = all rows in the period cohort and region (every owner): team per-100 = median of profile per-100 over profiles with matured ≥ 30 (None when no profile qualifies); team median days = `statistics.median_low` of `daysToInterview` over cohort rows with an interview (None when none).
 - Days per profile: first = min, median = `statistics.median_low`, slowest = max of `daysToInterview` over cohort rows with an interview; None when there are none.

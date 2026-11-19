@@ -103,9 +103,11 @@ Header: the existing you-vs-team cards (unchanged). Below, in order:
 6. **When to bid** — per-100 by weekday and by 3-hour block of `appliedAt` (app timezone).
 7. **Bidder quality** (owners and admins) — per bidder: bids, matured per-100, rejected share.
 
-Grades (thresholds from team numbers): ✅ matured per-100 ≥ team median and interviews reach tech or later;
-⚠ below median, or median days ≥ 2× team's, or intros that never reach tech; ⛔ ≥ 150 matured bids and 0 interviews,
-or no interview for 21 days while still bidding.
+Grades (user decision 2026-11-18; the team rate is ~0.5 per 100, so fixed thresholds graded by chance): expected =
+matured × team per-100 / 100. ⏳ fewer than 30 matured bids or no team baseline; ⛔ expected ≥ 3 and 0 matured interviews;
+✅ per-100 ≥ team and an interview reached tech; ⚠ below team (only when expected ≥ 3), slow (median days ≥ 2× team's,
+team median ≥ 1 day), intros that never reach tech (≥ 3 interviews), or at/above team with no tech yet; otherwise ⏳
+"too few to tell". No "silent for 21 days" rule.
 
 ### What to change (pattern → suggestion)
 

@@ -97,7 +97,6 @@ async def test_profiles_report_shape(db):
     assert out["subject"] == {"userId": str(ana.id), "name": "Ana"}
     assert out["coverage"] == {"rows": 80, "headerBids": 40, "noLink": 0, "unmatchedInterviews": 0}
     assert out["profiles"][1]["reasons"] and out["profiles"][0]["per100"] == 20.0
-    print(res.text[:600])
 
 
 async def test_coverage_excludes_rejected_and_counts_no_link(db):
@@ -158,10 +157,24 @@ async def test_sorting_by_grade_then_per100_then_name(db):
     assert out["profiles"][-1]["grade"] == "early"
 
 
-async def test_activity_ignores_rejected_rows(db):
+async def test_unmatched_interviews_respect_region(db, monkeypatch):
     ana, _ = await _users()
-    a = await _acct(ana, "Alpha")
-    await _rows(a, ana, 40, iv=8, days_ago=100)
-    await _rows(a, ana, 5, days_ago=1, status="rejected")  # would make it "still bidding" if counted
-    out = (await _get(ana)).json()
-    assert out["profiles"][0]["grade"] != "dead"
+    eu, us = await _acct(ana, "Eu", "EU"), await _acct(ana, "Us", "US")
+
+    async def regions():
+        return {eu.id: "EU", us.id: "US"}, 0
+
+    monkeypatch.setattr(interview_rates, "_profile_regions", regions)
+    at = NOW - timedelta(days=10)
+    for acc in (eu, us, us):  # countable interviews no row carries
+        await Interview.get_motor_collection().insert_one({
+            "accountId": acc.id, "createdBy": ana.id, "scheduledAt": at, "stage": "intro", "status": "completed",
+            "stageHistory": [], "createdAt": at, "updatedAt": at})
+    assert (await _get(ana, Q + "&region=EU")).json()["coverage"]["unmatchedInterviews"] == 1
+    assert (await _get(ana, Q + "&region=US")).json()["coverage"]["unmatchedInterviews"] == 2
+    assert (await _get(ana)).json()["coverage"]["unmatchedInterviews"] == 3
+
+
+def test_application_has_applied_at_index():
+    keys = [list(i.document["key"].items()) for i in Application.Settings.indexes]
+    assert [("appliedAt", 1)] in keys
