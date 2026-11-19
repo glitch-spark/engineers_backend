@@ -1,4 +1,4 @@
-"""GET /stats/applications/changes and /stats/applications/leaders (mongomock)."""
+"""GET /stats/applications/changes (mongomock)."""
 
 import os
 
@@ -197,21 +197,3 @@ async def test_quiet_now_only_when_period_includes_today(db):
     await _quiet_profile(ana)
     qs = f"?period=custom&date={(NOW - timedelta(days=200)).date()}&to={(NOW - timedelta(days=3)).date()}"
     assert (await _get(ana, qs=qs)).json()["profiles"] == []
-
-
-async def test_leaders_visible_to_staff_with_names(db):
-    ana, ben = await _users()
-    for i, (owner, region) in enumerate([(ana, "EU"), (ben, "EU"), (ana, "EU"), (ben, "US"), (ana, "EU")]):
-        a = await _acct(owner, f"P{i}", region)
-        await _rows(a, owner, 150, iv=i, region=region)
-    await _rows(await _acct(ana, "Small"), ana, 149, iv=50)
-    res = await _get(ana, "leaders", Q + f"&user={ben.id}")  # ignores user, any signed-in user
-    assert res.status_code == 200, res.text
-    out = res.json()
-    assert out["note"] == "These are patterns, not proof." and out["window"] == WIN and out["label"]
-    assert [p["name"] for p in out["best"]] == ["P4", "P3", "P2"]
-    assert [p["name"] for p in out["weakest"]] == ["P0", "P1"]
-    assert out["best"][1]["owner"] == "Ben" and out["best"][1]["region"] == "US"
-    assert out["groups"]["best"]["matured"] == 450
-    eu = (await _get(ana, "leaders", Q + "&region=EU")).json()
-    assert [p["name"] for p in eu["best"]] == ["P4", "P2", "P1"]

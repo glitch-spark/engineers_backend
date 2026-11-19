@@ -17,20 +17,41 @@ from app.models import Account, Application, UserExtra
 from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
-from app.stats import changes, conversion_scope as cs, leaders, timing
+from app.stats import changes, conversion, conversion_scope as cs, timing
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.conversion_scope import bounds as _bounds
 from app.stats.frame import previous_window
 from app.stats.interviews import interviews_view
-from app.stats.job_fit import breakdown
 from app.stats.profile_loader import accounts_with_rounds_since, count_unmatched_interviews, load_period_rows
 from app.stats.profile_report import grade, summarize, team_baseline
-from app.plan_profiles import owner_profiles
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
 VIEWS = {"bids": bids_view, "interviews": interviews_view, "ai-usage": ai_usage_view}
+
+
+@router.get("/conversion")
+async def conversion_report(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+    user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+    scope: Literal["me", "profile", "team"] = Query("me", description="me: the subject's profiles; team: every profile"),
+    profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
+) -> dict:
+    """The Conversion tab: totals and breakdowns of the scope's bids (by bidder only for me / profile)."""
+    sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
+    win = await response_window(sc["today"])
+    owners = list({a["ownerId"] for a in sc["accounts"].values()})
+    names = {} if scope == "team" or not owners else {d["_id"]: d.get("name") async for d in Bidder.get_motor_collection(
+    ).find({"createdBy": {"$in": owners}}, {"name": 1})}
+    rep = conversion.report(sc["rows"], sc["now"] - timedelta(days=win["matured_days"]),
+                            {k: v for k, v in names.items() if v}, scope != "team")
+    return {"label": sc["label"], "startClamped": sc["startClamped"], "window": win, "scope": scope,
+            "subject": sc["subject"], **({"profile": profile} if scope == "profile" else {}), **rep}
 
 
 @router.get("/{tab}")
@@ -77,19 +98,6 @@ async def applications_coverage(
 
 
 _GRADE_ORDER = {"strong": 0, "watch": 1, "dead": 2, "early": 3}
-
-
-async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Optional[str]) -> dict:
-    """Shared by the applications cards: query params -> subject, naive-UTC period bounds, label, now, response window."""
-    day, until = _stats_days(period, date, to)
-    sid = user.id if user_id and user_id == str(user.id) else await _subject_id(user, user_id)
-    subject = user if sid == user.id else await UserExtra.get(sid)
-    start_d, end_d = interview_rates.window(period, day, until)
-    tz = app_tz()
-    start, end = _bounds(start_d, end_d)
-    return {"sid": sid, "subject": {"userId": str(sid), "name": subject.name}, "start_d": start_d, "end_d": end_d,
-            "start": start, "end": end, "label": interview_rates.label(period, start_d, end_d), "now": datetime.utcnow(),
-            "today": datetime.now(tz).date(), "win": await response_window(datetime.now(tz).date())}
 
 
 async def _graded_profiles(accounts: dict, summaries: dict, team: dict, start: datetime) -> list[dict]:
@@ -163,24 +171,6 @@ async def applications_profiles(
     }
 
 
-@router.get("/applications/jobs")
-async def applications_jobs(
-    user: Annotated[UserExtra, Depends(get_current_user)],
-    period: Literal["week", "month", "custom"] = Query("month"),
-    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
-    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
-    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
-    user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
-) -> dict:
-    """"What kind of job works": interviews per 100 matured bids by site, score, area and profile age."""
-    sc = await _scope(user, period, date, to, user_id)
-    rows = await load_period_rows(sc["start"], sc["end"], region)
-    mine = {p["id"] for p in await owner_profiles(sc["sid"])}
-    you = [r for r in rows if str(r.get("accountId")) in mine]
-    cutoff = sc["now"] - timedelta(days=sc["win"]["matured_days"])
-    return {"label": sc["label"], "subject": sc["subject"], "window": sc["win"], **breakdown(you, rows, cutoff)}
-
-
 @router.get("/applications/changes")
 async def applications_changes(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -229,34 +219,6 @@ async def applications_changes(
     return {"label": sc["label"], "subject": sc["subject"], "profiles": out}
 
 
-@router.get("/applications/leaders")
-async def applications_leaders(
-    user: Annotated[UserExtra, Depends(get_current_user)],
-    period: Literal["week", "month", "custom"] = Query("month"),
-    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
-    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
-    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
-) -> dict:
-    """Winning vs weakest profiles of the team, named with their owners; visible to every signed-in user (no `user`)."""
-    sc = await _scope(user, period, date, to, None)
-    rows = await load_period_rows(sc["start"], sc["end"], region)
-    summaries = summarize(rows, sc["now"] - timedelta(days=sc["win"]["matured_days"]))
-    ids = [PydanticObjectId(k) for k, s in summaries.items() if s["matured"] >= leaders.MIN_MATURED]
-    accts = [d async for d in Account.get_motor_collection().find(
-        {"_id": {"$in": ids}}, {"name": 1, "createdBy": 1, "region": 1})] if ids else []
-    owner_ids = list({d.get("createdBy") for d in accts})
-    owners = {d["_id"]: d.get("name") async for d in UserExtra.get_motor_collection().find(
-        {"_id": {"$in": owner_ids}}, {"name": 1})} if owner_ids else {}
-    by_acct = _by_account([r for r in rows if r.get("bidStatus") != "rejected"])
-    team = []
-    for a in accts:
-        s = summaries[str(a["_id"])]
-        team.append({"accountId": str(a["_id"]), "name": a.get("name"), "owner": owners.get(a.get("createdBy")),
-                     "region": a.get("region"), "matured": s["matured"], "interviews": s["maturedInterviews"],
-                     "per100": s["per100"], "rows": by_acct.get(str(a["_id"]), [])})
-    return {"label": sc["label"], "window": sc["win"], **leaders.pick(team), "note": "These are patterns, not proof."}
-
-
 @router.get("/applications/timing")
 async def applications_timing(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -281,3 +243,4 @@ async def applications_timing(
     return {"label": sc["label"], "subject": sc["subject"], "window": win,
             "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
             "bidders": timing.bidders(you, names, cutoff), "teamBidder": timing.team_bidder(rows, cutoff)}
+
