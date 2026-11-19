@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from beanie import Document, Replace, SaveChanges, Update, before_event
+from beanie import Document, Replace, Save, SaveChanges, Update, before_event
 from pydantic import Field
 
 
@@ -10,6 +10,6 @@ class TimestampedDocument(Document):
     createdAt: datetime = Field(default_factory=datetime.utcnow)
     updatedAt: datetime = Field(default_factory=datetime.utcnow)
 
-    @before_event(Update, Replace, SaveChanges)
+    @before_event(Update, Replace, Save, SaveChanges)
     def _bump_updated_at(self) -> None:
         self.updatedAt = datetime.utcnow()
