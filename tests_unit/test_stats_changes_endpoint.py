@@ -101,6 +101,16 @@ async def test_changes_shape(db):
         "text": "Archive it, or rebuild it with a new base resume / prompt and judge it fresh after 14 days."}]}]
 
 
+async def test_changes_skips_archived_profiles(db):
+    ana, ben = await _users()
+    gone = await _acct(ana, "Gone")
+    await Account.get_motor_collection().update_one({"_id": gone.id}, {"$set": {"archived": True}})
+    await _rows(gone, ana, 40)
+    for name in ("B1", "B2"):
+        await _rows(await _acct(ben, name), ben, 40, iv=4)
+    assert (await _get(ana)).json()["profiles"] == []
+
+
 async def test_changes_subject_rule(db):
     ana, ben = await _users()
     boss = await UserExtra(name="Boss", email="b@x.io", role="admin").insert()
@@ -118,6 +128,7 @@ async def test_changes_names_top_bidder(db):
     await _rows(acct, ana, 40, by="bidder", bidderId=bob.id)
     sug = (await _get(ana)).json()["profiles"][0]["suggestions"]
     assert [s["pattern"] for s in sug] == ["bidder_gap"]
+    assert sug[0]["text"].startswith("Your own applies convert better than your bidders' (4 of 40 vs 0 of 40 matured")
     assert "review Bob's jobs" in sug[0]["text"]
 
 
@@ -151,6 +162,15 @@ async def test_quiet_now_counts_unmatched_interviews(db):
         "stageHistory": [{"stage": "intro", "at": at, "scheduledAt": at}], "createdAt": at, "updatedAt": at})
     profile_loader.clear_cache()
     assert (await _get(ana)).json()["profiles"] == []
+
+
+async def test_quiet_now_fires_in_month_view(db):
+    ana, _ = await _users()
+    acct = await _acct(ana, "Old")
+    await _rows(acct, ana, 1, days_ago=0, profileAgeDays=120)  # profile ~4 months old, bidding this month
+    qs = f"?period=month&date={NOW.date()}"
+    sug = (await _get(ana, qs=qs)).json()["profiles"][0]["suggestions"]
+    assert [s["pattern"] for s in sug] == ["quiet_now"]
 
 
 async def test_quiet_now_only_when_period_includes_today(db):

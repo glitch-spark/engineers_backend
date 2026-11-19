@@ -38,7 +38,8 @@ def profile_context(rows: list[dict], matured_before: datetime) -> dict:
     split, sites, bidders = {}, {}, {}
     for by in ("self", "bidder"):
         m = [r for r in matured if (r.get("by") == "self") == (by == "self")]
-        split[by] = {"matured": len(m), "per100": _per100(sum(1 for r in m if r.get("interviewId")), len(m))}
+        iv = sum(1 for r in m if r.get("interviewId"))
+        split[by] = {"matured": len(m), "interviews": iv, "per100": _per100(iv, len(m))}
     for r in matured:
         if r.get("board"):
             s = sites.setdefault(r["board"], [0, 0])
@@ -46,17 +47,18 @@ def profile_context(rows: list[dict], matured_before: datetime) -> dict:
             s[1] += bool(r.get("interviewId"))
         if r.get("by") == "bidder" and r.get("bidderId"):
             bidders[r["bidderId"]] = bidders.get(r["bidderId"], 0) + 1
-    dead_sites = [b for b, (n, iv) in sites.items() if n >= MIN_MATURED and iv == 0]
-    worst = max(dead_sites, key=lambda b: (sites[b][0], b), default=None)
+    dead_sites = sorted((b for b, (n, iv) in sites.items() if iv == 0), key=lambda b: (-sites[b][0], b))
     scores = [r["score"] for r in rows if r.get("score") is not None]
     return {"scores": {"avg": _avg(scores), "n": len(scores)}, "split": split,
-            "worstSite": BOARD_LABELS.get(worst, worst) if worst else None,
+            "deadSites": [{"label": BOARD_LABELS.get(b, b), "matured": sites[b][0]} for b in dead_sites],
             "topBidderId": max(bidders, key=lambda k: (bidders[k], str(k)), default=None)}
 
 
 def quiet_candidate(rows: list[dict], now: datetime, matured_days: int) -> bool:
-    """Still bidding (a non-rejected row in the last 7 days) and old enough (first row before matured_days + 21)."""
-    return (bool(rows) and min(r["appliedAt"] for r in rows) <= now - timedelta(days=matured_days + QUIET_DAYS)
+    """Still bidding (a non-rejected row in the last 7 days) and the profile older than matured_days + 21 (its
+    createdAt from appliedAt - profileAgeDays; the first row in the period when no row knows the age)."""
+    born = [r["appliedAt"] - timedelta(days=r["profileAgeDays"]) for r in rows if r.get("profileAgeDays") is not None]
+    return (bool(rows) and min(born or [r["appliedAt"] for r in rows]) <= now - timedelta(days=matured_days + QUIET_DAYS)
             and any(r["appliedAt"] >= now - timedelta(days=RECENT_DAYS) for r in rows
                     if r.get("bidStatus") != "rejected"))
 
@@ -97,9 +99,12 @@ def wrong_sites(s, g, ctx):
     sites = ctx["bestSites"]
     if not sites or not _below(s, ctx) or _low_scores(ctx):
         return None
-    drop = f"; drop {ctx['worstSite']}" if ctx["worstSite"] else ""
+    # drop a site only when the team rate would have given it 3+ interviews and it got none
+    worst = next((d for d in ctx["deadSites"] if d["label"] not in sites
+                  and _expected(d["matured"], ctx["team"]["per100"]) >= EXPECTED_MIN), None)
+    drop = f"; drop {worst['label']}" if worst else ""
     return _out("wrong_sites", f"Good resumes, wrong places — move bids to {' and '.join(sites)}, where the team "
-                               f"converts best{drop}.", bestSites=sites, worstSite=ctx["worstSite"])
+                               f"converts best{drop}.", bestSites=sites, worstSite=worst)
 
 
 def stuck_intro(s, g, ctx):
@@ -117,15 +122,13 @@ def slow(s, g, ctx):
 
 def bidder_gap(s, g, ctx):
     me, bd = ctx["split"]["self"], ctx["split"]["bidder"]
-    if me["matured"] < MIN_MATURED or bd["matured"] < MIN_MATURED or not me["per100"] or bd["per100"] is None:
+    if me["matured"] < MIN_MATURED or bd["matured"] < MIN_MATURED or me["interviews"] < EXPECTED_MIN:
         return None
     if me["per100"] < 2 * bd["per100"] or _expected(bd["matured"], me["per100"]) < EXPECTED_MIN:
         return None
-    # ponytail: a bidder rate of 0 has no ratio; "far better" stands in for "{self}× better"
-    times = f"{round(me['per100'] / bd['per100'], 1):g}×" if bd["per100"] else "far"
-    return _out("bidder_gap", f"Your own applies convert {times} better than your bidders' ({me['per100']} vs "
-                              f"{bd['per100']} per 100) — review {ctx['bidder'] or 'your top bidder'}'s jobs and "
-                              f"rejected share.", self=me, bidder=bd)
+    return _out("bidder_gap", f"Your own applies convert better than your bidders' ({me['interviews']} of "
+                              f"{me['matured']} vs {bd['interviews']} of {bd['matured']} matured bids) — review "
+                              f"{ctx['bidder'] or 'your top bidder'}'s jobs and rejected share.", self=me, bidder=bd)
 
 
 def volume_up_rate_down(s, g, ctx):

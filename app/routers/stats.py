@@ -183,7 +183,7 @@ async def applications_changes(
     rows = await load_period_rows(sc["start"], sc["end"], region)
     summaries = summarize(rows, cutoff)
     team = team_baseline(summaries, rows)
-    profiles = await _graded_profiles(sc["sid"], summaries, team)
+    profiles = [p for p in await _graded_profiles(sc["sid"], summaries, team) if not p["archived"]]
     prev = summarize(await load_period_rows(
         *_bounds(*previous_window(period, sc["start_d"], sc["end_d"], today)), region), cutoff)
     tctx = changes.team_context(rows, cutoff, team)

@@ -19,8 +19,9 @@ def _s(matured=600, iv=1, interviews=None, tech=0, median=None):
 def _ctx(**kw):
     base = {"team": {"per100": 0.5, "medianDays": 5, "avgScore": 70}, "bestSites": ["Ashby", "Lever"],
             "bestBand": "80+", "matured_days": 30, "scores": {"avg": None, "n": 0},
-            "split": {"self": {"matured": 0, "per100": None}, "bidder": {"matured": 0, "per100": None}},
-            "bidder": None, "worstSite": None, "prev": None, "quietNow": False, "reasons": []}
+            "split": {"self": {"matured": 0, "interviews": 0, "per100": None},
+                      "bidder": {"matured": 0, "interviews": 0, "per100": None}},
+            "bidder": None, "deadSites": [], "prev": None, "quietNow": False, "reasons": []}
     return base | kw
 
 
@@ -57,10 +58,24 @@ def test_low_scores_edges():
 
 # 3. wrong_sites
 def test_wrong_sites_two_sites_and_drop():
-    out = changes.suggest({}, _s(iv=1), "watch", _ctx(worstSite="Workday"))
+    out = changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=[{"label": "Workday", "matured": 600}]))
     assert out[0]["pattern"] == "wrong_sites"
     assert out[0]["text"] == ("Good resumes, wrong places — move bids to Ashby and Lever, where the team converts best; "
                               "drop Workday.")
+
+
+def test_wrong_sites_drop_only_beyond_chance():
+    out = changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=[{"label": "Workday", "matured": 30}]))
+    assert "drop" not in out[0]["text"]  # 30 * 0.5 / 100 = 0.15 expected: chance
+    assert "drop" not in changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=[{"label": "Workday", "matured": 598}]))[0]["text"]
+
+
+def test_wrong_sites_never_drops_a_best_site():
+    dead = [{"label": "Ashby", "matured": 900}, {"label": "Workday", "matured": 600}]
+    out = changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=dead))
+    assert out[0]["text"].endswith("where the team converts best; drop Workday.")
+    out = changes.suggest({}, _s(iv=1), "watch", _ctx(deadSites=dead[:1]))
+    assert "drop" not in out[0]["text"]
 
 
 def test_wrong_sites_one_site_no_drop():
@@ -92,28 +107,36 @@ def test_slow_edges():
 
 
 # 6. bidder_gap
-def _split(sm, sp, bm, bp):
-    return {"self": {"matured": sm, "per100": sp}, "bidder": {"matured": bm, "per100": bp}}
+def _split(sm, si, bm, bi):
+    return {"self": {"matured": sm, "interviews": si, "per100": round(si / sm * 100, 1)},
+            "bidder": {"matured": bm, "interviews": bi, "per100": round(bi / bm * 100, 1)}}
 
 
 def test_bidder_gap_fires():
-    out = changes.suggest({}, _s(iv=3), "watch", _ctx(split=_split(40, 10.0, 60, 5.0), bidder="Bob"))
+    out = changes.suggest({}, _s(iv=3), "watch", _ctx(split=_split(40, 4, 60, 3), bidder="Bob"))
     assert out[0]["pattern"] == "bidder_gap"
-    assert out[0]["text"] == ("Your own applies convert 2× better than your bidders' (10.0 vs 5.0 per 100) — review "
-                              "Bob's jobs and rejected share.")
+    assert out[0]["text"] == ("Your own applies convert better than your bidders' (4 of 40 vs 3 of 60 matured bids) — "
+                              "review Bob's jobs and rejected share.")
 
 
 def test_bidder_gap_edges():
-    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(29, 10.0, 60, 0.0))   # self matured < 30
-    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(40, 10.0, 29, 0.0))   # bidder matured < 30
-    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(40, 9.9, 60, 5.0))    # not 2x
-    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(40, 9.0, 30, 0.0))    # 30 * 9 / 100 < 3
-    assert "bidder_gap" in _patterns(_s(iv=3), split=_split(40, 10.0, 30, 0.0))       # 30 * 10 / 100 = 3
+    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(29, 3, 60, 0))   # self matured < 30
+    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(40, 4, 29, 0))   # bidder matured < 30
+    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(40, 4, 50, 3))   # 10.0 vs 6.0: not 2x
+    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(40, 4, 29, 0))   # 29 * 10 / 100 < 3
+    assert "bidder_gap" in _patterns(_s(iv=3), split=_split(40, 4, 30, 0))       # 30 * 10 / 100 = 3
+
+
+def test_bidder_gap_needs_three_self_interviews():
+    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(30, 1, 300, 0))
+    assert "bidder_gap" not in _patterns(_s(iv=3), split=_split(30, 2, 300, 0))
+    assert "bidder_gap" in _patterns(_s(iv=3), split=_split(30, 3, 300, 0))
 
 
 def test_bidder_gap_zero_bidder_rate_text():
-    out = changes.suggest({}, _s(iv=3), "watch", _ctx(split=_split(40, 10.0, 30, 0.0), bidder="Bob"))
-    assert out[0]["text"].startswith("Your own applies convert far better than your bidders' (10.0 vs 0.0 per 100)")
+    out = changes.suggest({}, _s(iv=3), "watch", _ctx(split=_split(40, 4, 30, 0), bidder="Bob"))
+    assert out[0]["text"].startswith("Your own applies convert better than your bidders' (4 of 40 vs 0 of 30 matured bids)")
+    assert "far" not in out[0]["text"]
 
 
 # 7. volume_up_rate_down (team 1.0: expected 4 and 5)
@@ -148,13 +171,13 @@ def test_quiet_now_flag():
 
 
 def test_no_negative_suggestion_when_too_few():
-    ctx = dict(scores={"avg": 50, "n": 10}, split=_split(40, 10.0, 60, 0.0), bidder="Bob",
+    ctx = dict(scores={"avg": 50, "n": 10}, split=_split(40, 4, 60, 0), bidder="Bob",
                prev=_s(matured=40, iv=4), quietNow=True)
     assert _patterns(_s(iv=1, median=20), "early", **ctx) == ["quiet_now"]
 
 
 def test_max_three_suggestions_in_order():
-    out = _patterns(_s(iv=3, median=20), "watch", reasons=["intros don't reach tech"], split=_split(40, 10.0, 60, 0.0),
+    out = _patterns(_s(iv=3, median=20), "watch", reasons=["intros don't reach tech"], split=_split(40, 4, 60, 0),
                     quietNow=True, team={"per100": 1.0, "medianDays": 5, "avgScore": 70})
     assert out == ["wrong_sites", "stuck_intro", "slow"]
 
@@ -173,9 +196,10 @@ def test_profile_context_split_scores_worst_site_and_bidder():
             + [_row("bidder", "lever.co", bidder=b2, matured=False) for _ in range(30)]
             + [_row("bidder", "lever.co", status="rejected", score=0) for _ in range(5)])
     ctx = changes.profile_context(rows, CUTOFF)
-    assert ctx["split"] == {"self": {"matured": 30, "per100": 10.0}, "bidder": {"matured": 40, "per100": 0.0}}
+    assert ctx["split"] == {"self": {"matured": 30, "interviews": 3, "per100": 10.0},
+                            "bidder": {"matured": 40, "interviews": 0, "per100": 0.0}}
     assert ctx["scores"] == {"avg": 60.0, "n": 10}
-    assert ctx["worstSite"] == "Workday"  # Lever has only 10 matured
+    assert ctx["deadSites"] == [{"label": "Workday", "matured": 30}, {"label": "Lever", "matured": 10}]
     assert ctx["topBidderId"] == b1        # most matured rows (b2 has more rows, fewer matured)
 
 
@@ -196,5 +220,7 @@ def test_quiet_candidate():
     old, recent = _row(days_ago=60), _row(days_ago=2)
     assert changes.quiet_candidate([old, recent], NOW, 30)
     assert not changes.quiet_candidate([_row(days_ago=50), recent], NOW, 30)        # first row 50 < 51 days
+    assert changes.quiet_candidate([recent | {"profileAgeDays": 49}], NOW, 30)      # profile created 51 days ago
+    assert not changes.quiet_candidate([recent | {"profileAgeDays": 48}], NOW, 30)  # 50 days: too young
     assert not changes.quiet_candidate([old, _row(days_ago=8)], NOW, 30)            # nothing in the last 7 days
     assert not changes.quiet_candidate([old, _row(days_ago=2, status="rejected")], NOW, 30)
