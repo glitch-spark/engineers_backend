@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date as date_cls, datetime, timedelta
 from typing import Annotated, Literal, Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 
 from app.applications.sync import BACKFILL_SINCE
@@ -12,14 +13,17 @@ from app.applications.window import response_window
 from app import interview_rates
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.deps import get_current_user, require_admin
-from app.models import Application, UserExtra
+from app.models import Account, Application, UserExtra
+from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
+from app.stats import changes, leaders
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
+from app.stats.frame import previous_window
 from app.stats.interviews import interviews_view
 from app.stats.job_fit import breakdown
-from app.stats.profile_loader import count_unmatched_interviews, load_period_rows
+from app.stats.profile_loader import accounts_with_rounds_since, count_unmatched_interviews, load_period_rows
 from app.stats.profile_report import grade, summarize, team_baseline
 from app.plan_profiles import owner_profiles
 
@@ -74,6 +78,12 @@ async def applications_coverage(
 _GRADE_ORDER = {"strong": 0, "watch": 1, "dead": 2, "early": 3}
 
 
+def _bounds(start_d: date_cls, end_d: date_cls) -> tuple[datetime, datetime]:
+    """Local days [start_d, end_d] -> naive-UTC [start, end)."""
+    tz = app_tz()
+    return local_day_start_utc(start_d, tz), local_day_start_utc(end_d + timedelta(days=1), tz)
+
+
 async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Optional[str]) -> dict:
     """Shared by the applications cards: query params -> subject, naive-UTC period bounds, label, now, response window."""
     day, until = _stats_days(period, date, to)
@@ -81,10 +91,32 @@ async def _scope(user: UserExtra, period: str, date: str, to: str, user_id: Opti
     subject = user if sid == user.id else await UserExtra.get(sid)
     start_d, end_d = interview_rates.window(period, day, until)
     tz = app_tz()
+    start, end = _bounds(start_d, end_d)
     return {"sid": sid, "subject": {"userId": str(sid), "name": subject.name}, "start_d": start_d, "end_d": end_d,
-            "start": local_day_start_utc(start_d, tz), "end": local_day_start_utc(end_d + timedelta(days=1), tz),
-            "label": interview_rates.label(period, start_d, end_d), "now": datetime.utcnow(),
+            "start": start, "end": end, "label": interview_rates.label(period, start_d, end_d), "now": datetime.utcnow(),
             "today": datetime.now(tz).date(), "win": await response_window(datetime.now(tz).date())}
+
+
+async def _graded_profiles(sid, summaries: dict, team: dict) -> list[dict]:
+    """The subject's profiles with rows in the cohort, graded, in the profiles card order."""
+    profiles = []
+    for p in await owner_profiles(sid):
+        if p["id"] not in summaries:
+            continue
+        s = summaries[p["id"]]
+        g, reasons = grade(s, team)
+        profiles.append({"accountId": p["id"], "name": p["name"], "region": p["region"], "archived": p["archived"],
+                         **s, "grade": g, "reasons": reasons})
+    profiles.sort(key=lambda x: (_GRADE_ORDER[x["grade"]], -(x["per100"] if x["per100"] is not None else -1), x["name"]))
+    return profiles
+
+
+def _by_account(rows: list[dict]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("accountId"):
+            out.setdefault(str(r["accountId"]), []).append(r)
+    return out
 
 
 @router.get("/applications/profiles")
@@ -102,14 +134,7 @@ async def applications_profiles(
     rows = await load_period_rows(start, end, region)
     summaries = summarize(rows, now - timedelta(days=win["matured_days"]))
     team = team_baseline(summaries, rows)
-    mine = [p for p in await owner_profiles(sid) if p["id"] in summaries]
-    profiles = []
-    for p in mine:
-        s = summaries[p["id"]]
-        g, reasons = grade(s, team)
-        profiles.append({"accountId": p["id"], "name": p["name"], "region": p["region"], "archived": p["archived"],
-                         **s, "grade": g, "reasons": reasons})
-    profiles.sort(key=lambda x: (_GRADE_ORDER[x["grade"]], -(x["per100"] if x["per100"] is not None else -1), x["name"]))
+    profiles = await _graded_profiles(sid, summaries, team)
     own = [r for r in rows if r["ownerId"] == sid and r.get("bidStatus") != "rejected"]
     regions, _ = await interview_rates._profile_regions()
     header = (await interview_rates.counts([sid], start_d, end_d, region, regions, {}, logged_only=False)).get(sid, (0,))[0]
@@ -140,3 +165,73 @@ async def applications_jobs(
     you = [r for r in rows if str(r.get("accountId")) in mine]
     cutoff = sc["now"] - timedelta(days=sc["win"]["matured_days"])
     return {"label": sc["label"], "subject": sc["subject"], "window": sc["win"], **breakdown(you, rows, cutoff)}
+
+
+@router.get("/applications/changes")
+async def applications_changes(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+    user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+) -> dict:
+    """"What to change": up to 3 suggestions per profile of the subject, from the pattern each profile shows."""
+    sc = await _scope(user, period, date, to, user_id)
+    now, today, md = sc["now"], sc["today"], sc["win"]["matured_days"]
+    cutoff = now - timedelta(days=md)
+    rows = await load_period_rows(sc["start"], sc["end"], region)
+    summaries = summarize(rows, cutoff)
+    team = team_baseline(summaries, rows)
+    profiles = await _graded_profiles(sc["sid"], summaries, team)
+    prev = summarize(await load_period_rows(
+        *_bounds(*previous_window(period, sc["start_d"], sc["end_d"], today)), region), cutoff)
+    tctx = changes.team_context(rows, cutoff, team)
+    by_acct = _by_account(rows)
+    pctx = {p["accountId"]: changes.profile_context(by_acct[p["accountId"]], cutoff) for p in profiles}
+    quiet: set[str] = set()
+    if sc["start_d"] <= today <= sc["end_d"]:
+        cands = [p["accountId"] for p in profiles if changes.quiet_candidate(by_acct[p["accountId"]], now, md)]
+        busy = await accounts_with_rounds_since([PydanticObjectId(i) for i in cands],
+                                                now - timedelta(days=changes.QUIET_DAYS))
+        quiet = set(cands) - busy
+    bidder_ids = [c["topBidderId"] for c in pctx.values() if c["topBidderId"]]
+    names = {d["_id"]: d.get("name") async for d in Bidder.get_motor_collection().find(
+        {"_id": {"$in": bidder_ids}}, {"name": 1})} if bidder_ids else {}
+    out = []
+    for p in profiles:
+        pc = pctx[p["accountId"]]
+        ctx = {**tctx, **pc, "matured_days": md, "prev": prev.get(p["accountId"]), "quietNow": p["accountId"] in quiet,
+               "bidder": names.get(pc["topBidderId"]), "reasons": p["reasons"]}
+        sug = changes.suggest(p, p, p["grade"], ctx)
+        if sug:
+            out.append({"accountId": p["accountId"], "name": p["name"], "grade": p["grade"], "suggestions": sug})
+    return {"label": sc["label"], "subject": sc["subject"], "profiles": out}
+
+
+@router.get("/applications/leaders")
+async def applications_leaders(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+) -> dict:
+    """Winning vs weakest profiles of the team, named with their owners; visible to every signed-in user (no `user`)."""
+    sc = await _scope(user, period, date, to, None)
+    rows = await load_period_rows(sc["start"], sc["end"], region)
+    summaries = summarize(rows, sc["now"] - timedelta(days=sc["win"]["matured_days"]))
+    ids = [PydanticObjectId(k) for k, s in summaries.items() if s["matured"] >= leaders.MIN_MATURED]
+    accts = [d async for d in Account.get_motor_collection().find(
+        {"_id": {"$in": ids}}, {"name": 1, "createdBy": 1, "region": 1})] if ids else []
+    owner_ids = list({d.get("createdBy") for d in accts})
+    owners = {d["_id"]: d.get("name") async for d in UserExtra.get_motor_collection().find(
+        {"_id": {"$in": owner_ids}}, {"name": 1})} if owner_ids else {}
+    by_acct = _by_account([r for r in rows if r.get("bidStatus") != "rejected"])
+    team = []
+    for a in accts:
+        s = summaries[str(a["_id"])]
+        team.append({"accountId": str(a["_id"]), "name": a.get("name"), "owner": owners.get(a.get("createdBy")),
+                     "region": a.get("region"), "matured": s["matured"], "interviews": s["maturedInterviews"],
+                     "per100": s["per100"], "rows": by_acct.get(str(a["_id"]), [])})
+    return {"label": sc["label"], "window": sc["win"], **leaders.pick(team), "note": "These are patterns, not proof."}

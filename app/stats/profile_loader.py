@@ -55,3 +55,12 @@ async def count_unmatched_interviews(since: datetime, until: Optional[datetime] 
     if region != "all":
         ivs = [d for d in ivs if (regions or {}).get(d.get("accountId")) == region]
     return sum(1 for d in ivs if d["_id"] not in carried and interview_outcome(Interview.model_validate(d)))
+
+
+async def accounts_with_rounds_since(account_ids: list, since: datetime) -> set[str]:
+    """Profiles (of `account_ids`) with any interview round scheduled at or after `since`, matched to a row or not."""
+    if not account_ids:
+        return set()
+    q = {"accountId": {"$in": list(account_ids)},
+         "$or": [{"stageHistory.scheduledAt": {"$gte": since}}, {"scheduledAt": {"$gte": since}}]}
+    return {str(a) for a in await Interview.get_motor_collection().distinct("accountId", q)}

@@ -1,0 +1,162 @@
+""""What to change": one suggestion per pattern a profile shows (pure, no DB). Copy per the slices 3-5 plan."""
+from datetime import datetime, timedelta
+from typing import Optional
+
+from app.stats.job_fit import BOARD_LABELS, breakdown
+from app.stats.profile_report import EXPECTED_MIN, MIN_MATURED, SLOW_RATIO, _per100
+
+MAX_SUGGESTIONS = 3
+QUIET_DAYS = 21
+RECENT_DAYS = 7
+LOW_SCORE_GAP = 5
+MIN_SCORED = 10
+VOLUME_STEP = 0.25
+
+
+def _avg(xs: list) -> Optional[float]:
+    return round(sum(xs) / len(xs), 1) if xs else None
+
+
+def _best_label(groups: list[dict], skip: set) -> list[str]:
+    ok = [g for g in groups if g["key"] not in skip and not g["team"]["tooFew"] and g["team"]["per100"] is not None]
+    return [g["label"] for g in sorted(ok, key=lambda g: -g["team"]["per100"])]
+
+
+def team_context(rows: list[dict], matured_before: datetime, team: dict) -> dict:
+    """Team numbers every profile's suggestions compare against: avg score, best 2 sites, best score band."""
+    b = breakdown([], rows, matured_before)
+    scores = [r["score"] for r in rows if r.get("bidStatus") != "rejected" and r.get("score") is not None]
+    bands = _best_label(b["byScore"], {None})
+    return {"team": {**team, "avgScore": _avg(scores)}, "bestSites": _best_label(b["bySite"], {"other", "none"})[:2],
+            "bestBand": bands[0] if bands else None}
+
+
+def profile_context(rows: list[dict], matured_before: datetime) -> dict:
+    """One profile's rows -> scores, self / bidder split, the site to drop and its busiest bidder."""
+    rows = [r for r in rows if r.get("bidStatus") != "rejected"]
+    matured = [r for r in rows if r["appliedAt"] <= matured_before]
+    split, sites, bidders = {}, {}, {}
+    for by in ("self", "bidder"):
+        m = [r for r in matured if (r.get("by") == "self") == (by == "self")]
+        split[by] = {"matured": len(m), "per100": _per100(sum(1 for r in m if r.get("interviewId")), len(m))}
+    for r in matured:
+        if r.get("board"):
+            s = sites.setdefault(r["board"], [0, 0])
+            s[0] += 1
+            s[1] += bool(r.get("interviewId"))
+        if r.get("by") == "bidder" and r.get("bidderId"):
+            bidders[r["bidderId"]] = bidders.get(r["bidderId"], 0) + 1
+    dead_sites = [b for b, (n, iv) in sites.items() if n >= MIN_MATURED and iv == 0]
+    worst = max(dead_sites, key=lambda b: (sites[b][0], b), default=None)
+    scores = [r["score"] for r in rows if r.get("score") is not None]
+    return {"scores": {"avg": _avg(scores), "n": len(scores)}, "split": split,
+            "worstSite": BOARD_LABELS.get(worst, worst) if worst else None,
+            "topBidderId": max(bidders, key=lambda k: (bidders[k], str(k)), default=None)}
+
+
+def quiet_candidate(rows: list[dict], now: datetime, matured_days: int) -> bool:
+    """Still bidding (a non-rejected row in the last 7 days) and old enough (first row before matured_days + 21)."""
+    return (bool(rows) and min(r["appliedAt"] for r in rows) <= now - timedelta(days=matured_days + QUIET_DAYS)
+            and any(r["appliedAt"] >= now - timedelta(days=RECENT_DAYS) for r in rows
+                    if r.get("bidStatus") != "rejected"))
+
+
+def _expected(matured: int, team_per100: Optional[float]) -> float:
+    return matured * (team_per100 or 0) / 100
+
+
+def _below(s: dict, ctx: dict) -> bool:
+    t = ctx["team"]["per100"]
+    return t is not None and _expected(s["matured"], t) >= EXPECTED_MIN and (s["per100"] or 0) < t
+
+
+def _out(pattern: str, text: str, **evidence) -> dict:
+    return {"pattern": pattern, "text": text, "evidence": evidence}
+
+
+def dead(s, g, ctx):
+    if g == "dead":
+        return _out("dead", f"Archive it, or rebuild it with a new base resume / prompt and judge it fresh after "
+                            f"{ctx['matured_days']} days.", matured=s["matured"], maturedDays=ctx["matured_days"])
+
+
+def _low_scores(ctx) -> bool:
+    sc, team_avg = ctx["scores"], ctx["team"].get("avgScore")
+    return sc["n"] >= MIN_SCORED and team_avg is not None and sc["avg"] < team_avg - LOW_SCORE_GAP
+
+
+def low_scores(s, g, ctx):
+    if _below(s, ctx) and _low_scores(ctx):
+        sc, team_avg = ctx["scores"], ctx["team"]["avgScore"]
+        return _out("low_scores", f"Low interview rate and low resume scores (avg {round(sc['avg'])} vs team "
+                                  f"{round(team_avg)}) — improve the base resume or the role's prompt; check it on "
+                                  f"Prompt tests.", avgScore=sc["avg"], scored=sc["n"], teamAvgScore=team_avg)
+
+
+def wrong_sites(s, g, ctx):
+    sites = ctx["bestSites"]
+    if not sites or not _below(s, ctx) or _low_scores(ctx):
+        return None
+    drop = f"; drop {ctx['worstSite']}" if ctx["worstSite"] else ""
+    return _out("wrong_sites", f"Good resumes, wrong places — move bids to {' and '.join(sites)}, where the team "
+                               f"converts best{drop}.", bestSites=sites, worstSite=ctx["worstSite"])
+
+
+def stuck_intro(s, g, ctx):
+    if "intros don't reach tech" in ctx["reasons"]:
+        return _out("stuck_intro", "Intros don't turn into tech rounds — tone the prompt down to real skills and add "
+                                   "interview prep.", interviews=s["interviews"], tech=s["reach"]["tech"])
+
+
+def slow(s, g, ctx):
+    med, tmed = (s["days"] or {}).get("median"), ctx["team"]["medianDays"]
+    if tmed is not None and tmed >= 1 and med is not None and med >= SLOW_RATIO * tmed:
+        return _out("slow", f"Interviews come slowly ({med} days vs team {tmed}) — sharpen the summary; try a winning "
+                            f"profile's template.", medianDays=med, teamMedianDays=tmed, interviews=s["interviews"])
+
+
+def bidder_gap(s, g, ctx):
+    me, bd = ctx["split"]["self"], ctx["split"]["bidder"]
+    if me["matured"] < MIN_MATURED or bd["matured"] < MIN_MATURED or not me["per100"] or bd["per100"] is None:
+        return None
+    if me["per100"] < 2 * bd["per100"] or _expected(bd["matured"], me["per100"]) < EXPECTED_MIN:
+        return None
+    # ponytail: a bidder rate of 0 has no ratio; "far better" stands in for "{self}× better"
+    times = f"{round(me['per100'] / bd['per100'], 1):g}×" if bd["per100"] else "far"
+    return _out("bidder_gap", f"Your own applies convert {times} better than your bidders' ({me['per100']} vs "
+                              f"{bd['per100']} per 100) — review {ctx['bidder'] or 'your top bidder'}'s jobs and "
+                              f"rejected share.", self=me, bidder=bd)
+
+
+def volume_up_rate_down(s, g, ctx):
+    prev, t = ctx["prev"], ctx["team"]["per100"]
+    if not prev or not prev["per100"] or s["per100"] is None:
+        return None
+    if min(_expected(s["matured"], t), _expected(prev["matured"], t)) < EXPECTED_MIN:
+        return None
+    if s["matured"] < (1 + VOLUME_STEP) * prev["matured"] or s["per100"] > (1 - VOLUME_STEP) * prev["per100"]:
+        return None
+    band = f" (score {ctx['bestBand']} converts best for the team)" if ctx["bestBand"] else ""
+    return _out("volume_up_rate_down", f"More bids, fewer interviews per bid — fewer, better-matched applies{band}.",
+                matured=s["matured"], per100=s["per100"], prevMatured=prev["matured"], prevPer100=prev["per100"])
+
+
+def quiet_now(s, g, ctx):
+    if ctx["quietNow"]:
+        return _out("quiet_now", "No interview on this profile for 21+ days while it's still bidding — check the base "
+                                 "resume and the jobs it's applied to.", days=QUIET_DAYS)
+
+
+PATTERNS = (dead, low_scores, wrong_sites, stuck_intro, slow, bidder_gap, volume_up_rate_down, quiet_now)
+NEGATIVE = {low_scores, wrong_sites, slow, bidder_gap, volume_up_rate_down}
+
+
+def suggest(profile: dict, summary: dict, grade: str, ctx: dict) -> list[dict]:
+    out = []
+    for p in PATTERNS:
+        if grade == "early" and p in NEGATIVE:
+            continue
+        hit = p(summary, grade, ctx)
+        if hit:
+            out.append(hit)
+    return out[:MAX_SUGGESTIONS]
