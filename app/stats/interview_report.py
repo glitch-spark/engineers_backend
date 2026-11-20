@@ -122,6 +122,12 @@ def period_rows(interviews: list[dict], accounts: dict, start: datetime, end: da
     return out
 
 
+def own_rows(ivs: list, start: datetime, end: datetime, now: datetime, tz) -> list[dict]:
+    """`period_rows` of Interview documents already narrowed to their owner (Home): whatever the profile, with no
+    bid-side keys and callers by their typed name."""
+    return period_rows([interview_facts(iv, iv.id, None, now) for iv in ivs], {}, start, end, now, tz, deleted=True)
+
+
 def pass_rate(rows: list[dict]) -> Optional[float]:
     """Unrounded passed ÷ decided × 100 (the team rate the findings compare with); None with nothing decided."""
     c = Counter(r["outcome"] for r in rows)
@@ -129,7 +135,7 @@ def pass_rate(rows: list[dict]) -> Optional[float]:
     return c["passed"] * 100 / decided if decided else None
 
 
-def _counts(rows: list[dict]) -> dict:
+def counts(rows: list[dict]) -> dict:
     c = Counter(r["outcome"] for r in rows)
     decided = sum(c[o] for o in DECIDED)
     return {"rounds": len(rows), "held": sum(c[o] for o in HELD), "decided": decided, "passed": c["passed"],
@@ -138,7 +144,7 @@ def _counts(rows: list[dict]) -> dict:
 
 
 def _totals(rows: list[dict]) -> dict:
-    return {**_counts(rows), "companies": sum(1 for r in rows if r["firstHeld"]),
+    return {**counts(rows), "companies": sum(1 for r in rows if r["firstHeld"]),
             "offers": sum(1 for r in rows if r["offer"])}
 
 
@@ -146,7 +152,7 @@ def _groups(rows: list[dict], keyf: Callable, order: list[tuple], skip_empty: bo
     by: dict = defaultdict(list)
     for r in rows:
         by[keyf(r)].append(r)
-    return [{"key": k, "label": label, **_counts(by[k]), "mark": None} for k, label in order if by[k] or not skip_empty]
+    return [{"key": k, "label": label, **counts(by[k]), "mark": None} for k, label in order if by[k] or not skip_empty]
 
 
 def _folded(rows: list[dict], keyf: Callable, labelf: Callable, other: str) -> list[dict]:
@@ -158,7 +164,7 @@ def _folded(rows: list[dict], keyf: Callable, labelf: Callable, other: str) -> l
         return groups
     keys = {g["key"] for g in few}
     return [g for g in groups if not g["few"]] + [{
-        "key": "other", "label": other, **_counts([r for r in rows if keyf(r) in keys]), "mark": None,
+        "key": "other", "label": other, **counts([r for r in rows if keyf(r) in keys]), "mark": None,
         "members": few, "memberCount": len(few)}]
 
 
@@ -213,7 +219,7 @@ def report(rows: list[dict], now: datetime) -> dict:
             "rescheduleRate": {"rescheduled": sum(1 for r in logged if r["reschedules"]), "rounds": len(logged),
                                "since": RESCHEDULE_LOG_START.isoformat()},
         },
-        "followUps": [{"key": k, "label": label, **{f: v for f, v in _counts(rs).items()
+        "followUps": [{"key": k, "label": label, **{f: v for f, v in counts(rs).items()
                                                     if f in ("rounds", "passed", "rejected", "noAnswer", "waiting")}}
                       for k, label, rs in follow],
     }

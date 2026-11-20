@@ -108,6 +108,14 @@ def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dic
     return out
 
 
+def _routine_done(item: Any, r: Optional[Any]) -> bool:
+    """A routine's day is done: ticked, or its value at / over the target (the result's frozen one, else the item's)."""
+    if r is None:
+        return False
+    target = r.target if r.target is not None else item.target
+    return bool(r.done or (r.value is not None and target is not None and r.value >= target))
+
+
 def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[int, int]:
     """(done, total) over the day's routines with a result (done = ticked, or value at / over its target) and its
     weekly goals touched that day like the standup post lists them (in focus, ticked or a value; done = either)."""
@@ -123,9 +131,8 @@ def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[
             continue
         if r is None:
             continue
-        target = r.target if r.target is not None else e["item"].target
         total += 1
-        done += r.done or (r.value is not None and target is not None and r.value >= target)
+        done += _routine_done(e["item"], r)
     return done, total
 
 
@@ -137,12 +144,38 @@ def routines_tally(weekly: Any, plans: dict, days: list) -> tuple[int, int]:
             if e["scope"] != "routine":
                 continue
             expected += 1
-            r = e["result"]
-            if r is None:
-                continue
-            target = r.target if r.target is not None else e["item"].target
-            done += bool(r.done or (r.value is not None and target is not None and r.value >= target))
+            done += _routine_done(e["item"], e["result"])
     return done, expected
+
+
+def routines_grid(weekly: Any, plans: dict, days: list, today: date) -> list[dict]:
+    """One row per routine shown on any of `days`, with each day's state: `done`, `short` (a value under its target,
+    carried as `value` / `target`), `missed` (a past day with nothing), `today` (today, nothing yet), `future`, or
+    `off` (not shown that day: archived with no result). `doneDays` / `totalDays` count the days up to `today` it
+    was shown, so their sums are `routines_tally` over those days."""
+    shown = {d: {e["item"].id: e for e in day_items(weekly, plans.get(d), d) if e["scope"] == "routine"} for d in days}
+    rows = []
+    for routine in weekly.routines:
+        cells = []
+        for d in days:
+            e = shown[d].get(routine.id)
+            value = target = None
+            if e is None:
+                state = "off"
+            elif d > today:
+                state = "future"
+            elif _routine_done(e["item"], e["result"]):
+                state = "done"
+            elif e["result"] is not None and e["result"].value and e["item"].target is not None:
+                state, value, target = "short", e["result"].value, e["item"].target
+            else:
+                state = "missed" if d < today else "today"
+            cells.append({"date": d.isoformat(), "state": state, "value": value, "target": target})
+        counted = [c["state"] for c in cells if c["state"] not in ("off", "future")]
+        if any(c["state"] != "off" for c in cells):
+            rows.append({"id": routine.id, "text": routine.text, "days": cells,
+                         "doneDays": counted.count("done"), "totalDays": len(counted)})
+    return rows
 
 
 def goal_progress(weekly: Any, days: list) -> dict[str, dict]:

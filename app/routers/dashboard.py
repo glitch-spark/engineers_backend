@@ -43,18 +43,23 @@ from app.interview_rounds import (
     empty_breakdown,
     load_interviews_for_window,
 )
-from app.models import DailyPlan, Transaction, UserExtra
+from app.models import DailyPlan, Interview, Transaction, UserExtra
 from app.plan_auto import (
     day_targets,
     goal_progress,
     interviews_by_day,
     interviews_split,
+    routines_grid,
     routines_tally,
     weekly_plans_for,
 )
+from app.routers.interviews import follow_ups_summary
 from app.routers._util import to_object_id
 from app.routers.metrics import _display_name
 from app.routers.transactions import _TOTALS_GROUP
+from app.stats import interview_report
+from app.stats.conversion_scope import DATA_START
+from app.stats.profile_loader import load_interview_facts
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -121,8 +126,33 @@ async def _logged_plans(user_ids: list, start: date, end: date) -> list[DailyPla
     return [p for p in plans if p.loggedAt is not None]
 
 
+def _now() -> datetime:
+    """Naive UTC now (the interview outcome rules' clock)."""
+    return datetime.utcnow()
+
+
 def _target(total: int) -> Optional[int]:
     return total or None
+
+
+_TICK = timedelta(microseconds=1)
+
+
+def _week_bounds(monday: date, tz) -> tuple[datetime, datetime]:
+    """Naive-UTC [start, end) of the Mon-Sun week in the app timezone."""
+    return local_day_start_utc(monday, tz), local_day_start_utc(monday + timedelta(days=7), tz)
+
+
+def _stage_counts(ivs: list, start: datetime, end: datetime) -> tuple[dict, int]:
+    """(rounds per stage tile, canceled rounds) of the rounds dated in [start, end]."""
+    breakdown = empty_breakdown()
+    canceled_total = 0
+    for iv in ivs:
+        _rounds, canceled, bd = count_interview_rounds(iv, start, end)
+        canceled_total += canceled
+        for k, v in bd.items():
+            breakdown[k] = breakdown.get(k, 0) + v
+    return breakdown, canceled_total
 
 
 @router.get("/week")
@@ -151,10 +181,11 @@ async def dashboard_week(
     workdays = [monday + timedelta(days=i) for i in range(5)]
     elapsed = [d for d in workdays if d <= day]
     days_left = len(workdays) - len(elapsed)
-    bids_expected = 0
-    for d in elapsed:
+    day_target = {}
+    for d in workdays:
         t = day_targets(plans_by_day.get(d), weekly_plan, d)
-        bids_expected += t.bidsSelf + t.bidsBidder
+        day_target[d] = t.bidsSelf + t.bidsBidder
+    bids_expected = sum(day_target[d] for d in elapsed)
     routines_done, routines_expected = routines_tally(weekly_plan, plans_by_day, elapsed) if weekly_plan else (0, 0)
     weekly_goals = []
     if weekly_plan:
@@ -167,17 +198,12 @@ async def dashboard_week(
     interviews_target = _target(goal.interviewsSelf + goal.interviewsCaller) if goal else None
 
     # Stage tiles: interview rounds created by the user, dated in the window.
-    iv_start = local_day_start_utc(monday, tz)
-    iv_end = local_day_start_utc(sunday + timedelta(days=1), tz) - timedelta(microseconds=1)
-    breakdown = empty_breakdown()
-    canceled_total = 0
-    for iv in await load_interviews_for_window([sid], iv_start, iv_end):
-        _rounds, canceled, bd = count_interview_rounds(iv, iv_start, iv_end)
-        canceled_total += canceled
-        for k, v in bd.items():
-            breakdown[k] = breakdown.get(k, 0) + v
+    iv_start, iv_end = _week_bounds(monday, tz)
+    week_ivs = await load_interviews_for_window([sid], iv_start, iv_end - _TICK)
+    breakdown, canceled_total = _stage_counts(week_ivs, iv_start, iv_end - _TICK)
     stages = [{"key": key, "label": label, "count": breakdown.get(key, 0)} for key, label in BREAKDOWN_ORDER]
     stages.append({"key": "canceled", "label": "Canceled", "count": canceled_total})
+    outcomes = interview_report.counts(interview_report.own_rows(week_ivs, iv_start, iv_end, _now(), tz))
 
     # Streak: consecutive working days (Mon-Sat) with a logged plan, looking
     # back up to 400 days (the helper itself caps the walk at 365).
@@ -220,6 +246,11 @@ async def dashboard_week(
             "target": bids_target,
             "pace": plan_pace(bids_total, bids_target, bids_expected, days_left),
             "percentile": percentile(bids_scores[sid], list(bids_scores.values())),
+            "byDay": [
+                {"date": d.isoformat(), "done": (p.done.bidsSelf + p.done.bidsBidder) if (p := plans_by_day.get(d)) else 0,
+                 "target": _target(day_target[d])}
+                for d in workdays
+            ],
         },
         "interviews": {
             "done": interviews_done,
@@ -228,11 +259,15 @@ async def dashboard_week(
             "target": interviews_target,
             "pace": plan_pace(interviews_done, interviews_target, ceil((interviews_target or 0) * len(elapsed) / 5), days_left),
             "percentile": percentile(interviews_done, list(iv_scores.values())),
+            # rounds scheduled Mon-Sun by the Statistics → Interviews outcome rule; scheduled = not held yet
+            "outcomes": {k: outcomes[k] for k in ("held", "passed", "rejected", "noAnswer", "waiting", "canceled",
+                                                  "scheduled")},
         },
         "stages": stages,
         "streak": streak_value,
         "hasWeeklyPlan": weekly_plan is not None,
-        "routines": {"done": routines_done, "expected": routines_expected},
+        "routines": {"done": routines_done, "expected": routines_expected,
+                     "rows": routines_grid(weekly_plan, plans_by_day, workdays, day) if weekly_plan else []},
         "weeklyGoals": weekly_goals,
     }
 
@@ -347,10 +382,49 @@ async def dashboard_net_monthly(
         income = round(float(row.get("income") or 0), 2) if row else 0.0
         outcome = round(float(row.get("outcome") or 0), 2) if row else 0.0
         net = round(income - outcome, 2)
-        months.append({"period": period, "income": income, "outcome": outcome, "net": net})
+        months.append({"period": period, "income": income, "outcome": outcome, "net": net,
+                       "in": income, "out": outcome})  # the Home card's names for income / outcome
         total += net
 
     return {"months": months, "total": round(total, 2)}
+
+
+@router.get("/month-interviews")
+async def dashboard_month_interviews(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    userId: Optional[str] = Query(None),
+    today: Optional[str] = Query(None),
+) -> dict:
+    """Home's "This month" interview tiles (spec 2026-11-20-home-redesign-design.md), the subject's own numbers:
+    `pipeline`, this week's stage tiles (`/week`'s `stages` without Canceled); `waitingForResult`, the rounds since
+    the data start that are the interview's latest, held and without a pass / reject; `followUpsDue`, the standup's
+    `followUps.toDo`; `passRate` over the rounds scheduled this month (app timezone) by the Statistics → Interviews
+    rules, beside the whole team's (`teamRate`, from that report's cached load)."""
+    sid = await _subject_id(user, userId)
+    day = _today(today)
+    tz, now = app_tz(), _now()
+    cutoff = local_day_start_utc(DATA_START, tz)
+    ivs = await Interview.find({"createdBy": sid, "$or": [
+        {"scheduledAt": {"$gte": cutoff}}, {"stageHistory.scheduledAt": {"$gte": cutoff}},
+    ]}).to_list()
+    rows = interview_report.own_rows(ivs, cutoff, datetime.max, now, tz)
+
+    week_start, week_end = _week_bounds(week_window(day)[0], tz)
+    breakdown, _canceled = _stage_counts(ivs, week_start, week_end - _TICK)
+    month_start = max(local_day_start_utc(day.replace(day=1), tz), cutoff)
+    month_end = local_day_start_utc((day.replace(day=1) + timedelta(days=32)).replace(day=1), tz)
+    mine = interview_report.counts([r for r in rows if month_start <= r["at"] < month_end])
+    team = await load_interview_facts(month_start, month_end) if month_end > cutoff else []
+    team_rate = interview_report.pass_rate(
+        interview_report.period_rows(team, {}, month_start, month_end, now, tz, deleted=True))
+    return {
+        "pipeline": [{"stage": key, "label": label, "count": breakdown.get(key, 0)} for key, label in BREAKDOWN_ORDER],
+        "waitingForResult": sum(
+            1 for r in rows if r["outcome"] == "waiting" or (r["latest"] and r["status"] == "completed")),
+        "followUpsDue": (await follow_ups_summary(sid, day))["toDo"],
+        "passRate": {"value": mine["rate"], "passed": mine["passed"], "decided": mine["decided"], "few": mine["few"],
+                     "teamRate": round(team_rate, 1) if team_rate is not None else None},
+    }
 
 
 async def _active_members() -> list[UserExtra]:

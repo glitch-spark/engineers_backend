@@ -92,7 +92,7 @@ async def test_routines_and_weekly_goals(me):
     await day(me, 16, results={"r1": ItemResult(done=True), "r2": ItemResult(value=50)})
     await day(me, 17, results={"r1": ItemResult(done=True)})
     out = await dashboard_week(me, None, TODAY)
-    assert out["routines"] == {"done": 3, "expected": 6}
+    assert (out["routines"]["done"], out["routines"]["expected"]) == (3, 6)
     assert out["weeklyGoals"][0]["id"] == "g1" and out["weeklyGoals"][0]["target"] == 250
 
 
@@ -105,7 +105,7 @@ async def test_percentile_and_streak_stay_logged_only(me):
 async def test_no_saved_week(db):
     user = await UserExtra(name="Bo", email="bo@x.io").insert()
     out = await dashboard_week(user, None, TODAY)
-    assert out["weeklyGoals"] == [] and out["routines"] == {"done": 0, "expected": 0}
+    assert out["weeklyGoals"] == [] and out["routines"] == {"done": 0, "expected": 0, "rows": []}
     assert out["bids"]["pace"] is None
 
 
