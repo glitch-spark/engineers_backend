@@ -31,6 +31,7 @@ async def test_run_cron_ticks_runs_slack_before_alerts():
         patch("app.slack_bot.run_alert_tick", slack),
         patch("app.alerts_service.run_alerts_tick", alerts),
         patch("app.bids.reports.run_bid_reports_tick", bids),
+        patch("app.applications.sync.run_applications_tick", AsyncMock(return_value={})),
     ):
         assert await run_cron_ticks() == 0
     assert order == ["slack", "alerts", "bids"]
@@ -83,3 +84,17 @@ async def test_weekly_plan_notification_links_to_plans():
         )
     assert created == 1
     assert put.await_args.kwargs["href"] == "/plans"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result, code", [({"error": "failed"}, 1), ({"error": "timeout"}, 1), ({"rows": 3}, 0),
+                                          ({"skipped": "disabled"}, 0)])
+async def test_run_cron_ticks_fails_the_run_when_the_applications_sync_reports_an_error(result, code):
+    """run_applications_tick logs and returns {"error": ...} instead of raising; the run must still show as failed."""
+    with (
+        patch("app.slack_bot.run_alert_tick", AsyncMock(return_value={})),
+        patch("app.alerts_service.run_alerts_tick", AsyncMock(return_value={})),
+        patch("app.bids.reports.run_bid_reports_tick", AsyncMock(return_value={})),
+        patch("app.applications.sync.run_applications_tick", AsyncMock(return_value=result)),
+    ):
+        assert await run_cron_ticks() == code

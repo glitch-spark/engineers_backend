@@ -60,6 +60,9 @@ async def run_cron_ticks() -> int:
 
         applications = await run_applications_tick()
         log.info("applications tick %s", applications)
+        # the sync logs its own failure and returns {"error": ...} instead of raising: the run must still fail
+        if isinstance(applications, dict) and applications.get("error"):
+            code = 1
     except Exception:
         log.exception("applications tick failed")
         code = 1
