@@ -289,3 +289,20 @@ def test_totals_interview_only_count():
     rows = [_r(iv=True, byInterviewOnly=True), _r(iv=True), _r(byInterviewOnly=True),
             _r(iv=True, byInterviewOnly=True, at=datetime(2026, 11, 1))]
     assert conversion.report(rows, CUT, {}, False)["totals"]["interviewOnly"] == 2
+
+
+def test_other_sites_members_capped_sorted_and_only_on_other():
+    rows = []
+    for i in range(8):
+        rows += [_r(board=f"top{i}.com") for _ in range(1000)]
+    rows += [_r(board="ashbyhq.com", iv=True) for _ in range(5)] + [_r(board="zzz.io") for _ in range(5)]
+    for i in range(60):
+        rows += [_r(board=f"s{i:02d}.io")]
+    out = conversion.report(rows, CUT, {}, False)["bySite"]
+    other = _g(out, "other")
+    m = other["members"]
+    assert other["memberCount"] == 62 and len(m) == 50 and other["moreMembers"] == 12
+    assert [x["label"] for x in m][:2] == ["Ashby", "zzz.io"] and m[0]["bids"] == 5  # bids desc, then label
+    assert m[0]["interviews"] == 5 and m[0]["rate"] == 100.0 and m[0]["few"] and m[0]["fewReason"] == "matured"
+    assert set(m[0]) == {"key", "label", "bids", "matured", "interviews", "rate", "few", "fewReason"}
+    assert all("members" not in g for g in out if g["key"] != "other")

@@ -78,6 +78,14 @@ def report(rows: list[dict], matured_before: datetime, bidder_names: dict, inclu
 
     sites = [(b, BOARD_LABELS.get(b, b)) for b in top] + [("other", "Other sites"), ("none", "No job link")]
     out["bySite"] = _groups(rows, matured_before, team_rate, site, sites)
+    by_board: dict[str, list[dict]] = {}
+    for r in rows:  # one pass: ~700 boards x all rows via _groups would be quadratic
+        if r.get("board") and r["board"] not in top:
+            by_board.setdefault(r["board"], []).append(r)
+    members = sorted(({"key": b, "label": BOARD_LABELS.get(b, b), **_counts(rs, matured_before, team_rate)}
+                      for b, rs in by_board.items()), key=lambda g: (-g["bids"], g["label"]))
+    other = next(g for g in out["bySite"] if g["key"] == "other")
+    other.update(members=members[:50], moreMembers=max(0, len(members) - 50), memberCount=len(members))
     out["byScore"] = _groups(rows, matured_before, team_rate, lambda r: r.get("scoreBand"), _SCORES)
     out["byArea"] = _groups(rows, matured_before, team_rate, lambda r: r.get("area"),
                             [(a, a or "Unknown") for a in _AREAS], skip_empty=True)
