@@ -17,7 +17,7 @@ from app.models import Account, Application, UserExtra
 from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
-from app.stats import changes, conversion, conversion_scope as cs, timing
+from app.stats import changes, conversion, conversion_scope as cs, conversion_summary, timing
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.conversion_scope import bounds as _bounds
@@ -55,7 +55,8 @@ async def conversion_report(
                                            ) if sc["end_d"] >= cs.DATA_START else 0
     return {"label": sc["label"], "startClamped": sc["startClamped"], "window": win, "scope": scope,
             "subject": sc["subject"], **({"profile": profile} if scope == "profile" else {}),
-            **rep, "totals": {**rep["totals"], "untied": untied}}
+            **rep, "totals": {**rep["totals"], "untied": untied},
+            "summary": await conversion_summary.summary(sc, region, rep["totals"])}
 
 
 @router.get("/{tab}")

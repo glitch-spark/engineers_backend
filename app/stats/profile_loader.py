@@ -68,25 +68,30 @@ async def count_unmatched_interviews(since: datetime, until: Optional[datetime] 
     return sum(1 for d in ivs if d["_id"] not in carried and interview_outcome(Interview.model_validate(d)))
 
 
+async def interviews_started(match: dict, start: datetime, end: datetime, skip: frozenset = frozenset()) -> list[dict]:
+    """Projected interviews matching `match` (ids in `skip` left out) whose first countable round is in [start, end)."""
+    # a first round in [start, end) implies a round near it: the day of slack covers timezone-free naive dates
+    near = {"$gte": start - timedelta(days=1), "$lt": end + timedelta(days=1)}
+    ivs = await Interview.get_motor_collection().find(
+        {**match, "$or": [{"scheduledAt": near}, {"stageHistory.scheduledAt": near}]},
+        {f: 1 for f in ("accountId", "createdBy", "scheduledAt", "stage", "status", "stageHistory", "createdAt", "updatedAt")},
+    ).to_list(None)
+    out = []
+    for d in ivs:
+        if d["_id"] in skip:
+            continue
+        o = interview_outcome(Interview.model_validate(d))
+        if o and o["firstRoundAt"] and start <= o["firstRoundAt"] < end:
+            out.append(d)
+    return out
+
+
 async def count_untied_interviews(account_ids: list, start: datetime, end: datetime) -> int:
     """Interviews on `account_ids` whose first countable round is in [start, end) and that no row carries."""
     if not account_ids:
         return 0
-    carried = set(await Application.get_motor_collection().distinct("interviewId"))
-    # a first round in [start, end) implies a round near it: the day of slack covers timezone-free naive dates
-    near = {"$gte": start - timedelta(days=1), "$lt": end + timedelta(days=1)}
-    ivs = await Interview.get_motor_collection().find(
-        {"accountId": {"$in": list(account_ids)}, "$or": [{"scheduledAt": near}, {"stageHistory.scheduledAt": near}]},
-        {f: 1 for f in ("accountId", "createdBy", "scheduledAt", "stage", "status", "stageHistory", "createdAt", "updatedAt")},
-    ).to_list(None)
-    n = 0
-    for d in ivs:
-        if d["_id"] in carried:
-            continue
-        out = interview_outcome(Interview.model_validate(d))
-        if out and out["firstRoundAt"] and start <= out["firstRoundAt"] < end:
-            n += 1
-    return n
+    carried = frozenset(await Application.get_motor_collection().distinct("interviewId"))
+    return len(await interviews_started({"accountId": {"$in": list(account_ids)}}, start, end, carried))
 
 
 async def accounts_with_rounds_since(account_ids: list, since: datetime) -> set[str]:

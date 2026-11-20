@@ -91,16 +91,24 @@ async def _targets(uid, days: list[date]) -> int:
     return total
 
 
-async def bids_view(subject, period: str, day: date, region: str, until: Optional[date], today: date) -> dict:
+async def team_counts(subject_id, start: date, end: date, region: str, days: Optional[dict] = None) -> tuple:
+    """The Bids frame's people: (non-admin users by id, their ids + the subject's, profile regions,
+    interview_rates.counts over [start, end] on every stored day)."""
     from app.models import UserExtra
+
+    users = {u.id: u for u in await UserExtra.find({"role": {"$ne": "admin"}}).to_list()}
+    user_ids = list(users) + ([] if subject_id in users else [subject_id])
+    regions, _ = await interview_rates._profile_regions()
+    now = await interview_rates.counts(user_ids, start, end, region, regions, days, logged_only=False)
+    return users, user_ids, regions, now
+
+
+async def bids_view(subject, period: str, day: date, region: str, until: Optional[date], today: date) -> dict:
     from app.routers.metrics import _display_name
 
     start, end = interview_rates.window(period, day, until)
-    users = {u.id: u for u in await UserExtra.find({"role": {"$ne": "admin"}}).to_list()}
-    user_ids = list(users) + ([] if subject.id in users else [subject.id])
-    regions, _ = await interview_rates._profile_regions()
     days: dict = {}
-    now = await interview_rates.counts(user_ids, start, end, region, regions, days, logged_only=False)
+    users, user_ids, regions, now = await team_counts(subject.id, start, end, region, days)
 
     team_ids = [uid for uid in users if now.get(uid, (0,))[0] > 0]
     in_team = subject.id in team_ids

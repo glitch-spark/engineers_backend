@@ -87,15 +87,12 @@ def up_vs_last_period(now: int, before: int, window: str = "the previous period"
 async def interviews_view(subject, period: str, day: date, region: str, until: Optional[date], today: date) -> dict:
     from app.dashboard_stats import app_tz, local_day_start_utc
     from app.interview_rounds import held_round_results, load_interviews_for_window
-    from app.models import UserExtra
     from app.routers.metrics import _display_name
+    from app.stats.bids import team_counts
 
     start, end = interview_rates.window(period, day, until)
-    users = {u.id: u for u in await UserExtra.find({"role": {"$ne": "admin"}}).to_list()}
-    user_ids = list(users) + ([] if subject.id in users else [subject.id])
-    regions, _ = await interview_rates._profile_regions()
     days: dict = {}
-    now = await interview_rates.counts(user_ids, start, end, region, regions, days, logged_only=False)
+    users, user_ids, regions, now = await team_counts(subject.id, start, end, region, days)
     bids = {uid: now[uid][0] if uid in now else 0 for uid in user_ids}
     ivs = {uid: now[uid][1] if uid in now else 0 for uid in user_ids}
     callers = {uid: now[uid][3] if uid in now else 0 for uid in user_ids}
