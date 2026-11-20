@@ -160,3 +160,24 @@ Your profiles (report card)      What to change      When to bid (+ Bidder quali
 
 Module names/layout, exact table styling, how the profile picker lists profiles (name + region), how the tooltip is
 rendered, tests layout.
+
+## Change 2026-11-19 (user decision after real data: "this is the correct interview count")
+
+Real data showed Conversion counting 18 of 38 October US interviews. User decisions:
+
+1. **Archived profiles count** in every scope (their bids and interviews); region = the profile's current region; the
+   profile picker lists archived profiles marked "archived". (Replaces "active (non-archived) profiles only".)
+2. **Interview-proven rows count**: rows built only from an unapplied tailored resume that an interview links
+   (`byInterviewOnly`) are applications and count in bids, interviews, rates, grades, suggestions and the response
+   window. The survivor-bias exclusion is removed; the totals line notes: `Includes applications known only from their
+   interview (no tracked bid), so rates can read a little high.`
+3. **Interviews not tied to any bid** still count in the totals: `untied` = interviews on the scope's profiles whose
+   first non-canceled round falls in the period and that no row carries; totals line adds `· {untied} more
+   interviews not tied to a bid`. They have no bid data, so they are not in the breakdown tables.
+4. **Fit score for interviews without a scored resume (option A):** a one-off script
+   `scripts/score_interview_fit.py` (dry run by default, `--apply` writes; never in the cron) scores the interview's
+   job description (`resumeLink.jobDescription`) against the profile's base resume text with the existing match
+   scoring (`app.job_apply.tailored_score.score_manual`), for interviews whose `resumeLink.kind` is fixed / uploaded /
+   none / missing and that have a job description; it stores `fitScore {total, band}` on the interview. The sync
+   uses an interview's `fitScore` for its matched row's `score/scoreBand` when the row has none. Rows scored this way
+   are still in the score bands (the score measures job-to-profile fit either way).
