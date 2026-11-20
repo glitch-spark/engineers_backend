@@ -181,7 +181,8 @@ def test_pass_rate_and_few_at_19_vs_20_decided():
     assert (score["strong"]["decided"], score["strong"]["rate"], score["strong"]["few"]) == (19, 31.6, True)
     assert (score["good"]["decided"], score["good"]["rate"], score["good"]["few"]) == (20, 35.0, False)
     assert score["fair"]["rate"] is None and score["fair"]["few"] is True
-    assert [g["label"] for g in rep["byScore"]] == ["80+", "65–79", "50–64", "Under 50", "No score"]
+    assert [(g["key"], g["label"]) for g in rep["byScore"]] == [
+        ("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), ("unknown", "No score")]
     assert ir.pass_rate(_many(1) + _many(2, "rejected") + _many(9, "waiting")) == 100 / 3
     assert ir.pass_rate(_many(3, "waiting")) is None
 
@@ -202,8 +203,8 @@ def test_stage_who_weekday_hour_region_area_applied_by_tables():
     assert table("byWho") == [("self", "Self", 3), ("caller", "Caller", 1)]
     assert table("byWeekday") == [("mon", "Mon", 1), ("wed", "Wed", 2), ("sun", "Sun", 1)]
     assert table("byHour") == [("morning", "Morning", 1), ("afternoon", "Afternoon", 2), ("evening", "Evening", 1)]
-    assert table("byRegion") == [("EU", "EU", 1), ("US", "US", 2), (None, "Unknown", 1)]
-    assert table("byArea") == [("Backend", "Backend", 1), (None, "Unknown", 3)]
+    assert table("byRegion") == [("EU", "EU", 1), ("US", "US", 2), ("unknown", "Unknown", 1)]
+    assert table("byArea") == [("Backend", "Backend", 1), ("unknown", "Unknown", 3)]
     assert table("byAppliedBy") == [("self", "Self bid", 1), ("bidder", "Bidder bid", 1), ("unknown", "Unknown", 2)]
     empty = ir.report([], NOW)
     assert [g["key"] for g in empty["byWho"]] == ["self", "caller"] and empty["byStage"] == empty["byWeekday"] == []

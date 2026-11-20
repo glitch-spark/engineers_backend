@@ -22,7 +22,7 @@ HELD = ("passed", "rejected", "no_answer", "waiting")
 DECIDED = HELD[:3]
 UNFILLED = ("none", "Reason not filled in yet")
 _DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_REGIONS = [("Latam", "Latam"), ("EU", "EU"), ("US", "US"), (None, "Unknown")]
+_REGIONS = [("Latam", "Latam"), ("EU", "EU"), ("US", "US"), ("unknown", "Unknown")]
 _BANDS = {k for k, _ in _SCORES}
 
 
@@ -155,7 +155,8 @@ def _part(hour: int) -> str:
 
 
 def report(rows: list[dict], now: datetime) -> dict:
-    """Everything of the response computed from the scope's period rows, but `window`, `summary` and `findings`."""
+    """Everything of the response computed from the scope's period rows, but `window`, `summary` and `findings`.
+    A group of rounds whose breakdown value is missing has key "unknown" (the app's contract)."""
     logged = [r for r in rows if r["local"].date() >= RESCHEDULE_LOG_START]
     ended = list({r["iid"]: r["heldCount"] for r in rows if r["ended"]}.values())
     answered = [max(0.0, (r["statusAt"] - r["end"]).total_seconds() / 86400) for r in rows
@@ -176,10 +177,11 @@ def report(rows: list[dict], now: datetime) -> dict:
         "byCaller": _folded([r for r in rows if r["caller"]], lambda r: r["caller"][0], lambda r: r["caller"][1],
                             "Other callers"),
         "byProfile": _folded(rows, lambda r: r["accountId"], lambda r: r["profile"], "Other profiles"),
-        "byRegion": _groups(rows, lambda r: r["region"] if r["region"] in ("Latam", "EU", "US") else None, _REGIONS,
+        "byRegion": _groups(rows, lambda r: r["region"] if r["region"] in ("Latam", "EU", "US") else "unknown", _REGIONS,
                             skip_empty=True),
-        "byArea": _groups(rows, lambda r: r["area"], [(a, a or "Unknown") for a in _AREAS], skip_empty=True),
-        "byScore": _groups(rows, lambda r: r["scoreBand"], _SCORES),
+        "byArea": _groups(rows, lambda r: r["area"] or "unknown", [(a or "unknown", a or "Unknown") for a in _AREAS],
+                          skip_empty=True),
+        "byScore": _groups(rows, lambda r: r["scoreBand"] or "unknown", [(k or "unknown", label) for k, label in _SCORES]),
         "byAppliedBy": _groups(rows, lambda r: r["by"], [("self", "Self bid"), ("bidder", "Bidder bid")]) + _groups(
             rows, lambda r: r["by"], [("unknown", "Unknown")], skip_empty=True),
         "byWeekday": _groups(rows, lambda r: _DAYS[r["local"].weekday()].lower(), [(d.lower(), d) for d in _DAYS],
