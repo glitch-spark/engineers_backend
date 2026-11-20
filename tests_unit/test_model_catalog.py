@@ -58,7 +58,7 @@ O = "openai:"
 
 # The agreed presets: ordered, first entry is the provider's recommended model for the task.
 EXPECTED = {
-    ("resume", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
+    ("resume", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-5-5", A + "haiku-4-5", A + "sonnet-5"],
     ("cover_letter", "anthropic"): [
         A + "opus-5-5", A + "fable-5-1", A + "sonnet-5-5", A + "opus-5", A + "opus-4-8",
     ],
@@ -133,9 +133,11 @@ def test_gpt_4o_mini_is_off_from_its_retirement_date(use_settings, today, day):
 ])
 def test_job_applies_resume_models_and_default_by_date(use_settings, today, day, default, offered):
     today(day)
-    assert mc.job_applies_resume_default() == O + default
-    assert ids(mc.job_applies_resume_models()) == [O + m for m in offered]
+    assert mc.job_applies_resume_default() == O + default  # Haiku 5.5 is offered, never the default
+    assert ids(mc.job_applies_resume_models()) == [O + "gpt-6-luna", A + "haiku-5-5"] + [O + m for m in offered[1:]]
     use_settings(OPENAI_API_KEY=None)
+    assert ids(mc.job_applies_resume_models()) == [A + "haiku-5-5"]
+    use_settings(OPENAI_API_KEY=None, ANTHROPIC_API_KEY=None)
     assert mc.job_applies_resume_models() == []
 
 
@@ -244,7 +246,7 @@ def test_turned_off_model_is_never_offered_defaulted_or_fallen_back_to(use_setti
 def test_usage_cost_uses_official_prices(use_settings):
     one_m = {"input": 1_000_000, "output": 1_000_000}
     prices = {
-        A + "sonnet-5-5": 12.0, A + "opus-5-5": 24.0, A + "fable-5-1": 60.0, A + "haiku-4-5": 6.0,
+        A + "sonnet-5-5": 12.0, A + "opus-5-5": 24.0, A + "fable-5-1": 60.0, A + "haiku-4-5": 6.0, A + "haiku-5-5": 0.6,
         A + "opus-5": 30.0, A + "opus-4-8": 30.0, A + "sonnet-5": 12.0,
         O + "gpt-6.1-sol": 12.0, O + "gpt-6-astra": 60.0, O + "gpt-6-luna": 0.6, O + "gpt-5.6-sol": 24.0,
         O + "gpt-5.5": 35.0, O + "gpt-5.6-terra": 14.0, O + "gpt-5.4-mini": 5.25, O + "gpt-5-mini": 2.25,
@@ -264,6 +266,7 @@ def test_cache_lane(use_settings):
     assert mc.cache_lane(mc.get_model(O + "gpt-6.1-sol", None), "cover_letter", None) == "openai:gpt-6.1-sol:high"
     assert mc.cache_lane(mc.get_model(A + "sonnet-5-5", None), "resume", None) == "anthropic:claude-sonnet-5-5:low"
     assert mc.cache_lane(mc.get_model(A + "haiku-4-5", None), "resume", None) == "anthropic:claude-haiku-4-5:none"
+    assert mc.cache_lane(mc.get_model(A + "haiku-5-5", None), "resume", None) == "anthropic:claude-haiku-5-5:low"
     assert mc.cache_lane(mc.get_model(O + "gpt-4o-mini", None), "resume", None) == "openai:gpt-4o-mini:none"
 
 
@@ -276,3 +279,11 @@ def test_public_view_has_tag_and_marks_each_providers_recommendation(use_setting
     assert views[O + "gpt-5-mini"]["recommended"] is True and views[O + "gpt-5-mini"]["isDefault"] is False
     assert views[A + "opus-5-5"]["recommended"] is False
     assert views[O + "gpt-6-luna"]["tag"] == "Cheapest"
+
+
+def test_haiku_5_5_writes_resumes_only(use_settings):
+    assert mc.validate_requested("resume", A + "haiku-5-5", None).api_model == "claude-haiku-5-5"
+    assert mc.preset_tag("resume", A + "haiku-5-5") == "Cheapest"
+    for task in ("cover_letter", "screening", "judge"):
+        with pytest.raises(mc.ModelNotAvailable):
+            mc.validate_requested(task, A + "haiku-5-5", None)

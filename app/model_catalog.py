@@ -76,8 +76,11 @@ _SPECS: tuple[ModelSpec, ...] = (
     _spec("anthropic", "claude-sonnet-5-5", "Sonnet 5.5", "balanced",
           "Best value: precise template edits and solid prose", 2, 10),
     _spec("anthropic", "claude-opus-5-5", "Opus 5.5", "premium", "Top quality writing and judgment", 4, 20),
+    # Price for prompts up to 100K tokens (a resume prompt is far below that).
+    _spec("anthropic", "claude-haiku-5-5", "Haiku 5.5", "budget",
+          "Cheapest Claude; built for high-volume tailoring", 0.1, 0.5),
     _spec("anthropic", "claude-haiku-4-5", "Haiku 4.5", "budget",
-          "Cheapest Claude; fine for simple, mechanical work", 1, 5, supports_effort=False),
+          "Older Haiku; ten times the price of Haiku 5.5", 1, 5, supports_effort=False),
     _spec("anthropic", "claude-fable-5-1", "Fable 5.1", "premium", "Maximum quality, most expensive", 10, 50),
     _spec("anthropic", "claude-sonnet-5", "Sonnet 5", "balanced",
           "Previous-generation Sonnet at the same price; a fallback", 2, 10),
@@ -109,8 +112,8 @@ _O = "openai:"
 # Ordered presets per (task, provider): (model id, short tag shown in the picker). First active one = recommended.
 PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
     ("resume", "anthropic"): [
-        (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
-        (_A + "haiku-4-5", "Cheapest"), (_A + "sonnet-5", "Older generation"),
+        (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"), (_A + "haiku-5-5", "Cheapest"),
+        (_A + "haiku-4-5", "Older generation"), (_A + "sonnet-5", "Older generation"),
     ],
     ("cover_letter", "anthropic"): [
         (_A + "opus-5-5", "Recommended"), (_A + "fable-5-1", "Max quality"), (_A + "sonnet-5-5", "Lower cost"),
@@ -144,10 +147,11 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
     ],
 }
 
-# Job Applies tailors in bulk: budget OpenAI models only. GPT-4o mini is the default through 2026 (the resume
-# prompts were tuned on it); GPT-6 Luna from 2027, before GPT-4o mini's retirement.
+# Job Applies tailors in bulk: budget models only. GPT-4o mini is the default through 2026 (the resume
+# prompts were tuned on it); GPT-6 Luna from 2027, before GPT-4o mini's retirement. Haiku 5.5 is offered as a
+# choice at Luna's price (user, 2026-11-20), never as the default.
 JOB_APPLIES_RESUME_MODELS: tuple[str, ...] = (
-    _O + "gpt-6-luna", _O + "gpt-5-mini", _O + "gpt-5.4-mini", _O + "gpt-4o-mini",
+    _O + "gpt-6-luna", _A + "haiku-5-5", _O + "gpt-5-mini", _O + "gpt-5.4-mini", _O + "gpt-4o-mini",
 )
 _JOB_APPLIES_LUNA_FROM = date(2027, 1, 1)
 
