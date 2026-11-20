@@ -88,7 +88,7 @@ def test_score_bands_and_other_groups():
     assert [g["label"] for g in out["byScore"]] == ["80+", "65–79", "50–64", "Under 50", "No score"]
     assert _g(out["byScore"], "strong")["rate"] == 100.0 and _g(out["byScore"], None)["bids"] == 2
     assert [g["key"] for g in out["byArea"]] == ["Backend", None]
-    assert _g(out["byAge"], "<2w")["bids"] == 1 and _g(out["byAge"], "3m+")["bids"] == 1
+    assert _g(out["byAge"], "0-2w")["bids"] == 1 and _g(out["byAge"], "12w+")["bids"] == 1
     assert [g["key"] for g in out["bySite"]][:2] == ["lever.co", "zz.io"]
     assert _g(out["bySite"], "none")["bids"] == 2 and "bySite" in out and "byBidder" not in out
 
@@ -204,8 +204,8 @@ def test_site_top8_other_none_and_labels():
 
 
 def test_age_bucket_edges():
-    rows = [_r(profileAgeDays=d) for d in (13, 14, 41, 42, 90, 91, None)]
-    assert [g["bids"] for g in conversion.report(rows, CUT, {}, False)["byAge"]] == [1, 2, 2, 1, 1]
+    rows = [_r(profileAgeDays=d) for d in (13, 14, 27, 28, 41, 42, 83, 84, None)]
+    assert [g["bids"] for g in conversion.report(rows, CUT, {}, False)["byAge"]] == [1, 2, 2, 2, 1, 1]
 
 
 async def test_interview_only_rows_count_in_conversion(db):
@@ -263,3 +263,13 @@ async def test_untied_prefilter_skips_far_interviews_and_keeps_edges(db, monkeyp
     monkeypatch.setattr(profile_loader.Interview, "model_validate", lambda d, *x, **k: (seen.append(d["_id"]), orig(d, *x, **k))[1])
     assert (await _get(ana)).json()["totals"]["untied"] == 1
     assert far not in seen
+
+
+def test_self_vs_bidder_in_every_scope():
+    """Self vs bidder bids (user, 2026-11-19): two groups, no bidder names, shown for team too."""
+    rows = [_r(iv=True, by="self"), _r(by="self"), _r(by="bidder", bidderId=ObjectId()), _r(by="bidder"),
+            _r(by="bidder", iv=True), _r(by="bidder")]
+    for include_bidders in (True, False):
+        out = conversion.report(rows, CUT, {}, include_bidders)
+        assert [(g["key"], g["label"], g["bids"], g["interviews"]) for g in out["byWho"]] == [
+            ("self", "Self", 2, 1), ("bidder", "Bidder", 4, 1)]

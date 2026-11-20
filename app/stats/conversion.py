@@ -59,6 +59,9 @@ def report(rows: list[dict], matured_before: datetime, bidder_names: dict, inclu
         groups = _groups(rows, matured_before, team_rate, who, [(k, by_key.get(k, "Unnamed bidder")) for k in keys])
         groups.sort(key=lambda g: (-g["bids"], g["label"]))
         out["byBidder"] = _groups(rows, matured_before, team_rate, who, [("self", "Self")], skip_empty=True) + groups
+    # self vs bidder bids, every scope (no names, so Team total shows it too) — user, 2026-11-19
+    out["byWho"] = _groups(rows, matured_before, team_rate, lambda r: r.get("by") or "self",
+                           [("self", "Self"), ("bidder", "Bidder")])
     counts: dict[str, int] = {}
     for r in rows:
         if r.get("board"):

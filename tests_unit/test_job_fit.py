@@ -77,10 +77,12 @@ def test_area_unknown_and_empty_groups_omitted():
 
 
 def test_age_buckets_edges():
-    team = [r for d in (13, 14, 41, 42, 90, 91, None) for r in row(1, profileAgeDays=d)]
+    """0–2 / 2–4 / 4–6 / 6–12 / 12+ weeks (user, 2026-11-19)."""
+    team = [r for d in (13, 14, 27, 28, 41, 42, 83, 84, None) for r in row(1, profileAgeDays=d)]
     out = job_fit.breakdown([], team, CUT)
-    assert [x["label"] for x in out["byAge"]] == ["Under 2 weeks", "2–6 weeks", "6 weeks – 3 months", "3+ months", "Unknown"]
-    assert [x["team"]["bids"] for x in out["byAge"]] == [1, 2, 2, 1, 1]  # 91 -> 3+, 90 -> 6w-3m, None -> Unknown
+    assert [x["label"] for x in out["byAge"]] == ["0–2 weeks", "2–4 weeks", "4–6 weeks", "6–12 weeks", "12+ weeks",
+                                                  "Unknown"]
+    assert [x["team"]["bids"] for x in out["byAge"]] == [1, 2, 2, 2, 1, 1]
 
 
 def test_too_few_under_30_matured():

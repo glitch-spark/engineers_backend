@@ -13,14 +13,15 @@ BOARD_LABELS = {
 TOP_SITES = 8
 _SCORES = [("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), (None, "No score")]
 _AREAS = ["Backend", "Full stack", "Frontend", "AI / ML", "Data", "DevOps", "QA", "Mobile", "Other", None]
-_AGES = [("<2w", "Under 2 weeks"), ("2-6w", "2–6 weeks"), ("6w-3m", "6 weeks – 3 months"), ("3m+", "3+ months"),
-         (None, "Unknown")]
+# profile age when the bid went out (user, 2026-11-19): 0–2 / 2–4 / 4–6 / 6–12 / 12+ weeks
+_AGES = [("0-2w", "0–2 weeks"), ("2-4w", "2–4 weeks"), ("4-6w", "4–6 weeks"), ("6-12w", "6–12 weeks"),
+         ("12w+", "12+ weeks"), (None, "Unknown")]
 
 
 def _age(days: Optional[int]) -> Optional[str]:
     if days is None:
         return None
-    return "<2w" if days < 14 else "2-6w" if days < 42 else "6w-3m" if days < 91 else "3m+"
+    return "0-2w" if days < 14 else "2-4w" if days < 28 else "4-6w" if days < 42 else "6-12w" if days < 84 else "12w+"
 
 
 def _stats(rows: list[dict], matured_before: datetime) -> dict:
