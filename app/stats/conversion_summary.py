@@ -68,14 +68,14 @@ def build(people: dict, subject_id, team_view: bool, rows: int) -> dict:
         everyone.append({"userId": str(u), "name": p["name"], "bids": p["bids"], "interviews": p["interviews"],
                          "per100": _per100(p) if p["bids"] >= MIN_BIDS else None, "isSubject": u == subject_id,
                          "ranks": {k: v[0] for k, v in r.items()}})
-    everyone.sort(key=lambda e: (-e["interviews"], -e["bids"], e["name"].lower()))
+    everyone.sort(key=lambda e: (-e["interviews"], -e["bids"], (e["name"] or "").lower()))
     return {"cards": cards, "everyone": everyone,
             "coverage": {"rows": rows, "bids": me["bids"], "matched": me["matched"], "interviews": me["interviews"]}}
 
 
 async def summary(sc: dict, region: str, totals: dict) -> dict:
     """`sc`: conversion_scope's result; `totals`: the conversion report's totals. scope=profile reads as the subject."""
-    from app.models import Application
+    from app.models import Application, UserExtra
     from app.routers.metrics import _display_name
 
     sid = sc["sid"]
@@ -86,10 +86,15 @@ async def summary(sc: dict, region: str, totals: dict) -> dict:
         "interviewId", {"interviewId": {"$in": [d["_id"] for d in started]}}))
     by_owner = Counter(d["createdBy"] for d in started)
     matched = Counter(d["createdBy"] for d in started if d["_id"] in carried)
+    subject = users.get(sid) or await UserExtra.get(sid)  # an admin is not a member but can view their own
     people = {}
     for u in user_ids:
         bids, rounds, bidder, _ = now.get(u, (0, 0, 0, 0))
-        people[u] = {"name": _display_name(users[u]) if u in users else sc["subject"]["name"], "bids": bids,
+        people[u] = {"name": _display_name(users.get(u, subject)), "bids": bids,
                      "bidder": bidder, "interviews": by_owner[u], "rounds": rounds,
                      "matched": matched[u], "member": u in users}
-    return build(people, sid, sc["scope"] == "team", totals["bids"])
+    team = sc["scope"] == "team"
+    # Whole team: only members' rows, the people the bids total covers (admin-owned profiles would push rows > bids)
+    rows = sum(1 for r in sc["rows"] if r.get("bidStatus") != "rejected"
+               and sc["accounts"][str(r["accountId"])]["ownerId"] in users) if team else totals["bids"]
+    return build(people, sid, team, rows)

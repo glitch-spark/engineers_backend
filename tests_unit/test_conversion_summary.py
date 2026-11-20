@@ -163,6 +163,8 @@ async def test_everyone_rows_and_per100_needs_30_bids(db):
 
 async def test_coverage_reconciles(db):
     ana, *_ = await _team()
+    boss = await UserExtra.find_one(UserExtra.name == "Boss")
+    await _rows(await _acct(boss, "BossEu"), boss, 40)                     # admin-owned profile: not a member's rows
     me = (await _get(ana))["summary"]["coverage"]
     # matched = the scope's started interviews some row carries: `first` only; `late` starts after the period and
     # `by_ben` is Ben's (created by him), though Ana's rows carry both
@@ -204,3 +206,16 @@ async def test_subject_with_nothing_still_gets_cards(db):
     assert s["cards"]["bids"]["value"] == 0 and s["cards"]["bids"]["rank"] == 4 and s["cards"]["bids"]["of"] == 4
     assert s["cards"]["per100"] == {"value": None, "rank": None, "of": 2, "teamRate": 4.5}
     assert "Eve" not in [r["name"] for r in s["everyone"]]
+
+
+async def test_admin_subject_without_name_still_gets_a_summary(db):
+    await _team()
+    boss = await UserExtra.find_one(UserExtra.name == "Boss")
+    boss.name = None
+    await boss.save()
+    s = (await _get(boss))["summary"]                                      # 200, not a 500 on a None name
+    assert s["cards"]["bids"] == {"value": 99, "self": 99, "bidder": 0, "rank": 1, "of": 4, "median": 40,
+                                  "vsMedian": 1.475}
+    assert s["cards"]["interviews"]["value"] == 1
+    row = next(r for r in s["everyone"] if r["isSubject"])
+    assert (row["name"], row["bids"], row["interviews"]) == ("boss@x.io", 99, 1)
