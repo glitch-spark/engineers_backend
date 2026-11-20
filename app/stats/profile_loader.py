@@ -24,8 +24,8 @@ def clear_cache() -> None:
 
 
 async def _fetch(start: datetime, end: datetime, region: str) -> list[dict]:
-    # byInterviewOnly rows exist only because they got an interview (survivor bias): out of every rate, both sides
-    q: dict = {"appliedAt": {"$gte": start, "$lt": end}, "byInterviewOnly": {"$ne": True}}
+    # byInterviewOnly rows (interview-proven applications) count like any other row
+    q: dict = {"appliedAt": {"$gte": start, "$lt": end}}
     if region != "all":
         q["region"] = region
     return await Application.get_motor_collection().find(q, {f: 1 for f in _ROW_FIELDS}).to_list(None)
@@ -66,6 +66,23 @@ async def count_unmatched_interviews(since: datetime, until: Optional[datetime] 
     if region != "all":
         ivs = [d for d in ivs if (regions or {}).get(d.get("accountId")) == region]
     return sum(1 for d in ivs if d["_id"] not in carried and interview_outcome(Interview.model_validate(d)))
+
+
+async def count_untied_interviews(account_ids: list, start: datetime, end: datetime) -> int:
+    """Interviews on `account_ids` whose first countable round is in [start, end) and that no row carries."""
+    if not account_ids:
+        return 0
+    carried = set(await Application.get_motor_collection().distinct("interviewId"))
+    # ponytail: scans every interview of the scope's profiles; add a round-date prefilter if it gets slow
+    ivs = await Interview.get_motor_collection().find({"accountId": {"$in": list(account_ids)}}).to_list(None)
+    n = 0
+    for d in ivs:
+        if d["_id"] in carried:
+            continue
+        out = interview_outcome(Interview.model_validate(d))
+        if out and out["firstRoundAt"] and start <= out["firstRoundAt"] < end:
+            n += 1
+    return n
 
 
 async def accounts_with_rounds_since(account_ids: list, since: datetime) -> set[str]:

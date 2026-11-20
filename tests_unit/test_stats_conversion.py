@@ -206,3 +206,48 @@ def test_site_top8_other_none_and_labels():
 def test_age_bucket_edges():
     rows = [_r(profileAgeDays=d) for d in (13, 14, 41, 42, 90, 91, None)]
     assert [g["bids"] for g in conversion.report(rows, CUT, {}, False)["byAge"]] == [1, 2, 2, 1, 1]
+
+
+async def test_interview_only_rows_count_in_conversion(db):
+    ana = await UserExtra(name="Ana", email="a@x.io").insert()
+    a = await _acct(ana, "Alpha")
+    await _rows(a, ana, 3, iv=1)
+    await _rows(a, ana, 1, iv=1, byInterviewOnly=True)
+    t = (await _get(ana)).json()["totals"]
+    assert t["bids"] == 4 and t["interviews"] == 2 and t["interviewsAll"] == 2
+
+
+async def _iv(acct, owner, first, rounds=None, **kw):
+    ivs = Interview.get_motor_collection()
+    doc = {"accountId": acct.id, "createdBy": owner.id, "scheduledAt": first, "stage": "intro", "status": "completed",
+           "stageHistory": rounds or [], "createdAt": first, "updatedAt": first, **kw}
+    return (await ivs.insert_one(doc)).inserted_id
+
+
+async def test_untied_counts_interviews_no_row_carries(db):
+    ana = await UserExtra(name="Ana", email="a@x.io").insert()
+    ben = await UserExtra(name="Ben", email="b@x.io").insert()
+    a, b = await _acct(ana, "Alpha"), await _acct(ben, "BenEu")
+    await _rows(a, ana, 2)
+    carried = await _iv(a, ana, OCT10)
+    await Application.get_motor_collection().update_one({}, {"$set": {"interviewId": carried}})
+    await _iv(a, ana, OCT10)                                                   # untied
+    await _iv(a, ana, OCT10, status="canceled", stage="intro", stageHistory=[])  # canceled only: not countable
+    await _iv(a, ana, datetime(2026, 9, 20, 15))                               # first round before the period
+    await _iv(b, ben, OCT10)                                                   # other profile
+    out = (await _get(ana)).json()["totals"]
+    assert out["untied"] == 1                                                  # not double counted: carried is out
+    assert (await _get(ana, Q + "&scope=team")).json()["totals"]["untied"] == 2
+    assert (await _get(ana, Q + f"&scope=profile&profile={b.id}")).status_code == 403
+
+
+async def test_untied_uses_first_round_in_period_and_archived_profile(db):
+    ana = await UserExtra(name="Ana", email="a@x.io").insert()
+    gone = await Account(name="Gone", region="EU", archived=True, createdBy=ana.id, template="x").insert()
+    a = await _acct(ana, "Alpha")
+    await _rows(a, ana, 1)
+    # created before the period but its first round (scheduledAt) is inside it: counts
+    await _iv(gone, ana, OCT10, createdAt=datetime(2026, 9, 1))
+    # created inside the period but its first round is before it: out
+    await _iv(a, ana, datetime(2026, 9, 20, 15), createdAt=OCT10)
+    assert (await _get(ana)).json()["totals"]["untied"] == 1

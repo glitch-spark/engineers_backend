@@ -1,17 +1,18 @@
-"""The Conversion tab's scope: whose rows (me / one profile / the team) on non-archived profiles of their CURRENT
+"""The Conversion tab's scope: whose rows (me / one profile / the team) on profiles (archived too) of their CURRENT
 region (Account.region, not the row's region at sync time), for a period clamped to DATA_START."""
 from __future__ import annotations
 
 from datetime import date as Date, datetime, timedelta
 from typing import Literal, Optional
 
+from beanie import PydanticObjectId
 from fastapi import HTTPException, status
 
 from app import interview_rates
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.models import Account, UserExtra
 from app.routers._util import to_object_id
-from app.stats.profile_loader import load_period_rows
+from app.stats.profile_loader import count_untied_interviews, load_period_rows
 
 DATA_START = Date(2026, 10, 6)  # bids before it are incomplete: no period of this tab starts earlier
 
@@ -25,7 +26,7 @@ def bounds(start_d: Date, end_d: Date) -> tuple[datetime, datetime]:
 async def conversion_scope(user: UserExtra, period: str, date: str, to: str, region: str, user_id: Optional[str],
                            scope: Literal["me", "profile", "team"] = "me", profile: Optional[str] = None) -> dict:
     """Query params -> subject, clamped bounds and the loader rows of the scope (`rows`) and of the team (`teamRows`,
-    every non-archived profile of the region: the baseline). Rows still include rejected bids; callers drop them."""
+    every profile of the region: the baseline). Rows still include rejected bids; callers drop them."""
     from app.routers.dashboard import _subject_id
     from app.routers.metrics import _stats_days
 
@@ -39,7 +40,7 @@ async def conversion_scope(user: UserExtra, period: str, date: str, to: str, reg
     if clamped and end_d >= DATA_START:
         start_d = DATA_START
         label = interview_rates.label(period, start_d, end_d)
-    q: dict = {"archived": {"$ne": True}}
+    q: dict = {}
     if region != "all":
         q["region"] = region
     team = {str(d["_id"]): {"name": d.get("name"), "region": d.get("region"), "archived": bool(d.get("archived")),
@@ -53,7 +54,7 @@ async def conversion_scope(user: UserExtra, period: str, date: str, to: str, reg
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="profile not found")
         if acct.get("createdBy") != sid and user.role != "admin":
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not your profile")
-        ids = {str(acct["_id"])} & team.keys()  # archived / other region: an empty scope, not an error
+        ids = {str(acct["_id"])} & team.keys()  # other region: an empty scope, not an error
     elif scope == "me":
         ids = {k for k, a in team.items() if a["ownerId"] == sid}
     else:
@@ -63,8 +64,9 @@ async def conversion_scope(user: UserExtra, period: str, date: str, to: str, reg
     loaded = await load_period_rows(start, end, "all") if end_d >= DATA_START else []
     team_rows = [r for r in loaded if str(r.get("accountId")) in team]
     tz = app_tz()
+    untied = await count_untied_interviews([PydanticObjectId(i) for i in ids], start, end) if end_d >= DATA_START else 0
     return {"sid": sid, "subject": {"userId": str(sid), "name": subject.name}, "scope": scope,
             "start_d": start_d, "end_d": end_d, "start": start, "end": end, "label": label, "startClamped": clamped,
             "now": datetime.utcnow(), "today": datetime.now(tz).date(),
             "accounts": {k: team[k] for k in ids}, "rows": [r for r in team_rows if str(r["accountId"]) in ids],
-            "teamRows": team_rows}
+            "teamRows": team_rows, "untied": untied}

@@ -204,18 +204,18 @@ async def _flagged(acct, owner, n, days_ago=60):
     return ivs
 
 
-async def test_loader_excludes_by_interview_only_rows_coverage_still_matched(db):
-    """C1: flagged rows leave numerator and denominator; their interviews still count as matched."""
+async def test_loader_includes_by_interview_only_rows(db):
+    """Interview-proven rows are applications: in numerator and denominator."""
     ana, _ = await _users()
     a = await _acct(ana, "Alpha")
     await _rows(a, ana, 40, iv=2)
     await _flagged(a, ana, 5)
     rows = await profile_loader.load_period_rows(NOW - timedelta(days=200), NOW + timedelta(days=1), "all")
-    assert len(rows) == 40 and not any(r.get("byInterviewOnly") for r in rows)
+    assert len(rows) == 45 and sum(1 for r in rows if r.get("interviewId")) == 7
     out = (await _get(ana)).json()
     p = out["profiles"][0]
-    assert p["matured"] == 40 and p["per100"] == 5.0
-    assert out["coverage"]["rows"] == 40 and out["coverage"]["unmatchedInterviews"] == 0
+    assert p["matured"] == 45 and p["per100"] == 15.6
+    assert out["coverage"]["rows"] == 45 and out["coverage"]["unmatchedInterviews"] == 0
 
 
 async def test_profile_with_rounds_in_period_never_dead(db):
@@ -229,7 +229,7 @@ async def test_profile_with_rounds_in_period_never_dead(db):
     profile_loader.clear_cache()
     await _flagged(a, ana, 2)
     p = (await _get(ana)).json()["profiles"][0]
-    assert p["grade"] == "watch" and any("not marked as bids" in r for r in p["reasons"])
+    assert p["grade"] != "dead"  # flagged rows now count: their interviews are real
 
 
 # ---- coverage under the conversion scope (fix round 1) ----

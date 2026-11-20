@@ -100,7 +100,7 @@ async def test_clamp_to_oct6(db):
     assert after["startClamped"] is False and len(after["rows"]) == 3
 
 
-async def test_scope_uses_current_region_and_drops_archived(db):
+async def test_scope_uses_current_region(db):
     ana, ben, _ = await _users()
     moved = await _acct(ana, "Moved", "EU")  # rows say US: the profile's region changed since
     us = await _acct(ana, "Us", "US")
@@ -111,14 +111,24 @@ async def test_scope_uses_current_region_and_drops_archived(db):
     for acct, owner in ((us, ana), (gone, ana), (team_eu, ben), (team_gone, ben)):
         await _rows(acct, owner, 2)
     sc = await cs.conversion_scope(ana, "custom", "2026-10-07", "2026-10-20", "EU", None)
-    assert _accts(sc["rows"]) == {str(moved.id)} and len(sc["rows"]) == 3
-    assert _accts(sc["teamRows"]) == {str(moved.id), str(team_eu.id)}
-    assert sc["accounts"] == {str(moved.id): {"name": "Moved", "region": "EU", "archived": False, "ownerId": ana.id}}
+    assert _accts(sc["rows"]) == {str(moved.id), str(gone.id)} and len(sc["rows"]) == 5
+    assert _accts(sc["teamRows"]) == {str(moved.id), str(gone.id), str(team_eu.id), str(team_gone.id)}
+    assert sc["accounts"][str(moved.id)] == {"name": "Moved", "region": "EU", "archived": False, "ownerId": ana.id}
+    assert sc["accounts"][str(gone.id)]["archived"] is True
     every = await cs.conversion_scope(ana, "custom", "2026-10-07", "2026-10-20", "all", None)
-    assert _accts(every["rows"]) == {str(moved.id), str(us.id)}
-    assert _accts(every["teamRows"]) == {str(moved.id), str(us.id), str(team_eu.id)}
+    assert _accts(every["rows"]) == {str(moved.id), str(us.id), str(gone.id)}
     team = await cs.conversion_scope(ana, "custom", "2026-10-07", "2026-10-20", "EU", None, scope="team")
-    assert team["rows"] == team["teamRows"] and set(team["accounts"]) == {str(moved.id), str(team_eu.id)}
+    assert team["rows"] == team["teamRows"] and set(team["accounts"]) == {
+        str(moved.id), str(gone.id), str(team_eu.id), str(team_gone.id)}
+
+
+async def test_archived_profiles_count_in_every_scope(db):
+    ana, ben, _ = await _users()
+    gone = await _acct(ana, "Gone", "EU", archived=True)
+    await _rows(gone, ana, 2)
+    for kw in ({}, {"scope": "team"}, {"scope": "profile", "profile": str(gone.id)}):
+        sc = await cs.conversion_scope(ana, "custom", "2026-10-07", "2026-10-20", "EU", None, **kw)
+        assert len(sc["rows"]) == 2 and str(gone.id) in sc["accounts"]
 
 
 async def test_profile_scope_other_users_profile_403(db):
@@ -161,11 +171,11 @@ async def test_team_rows_are_the_baseline(db):
     a = await _acct(ana, "Alpha")
     await _rows(a, ana, 40, iv=4)                                          # 4 / 40
     await _rows(await _acct(ben, "BenEu"), ben, 40, iv=8)                  # 8 / 40
-    await _rows(await _acct(ben, "Gone", archived=True), ben, 40, iv=40)   # archived: out of the baseline
+    await _rows(await _acct(ben, "Gone", archived=True), ben, 40, iv=40)   # archived: in the baseline
     await _rows(await _acct(ben, "BenUs", "US"), ben, 40, iv=40)           # other region: out
     await _rows(a, ana, 10, iv=10, at=SEP20)                               # before DATA_START: out
     out = (await _get(ana, "profiles", Q + "&region=EU")).json()
-    assert out["team"]["per100"] == 15.0  # 12 of 80
+    assert out["team"]["per100"] == 43.3  # 52 of 120
     assert [p["name"] for p in out["profiles"]] == ["Alpha"] and out["profiles"][0]["per100"] == 10.0
 
 

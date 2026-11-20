@@ -103,14 +103,14 @@ async def test_changes_shape(db):
         "text": "Archive it, or rebuild it with a new base resume / prompt and judge it fresh after 14 days."}]}]
 
 
-async def test_changes_skips_archived_profiles(db):
+async def test_changes_include_archived_profiles(db):
     ana, ben = await _users()
     gone = await _acct(ana, "Gone")
     await Account.get_motor_collection().update_one({"_id": gone.id}, {"$set": {"archived": True}})
     await _rows(gone, ana, 40)
     for name in ("B1", "B2"):
-        await _rows(await _acct(ben, name), ben, 40, iv=4)
-    assert (await _get(ana)).json()["profiles"] == []
+        await _rows(await _acct(ben, name), ben, 40, iv=8)
+    assert [p["name"] for p in (await _get(ana)).json()["profiles"]] == ["Gone"]
 
 
 async def test_changes_subject_rule(db):
