@@ -75,13 +75,14 @@ async def interviews_report(
 ) -> dict:
     """The Interviews tab (docs/superpowers/specs/2026-11-20-interview-statistics-design.md): what happened to the
     rounds scheduled in the period. A round belongs to the interview's creator; the team is every profile of the
-    region, and its pass rate is what the findings and marks compare with in both scopes."""
+    region (and, for every region, the interviews on deleted profiles), and its pass rate is what the findings and marks compare with in both scopes."""
     from app.routers.metrics import _display_name
 
     sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope)
     sid, now = sc["sid"], sc["now"]
     loaded = await load_interview_facts(sc["start"], sc["end"]) if sc["end_d"] >= cs.DATA_START else []
-    team_rows = interview_report.period_rows(loaded, sc["teamAccounts"], sc["start"], sc["end"], now, app_tz())
+    team_rows = interview_report.period_rows(loaded, sc["teamAccounts"], sc["start"], sc["end"], now, app_tz(),
+                                             deleted=region == "all")
     rows = team_rows if scope == "team" else [r for r in team_rows if r["ownerId"] == sid]
     rep = interview_report.report(rows, now)
     team_rate = interview_report.pass_rate(team_rows)

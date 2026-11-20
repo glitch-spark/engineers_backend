@@ -7,9 +7,10 @@ from datetime import date, datetime, timedelta, timezone
 from statistics import mean, median
 from typing import Callable, Optional
 
-from app.interview_normalize import _utc_naive
+from app.interview_normalize import _utc_naive, normalize_stage
 from app.interview_reasons import CANCEL_REASONS, REJECT_REASONS
-from app.interview_rounds import BREAKDOWN_ORDER, _breakdown_group, merged_rounds
+from app.interview_rounds import merged_rounds
+from app.slack_bot import _ROUND_LABELS  # the stages in pipeline order, labelled as on the Interviews board
 from app.stats import frame
 from app.stats.conversion import _rate
 from app.stats.job_fit import _AREAS, _SCORES
@@ -21,6 +22,7 @@ RESCHEDULE_LOG_START = date(2026, 11, 20)  # reschedules are logged from this da
 HELD = ("passed", "rejected", "no_answer", "waiting")
 DECIDED = HELD[:3]
 UNFILLED = ("none", "Reason not filled in yet")
+DELETED_PROFILE = {"name": "Deleted profile", "region": None}
 _DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _REGIONS = [("Latam", "Latam"), ("EU", "EU"), ("US", "US"), ("unknown", "Unknown")]
 _BANDS = {k for k, _ in _SCORES}
@@ -46,8 +48,8 @@ def interview_facts(iv, iv_id, app: Optional[dict], now: datetime) -> dict:
     entries = {e.id: e for e in iv.stageHistory or []}
     rounds = []
     for r in merged_rounds(iv):
-        at, stage = _utc_naive(r.at), _breakdown_group(r.stage)  # no group: AI interview, home assessment, unknown
-        if not stage or at is None:
+        at, stage = _utc_naive(r.at), normalize_stage(r.stage)
+        if stage not in _ROUND_LABELS or at is None:  # AI interview, home assessment, unknown
             continue
         e, c = entries.get(r.entry_id), r.caller
         name = (getattr(c, "callerName", None) or "").strip()
@@ -71,12 +73,14 @@ def interview_facts(iv, iv_id, app: Optional[dict], now: datetime) -> dict:
             "area": app.get("area") if app.get("area") in _AREAS else None, "scoreBand": band if band in _BANDS else None}
 
 
-def period_rows(interviews: list[dict], accounts: dict, start: datetime, end: datetime, now: datetime, tz) -> list[dict]:
+def period_rows(interviews: list[dict], accounts: dict, start: datetime, end: datetime, now: datetime, tz,
+                deleted: bool = False) -> list[dict]:
     """One row per round scheduled in [start, end) on a profile of `accounts` (conversion_scope's shape). A round's
-    outcome, first-held and ended flags come from the whole interview, whatever the period."""
+    outcome, first-held and ended flags come from the whole interview, whatever the period. `deleted`: `accounts`
+    is every profile, so an interview on none of them is on a deleted one and counts, with no region."""
     out = []
     for iv in interviews:
-        acct = accounts.get(iv["accountId"])
+        acct = accounts.get(iv["accountId"]) or (DELETED_PROFILE if deleted else None)
         if not acct or not iv["rounds"]:
             continue
         last = iv["rounds"][-1]
@@ -172,7 +176,7 @@ def report(rows: list[dict], now: datetime) -> dict:
               ("not_followed_up", "Not followed up", [r for r in held if not r["followed"] and unanswered_a_week(r)])]
     return {
         "totals": {"key": "all", "label": "All rounds", **_totals(rows), "mark": None},
-        "byStage": _groups(rows, lambda r: r["stage"], list(BREAKDOWN_ORDER), skip_empty=True),
+        "byStage": _groups(rows, lambda r: r["stage"], list(_ROUND_LABELS.items()), skip_empty=True),
         "byWho": _groups(rows, lambda r: "caller" if r["caller"] else "self", [("self", "Self"), ("caller", "Caller")]),
         "byCaller": _folded([r for r in rows if r["caller"]], lambda r: r["caller"][0], lambda r: r["caller"][1],
                             "Other callers"),
@@ -191,7 +195,9 @@ def report(rows: list[dict], now: datetime) -> dict:
         "reasons": {
             "canceled": _reasons([r["reason"] for r in rows if r["outcome"] == "canceled"], CANCEL_REASONS),
             "rescheduled": _reasons([k for r in rows for k in r["reschedules"]], CANCEL_REASONS),
-            "rejected": _reasons([r["reason"] for r in rows if r["outcome"] == "rejected"], REJECT_REASONS),
+            # closed as rejected, "No answer from the company" included; not the rounds silent for 14 days
+            "rejected": _reasons([r["reason"] for r in rows if r["status"] == "rejected"
+                                  and r["outcome"] in ("rejected", "no_answer")], REJECT_REASONS),
             "rescheduleRate": {"rescheduled": sum(1 for r in logged if r["reschedules"]), "rounds": len(logged),
                                "since": RESCHEDULE_LOG_START.isoformat()},
         },

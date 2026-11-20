@@ -94,7 +94,7 @@ def test_outcome_canceled_and_scheduled_win_over_a_later_round():
 # ---- interview_facts / period_rows ----
 def test_completed_round_followed_by_a_later_round_passed_whatever_the_later_status():
     rows = _rows(_facts(_rnd("intro", _at(10, 10), "completed"), _rnd("tech_round_1", _at(10, 15), "canceled")))
-    assert [(r["stage"], r["outcome"]) for r in rows] == [("intro", "passed"), ("tech", "canceled")]
+    assert [(r["stage"], r["outcome"]) for r in rows] == [("intro", "passed"), ("tech_round_1", "canceled")]
 
 
 def test_ai_interview_and_home_assessment_ignored():
@@ -108,14 +108,29 @@ def test_round_counts_by_its_own_date_but_is_judged_on_the_whole_interview():
     f = _facts(_rnd("intro", _at(10, 1), "completed"), _rnd("tech_round_1", _at(10, 10), "completed"),
                _rnd("final", _at(11, 25), "scheduled"))
     rows = _rows(f)  # intro before the period, final after it
-    assert [(r["stage"], r["outcome"]) for r in rows] == [("tech", "passed")]
+    assert [(r["stage"], r["outcome"]) for r in rows] == [("tech_round_1", "passed")]
     assert rows[0]["firstHeld"] is False and rows[0]["heldCount"] == 2
     assert _rows(f, start=_at(10, 10), end=_at(10, 10) + timedelta(seconds=1)) != []
     assert _rows(f, start=_at(10, 9), end=_at(10, 10)) == []  # [start, end)
 
 
-def test_profile_outside_the_accounts_is_dropped():
-    assert _rows(_facts(_rnd("intro", _at(11, 3), "passed"), account=ObjectId())) == []
+def test_profile_outside_the_accounts_is_dropped_unless_deleted_profiles_count():
+    gone = ObjectId()
+    f = _facts(_rnd("intro", _at(11, 3), "passed"), account=gone)
+    assert _rows(f) == []  # a region view: another region's profile, or a deleted one
+    row = ir.period_rows([f], ACCOUNTS, START, END, NOW, UTC, deleted=True)[0]  # every region
+    assert (row["accountId"], row["profile"], row["region"], row["ownerId"]) == (str(gone), "Deleted profile", None, OWNER)
+
+
+def test_every_real_stage_is_its_own_row_in_board_order():
+    stages = ["final", "panel", "cultural", "system_design", "live_coding", "tech_round_2", "tech_round_1", "intro",
+              "hiring_manager", "tech", "offer", "ai_interview", "home_assessment"]
+    rows = _rows(*[_facts(_rnd(s, _at(11, 3), "passed")) for s in stages])
+    assert [(g["key"], g["label"], g["rounds"]) for g in ir.report(rows, NOW)["byStage"]] == [
+        ("intro", "Intro", 1), ("tech_round_1", "Tech round 1", 2), ("tech_round_2", "Tech round 2", 1),
+        ("live_coding", "Live Coding", 1), ("system_design", "System Design", 1), ("cultural", "Hiring Manager", 2),
+        ("panel", "Panel", 1), ("final", "Final", 2)]
+    assert ir.report(rows, NOW)["totals"]["offers"] == 2
 
 
 def test_company_counts_on_its_first_held_round_only():
@@ -193,13 +208,13 @@ def test_stage_who_weekday_hour_region_area_applied_by_tables():
             _row("rejected", stage="intro", local=_at(11, 4, 12).replace(tzinfo=UTC), region="US", by="bidder",
                  caller=("c1", "Cal")),                                             # Wednesday 12:00
             _row(stage="intro", local=_at(11, 4, 16).replace(tzinfo=UTC), region="US"),
-            _row(stage="tech", local=_at(11, 8, 17).replace(tzinfo=UTC), region="Mars")]  # Sunday 17:00
+            _row(stage="tech_round_2", local=_at(11, 8, 17).replace(tzinfo=UTC), region="Mars")]  # Sunday 17:00
     rep = ir.report(rows, NOW)
 
     def table(name):
         return [(g["key"], g["label"], g["rounds"]) for g in rep[name]]
 
-    assert table("byStage") == [("intro", "Intro", 2), ("tech", "Tech", 1), ("final", "Final", 1)]
+    assert table("byStage") == [("intro", "Intro", 2), ("tech_round_2", "Tech round 2", 1), ("final", "Final", 1)]
     assert table("byWho") == [("self", "Self", 3), ("caller", "Caller", 1)]
     assert table("byWeekday") == [("mon", "Mon", 1), ("wed", "Wed", 2), ("sun", "Sun", 1)]
     assert table("byHour") == [("morning", "Morning", 1), ("afternoon", "Afternoon", 2), ("evening", "Evening", 1)]
@@ -232,14 +247,17 @@ def test_few_callers_and_profiles_fold_into_other_with_members():
 # ---- reasons ----
 def test_reason_lists_count_share_and_unfilled_last():
     rows = (_many(3, "rejected", reason="pay") + _many(1, "rejected", reason="experience") + _many(4, "rejected")
-            + _many(2, "no_answer", status="rejected", reason="no_answer")
+            + _many(8, "no_answer", status="rejected", reason="no_answer")   # closed as no answer: listed
+            + _many(5, "no_answer")                                          # silent for 14 days: not a rejection
+            + _many(2, status="rejected", reason="pay")                      # a later round came: passed
             + _many(2, "canceled", reason="company") + _many(1, "canceled", reason="bogus")
             + [_row(reschedules=["me", "company"]), _row("canceled", reason="company", reschedules=["me"])])
     r = ir.report(rows, NOW)["reasons"]
     assert r["rejected"] == [
-        {"key": "pay", "label": "Pay or contract terms", "count": 3, "share": 37.5},
-        {"key": "experience", "label": "Experience didn't match (stack, seniority, domain)", "count": 1, "share": 12.5},
-        {"key": "none", "label": "Reason not filled in yet", "count": 4, "share": 50.0}]
+        {"key": "no_answer", "label": "No answer from the company", "count": 8, "share": 50.0},
+        {"key": "pay", "label": "Pay or contract terms", "count": 3, "share": 18.8},
+        {"key": "experience", "label": "Experience didn't match (stack, seniority, domain)", "count": 1, "share": 6.2},
+        {"key": "none", "label": "Reason not filled in yet", "count": 4, "share": 25.0}]
     assert r["canceled"] == [{"key": "company", "label": "Company", "count": 3, "share": 75.0},
                              {"key": "none", "label": "Reason not filled in yet", "count": 1, "share": 25.0}]
     assert r["rescheduled"] == [{"key": "me", "label": "Me", "count": 2, "share": 66.7},

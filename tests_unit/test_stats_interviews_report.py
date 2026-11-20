@@ -102,7 +102,7 @@ def _blocks(out):
     assert all(sum(g["rounds"] for g in out[by]) == t["rounds"] for by in TABLES if by != "byCaller")
     assert out["summary"]["cards"]["rounds"]["value"] == t["rounds"]
     assert sum(r["count"] for r in out["reasons"]["canceled"]) == t["canceled"]
-    assert sum(r["count"] for r in out["reasons"]["rejected"]) == t["rejected"]
+    assert sum(r["count"] for r in out["reasons"]["rejected"]) >= t["rejected"]
     return t["rounds"], t["companies"], t["offers"], sum(g["rounds"] for g in out["byCaller"]), out["depth"]["ended"]
 
 
@@ -158,7 +158,8 @@ async def test_scope_and_region_apply_to_every_block(db):
     assert _blocks((await _get(ben, Q + "&scope=me")).json()) == (2, 2, 0, 0, 2)  # the archived profile counts
     assert _blocks((await _get(ana, Q + "&scope=me&region=Latam")).json()) == (0, 0, 0, 0, 0)
     me = (await _get(ana, Q + "&scope=me&region=EU")).json()
-    assert [g["label"] for g in me["byRegion"]] == ["EU"] and [g["key"] for g in me["byStage"]] == ["intro", "tech"]
+    assert [g["label"] for g in me["byRegion"]] == ["EU"] and [(g["key"], g["label"]) for g in me["byStage"]] == [
+        ("intro", "Intro"), ("tech_round_1", "Tech round 1")]
     assert me["reasons"]["rejected"] == [{"key": "pay", "label": "Pay or contract terms", "count": 1, "share": 100.0}]
     assert [g["label"] for g in me["byCaller"][0]["members"]] == ["Cal"]
 
@@ -288,3 +289,25 @@ async def test_load_is_cached_per_period_and_drops_big_fields(db, monkeypatch):
     await _get(ana)
     assert seen and all("transcript" not in d and "transcript" not in d["stageHistory"][0] for d in seen)
     assert seen[0]["stageHistory"][0]["status"] == "passed"
+
+
+async def test_interview_on_a_deleted_profile_counts_under_region_all(db):
+    ana, ben = await _user("Ana"), await _user("Ben")
+    await _iv(await _acct(ana, "Alpha"), ana, ("intro", _d(7), "passed"))
+    gone = await _acct(ben, "Gone")
+    await _iv(gone, ben, ("intro", _d(8), "passed"), ("final", _d(12), "rejected", {"statusReason": "pay"}))
+    await gone.delete()
+    team = (await _get(ana, Q + "&scope=team")).json()
+    assert _blocks(team) == (3, 2, 0, 0, 1)
+    assert [(g["key"], g["label"], g["rounds"]) for g in team["byRegion"]] == [("EU", "EU", 1), ("unknown", "Unknown", 2)]
+    assert {e["name"]: e["held"] for e in team["summary"]["everyone"]} == {"Ana": 1, "Ben": 2}
+    assert team["summary"]["cards"]["companies"]["value"] == 2
+    profiles = team["byProfile"][0]["members"]
+    assert [(m["key"], m["label"]) for m in profiles] == [(str(gone.id), "Deleted profile"), (profiles[1]["key"], "Alpha")]
+    assert all(g["mark"] is None for g in team["byRegion"])
+    mine = (await _get(ben, Q + "&scope=me")).json()
+    assert _blocks(mine) == (2, 1, 0, 0, 1) and mine["summary"]["cards"]["rounds"]["value"] == 2
+    # a deleted profile has no region: out of every region view
+    assert _blocks((await _get(ana, Q + "&scope=team&region=EU")).json()) == (1, 1, 0, 0, 0)
+    assert _blocks((await _get(ben, Q + "&scope=me&region=EU")).json()) == (0, 0, 0, 0, 0)
+    assert [e["name"] for e in (await _get(ben, Q + "&scope=me&region=EU")).json()["summary"]["everyone"]] == ["Ana"]

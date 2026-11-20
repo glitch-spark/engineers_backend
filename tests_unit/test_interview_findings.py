@@ -81,6 +81,17 @@ def test_top_reason_at_40_percent_of_10_rounds():
     assert _run(canceled, None)[1] == [{"kind": "reason", "text": "40.0% of canceled rounds: Company (4 of 10)."}]
 
 
+def test_top_reason_counts_and_may_name_no_answer_from_the_company():
+    closed = _many(4, "no_answer", status="rejected", reason="no_answer")
+    assert _run(closed + _many(6, "rejected"), None)[1] == [{"kind": "reason", "text": (
+        "40.0% of rejected rounds: No answer from the company (4 of 10).")}]
+    # they are in the denominator: pay holds 4 of 11, not 4 of 7
+    assert _run(_many(4, "rejected", reason="pay") + closed + _many(3, "rejected"), None)[1] == NONE
+    # silent for 14 days is no rejection: 4 of 10 again
+    assert _run(_many(4, "rejected", reason="pay") + _many(6, "rejected") + _many(3, "no_answer"), None)[1][0][
+        "text"] == "40.0% of rejected rounds: Pay or contract terms (4 of 10)."
+
+
 def test_top_reason_never_names_unfilled_no_reason_or_other():
     rows = _many(4, "rejected", reason="other") + _many(3, "rejected", reason="no_reason") + _many(3, "rejected")
     assert _run(rows, None)[1] == NONE
