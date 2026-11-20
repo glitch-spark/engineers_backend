@@ -13,7 +13,7 @@ from app.interview_rounds import merged_rounds
 from app.slack_bot import _ROUND_LABELS  # the stages in pipeline order, labelled as on the Interviews board
 from app.stats import frame
 from app.stats.conversion import _rate
-from app.stats.job_fit import _AREAS, _SCORES
+from app.stats.job_fit import _AREAS, _SCORES, NO_AREA
 
 FEW_DECIDED = 20  # a pass rate over fewer decided rounds is too thin to read
 NO_ANSWER_AFTER = timedelta(days=14)
@@ -195,7 +195,7 @@ def report(rows: list[dict], now: datetime) -> dict:
         "byProfile": _folded(rows, lambda r: r["accountId"], lambda r: r["profile"], "Other profiles"),
         "byRegion": _groups(rows, lambda r: r["region"] if r["region"] in ("Latam", "EU", "US") else "unknown", _REGIONS,
                             skip_empty=True),
-        "byArea": _groups(rows, lambda r: r["area"] or "unknown", [(a or "unknown", a or "Unknown") for a in _AREAS],
+        "byArea": _groups(rows, lambda r: r["area"] or "unknown", [(a or "unknown", a or NO_AREA) for a in _AREAS],
                           skip_empty=True),
         "byScore": _groups(rows, lambda r: r["scoreBand"] or "unknown", [(k or "unknown", label) for k, label in _SCORES]),
         "byAppliedBy": _groups(rows, lambda r: r["by"], [("self", "Self bid"), ("bidder", "Bidder bid")]) + _groups(

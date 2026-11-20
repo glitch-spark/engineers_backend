@@ -9,7 +9,7 @@ _RULES = (
     ("QA", ("qa", "quality", "test", "sdet")),
     ("Data", ("data engineer", "data platform", "data analyst", "data analytics", "analytics", "etl",
               "business intelligence", "bi")),
-    ("DevOps", ("devops", "sre", "site reliability", "platform", "infrastructure", "cloud")),
+    ("DevOps", ("devops", "devsecops", "dev ops", "sre", "reliability", "kubernetes", "platform", "infrastructure", "cloud")),
     ("AI / ML", ("ai", "ml", "machine learning", "llm", "genai", "data scien")),
     ("Mobile", ("ios", "android", "mobile", "react native", "flutter")),
     ("Full stack", ("full stack", "fullstack", "full-stack")),
@@ -17,6 +17,9 @@ _RULES = (
     ("Backend", ("back end", "backend", "back-end", "python", "java", "golang", "go", "node", ".net", "ruby", "php",
                  "api")),
     ("Frontend", ("javascript", "typescript")),
+    # a title naming no speciality ("Senior Software Engineer"): its own group, so Other is the true leftovers
+    # (user, 2026-11-20)
+    ("General software", ("software engineer", "software developer", "software development", "developer")),
 )
 
 

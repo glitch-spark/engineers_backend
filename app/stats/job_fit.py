@@ -12,7 +12,9 @@ BOARD_LABELS = {
 }
 TOP_SITES = 8
 _SCORES = [("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"), (None, "No score")]
-_AREAS = ["Backend", "Full stack", "Frontend", "AI / ML", "Data", "DevOps", "QA", "Mobile", "Other", None]
+_AREAS = ["Backend", "Full stack", "Frontend", "AI / ML", "Data", "DevOps", "QA", "Mobile", "General software", "Other",
+          None]
+NO_AREA = "No job linked"  # no bid or tailored resume to read a job title from
 # profile age when the bid went out (user, 2026-11-19): 0–2 / 2–4 / 4–6 / 6–12 / 12+ weeks
 _AGES = [("0-2w", "0–2 weeks"), ("2-4w", "2–4 weeks"), ("4-6w", "4–6 weeks"), ("6-12w", "6–12 weeks"),
          ("12w+", "12+ weeks"), (None, "Unknown")]
@@ -65,7 +67,7 @@ def breakdown(you: list[dict], team: list[dict], matured_before: datetime) -> di
         "bySite": _groups(you, team, matured_before, site, sites),
         "byScore": _groups(you, team, matured_before, lambda r: r.get("scoreBand"), _SCORES),
         "byArea": _groups(you, team, matured_before, lambda r: r.get("area"),
-                          [(a, a or "Unknown") for a in _AREAS], skip_empty=True),
+                          [(a, a or NO_AREA) for a in _AREAS], skip_empty=True),
         "byAge": _groups(you, team, matured_before, lambda r: _age(r.get("profileAgeDays")), _AGES),
         "known": {"score": _share(you, "scoreBand"), "area": _share(you, "area")},
     }

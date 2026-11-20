@@ -73,7 +73,7 @@ def test_score_bands_and_no_resume():
 def test_area_unknown_and_empty_groups_omitted():
     team = row(1, area="Backend") + row(1, area="AI / ML") + row(1, area=None)
     out = job_fit.breakdown(row(1, area="Data"), team, CUT)
-    assert [x["label"] for x in out["byArea"]] == ["Backend", "AI / ML", "Data", "Unknown"]
+    assert [x["label"] for x in out["byArea"]] == ["Backend", "AI / ML", "Data", "No job linked"]
 
 
 def test_age_buckets_edges():

@@ -220,7 +220,7 @@ async def test_bid_side_tables_read_the_applications_row(db):
     assert table("byAppliedBy") == {"self": 1, "bidder": 1, "unknown": 1}
     assert table("byScore") == {"strong": 1, "good": 1, "unknown": 1}
     assert table("byArea") == {"Backend": 1, "unknown": 2}
-    assert [(g["key"], g["label"]) for g in out["byArea"]][-1] == ("unknown", "Unknown")
+    assert [(g["key"], g["label"]) for g in out["byArea"]][-1] == ("unknown", "No job linked")
     assert [(g["key"], g["label"]) for g in out["byScore"]][-1] == ("unknown", "No score")
     assert all(set(g) == GROUP_KEYS for by in ("byScore", "byArea", "byAppliedBy") for g in out[by])
 

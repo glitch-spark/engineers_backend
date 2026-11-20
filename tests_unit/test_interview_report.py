@@ -256,7 +256,7 @@ def test_stage_who_weekday_hour_region_area_applied_by_tables():
     assert table("byWeekday") == [("mon", "Mon", 1), ("wed", "Wed", 2), ("sun", "Sun", 1)]
     assert table("byHour") == [("morning", "Morning", 1), ("afternoon", "Afternoon", 2), ("evening", "Evening", 1)]
     assert table("byRegion") == [("EU", "EU", 1), ("US", "US", 2), ("unknown", "Unknown", 1)]
-    assert table("byArea") == [("Backend", "Backend", 1), ("unknown", "Unknown", 3)]
+    assert table("byArea") == [("Backend", "Backend", 1), ("unknown", "No job linked", 3)]
     assert table("byAppliedBy") == [("self", "Self bid", 1), ("bidder", "Bidder bid", 1), ("unknown", "Unknown", 2)]
     empty = ir.report([], NOW)
     assert empty["byStage"] == empty["byWeekday"] == empty["byCaller"] == []
