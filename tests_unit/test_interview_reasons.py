@@ -331,17 +331,18 @@ async def test_needs_input_lists_results_and_reasons_newest_first(client):
     )
     await make_interview(owner, rnd(status="canceled", statusReason="company"), company="Has a reason")
     await make_interview(owner, rnd(status="passed"), company="Done")
-    await make_interview(owner, rnd(status="scheduled"), company="Not answered yet")
+    await make_interview(owner, rnd(status="scheduled", start=FUTURE), company="Not held yet")
 
     out = await needs(client, owner)
-    assert out["counts"] == {"result": 1, "reason": 2}
+    assert out["counts"] == {"outcome": 0, "follow_up": 1, "heard_back": 0, "reason": 2}
     assert [(i["companyName"], i["need"], i["status"]) for i in out["items"]] == [
-        ("Canceled", "reason", "canceled"), ("Held", "result", "completed"), ("Rejected", "reason", "rejected"),
+        ("Canceled", "reason", "canceled"), ("Held", "follow_up", "completed"), ("Rejected", "reason", "rejected"),
     ]
     assert out["items"][1] == {
         "interviewId": str(held.id), "roundId": held.stageHistory[-1].id, "companyName": "Held",
         "profileName": "Backend", "ownerId": str(owner.id), "ownerName": "Pedro", "stage": "intro",
-        "status": "completed", "scheduledAt": "2026-10-07T15:00:00Z", "need": "result",
+        "status": "completed", "scheduledAt": "2026-10-07T15:00:00Z", "endsAt": "2026-10-07T16:00:00Z",
+        "need": "follow_up",
     }
     assert out["items"][0]["interviewId"] == str(canceled.id) and out["items"][0]["profileName"] is None
     assert out["items"][2]["roundId"] == rejected.stageHistory[0].id
@@ -350,7 +351,9 @@ async def test_needs_input_lists_results_and_reasons_newest_first(client):
 async def test_completed_round_followed_by_a_later_round_is_not_listed(client):
     owner = await make_user()
     await make_interview(owner, rnd(status="completed"), rnd("final", status="scheduled", start=FUTURE))
-    assert (await needs(client, owner)) == {"items": [], "counts": {"result": 0, "reason": 0}}
+    assert (await needs(client, owner)) == {
+        "items": [], "counts": {"outcome": 0, "follow_up": 0, "heard_back": 0, "reason": 0},
+    }
 
 
 async def test_completed_round_that_has_not_ended_is_not_listed(client):
@@ -368,7 +371,7 @@ async def test_completed_round_waits_seven_days_for_a_result(client):
     await make_interview(owner, rnd(status="canceled", start=now - timedelta(days=1)), company="Canceled")  # no wait
     out = await needs(client, owner)
     assert [i["companyName"] for i in out["items"]] == ["Canceled", "Overdue"]
-    assert out["counts"] == {"result": 1, "reason": 1}
+    assert (out["counts"]["follow_up"], out["counts"]["reason"]) == (1, 1)
 
 
 async def test_rounds_before_the_data_start_are_not_listed(client):
@@ -412,10 +415,10 @@ async def test_admin_sees_everyone_or_one_person(client):
     await make_interview(sam, rnd(status="canceled", start=LATER), company="Sam's")
     everyone = await needs(client, admin)
     assert [(i["companyName"], i["ownerName"]) for i in everyone["items"]] == [("Sam's", "Sam"), ("Pedro's", "Pedro")]
-    assert everyone["counts"] == {"result": 1, "reason": 1}
+    assert everyone["counts"] == {"outcome": 0, "follow_up": 1, "heard_back": 0, "reason": 1}
     one = await needs(client, admin, userId=str(sam.id))
     assert [(i["companyName"], i["ownerId"]) for i in one["items"]] == [("Sam's", str(sam.id))]
-    assert one["counts"] == {"result": 0, "reason": 1}
+    assert one["counts"] == {"outcome": 0, "follow_up": 0, "heard_back": 0, "reason": 1}
     async with client(admin) as c:
         assert (await c.get("/interviews/needs-input", params={"userId": "nope"})).status_code == 400
 
