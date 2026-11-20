@@ -11,7 +11,7 @@ from app.models import Application
 WINDOW_DAYS = 90
 MIN_MATCHED = 30  # fewer matched applications than this = thin data
 FALLBACK_P90 = 14
-MIN_MATURED = 7
+MATURED_DAYS = 14  # a bid is "matured" after a fixed 14 days (user decision 2026-11-19; median/p90 stay informational)
 _TTL = 600
 _cache: dict[date, tuple[float, dict]] = {}
 
@@ -39,6 +39,6 @@ async def response_window(today: date) -> dict:
         median, p90 = None, FALLBACK_P90
     else:
         median, p90 = _rank(days, 0.5), _rank(days, 0.9)
-    out = {"median": median, "p90": p90, "matured_days": max(MIN_MATURED, p90), "n": n, "thin": n < MIN_MATCHED}
+    out = {"median": median, "p90": p90, "matured_days": MATURED_DAYS, "n": n, "thin": n < MIN_MATCHED}
     _cache[today] = (time.monotonic(), out)
     return out

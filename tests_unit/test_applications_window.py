@@ -39,7 +39,7 @@ async def test_window_median_p90(db):
     await add_rows(db, [99], age=100)  # outside the 90 days
     await db["applications"].insert_one({"key": "nomatch", "ownerId": ObjectId(), "appliedAt": datetime(2026, 11, 8)})
     w = await window.response_window(TODAY)
-    assert w == {"median": 20, "p90": 36, "matured_days": 36, "n": 40, "thin": False}
+    assert w == {"median": 20, "p90": 36, "matured_days": 14, "n": 40, "thin": False}  # fixed 14 (user, 2026-11-19)
 
 
 async def test_window_thin_fallback(db):
@@ -48,10 +48,10 @@ async def test_window_thin_fallback(db):
     assert w == {"median": None, "p90": 14, "matured_days": 14, "n": 29, "thin": True}
 
 
-async def test_matured_never_below_7(db):
+async def test_matured_is_fixed_14_days(db):
     await add_rows(db, [0, 1, 2] * 10)
     w = await window.response_window(TODAY)
-    assert w["p90"] == 2 and w["matured_days"] == 7 and not w["thin"]
+    assert w["p90"] == 2 and w["matured_days"] == 14 and not w["thin"]
 
 
 async def test_cache_reused_within_10_minutes(db):
