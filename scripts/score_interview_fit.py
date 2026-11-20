@@ -21,6 +21,7 @@ from collections import Counter
 from datetime import date, datetime
 
 from app.job_apply import tailored_score
+from app.job_apply.scoring import band
 from app.models import Account, Interview, ResumeApplication
 from app.models.user_extra import UserExtra
 from app.resume_retention import archived_text
@@ -73,7 +74,7 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
         linked = link.get("score") or {}  # a TailoredMatch dict already scored when linked: no LLM call needed
         if linked.get("total") is not None:
             if apply:
-                await write(d, linked["total"], linked.get("band"))
+                await write(d, linked["total"], linked.get("band") or band(linked["total"]))
             counts["copied"] += 1
             return
         async with sem:
@@ -87,7 +88,8 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
                 m = await asyncio.wait_for(tailored_score.score_manual(
                     link["jobDescription"], text, owners.get(account.get("createdBy"))), CALL_TIMEOUT)
             except Exception as exc:  # noqa: BLE001 — counted and logged; retried on the next run
-                log.warning("fit score for interview %s failed: %r", d["_id"], exc)
+                # type only: the message can carry resume / job description text
+                log.warning("fit score for interview %s failed: %s", d["_id"], type(exc).__name__)
                 m = None
         if m is None:
             counts["unscorable"] += 1
@@ -95,7 +97,14 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
         await write(d, m.total, m.band)
         counts["scored"] += 1
 
-    await asyncio.gather(*(one(d) for d in cands))
+    async def safe(d: dict) -> None:
+        try:
+            await one(d)
+        except Exception as exc:  # noqa: BLE001 — a failed read or write is counted; the batch goes on
+            log.warning("fit score for interview %s failed: %s", d["_id"], type(exc).__name__)
+            counts["unscorable"] += 1
+
+    await asyncio.gather(*(safe(d) for d in cands))
     return counts
 
 

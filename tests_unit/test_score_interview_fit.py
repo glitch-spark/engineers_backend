@@ -130,3 +130,32 @@ async def test_link_score_copied_without_scoring_and_write_bumps_updated_at(db):
     assert await fit(db, copied) == {"total": 88, "band": "strong"}
     for i in (copied, scored):  # so the incremental applications sync picks the interview up
         assert (await db["interviews"].find_one({"_id": i}))["updatedAt"] > WHEN
+
+
+async def test_a_failing_resume_read_is_unscorable_and_does_not_stop_the_batch(db, monkeypatch):
+    async def broken(link, account):
+        if link["jobDescription"] == "broken":
+            raise RuntimeError("archive down")
+        return "base resume text"
+
+    monkeypatch.setattr(sif, "_resume_text", broken)
+    await add_iv(db, {"kind": "none", "jobDescription": "broken"})
+    ok = await add_iv(db, {"kind": "none", "jobDescription": "JD ok"})
+    out = await sif.score_interview_fit(True, SINCE)
+    assert out["unscorable"] == 1 and out["scored"] == 1 and await fit(db, ok) is not None
+
+
+async def test_failure_log_does_not_echo_resume_or_jd_text(db, monkeypatch, caplog):
+    async def leaky(jd, text, user):
+        raise RuntimeError(f"bad input: {text}")
+
+    monkeypatch.setattr(tailored_score, "score_manual", leaky)
+    await add_iv(db, {"kind": "none", "jobDescription": "Secret Job Description"})
+    await sif.score_interview_fit(True, SINCE)
+    assert "Secret" not in caplog.text and "bad input" not in caplog.text and "RuntimeError" in caplog.text
+
+
+async def test_copied_score_without_band_gets_its_band(db):
+    _id = await add_iv(db, {"kind": "uploaded", "jobDescription": "JD", "score": {"total": 82}})
+    await sif.score_interview_fit(True, SINCE)
+    assert await fit(db, _id) == {"total": 82, "band": "strong"}
