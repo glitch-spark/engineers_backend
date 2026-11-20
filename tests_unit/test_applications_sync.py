@@ -369,3 +369,12 @@ async def test_title_from_a_long_description_with_leading_blank_lines(db):
     await sync.full_rebuild(SINCE, apply=True)
     [row] = await db["applications"].find({}).to_list(None)
     assert row["title"] == "Senior Backend Engineer" and row["area"] == "Backend"
+
+
+async def test_interview_fit_score_reaches_the_row(db):
+    await add_bid(db)
+    iv = await add_interview(db)
+    await db["interviews"].update_one({"_id": iv["_id"]}, {"$set": {"fitScore": {"total": 61, "band": "fair"}}})
+    await sync.full_rebuild(SINCE, apply=True)
+    row = await db["applications"].find_one({})
+    assert row["interviewId"] == iv["_id"] and (row["score"], row["scoreBand"]) == (61, "fair")

@@ -46,7 +46,7 @@ _RESUME_FIELDS = ("userId", "accountId", "jobUrl", "createdAt", "countsAsBid", "
                   "promptName", "templateName", "jobDescription")
 _TITLE_LINES = 5  # lines of jobDescription fetched for the title (leading blank lines are skipped)
 _IV_FIELDS = ("accountId", "createdBy", "scheduledAt", "stage", "status", "jobUrl", "stageHistory", "resumeLink",
-              "createdAt", "updatedAt")
+              "fitScore", "createdAt", "updatedAt")
 
 
 def _proj(fields) -> dict:

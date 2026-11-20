@@ -198,6 +198,9 @@ class Interview(TimestampedDocument):
     resumeLink: Optional[InterviewResumeLink] = None
     # Who applied for the job (None = not set: interviews from before the field existed).
     appliedBy: Optional[InterviewAppliedBy] = None
+    # {total, band}: the profile's resume scored against resumeLink.jobDescription when no tailored score exists
+    # (scripts/score_interview_fit.py); the applications sync gives it to a matched row that has no score.
+    fitScore: Optional[dict] = None
 
     @field_serializer("scheduledAt", "endsAt", when_used="json")
     def _times_utc(self, v: Optional[datetime]) -> Optional[str]:

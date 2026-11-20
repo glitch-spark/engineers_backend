@@ -152,5 +152,8 @@ def match_interviews(rows: dict[str, dict], interviews: list, resume_row: dict[s
         at = out["firstRoundAt"]
         r.update(interviewId=iv.id, firstRoundAt=at, furthest=out["furthest"], result=out["result"],
                  daysToInterview=max(0, (at - r["appliedAt"]).days) if at else None)
+        fit = getattr(iv, "fitScore", None)
+        if fit and r.get("score") is None:  # no tailored score: the interview's fit score (scripts/score_interview_fit.py)
+            r["score"], r["scoreBand"] = fit.get("total"), fit.get("band")
     return len(best), unmatched
 

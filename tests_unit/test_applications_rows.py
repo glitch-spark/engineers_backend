@@ -252,3 +252,16 @@ def test_interview_linked_to_tailored_resume_matches_bid_row():
     i = iv([rnd("intro", T0 + timedelta(days=2))], url="https://elsewhere.com/x", resume_id=str(t["_id"]))
     assert match_interviews(rows, [i], {str(t["_id"]): key}) == (1, 0)
     assert rows[key]["interviewId"] == i.id
+
+
+def test_interview_fit_score_fills_an_unscored_row_only():
+    rows = build_rows([bid()], [], {})
+    i = iv([rnd("intro", T0 + timedelta(days=2))], url="https://jobs.acme.com/1")
+    i.fitScore = {"total": 61, "band": "fair"}
+    match_interviews(rows, [i], {})
+    row = next(iter(rows.values()))
+    assert (row["score"], row["scoreBand"]) == (61, "fair")
+    rows = build_rows([bid()], [resume()], {})
+    match_interviews(rows, [i], {})
+    row = next(iter(rows.values()))
+    assert (row["score"], row["scoreBand"]) == (80, "strong")  # the tailored score stays
