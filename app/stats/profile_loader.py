@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from app.applications.rows import interview_outcome
@@ -73,8 +73,12 @@ async def count_untied_interviews(account_ids: list, start: datetime, end: datet
     if not account_ids:
         return 0
     carried = set(await Application.get_motor_collection().distinct("interviewId"))
-    # ponytail: scans every interview of the scope's profiles; add a round-date prefilter if it gets slow
-    ivs = await Interview.get_motor_collection().find({"accountId": {"$in": list(account_ids)}}).to_list(None)
+    # a first round in [start, end) implies a round near it: the day of slack covers timezone-free naive dates
+    near = {"$gte": start - timedelta(days=1), "$lt": end + timedelta(days=1)}
+    ivs = await Interview.get_motor_collection().find(
+        {"accountId": {"$in": list(account_ids)}, "$or": [{"scheduledAt": near}, {"stageHistory.scheduledAt": near}]},
+        {f: 1 for f in ("accountId", "createdBy", "scheduledAt", "stage", "status", "stageHistory", "createdAt", "updatedAt")},
+    ).to_list(None)
     n = 0
     for d in ivs:
         if d["_id"] in carried:

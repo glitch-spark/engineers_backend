@@ -23,7 +23,7 @@ from app.stats.bids import bids_view
 from app.stats.conversion_scope import bounds as _bounds
 from app.stats.frame import previous_window
 from app.stats.interviews import interviews_view
-from app.stats.profile_loader import accounts_with_rounds_since, count_unmatched_interviews, load_period_rows
+from app.stats.profile_loader import accounts_with_rounds_since, count_unmatched_interviews, count_untied_interviews, load_period_rows
 from app.stats.profile_report import grade, summarize, team_baseline
 
 router = APIRouter(prefix="/stats", tags=["stats"])
@@ -51,9 +51,11 @@ async def conversion_report(
     cutoff = sc["now"] - timedelta(days=win["matured_days"])
     team_rate = team_baseline(summarize(sc["teamRows"], cutoff), sc["teamRows"])["rate"]
     rep = conversion.report(sc["rows"], cutoff, {k: v for k, v in names.items() if v}, scope != "team", team_rate)
+    untied = await count_untied_interviews([PydanticObjectId(i) for i in sc["accounts"]], sc["start"], sc["end"]
+                                           ) if sc["end_d"] >= cs.DATA_START else 0
     return {"label": sc["label"], "startClamped": sc["startClamped"], "window": win, "scope": scope,
             "subject": sc["subject"], **({"profile": profile} if scope == "profile" else {}),
-            **rep, "totals": {**rep["totals"], "untied": sc["untied"]}}
+            **rep, "totals": {**rep["totals"], "untied": untied}}
 
 
 @router.get("/{tab}")
@@ -104,8 +106,7 @@ _GRADE_ORDER = {"strong": 0, "watch": 1, "dead": 2, "early": 3}
 
 async def _graded_profiles(accounts: dict, summaries: dict, team: dict, start: datetime) -> list[dict]:
     """The scope's profiles (conversion_scope `accounts`) with rows in the cohort, graded, in the profiles card order.
-    A profile with an interview round since `start` is never dead: its interviews may sit on byInterviewOnly or
-    unmatched rows."""
+    A profile with an interview round since `start` is never dead: its interviews may be carried by no row."""
     profiles = []
     for pid, a in accounts.items():
         if pid not in summaries:
@@ -119,7 +120,7 @@ async def _graded_profiles(accounts: dict, summaries: dict, team: dict, start: d
     for p in dead:
         if p["accountId"] in busy:
             p["grade"], p["reasons"] = "watch", p["reasons"] + [
-                "but it has interviews in the period, from applies not marked as bids or not tied to a job"]
+                "but it has interviews in the period that no tracked bid carries"]
     profiles.sort(key=lambda x: (_GRADE_ORDER[x["grade"]], -(x["per100"] if x["per100"] is not None else -1), x["name"]))
     return profiles
 
@@ -144,7 +145,7 @@ async def applications_profiles(
     profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
 ) -> dict:
     """The "Your profiles" report (cohort = rows applied in the period) and the coverage numbers. Grades compare
-    against the team = every active profile of the region; `scope=team` has no per-profile list."""
+    against the team = every profile of the region; `scope=team` has no per-profile list."""
     sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
     sid, start_d, end_d, start, end, now = (sc[k] for k in ("sid", "start_d", "end_d", "start", "end", "now"))
     win = await response_window(sc["today"])

@@ -251,3 +251,15 @@ async def test_untied_uses_first_round_in_period_and_archived_profile(db):
     # created inside the period but its first round is before it: out
     await _iv(a, ana, datetime(2026, 9, 20, 15), createdAt=OCT10)
     assert (await _get(ana)).json()["totals"]["untied"] == 1
+
+
+async def test_untied_prefilter_skips_far_interviews_and_keeps_edges(db, monkeypatch):
+    ana = await UserExtra(name="Ana", email="a@x.io").insert()
+    a = await _acct(ana, "Alpha")
+    far = await _iv(a, ana, datetime(2026, 8, 1))                       # all rounds far outside
+    await _iv(a, ana, datetime(2026, 8, 1), rounds=[{"stage": "intro", "status": "completed", "at": OCT10, "scheduledAt": OCT10}])
+    seen = []
+    orig = profile_loader.Interview.model_validate
+    monkeypatch.setattr(profile_loader.Interview, "model_validate", lambda d, *x, **k: (seen.append(d["_id"]), orig(d, *x, **k))[1])
+    assert (await _get(ana)).json()["totals"]["untied"] == 1
+    assert far not in seen

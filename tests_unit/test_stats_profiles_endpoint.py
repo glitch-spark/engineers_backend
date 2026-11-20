@@ -219,7 +219,7 @@ async def test_loader_includes_by_interview_only_rows(db):
 
 
 async def test_profile_with_rounds_in_period_never_dead(db):
-    """C1 follow-on: interviews that come only from flagged rows must not leave the profile graded dead."""
+    """A dead-looking profile whose only round in the period is on an interview no row carries is held at watch."""
     ana, ben = await _users()
     a, other = await _acct(ana, "Alpha"), await _acct(ben, "Other")
     await _rows(other, ben, 40, iv=8)
@@ -227,9 +227,32 @@ async def test_profile_with_rounds_in_period_never_dead(db):
     dead = (await _get(ana)).json()["profiles"][0]
     assert dead["grade"] == "dead"
     profile_loader.clear_cache()
+    at = NOW - timedelta(days=10)
+    await Interview.get_motor_collection().insert_one({
+        "accountId": a.id, "createdBy": ana.id, "scheduledAt": at, "stage": "intro", "status": "completed",
+        "stageHistory": [], "createdAt": at, "updatedAt": at})  # no row carries it
+    p = (await _get(ana)).json()["profiles"][0]
+    assert p["grade"] == "watch" and p["reasons"][-1] == "but it has interviews in the period that no tracked bid carries"
+
+
+async def test_interview_only_rows_keep_a_profile_off_dead(db):
+    ana, ben = await _users()
+    a, other = await _acct(ana, "Alpha"), await _acct(ben, "Other")
+    await _rows(other, ben, 40, iv=8)
+    await _rows(a, ana, 40)
     await _flagged(a, ana, 2)
     p = (await _get(ana)).json()["profiles"][0]
-    assert p["grade"] != "dead"  # flagged rows now count: their interviews are real
+    assert p["grade"] == "watch" and p["matured"] == 42 and p["interviews"] == 2
+
+
+async def test_profiles_endpoint_does_not_count_untied(db, monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError("untied is a /conversion-only count")
+
+    monkeypatch.setattr(stats, "count_untied_interviews", boom)
+    ana, _ = await _users()
+    await _rows(await _acct(ana, "Alpha"), ana, 3)
+    assert (await _get(ana)).status_code == 200
 
 
 # ---- coverage under the conversion scope (fix round 1) ----

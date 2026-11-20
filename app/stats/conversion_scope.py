@@ -5,14 +5,13 @@ from __future__ import annotations
 from datetime import date as Date, datetime, timedelta
 from typing import Literal, Optional
 
-from beanie import PydanticObjectId
 from fastapi import HTTPException, status
 
 from app import interview_rates
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.models import Account, UserExtra
 from app.routers._util import to_object_id
-from app.stats.profile_loader import count_untied_interviews, load_period_rows
+from app.stats.profile_loader import load_period_rows
 
 DATA_START = Date(2026, 10, 6)  # bids before it are incomplete: no period of this tab starts earlier
 
@@ -64,9 +63,8 @@ async def conversion_scope(user: UserExtra, period: str, date: str, to: str, reg
     loaded = await load_period_rows(start, end, "all") if end_d >= DATA_START else []
     team_rows = [r for r in loaded if str(r.get("accountId")) in team]
     tz = app_tz()
-    untied = await count_untied_interviews([PydanticObjectId(i) for i in ids], start, end) if end_d >= DATA_START else 0
     return {"sid": sid, "subject": {"userId": str(sid), "name": subject.name}, "scope": scope,
             "start_d": start_d, "end_d": end_d, "start": start, "end": end, "label": label, "startClamped": clamped,
             "now": datetime.utcnow(), "today": datetime.now(tz).date(),
             "accounts": {k: team[k] for k in ids}, "rows": [r for r in team_rows if str(r["accountId"]) in ids],
-            "teamRows": team_rows, "untied": untied}
+            "teamRows": team_rows}
