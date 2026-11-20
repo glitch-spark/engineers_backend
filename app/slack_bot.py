@@ -432,17 +432,34 @@ def _item_line(e: dict, progress: dict) -> Optional[str]:
     return _plan_line(item.text, text + ("  ✅" if p.get("done") else ""))
 
 
+FOLLOW_UPS_SHOWN = 5
+
+
+def follow_ups_line(follow_ups: Optional[dict], label: str = "Follow-ups") -> str:
+    """The standup's Follow-ups line from the day view's `followUps` ({doneToday, toDo}); "" when there is nothing
+    to say. `Follow-ups · done today: Acme, Globex · still to do: 3`; past 5 names, the first 5 then `+{n}`."""
+    names, to_do = list((follow_ups or {}).get("doneToday") or []), (follow_ups or {}).get("toDo") or 0
+    parts = []
+    if names:
+        more = len(names) - FOLLOW_UPS_SHOWN
+        parts.append("done today: " + ", ".join(names[:FOLLOW_UPS_SHOWN]) + (f" +{more}" if more > 0 else ""))
+    if to_do:
+        parts.append(f"still to do: {to_do}")
+    return " · ".join([label, *parts]) if parts else ""
+
+
 def daily_plan_text(
     plan: Any, owner: Optional[UserExtra], *, done: Any = None, rounds: Optional[dict] = None,
     targets: Any = None, items: Optional[list] = None, progress: Optional[dict] = None,
-    week_interviews: Optional[tuple] = None,
+    week_interviews: Optional[tuple] = None, follow_ups: Optional[dict] = None,
 ) -> str:
     """The day's Goal vs Done standup: bids, interviews, routines, weekly goals (those touched today), extra.
 
     The sections sit in a code block so the columns line up; the heading (with the owner's mention) and the
     report link stay outside it. `done` defaults to what the plan stores; `rounds` is {"self": {stage: n},
     "caller": {stage: n}}; `items` are `plan_auto.day_items` lines; `progress` is `goal_progress`;
-    `week_interviews` is (held Monday..today, week target), the Week line is left out without a target.
+    `week_interviews` is (held Monday..today, week target), the Week line is left out without a target;
+    `follow_ups` is the day view's `followUps`, one line closing the Interviews section when it says anything.
     """
     targets = targets if targets is not None else Counts()
     done = done if done is not None else plan.done
@@ -460,6 +477,8 @@ def daily_plan_text(
     ]
     if week_interviews and week_interviews[1]:
         interviews.append(_plan_line("Week", f"{week_interviews[0]} / {week_interviews[1]}"))
+    if line := follow_ups_line(follow_ups):
+        interviews.append(f"{_PLAN_INDENT}{_plan_block_text(line)}")
     sections.append(["Interviews", *interviews])
 
     routines = [ln for e in items or [] if e["scope"] == "routine" and (ln := _item_line(e, progress))]

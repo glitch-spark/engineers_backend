@@ -24,6 +24,7 @@ from app.plan_auto import (
 )
 from app.plan_profiles import owner_profiles
 from app.plan_save import DayIn, ProgressIn, save_day, save_progress
+from app.routers.interviews import follow_ups_summary
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
@@ -137,6 +138,7 @@ async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: d
         plan, owner, done=done, rounds=rounds, targets=day_targets(plan, weekly, when),
         items=day_items(weekly, plan, when), progress=goal_progress(weekly, days) if weekly else {},
         week_interviews=(sum(e["self"] + e["caller"] for e in held.values()), target),
+        follow_ups=await follow_ups_summary(owner.id, when),
     )
     coll = DailyPlan.get_motor_collection()
     if claim is not None and not posted:  # the post failed: free the claim for the next save
@@ -192,6 +194,7 @@ async def _view(uid, when: date) -> dict:
     auto_day = (await _interviews(uid, when, when)).get(when, empty_day())
     out = _day_out(uid, when, plan, auto_day, await week_or_draft(uid, monday), plans,
                    await plan_bidder.bidder_done(uid, when), await owner_profiles(uid))
+    out["followUps"] = await follow_ups_summary(uid, when)  # read-only, never stored on the plan
     return await _with_tracked(out, uid, when)
 
 
