@@ -1,5 +1,6 @@
 """Conversion tab key findings and the ★ / ⚠ group marks (pure). Rules and copy: the 2026-11-19 conversion redesign
 spec, "Findings rules". `team_rate` is the unrounded per-100 team rate the report was built with."""
+import math
 from typing import Optional
 
 from app.stats.profile_report import EXPECTED_MIN, MIN_MATURED
@@ -20,15 +21,21 @@ def _rate(g: dict) -> float:
     return g["interviews"] / g["matured"] * 100
 
 
+def _chance(i: int, expected: float) -> float:
+    """Poisson upper tail P(X >= i | lambda = expected): how often a group this lucky happens by chance."""
+    return 1 - sum(math.exp(-expected) * expected ** k / math.factorial(k) for k in range(i))
+
+
 def _picks(report: dict, team_rate: Optional[float]) -> dict:
     """Per breakdown: (best group or None, weakest group or None) by the spec rules. Best = highest rate among
-    non-few groups with >= 3 interviews and rate >= 1.5 x team; weak = largest expected (matured x team / 100 >= 3)
+    non-few groups with >= 3 interviews and rate >= 1.5 x team and Poisson upper-tail P(X >= interviews | expected) <= 0.05; weak = largest expected (matured x team / 100 >= 3)
     among non-few groups with 0 interviews. Catch-alls never qualify; no team rate → nothing."""
     out = {}
     for by in BY:
         groups = [g for g in report.get(by, []) if g["key"] not in CATCH_ALLS and not g["few"]] if team_rate else []
         best = [g for g in groups if g["interviews"] >= EXPECTED_MIN
-                and g["interviews"] * 100 >= 1.5 * team_rate * g["matured"]]
+                and g["interviews"] * 100 >= 1.5 * team_rate * g["matured"]
+                and _chance(g["interviews"], g["matured"] * team_rate / 100) <= 0.05]
         weak = [g for g in groups if g["interviews"] == 0 and g["matured"] * team_rate >= EXPECTED_MIN * 100]
         out[by] = (max(best, key=lambda g: (_rate(g), g["interviews"])) if best else None,
                    max(weak, key=lambda g: g["matured"]) if weak else None)

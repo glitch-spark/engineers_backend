@@ -24,12 +24,12 @@ def _kinds(found):
     return [(f["kind"], f["evidence"].get("by"), f["evidence"].get("key")) for f in found]
 
 
-def test_best_fires_at_one_and_a_half_times_team_rate():
-    _, found = _run(_rows(200, 3, scoreBand="strong"), 1.0)
-    assert found == [{"kind": "best", "text": "80+ converts best for resume score: 1.5% (3 interviews from 200 "
+def test_best_fires_when_well_above_team_rate():
+    _, found = _run(_rows(100, 6, scoreBand="strong"), 1.0)
+    assert found == [{"kind": "best", "text": "80+ converts best for resume score: 6.0% (6 interviews from 100 "
                                               "matured bids) vs 1.0% across all matured bids.",
-                      "evidence": {"by": "byScore", "key": "strong", "label": "80+", "rate": 1.5, "interviews": 3,
-                                   "matured": 200, "teamRate": 1.0}}]
+                      "evidence": {"by": "byScore", "key": "strong", "label": "80+", "rate": 6.0, "interviews": 6,
+                                   "matured": 100, "teamRate": 1.0}}]
 
 
 def test_best_not_below_the_edges():
@@ -124,7 +124,7 @@ def test_marks_come_from_the_rules_per_table_not_the_capped_sentences():
     rows = (_rows(100, 6, scoreBand="strong", by="self")   # Self 6% and 80+ 6%
             + _rows(100, 5, board="a.io")
             + _rows(100, 4, area="Backend")
-            + _rows(100, 3, profileAgeDays=3)
+            + _rows(100, 4, profileAgeDays=3)
             + _rows(100, 2, scoreBand="good"))
     rep, found = _run(rows, 1.0)
     mark_groups(rep, 1.0)
@@ -178,3 +178,14 @@ def test_report_groups_start_unmarked():
     rep = conversion.report(_rows(5, scoreBand="strong"), CUT, {}, True)
     assert all(g["mark"] is None for k in ("byWho", "bySite", "byScore", "byArea", "byAge", "byBidder")
                for g in rep[k])
+
+
+def test_best_needs_poisson_significance():
+    # 222 matured, 3 interviews at team 0.9%: expected 2.0, 3+ happens ~32% by chance -> not best
+    rep, found = _run(_rows(222, 3, scoreBand="strong"), 0.9)
+    mark_groups(rep, 0.9)
+    assert found[0]["kind"] == "none" and rep["byScore"][0]["mark"] is None
+    # 438 matured, 33 interviews: clearly beyond chance
+    rep, found = _run(_rows(438, 33, scoreBand="strong"), 0.9)
+    mark_groups(rep, 0.9)
+    assert found[0]["kind"] == "best" and rep["byScore"][0]["mark"] == "best"
