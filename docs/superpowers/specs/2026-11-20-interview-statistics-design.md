@@ -19,10 +19,10 @@ default / All my profiles), Date range (from Oct 6, 2026, default "Since Oct 6",
 2. **Everyone**: ranked list with a switch Companies | Rounds held | Pass rate | Offers.
 3. **Key findings**: up to 4 sentences, ★ / ⚠, same evidence idea as the other tab.
 4. **By stage**: per stage — rounds, held, passed, rejected, no answer, waiting, canceled, pass rate.
-5. **Self vs caller**, and **By caller** (one row per caller).
+5. **By caller** (one row per caller; a caller stored by list id, by platform-user id or by typed name is one row).
+   Self vs caller removed (user, 2026-11-20).
 6. **Why**: canceled reasons, rescheduled reasons, rejected reasons (count and share).
-7. **Depth and speed**: average rounds held until an interview ends (offer, rejected or no answer); days between
-   rounds; days until an answer.
+7. Depth and speed removed (user, 2026-11-20).
 8. **What raises the pass rate** — breakdown tables: profile, region, job area, resume score, self vs bidder bid,
    weekday, time of day.
 9. **Follow-ups**: rounds followed up vs not, and how each ended.
@@ -57,10 +57,6 @@ yet); changing the Bids → Interviews tab.
 - **Caller round** = the round's caller is enabled and names a caller; otherwise self.
 - **Reschedule rate** = rounds with at least one logged reschedule ÷ rounds in the period scheduled on or after
   2026-11-20 (the day logging started); a note says so.
-- **Rounds until the end** = per interview whose latest round is decided and not passed, or is an offer: number of
-  held rounds; the average, and the split by how it ended.
-- **Days between rounds** = start of round n to start of round n+1, median. **Days until an answer** = round end to
-  `statusAt` (follow-up design), median, only rounds that have `statusAt`; a note gives the count.
 - **Breakdown keys**: job area, resume score band and self/bidder come from the interview's `applications` row
   (`interviewId`) and fall back to `resumeLink` / `appliedBy`; missing → "Unknown" (never named or marked).
   Weekday and time of day (morning before 12, afternoon 12–17, evening after) in the app timezone.
@@ -85,7 +81,7 @@ yet); changing the Bids → Interviews tab.
 
 **Compute on read from `interviews` (chosen).** About 1,200 rounds: one cached load per (period, region), the same
 single-flight cache pattern as `load_period_rows`; `GET /stats/interviews-report` returns `{window, totals,
-summary: {cards, everyone}, findings, byStage, byWho, byCaller, reasons: {canceled, rescheduled, rejected}, depth,
+summary: {cards, everyone}, findings, byStage, byCaller, reasons: {canceled, rescheduled, rejected},
 byProfile, byRegion, byArea, byScore, byAppliedBy, byWeekday, byHour, followUps}`. Scope through
 `app.stats.conversion_scope` (me / team, region, DATA_START).
 
@@ -118,26 +114,23 @@ Group = {key, label, rounds, held, decided, passed, rejected, noAnswer, waiting,
                 ranks: {companies, held, passRate, offers}}]
   },
   findings: [{kind: "best" | "weak" | "reason" | "no_answer" | "none", text}],
-  byStage, byWho, byCaller, byProfile, byRegion, byArea, byScore, byAppliedBy, byWeekday, byHour: Group[],
+  byStage, byCaller, byProfile, byRegion, byArea, byScore, byAppliedBy, byWeekday, byHour: Group[],
   reasons: {
     canceled, rescheduled, rejected: [{key, label, count, share}],     // share = % of that list, one decimal;
                                                                        // key "none" / label "Reason not filled in yet" last
     rescheduleRate: {rescheduled, rounds, since: "2026-11-20"}
   },
-  depth: {ended, avgRounds, endedAfter: [{label: "1 round" | "2 rounds" | "3 or more", count}],
-          daysBetweenRounds: {median, n}, daysToAnswer: {median, n}},
   followUps: [{key: "followed_up" | "not_followed_up", label, rounds, passed, rejected, noAnswer, waiting}]
 }
 ```
 
-- `byStage` in stage order (intro … final), stages with no rounds left out. `byWho`: Self, Caller. `byCaller` and
+- `byStage` in stage order (intro … final), stages with no rounds left out. `byCaller` (only rounds with an assigned caller) and
   `byProfile`: rows with `few` are folded into one "Other callers" / "Other profiles" row with `members` (as
   "Other sites" on the other tab). `byWeekday` Mon–Sun without empty days; `byHour` Morning, Afternoon, Evening.
   `byScore` bands and labels as on the other tab, plus "No score". `byAppliedBy`: Self bid, Bidder bid, Unknown.
 - `followUps`: `followed_up` = held rounds in the period with at least one follow-up. `not_followed_up` = held
   rounds with no follow-up that stayed without a result for 7 days after they ended (still `completed` and ended
   7+ days ago, or `statusAt` 7+ days after the end; a round with no `statusAt` counts only while still `completed`).
-- `depth.ended` counts interviews with a round in the period whose latest round is rejected, no answer, or an offer.
 
 ## App
 
@@ -150,7 +143,7 @@ copying. Reasons tables are count + share bars. Dark mode, phone width.
 
 - `few` at 20 decided rounds (about 300 held rounds exist since Oct 6; 30 would mute most tables).
 - "Waiting" rounds are outside the pass rate.
-- Reschedule rate only from 2026-11-20; days-until-answer only for rounds with `statusAt`.
+- Reschedule rate only from 2026-11-20.
 
 ## Constraints
 

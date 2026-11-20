@@ -59,15 +59,11 @@ def test_catch_alls_and_folded_groups_never_named():
     # two few callers pass everything: folded into Other callers; the catch-all rows (No score, Unknown) sit at 0%
     rows = _many(19, caller=("c2", "Dee")) + _many(5, caller=("c3", "Eve")) + _many(96, "rejected")
     rep, found = _run(rows, 20.0)
-    assert [f["text"] for f in found] == [
-        "Self: 0.0% pass (0 of 96 decided rounds) vs 20.0% overall.",
-        "Caller passes best for who took the round: 100.0% (24 of 24 decided rounds) vs 20.0% overall."]
+    assert found == NONE
     mark_groups(rep, 20.0)
     other = rep["byCaller"][0]
     assert other["key"] == "other" and other["few"] is False and other["mark"] is None
     assert all(m["mark"] is None for m in other["members"])
-    assert [g["mark"] for g in rep["byWho"]] == ["weak", "best"]
-    assert all(g["mark"] is None for by in ("byScore", "byArea", "byRegion", "byAppliedBy", "byProfile") for g in rep[by])
 
 
 def test_top_reason_at_40_percent_of_10_rounds():
@@ -130,5 +126,5 @@ def test_marks_one_best_and_one_weak_per_table():
     mark_groups(rep, 40.0)
     assert [(g["key"], g["mark"]) for g in rep["byScore"]] == [
         ("strong", "best"), ("good", None), ("fair", "weak"), ("weak", None), ("unknown", None)]
-    for by in ("byStage", "byWho", "byWeekday", "byHour"):
+    for by in ("byStage", "byWeekday", "byHour"):
         assert [g["mark"] for g in rep[by] if g["rounds"]] == [None]

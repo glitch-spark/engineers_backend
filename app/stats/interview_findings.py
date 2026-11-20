@@ -6,7 +6,7 @@ from typing import Optional
 from app.stats import conversion_findings
 from app.stats.conversion_findings import CATCH_ALLS, FALLBACK, MAX, _pct
 
-BY = {"byStage": "stage", "byWho": "who took the round", "byCaller": "caller", "byProfile": "profile",
+BY = {"byStage": "stage", "byCaller": "caller", "byProfile": "profile",
       "byRegion": "region", "byArea": "job area", "byScore": "resume score", "byAppliedBy": "who applied",
       "byWeekday": "weekday", "byHour": "time of day"}
 UNNAMED_REASONS = {"none", "no_reason", "other"}

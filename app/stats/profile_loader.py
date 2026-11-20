@@ -9,7 +9,7 @@ from typing import Optional
 
 from app.applications.rows import interview_outcome
 from app.models import Application, Interview
-from app.stats.interview_report import interview_facts
+from app.stats.interview_report import caller_index, interview_facts
 
 _ROW_FIELDS = ("key", "accountId", "ownerId", "appliedAt", "by", "bidStatus", "interviewId", "daysToInterview",
                "furthest", "firstRoundAt", "board", "scoreBand", "score", "area", "profileAgeDays", "bidderId",
@@ -74,8 +74,10 @@ async def _fetch_interviews(start: datetime, end: datetime) -> list[dict]:
             {"interviewId": {"$in": [d["_id"] for d in docs]}}, {f: 1 for f in ("interviewId", "by", "scoreBand", "area")},
     ).to_list(None):
         apps.setdefault(a["interviewId"], a)
-    now = datetime.utcnow()
-    return [interview_facts(Interview.model_validate(d), d["_id"], apps.get(d["_id"]), now) for d in docs]
+    from app.caller_directory import list_directory
+
+    callers, now = caller_index(await list_directory(include_archived=True)), datetime.utcnow()
+    return [interview_facts(Interview.model_validate(d), d["_id"], apps.get(d["_id"]), now, callers) for d in docs]
 
 
 async def load_interview_facts(start: datetime, end: datetime) -> list[dict]:

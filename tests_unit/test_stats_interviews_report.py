@@ -19,6 +19,7 @@ from app.deps import get_current_user
 from app.models import Account, Application, DailyPlan, Interview, InterviewQuestion, UserExtra
 from app.models.bid import Bid
 from app.models.bidder import Bidder
+from app.models.caller import Caller
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import stats
 from app.stats import profile_loader
@@ -30,7 +31,7 @@ pytestmark = [
 Q = "?period=custom&date=2026-10-06&to=2026-10-31"
 GROUP_KEYS = {"key", "label", "rounds", "held", "decided", "passed", "rejected", "noAnswer", "waiting", "canceled",
               "scheduled", "rate", "few", "mark"}
-TABLES = ("byStage", "byWho", "byCaller", "byProfile", "byRegion", "byArea", "byScore", "byAppliedBy", "byWeekday",
+TABLES = ("byStage", "byCaller", "byProfile", "byRegion", "byArea", "byScore", "byAppliedBy", "byWeekday",
           "byHour")
 
 
@@ -42,7 +43,7 @@ def _d(day, hour=15):
 async def db():
     profile_loader.clear_cache()
     await init_beanie(database=AsyncMongoMockClient()["interviews-report-unit"], document_models=[
-        UserExtra, Account, DailyPlan, Interview, InterviewQuestion, Bid, Bidder, WeeklyPlan, Application])
+        UserExtra, Account, DailyPlan, Interview, InterviewQuestion, Bid, Bidder, WeeklyPlan, Application, Caller])
     yield
     profile_loader.clear_cache()
 
@@ -103,7 +104,7 @@ def _blocks(out):
     assert out["summary"]["cards"]["rounds"]["value"] == t["rounds"]
     assert sum(r["count"] for r in out["reasons"]["canceled"]) == t["canceled"]
     assert sum(r["count"] for r in out["reasons"]["rejected"]) >= t["rejected"]
-    return t["rounds"], t["companies"], t["offers"], sum(g["rounds"] for g in out["byCaller"]), out["depth"]["ended"]
+    return t["rounds"], t["companies"], t["offers"], sum(g["rounds"] for g in out["byCaller"])
 
 
 async def test_empty_period_returns_the_full_shape_with_zeros(db):
@@ -127,7 +128,7 @@ async def test_empty_period_returns_the_full_shape_with_zeros(db):
                          "teamRate": None},
             "offers": {"value": 0, "rank": 1, "of": 1}}, "everyone": []},
         "findings": [{"kind": "none", "text": "No clear pattern yet in this period — try a longer date range."}],
-        "byStage": [], "byWho": empty(("self", "Self"), ("caller", "Caller")), "byCaller": [], "byProfile": [],
+        "byStage": [], "byCaller": [], "byProfile": [],
         "byRegion": [], "byArea": [],
         "byScore": empty(("strong", "80+"), ("good", "65–79"), ("fair", "50–64"), ("weak", "Under 50"),
                          ("unknown", "No score")),
@@ -135,10 +136,6 @@ async def test_empty_period_returns_the_full_shape_with_zeros(db):
         "byHour": empty(("morning", "Morning"), ("afternoon", "Afternoon"), ("evening", "Evening")),
         "reasons": {"canceled": [], "rescheduled": [], "rejected": [],
                     "rescheduleRate": {"rescheduled": 0, "rounds": 0, "since": "2026-11-20"}},
-        "depth": {"ended": 0, "avgRounds": None,
-                  "endedAfter": [{"label": "1 round", "count": 0}, {"label": "2 rounds", "count": 0},
-                                 {"label": "3 or more", "count": 0}],
-                  "daysBetweenRounds": {"median": None, "n": 0}, "daysToAnswer": {"median": None, "n": 0}},
         "followUps": [
             {"key": "followed_up", "label": "Followed up", "rounds": 0, "passed": 0, "rejected": 0, "noAnswer": 0,
              "waiting": 0},
@@ -148,15 +145,15 @@ async def test_empty_period_returns_the_full_shape_with_zeros(db):
 
 async def test_scope_and_region_apply_to_every_block(db):
     ana, ben, boss, _ = await _team()
-    # (rounds, companies, offers, caller rounds, ended interviews)
-    assert _blocks((await _get(ana, Q + "&scope=team")).json()) == (8, 5, 1, 1, 4)
-    assert _blocks((await _get(ana, Q)).json()) == (8, 5, 1, 1, 4)  # Whole team is the default
-    assert _blocks((await _get(ana, Q + "&scope=team&region=EU")).json()) == (6, 4, 0, 1, 3)
-    assert _blocks((await _get(ana, Q + "&scope=team&region=US")).json()) == (2, 1, 1, 0, 1)
-    assert _blocks((await _get(ana, Q + "&scope=me")).json()) == (5, 2, 1, 1, 2)
-    assert _blocks((await _get(ana, Q + "&scope=me&region=EU")).json()) == (3, 1, 0, 1, 1)
-    assert _blocks((await _get(ben, Q + "&scope=me")).json()) == (2, 2, 0, 0, 2)  # the archived profile counts
-    assert _blocks((await _get(ana, Q + "&scope=me&region=Latam")).json()) == (0, 0, 0, 0, 0)
+    # (rounds, companies, offers, caller rounds)
+    assert _blocks((await _get(ana, Q + "&scope=team")).json()) == (8, 5, 1, 1)
+    assert _blocks((await _get(ana, Q)).json()) == (8, 5, 1, 1)  # Whole team is the default
+    assert _blocks((await _get(ana, Q + "&scope=team&region=EU")).json()) == (6, 4, 0, 1)
+    assert _blocks((await _get(ana, Q + "&scope=team&region=US")).json()) == (2, 1, 1, 0)
+    assert _blocks((await _get(ana, Q + "&scope=me")).json()) == (5, 2, 1, 1)
+    assert _blocks((await _get(ana, Q + "&scope=me&region=EU")).json()) == (3, 1, 0, 1)
+    assert _blocks((await _get(ben, Q + "&scope=me")).json()) == (2, 2, 0, 0)  # the archived profile counts
+    assert _blocks((await _get(ana, Q + "&scope=me&region=Latam")).json()) == (0, 0, 0, 0)
     me = (await _get(ana, Q + "&scope=me&region=EU")).json()
     assert [g["label"] for g in me["byRegion"]] == ["EU"] and [(g["key"], g["label"]) for g in me["byStage"]] == [
         ("intro", "Intro"), ("tech_round_1", "Tech round 1")]
@@ -250,9 +247,7 @@ async def test_contract_details_the_app_relies_on(db):
     # 3. the not-filled reason row is last
     assert [(r["key"], r["label"], r["count"]) for r in out["reasons"]["rejected"]] == [
         ("pay", "Pay or contract terms", 8), ("none", "Reason not filled in yet", 2)]
-    # 4. always the three labels, in order
-    assert out["depth"]["endedAfter"] == [{"label": "1 round", "count": 10}, {"label": "2 rounds", "count": 0},
-                                          {"label": "3 or more", "count": 1}]
+    assert "depth" not in out and "byWho" not in out  # both sections removed (user, 2026-11-20)
     # 6. / 7.
     assert out["summary"]["cards"]["passRate"]["teamRate"] == 64.3
     assert (await _get(ana, Q + "&scope=me")).json()["summary"]["cards"]["passRate"]["teamRate"] == 64.3
@@ -298,7 +293,7 @@ async def test_interview_on_a_deleted_profile_counts_under_region_all(db):
     await _iv(gone, ben, ("intro", _d(8), "passed"), ("final", _d(12), "rejected", {"statusReason": "pay"}))
     await gone.delete()
     team = (await _get(ana, Q + "&scope=team")).json()
-    assert _blocks(team) == (3, 2, 0, 0, 1)
+    assert _blocks(team) == (3, 2, 0, 0)
     assert [(g["key"], g["label"], g["rounds"]) for g in team["byRegion"]] == [("EU", "EU", 1), ("unknown", "Unknown", 2)]
     assert {e["name"]: e["held"] for e in team["summary"]["everyone"]} == {"Ana": 1, "Ben": 2}
     assert team["summary"]["cards"]["companies"]["value"] == 2
@@ -306,8 +301,29 @@ async def test_interview_on_a_deleted_profile_counts_under_region_all(db):
     assert [(m["key"], m["label"]) for m in profiles] == [(str(gone.id), "Deleted profile"), (profiles[1]["key"], "Alpha")]
     assert all(g["mark"] is None for g in team["byRegion"])
     mine = (await _get(ben, Q + "&scope=me")).json()
-    assert _blocks(mine) == (2, 1, 0, 0, 1) and mine["summary"]["cards"]["rounds"]["value"] == 2
+    assert _blocks(mine) == (2, 1, 0, 0) and mine["summary"]["cards"]["rounds"]["value"] == 2
     # a deleted profile has no region: out of every region view
-    assert _blocks((await _get(ana, Q + "&scope=team&region=EU")).json()) == (1, 1, 0, 0, 0)
-    assert _blocks((await _get(ben, Q + "&scope=me&region=EU")).json()) == (0, 0, 0, 0, 0)
+    assert _blocks((await _get(ana, Q + "&scope=team&region=EU")).json()) == (1, 1, 0, 0)
+    assert _blocks((await _get(ben, Q + "&scope=me&region=EU")).json()) == (0, 0, 0, 0)
     assert [e["name"] for e in (await _get(ben, Q + "&scope=me&region=EU")).json()["summary"]["everyone"]] == ["Ana"]
+
+
+async def test_one_caller_is_one_row_and_unassigned_rounds_are_no_callers(db):
+    ana, nick = await _user("Ana"), await _user("Nicholas")
+    a = await _acct(ana, "Alpha")
+    muh = await Caller(name="Muhammad", nameKey="muhammad").insert()
+
+    def cal(**kw):
+        return {"caller": {"enabled": True, **kw}}
+
+    await _many(a, ana, 1, **cal(callerName="Muhammad", callerId=str(muh.id)))
+    await _many(a, ana, 1, **cal(callerName="Muhammad"))
+    await _many(a, ana, 1, **cal(callerName="Nicholas", callerId=str(nick.id), callerKind="user"))
+    await _many(a, ana, 2, **cal(callerName="nicholas"))
+    await _many(a, ana, 2, **cal(callerName="TBD"))
+    await _many(a, ana, 4)
+    out = (await _get(ana)).json()
+    assert out["totals"]["rounds"] == 11 and sum(g["rounds"] for g in out["byCaller"]) == 5
+    assert [(m["key"], m["label"], m["rounds"]) for m in out["byCaller"][0]["members"]] == [
+        (str(nick.id), "Nicholas", 3), (str(muh.id), "Muhammad", 2)]
+    assert (await _get(nick, Q + "&scope=me")).json()["byCaller"] == []

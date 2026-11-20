@@ -1,4 +1,4 @@
-"""Statistics → Interviews report: outcomes, period rows, groups, reasons, depth, follow-ups and the summary (pure)."""
+"""Statistics → Interviews report: outcomes, period rows, groups, reasons, follow-ups and the summary (pure)."""
 
 import os
 
@@ -38,12 +38,12 @@ def _rnd(stage, at, status, **kw):
     return {"stage": stage, "at": at, "scheduledAt": at, "status": status, **kw}
 
 
-def _facts(*rounds, app=None, account=ACCT, owner=OWNER, **kw):
+def _facts(*rounds, app=None, account=ACCT, owner=OWNER, directory=(), **kw):
     """An interview's facts from its history rounds (the tip mirrors the last one, as saved documents do)."""
     last = rounds[-1]
     iv = Interview.model_validate({"accountId": account, "createdBy": owner, "scheduledAt": last["scheduledAt"],
                                    "stage": last["stage"], "status": last["status"], "stageHistory": list(rounds), **kw})
-    return ir.interview_facts(iv, ObjectId(), app, NOW)
+    return ir.interview_facts(iv, ObjectId(), app, NOW, ir.caller_index(directory))
 
 
 def _rows(*facts, start=START, end=END, accounts=ACCOUNTS):
@@ -58,7 +58,7 @@ def _row(outcome="passed", **kw):
             "area": None, "scoreBand": None, "by": "unknown", "stage": "intro", "at": at,
             "end": at + timedelta(hours=1), "status": status, "reason": None, "caller": None, "reschedules": [],
             "followed": False, "statusAt": None, "outcome": outcome, "latest": True, "firstHeld": False,
-            "offer": False, "ended": False, "heldCount": 1, "gapDays": None, "local": at.replace(tzinfo=UTC), **kw}
+            "offer": False, "local": at.replace(tzinfo=UTC), **kw}
 
 
 def _many(n, outcome="passed", **kw):
@@ -109,7 +109,7 @@ def test_round_counts_by_its_own_date_but_is_judged_on_the_whole_interview():
                _rnd("final", _at(11, 25), "scheduled"))
     rows = _rows(f)  # intro before the period, final after it
     assert [(r["stage"], r["outcome"]) for r in rows] == [("tech_round_1", "passed")]
-    assert rows[0]["firstHeld"] is False and rows[0]["heldCount"] == 2
+    assert rows[0]["firstHeld"] is False
     assert _rows(f, start=_at(10, 10), end=_at(10, 10) + timedelta(seconds=1)) != []
     assert _rows(f, start=_at(10, 9), end=_at(10, 10)) == []  # [start, end)
 
@@ -154,15 +154,51 @@ def test_offer_is_a_passed_final():
     assert ir.report(rows, NOW)["totals"]["offers"] == 1
 
 
-def test_caller_round_needs_an_enabled_named_caller():
-    def who(caller):
-        return _rows(_facts(_rnd("intro", _at(11, 3), "passed", **({"caller": caller} if caller else {}))))[0]["caller"]
+USER_NICK, LIST_MUH, LIST_PIETRO = "5f0000000000000000000001", "5f0000000000000000000002", "5f0000000000000000000003"
+DIRECTORY = [{"_id": USER_NICK, "kind": "user", "name": "Nicholas", "color": "sky", "archived": False},
+             {"_id": LIST_MUH, "kind": "external", "name": "Muhammad", "color": "sky", "archived": False},
+             {"_id": LIST_PIETRO, "kind": "external", "name": "Pietro", "color": "sky", "archived": True}]
 
-    assert who(None) is None
-    assert who({"enabled": False, "callerName": "Cal", "callerId": "c1"}) is None
-    assert who({"enabled": True, "callerName": "TBD"}) is None
-    assert who({"enabled": True, "callerName": "Cal", "callerId": "c1"}) == ("c1", "Cal")
-    assert who({"enabled": True, "callerName": " Cal "}) == ("name:cal", "Cal")
+
+def _who(caller, directory=DIRECTORY):
+    row = _rows(_facts(_rnd("intro", _at(11, 3), "passed", **({"caller": caller} if caller else {})),
+                       directory=directory))[0]
+    return row["caller"]
+
+
+def test_only_rounds_with_an_assigned_caller_are_a_callers():
+    assert _who(None) is None
+    assert _who({"enabled": False, "callerName": "Muhammad", "callerId": LIST_MUH}) is None
+    assert _who({"enabled": True, "callerName": "TBD"}) is None  # asked for, nobody named yet
+    assert _who({"enabled": True, "callerName": "  "}) is None
+    assert _who({"enabled": True, "callerName": "TBD", "callerId": LIST_MUH}) == (LIST_MUH, "Muhammad")
+
+
+def test_one_caller_stored_three_ways_is_one_person():
+    by_list = {"enabled": True, "callerName": "Muhammad", "callerId": LIST_MUH}
+    typed = {"enabled": True, "callerName": " mohammed "}  # a typed spelling (caller_stats.ALIASES)
+    as_user = {"enabled": True, "callerName": "Nick", "callerId": USER_NICK, "callerKind": "user"}
+    assert _who(by_list) == _who(typed) == (LIST_MUH, "Muhammad")
+    assert _who(as_user) == _who({"enabled": True, "callerName": "NICHOLAS"}) == (USER_NICK, "Nicholas")
+    assert _who({"enabled": True, "callerName": "pietro"}) == (LIST_PIETRO, "Pietro")  # archived: still him
+    # a platform user and a list caller of one name are one person too (the list caller's row)
+    both = DIRECTORY + [{"_id": "5f00000000000000000000aa", "kind": "external", "name": "nicholas ", "color": "sky",
+                         "archived": False}]
+    assert _who(as_user, both) == _who({"enabled": True, "callerName": "Nicholas"}, both) == (
+        "5f00000000000000000000aa", "nicholas ")
+
+
+def test_callers_outside_the_directory_merge_by_name_and_stay_apart_from_others():
+    gone = {"enabled": True, "callerName": "Zed", "callerId": "5f00000000000000000000ff"}
+    assert _who(gone) == ("name:zed", "Zed") and _who({"enabled": True, "callerName": "zed "})[0] == "name:zed"
+    assert _who({"enabled": True, "callerName": "TBD", "callerId": "5f00000000000000000000ff"}) == (
+        "5f00000000000000000000ff", "Removed caller")
+    stored = [{"callerName": "Muhammad", "callerId": LIST_MUH}, {"callerName": "Muhammad"}, {"callerName": "Mohammad"},
+              {"callerName": "Nicholas", "callerId": USER_NICK, "callerKind": "user"}, {"callerName": "Nicholas"}]
+    rows = [_row(caller=_who({"enabled": True, **c})) for c in stored]
+    members = ir.report(rows, NOW)["byCaller"][0]["members"]
+    assert [(m["key"], m["label"], m["rounds"]) for m in members] == [
+        (LIST_MUH, "Muhammad", 3), (USER_NICK, "Nicholas", 2)]
 
 
 def test_bid_side_keys_from_the_applications_row_then_the_interview():
@@ -215,14 +251,15 @@ def test_stage_who_weekday_hour_region_area_applied_by_tables():
         return [(g["key"], g["label"], g["rounds"]) for g in rep[name]]
 
     assert table("byStage") == [("intro", "Intro", 2), ("tech_round_2", "Tech round 2", 1), ("final", "Final", 1)]
-    assert table("byWho") == [("self", "Self", 3), ("caller", "Caller", 1)]
+    assert "byWho" not in rep  # Self vs caller removed (user, 2026-11-20)
+    assert table("byCaller") == [("other", "Other callers", 1)]
     assert table("byWeekday") == [("mon", "Mon", 1), ("wed", "Wed", 2), ("sun", "Sun", 1)]
     assert table("byHour") == [("morning", "Morning", 1), ("afternoon", "Afternoon", 2), ("evening", "Evening", 1)]
     assert table("byRegion") == [("EU", "EU", 1), ("US", "US", 2), ("unknown", "Unknown", 1)]
     assert table("byArea") == [("Backend", "Backend", 1), ("unknown", "Unknown", 3)]
     assert table("byAppliedBy") == [("self", "Self bid", 1), ("bidder", "Bidder bid", 1), ("unknown", "Unknown", 2)]
     empty = ir.report([], NOW)
-    assert [g["key"] for g in empty["byWho"]] == ["self", "caller"] and empty["byStage"] == empty["byWeekday"] == []
+    assert empty["byStage"] == empty["byWeekday"] == empty["byCaller"] == []
     assert [g["key"] for g in empty["byAppliedBy"]] == ["self", "bidder"]
 
 
@@ -273,49 +310,6 @@ def test_reschedule_rate_ignores_rounds_before_the_log_started():
     assert rate == {"rescheduled": 2, "rounds": 4, "since": "2026-11-20"}
     assert ir.report([], NOW)["reasons"] == {"canceled": [], "rescheduled": [], "rejected": [],
                                              "rescheduleRate": {"rescheduled": 0, "rounds": 0, "since": "2026-11-20"}}
-
-
-# ---- depth ----
-def test_depth_counts_ended_interviews_by_held_rounds():
-    one = _facts(_rnd("intro", _at(11, 3), "rejected", statusReason="pay"))
-    two = _facts(_rnd("intro", _at(10, 10), "passed"), _rnd("tech_round_1", _at(10, 20), "completed"))  # no answer
-    offer = _facts(_rnd("intro", _at(10, 10), "passed"), _rnd("tech_round_1", _at(10, 12), "canceled"),
-                   _rnd("tech_round_2", _at(10, 14), "passed"), _rnd("panel", _at(10, 16), "passed"),
-                   _rnd("final", _at(10, 20), "passed"))
-    open_ = _facts(_rnd("intro", _at(11, 3), "passed"), _rnd("tech_round_1", _at(11, 18), "completed"))  # waiting
-    passed_tip = _facts(_rnd("intro", _at(11, 3), "passed"))  # passed, not a final: not ended
-    d = ir.report(_rows(one, two, offer, open_, passed_tip), NOW)["depth"]
-    assert d["ended"] == 3 and d["avgRounds"] == 2.3  # 1, 2 and 4 held rounds
-    assert d["endedAfter"] == [{"label": "1 round", "count": 1}, {"label": "2 rounds", "count": 1},
-                               {"label": "3 or more", "count": 1}]
-    # one interview, counted once, by all its held rounds even when only one round is in the period
-    late = ir.report(_rows(two, start=_at(10, 15)), NOW)["depth"]
-    assert late["ended"] == 1 and late["avgRounds"] == 2.0
-
-
-def test_days_between_rounds_skip_canceled_and_need_the_later_round_in_the_period():
-    f = _facts(_rnd("intro", _at(10, 1), "passed"), _rnd("tech_round_1", _at(10, 8), "canceled"),
-               _rnd("tech_round_2", _at(10, 11, 3), "passed"), _rnd("final", _at(10, 13, 3), "scheduled"))
-    g = _facts(_rnd("intro", _at(10, 20), "passed"), _rnd("final", _at(10, 24), "passed"))
-    d = ir.report(_rows(f, g), NOW)["depth"]["daysBetweenRounds"]
-    assert d == {"median": 4.0, "n": 3}  # 9.5 (Oct 1 → Oct 11, 03:00), 2 and 4 days
-    assert ir.report([], NOW)["depth"] == {
-        "ended": 0, "avgRounds": None,
-        "endedAfter": [{"label": "1 round", "count": 0}, {"label": "2 rounds", "count": 0},
-                       {"label": "3 or more", "count": 0}],
-        "daysBetweenRounds": {"median": None, "n": 0}, "daysToAnswer": {"median": None, "n": 0}}
-
-
-def test_days_to_answer_uses_only_rounds_with_status_at():
-    def r(status, days, **kw):
-        at = _at(11, 2)
-        return _rnd("intro", at, status, endsAt=at + timedelta(hours=1),
-                    **({"statusAt": at + timedelta(hours=1, days=days)} if days is not None else {}), **kw)
-
-    rows = _rows(_facts(r("passed", 2)), _facts(r("rejected", 5, statusReason="pay")), _facts(r("passed", None)),
-                 _facts(r("rejected", 9, statusReason="no_answer")),   # gave up waiting: not an answer
-                 _facts(r("completed", 0)))                             # marked held: not an answer
-    assert ir.report(rows, NOW)["depth"]["daysToAnswer"] == {"median": 3.5, "n": 2}
 
 
 # ---- follow-ups ----

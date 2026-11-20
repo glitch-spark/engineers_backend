@@ -1,12 +1,12 @@
-"""Statistics → Interviews report: round outcomes, group tables, reasons, depth, follow-ups and the summary (pure, no
+"""Statistics → Interviews report: round outcomes, group tables, reasons, follow-ups and the summary (pure, no
 DB). Definitions and the response shape: docs/superpowers/specs/2026-11-20-interview-statistics-design.md."""
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
-from statistics import mean, median
 from typing import Callable, Optional
 
+from app.caller_stats import ALIASES, name_key, typed_caller
 from app.interview_normalize import _utc_naive, normalize_stage
 from app.interview_reasons import CANCEL_REASONS, REJECT_REASONS
 from app.interview_rounds import merged_rounds
@@ -40,9 +40,35 @@ def outcome(status: str, reason: Optional[str], latest: bool, end: datetime, now
     return "no_answer" if end <= now - NO_ANSWER_AFTER else "waiting"
 
 
-def interview_facts(iv, iv_id, app: Optional[dict], now: datetime) -> dict:
+def caller_index(directory: list) -> tuple[dict, dict]:
+    """The caller directory (caller_directory.list_directory, archived callers too) by id and by name key. A platform
+    user and a list caller of one name are one person: the list caller."""
+    return {e["_id"]: e for e in directory}, {name_key(e["name"]): e for e in directory}
+
+
+def caller_person(caller, index: tuple[dict, dict]) -> Optional[tuple]:
+    """(key, label) of the person a round's caller is, or None when no caller is assigned (caller off, or on with no
+    id and a blank / TBD name). One person whatever the way the round stores them: an id of the caller list, an id of
+    a platform user, or a typed name (caller_stats.typed_caller: aliases too) all resolve to the directory entry of
+    that name, labelled with its current name. A caller no longer in the directory is keyed by the typed name."""
+    if caller is None or not caller.enabled:
+        return None
+    by_id, by_name = index
+    name = " ".join((caller.callerName or "").split())
+    name = "" if name.upper() == "TBD" else name
+    entry = by_id.get(caller.callerId) if caller.callerId else None
+    entry = typed_caller(entry["name"] if entry else name, by_name) or entry
+    if entry:
+        return entry["_id"], entry["name"]
+    if name:
+        return f"name:{ALIASES.get(name_key(name), name_key(name))}", name
+    return (caller.callerId, "Removed caller") if caller.callerId else None
+
+
+def interview_facts(iv, iv_id, app: Optional[dict], now: datetime, callers: tuple[dict, dict] = ({}, {})) -> dict:
     """What the report needs of one interview (the cached load): its countable, dated rounds in history order and the
-    bid-side keys, from its `applications` row (`app`) falling back to resumeLink / fitScore / appliedBy."""
+    bid-side keys, from its `applications` row (`app`) falling back to resumeLink / fitScore / appliedBy. `callers`:
+    `caller_index` of the caller directory."""
     from app.routers.interviews import round_ends_at  # lazy: the routers import app.stats
 
     entries = {e.id: e for e in iv.stageHistory or []}
@@ -51,14 +77,12 @@ def interview_facts(iv, iv_id, app: Optional[dict], now: datetime) -> dict:
         at, stage = _utc_naive(r.at), normalize_stage(r.stage)
         if stage not in _ROUND_LABELS or at is None:  # AI interview, home assessment, unknown
             continue
-        e, c = entries.get(r.entry_id), r.caller
-        name = (getattr(c, "callerName", None) or "").strip()
-        named = c is not None and c.enabled and bool(c.callerId or name not in ("", "TBD"))
+        e = entries.get(r.entry_id)
         rounds.append({
             "stage": stage, "at": at, "end": _utc_naive(round_ends_at(at, _utc_naive(e.endsAt if e else iv.endsAt))),
             "status": r.status or ("scheduled" if at > now else "completed"),
             "reason": e.statusReason if e else None,
-            "caller": (c.callerId or f"name:{name.lower()}", name or "Caller") if named else None,
+            "caller": caller_person(r.caller, callers),
             "reschedules": [x.reason for x in e.reschedules] if e else [],
             "followed": bool(e and e.followUps),
             "statusAt": _utc_naive(e.statusAt) if e else None,
@@ -76,7 +100,7 @@ def interview_facts(iv, iv_id, app: Optional[dict], now: datetime) -> dict:
 def period_rows(interviews: list[dict], accounts: dict, start: datetime, end: datetime, now: datetime, tz,
                 deleted: bool = False) -> list[dict]:
     """One row per round scheduled in [start, end) on a profile of `accounts` (conversion_scope's shape). A round's
-    outcome, first-held and ended flags come from the whole interview, whatever the period. `deleted`: `accounts`
+    outcome and first-held flag come from the whole interview, whatever the period. `deleted`: `accounts`
     is every profile, so an interview on none of them is on a deleted one and counts, with no region."""
     out = []
     for iv in interviews:
@@ -89,15 +113,11 @@ def period_rows(interviews: list[dict], accounts: dict, start: datetime, end: da
         for r in rs:
             r["offer"] = r["stage"] == "final" and r["outcome"] == "passed"
         held = [r for r in rs if r["outcome"] in HELD]
-        live = [r for r in rs if r["outcome"] != "canceled"]
-        gaps = {id(b): (b["at"] - a["at"]).total_seconds() / 86400 for a, b in zip(live, live[1:]) if b["at"] > a["at"]}
-        ended = rs[-1]["outcome"] in ("rejected", "no_answer") or rs[-1]["offer"]
         for r in rs:
             if start <= r["at"] < end:
                 out.append({**r, "iid": iv["id"], "accountId": iv["accountId"], "ownerId": iv["ownerId"],
                             "profile": acct["name"], "region": acct["region"], "area": iv["area"],
                             "scoreBand": iv["scoreBand"], "by": iv["by"], "firstHeld": bool(held) and r is held[0],
-                            "ended": ended, "heldCount": len(held), "gapDays": gaps.get(id(r)),
                             "local": r["at"].replace(tzinfo=timezone.utc).astimezone(tz)})
     return out
 
@@ -150,10 +170,6 @@ def _reasons(keys: list, labels: dict) -> list[dict]:
             for k in order]
 
 
-def _median(values: list[float]) -> dict:
-    return {"median": round(median(values), 1) if values else None, "n": len(values)}
-
-
 def _part(hour: int) -> str:
     return "morning" if hour < 12 else "afternoon" if hour < 17 else "evening"
 
@@ -162,9 +178,6 @@ def report(rows: list[dict], now: datetime) -> dict:
     """Everything of the response computed from the scope's period rows, but `window`, `summary` and `findings`.
     A group of rounds whose breakdown value is missing has key "unknown" (the app's contract)."""
     logged = [r for r in rows if r["local"].date() >= RESCHEDULE_LOG_START]
-    ended = list({r["iid"]: r["heldCount"] for r in rows if r["ended"]}.values())
-    answered = [max(0.0, (r["statusAt"] - r["end"]).total_seconds() / 86400) for r in rows
-                if r["statusAt"] and r["status"] in ("passed", "rejected") and r["outcome"] != "no_answer"]
     held = [r for r in rows if r["outcome"] in HELD]
 
     def unanswered_a_week(r: dict) -> bool:
@@ -177,7 +190,6 @@ def report(rows: list[dict], now: datetime) -> dict:
     return {
         "totals": {"key": "all", "label": "All rounds", **_totals(rows), "mark": None},
         "byStage": _groups(rows, lambda r: r["stage"], list(_ROUND_LABELS.items()), skip_empty=True),
-        "byWho": _groups(rows, lambda r: "caller" if r["caller"] else "self", [("self", "Self"), ("caller", "Caller")]),
         "byCaller": _folded([r for r in rows if r["caller"]], lambda r: r["caller"][0], lambda r: r["caller"][1],
                             "Other callers"),
         "byProfile": _folded(rows, lambda r: r["accountId"], lambda r: r["profile"], "Other profiles"),
@@ -200,14 +212,6 @@ def report(rows: list[dict], now: datetime) -> dict:
                                   and r["outcome"] in ("rejected", "no_answer")], REJECT_REASONS),
             "rescheduleRate": {"rescheduled": sum(1 for r in logged if r["reschedules"]), "rounds": len(logged),
                                "since": RESCHEDULE_LOG_START.isoformat()},
-        },
-        "depth": {
-            "ended": len(ended), "avgRounds": round(mean(ended), 1) if ended else None,
-            "endedAfter": [{"label": "1 round", "count": sum(1 for n in ended if n == 1)},
-                           {"label": "2 rounds", "count": sum(1 for n in ended if n == 2)},
-                           {"label": "3 or more", "count": sum(1 for n in ended if n >= 3)}],
-            "daysBetweenRounds": _median([r["gapDays"] for r in rows if r["gapDays"] is not None]),
-            "daysToAnswer": _median(answered),
         },
         "followUps": [{"key": k, "label": label, **{f: v for f, v in _counts(rs).items()
                                                     if f in ("rounds", "passed", "rejected", "noAnswer", "waiting")}}
