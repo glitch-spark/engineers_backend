@@ -193,16 +193,15 @@ async def test_profiles_scope_profile_and_team(db):
     assert (await _get(ana, "profiles", Q + f"&scope=profile&profile={ObjectId()}")).status_code == 404
 
 
-async def test_timing_team_scope_has_no_bidders(db):
+async def test_timing_scopes_you_and_team(db):
     ana, ben, _ = await _users()
     bob = await Bidder(createdBy=ana.id, name="Bob", rate=1, screenshotFolderUrl="u").insert()
     await _rows(await _acct(ana, "Alpha"), ana, 5, by="bidder", bidderId=bob.id)
     await _rows(await _acct(ben, "BenEu"), ben, 7)
     me = (await _get(ana, "timing")).json()
-    assert [b["name"] for b in me["bidders"]] == ["Bob"]
+    assert "bidders" not in me  # bidder quality removed (user, 2026-11-19)
     assert sum(g["you"]["bids"] for g in me["weekday"]) == 5 and sum(g["team"]["bids"] for g in me["weekday"]) == 12
     team = (await _get(ana, "timing", Q + "&scope=team")).json()
-    assert team["bidders"] == []
     assert sum(g["you"]["bids"] for g in team["weekday"]) == 12 == sum(g["team"]["bids"] for g in team["weekday"])
 
 
