@@ -79,9 +79,12 @@ async def _profile_regions() -> tuple[dict, int]:
     return regions, sum(1 for r in regions.values() if not r)
 
 
-async def bidder_bids(user_ids: list, start: date, end: date, region: Region, regions: dict) -> dict:
+async def bidder_bids(
+    user_ids: list, start: date, end: date, region: Region, regions: dict, by_profile: Optional[dict] = None,
+) -> dict:
     """(Bid Track day, owner id) → approved + pending bids of the owners' bidders (archived included) over
-    [start, end], in the selected region unless `all` (the bidder's profile region)."""
+    [start, end], in the selected region unless `all` (the bidder's profile region). With `by_profile`, also fills
+    (profile id, Bid Track day) → bids."""
     from app.bids.performance import day_counts
     from app.bids.windows import schedule_from_settings
     from app.models.bidder import Bidder
@@ -90,10 +93,14 @@ async def bidder_bids(user_ids: list, start: date, end: date, region: Region, re
     if region != "all":
         bidders = [b for b in bidders if b.profileId and regions.get(b.profileId) == region]
     owner = {str(b.id): b.createdBy for b in bidders}
+    profile = {str(b.id): b.profileId for b in bidders}
     out: dict = defaultdict(int)
     for (bid, day), (approved, pending, _rejected) in (await day_counts(bidders, start, end, schedule_from_settings())).items():
         if approved + pending:
             out[(day, owner[bid])] += approved + pending
+            if by_profile is not None and profile[bid]:
+                key = (str(profile[bid]), day)
+                by_profile[key] = by_profile.get(key, 0) + approved + pending
     return dict(out)
 
 
@@ -109,23 +116,26 @@ async def bid_records_start() -> Optional[date]:
 
 
 async def counts(
-    user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None,
+    user_ids: list, start: date, end: date, region: Region, regions: dict, days: Optional[dict] = None, logged_only: bool = True,
 ) -> dict:
     """userId → [bids, interviews, bidder bids, caller interviews] over the local days [start, end], in the selected
     region unless `all`. Bids are self + bidder (see the module docstring); interviews are the rounds held, of which
     the caller ones had an enabled caller. With `days`, also fills
-    (day, userId) → [self bids, bidder bids, self interviews, caller interviews] for the per-user charts."""
+    (day, userId) → [self bids, bidder bids, self interviews, caller interviews] for the per-user charts.
+    `logged_only=False` also counts self bids of days not yet followed up (every stored day)."""
     from app.dashboard_stats import app_tz, local_day_start_utc
     from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
     from app.models import DailyPlan
 
     out: dict = defaultdict(lambda: [0, 0, 0, 0])
     field = _BID_FIELD.get(region)
-    plans = await DailyPlan.find({
+    query = {
         "userId": {"$in": user_ids},
         "date": {"$gte": datetime(start.year, start.month, start.day), "$lte": datetime(end.year, end.month, end.day)},
-        "loggedAt": {"$ne": None},  # a goal-only day hasn't been followed up: no bids yet (plan_auto.weekly_done)
-    }).to_list()
+    }
+    if logged_only:
+        query["loggedAt"] = {"$ne": None}  # a goal-only day hasn't been followed up: no bids yet (plan_auto.weekly_done)
+    plans = await DailyPlan.find(query).to_list()
     for p in plans:
         own = getattr(p.done, field) if field else p.done.bidsSelf
         out[p.userId][0] += own

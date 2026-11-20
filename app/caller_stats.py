@@ -82,19 +82,19 @@ def _brief(rounds: list[dict]) -> dict:
     return {"done": s["done"], "passRate": s["passRate"]}
 
 
-async def caller_stats(period: Period, day: date, region: Region, until: Optional[date] = None,
-                       now: Optional[datetime] = None) -> dict:
+async def collect_rounds(start: date, end: date, region: Region) -> tuple[list[dict], list[dict]]:
+    """(caller_rounds, self_rounds) held on a local day of start..end, in the region of the interview's profile.
+    Every row has result, group, day, engineerId (the interview's owner); caller rows also interviewId, roundId,
+    callerId, callerName, roundDate, company, stage."""
     from app.dashboard_stats import app_tz, local_day_start_utc
     from app.interview_rounds import _ROUND_COUNT_EXCLUDED, _breakdown_group, merged_rounds
-    from app.models import Interview, UserExtra
+    from app.models import Interview
     from app.models.caller import Caller
 
     tz = app_tz()
-    start, end = window(period, day, until)
     first = local_day_start_utc(start, tz)
     last = local_day_start_utc(end + timedelta(days=1), tz) - timedelta(microseconds=1)
     regions, _ = await _profile_regions()
-    directory = await list_directory(include_archived=True)
     by_key = {c.nameKey: c for c in await Caller.find_all().to_list()}
 
     caller_rounds, self_rounds = [], []
@@ -111,7 +111,7 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
             held_day = held.astimezone(tz).date()
             if not start <= held_day <= end:
                 continue
-            row = {"result": round_result(rd.status), "group": group, "day": held_day}
+            row = {"result": round_result(rd.status), "group": group, "day": held_day, "engineerId": iv.createdBy}
             caller = rd.caller
             if caller is None or not getattr(caller, "enabled", False):
                 self_rounds.append(row)
@@ -120,9 +120,19 @@ async def caller_stats(period: Period, day: date, region: Region, until: Optiona
                 "interviewId": str(iv.id), "roundId": rd.entry_id,
                 "callerId": _caller_id(caller, by_key),
                 "callerName": (caller.callerName or "").strip(), "roundDate": _iso(held),
-                "company": (iv.companyName or "").strip(), "stage": rd.stage, "engineerId": iv.createdBy,
+                "company": (iv.companyName or "").strip(), "stage": rd.stage,
             })
             caller_rounds.append(row)
+    return caller_rounds, self_rounds
+
+
+async def caller_stats(period: Period, day: date, region: Region, until: Optional[date] = None,
+                       now: Optional[datetime] = None) -> dict:
+    from app.models import UserExtra
+
+    start, end = window(period, day, until)
+    directory = await list_directory(include_archived=True)
+    caller_rounds, self_rounds = await collect_rounds(start, end, region)
 
     team = summary(caller_rounds)
     rows = _caller_rows(directory, caller_rounds, team["passRate"])

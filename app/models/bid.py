@@ -64,4 +64,5 @@ class Bid(TimestampedDocument):
             IndexModel([("ownerId", 1), ("firstAt", 1)]),
             IndexModel([("bidderId", 1), ("firstAt", 1)]),
             IndexModel([("status", 1), ("firstAt", 1)]),
+            IndexModel([("updatedAt", 1)]),
         ]

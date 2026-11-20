@@ -33,6 +33,7 @@ STALE_INDEXES: dict[str, list[str]] = {
 
 from app.models import (
     Account,
+    Application,
     AiReviewRun,
     AiUsageEvent,
     AnalyzeChatLog,
@@ -107,6 +108,7 @@ DOCUMENT_MODELS = [
     ResumePromptEval,
     AiUsageEvent,
     Caller,
+    Application,
 ]
 
 
@@ -331,12 +333,33 @@ async def _migrate_run_retention(database) -> None:
         log.warning("job-apply retention back-fill failed: %s", exc)
 
 
+async def _cache_build_info(database) -> None:
+    """Beanie asks the server version once per model (72 round trips); answer it from one call."""
+    info = await database.command({"buildInfo": 1})
+    command = database.command
+
+    async def cached(cmd, *args, **kwargs):
+        return info if cmd == {"buildInfo": 1} else await command(cmd, *args, **kwargs)
+
+    database.command = cached
+
+
+def fast_start() -> bool:
+    """DB_FAST_START=1: start against an already-migrated database without the startup writes (slow links)."""
+    return os.environ.get("DB_FAST_START") == "1"
+
+
 async def init_db():
     global _client
     uri = os.environ["MONGODB_URI"]
     client = AsyncIOMotorClient(uri)
     _client = client
     database = client.get_default_database()
+    await _cache_build_info(database)
+    if fast_start():
+        # ponytail: local dev only — skips migrations, index builds and seeds (the deployed backend runs them).
+        await init_beanie(database=database, document_models=DOCUMENT_MODELS, skip_indexes=True)
+        return client
     await _migrate_log_filekey(database)
     await _migrate_tailored_map(database)
     await _drop_stale_indexes(database)

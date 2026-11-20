@@ -173,6 +173,7 @@ async def test_bid_indexes(db):
         ([("ownerId", 1), ("firstAt", 1)], False),
         ([("bidderId", 1), ("firstAt", 1)], False),
         ([("status", 1), ("firstAt", 1)], False),
+        ([("updatedAt", 1)], False),
     ])
 
 
