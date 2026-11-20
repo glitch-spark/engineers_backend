@@ -68,7 +68,8 @@ async def test_candidates_skip_tailored_no_jd_scored_and_old(db):
     await add_iv(db, {"kind": "none", "jobDescription": "x"}, fitScore={"total": 50, "band": "fair"})
     await add_iv(db, {"kind": "none", "jobDescription": "x"}, at=datetime(2026, 9, 1))
     out = await sif.score_interview_fit(False, SINCE)
-    assert out == {"candidates": 2, "byKind": {"none": 1, "uploaded": 1}, "scored": 0, "noResume": 0, "unscorable": 0}
+    assert out == {"candidates": 2, "byKind": {"none": 1, "uploaded": 1}, "scored": 0, "copied": 0, "noResume": 0,
+                   "unscorable": 0}
     assert db.calls == []  # dry run: no scoring, no LLM cost
     assert await db["interviews"].count_documents({"fitScore": {"$exists": True}}) == 1
 
@@ -81,8 +82,8 @@ async def test_apply_stores_fit_score_from_the_right_resume_and_is_idempotent(db
     fixed_id = await add_iv(db, {"kind": "fixed", "resumeJobId": fork, "jobDescription": "JD fixed"})
     junk_id = await add_iv(db, {"kind": "none", "jobDescription": "junk page"})
     out = await sif.score_interview_fit(True, SINCE)
-    assert out == {"candidates": 4, "byKind": {"none": 2, "uploaded": 1, "fixed": 1}, "scored": 3, "noResume": 0,
-                   "unscorable": 1}
+    assert out == {"candidates": 4, "byKind": {"none": 2, "uploaded": 1, "fixed": 1}, "scored": 3, "copied": 0,
+                   "noResume": 0, "unscorable": 1}
     assert sorted(c[:2] for c in db.calls) == [("JD fixed", "fork text"), ("JD none", "new base"),
                                                ("JD up", "uploaded one"), ("junk page", "new base")]
     assert {c[2] for c in db.calls} == {OWN}  # scored for the profile's owner
@@ -114,3 +115,18 @@ async def test_scoring_timeout_or_error_is_unscorable(db, monkeypatch):
     await add_iv(db, {"kind": "none", "jobDescription": "boom"})
     out = await sif.score_interview_fit(True, SINCE)
     assert out["unscorable"] == 2 and out["scored"] == 0
+
+
+async def test_link_score_copied_without_scoring_and_write_bumps_updated_at(db):
+    fork = ObjectId()
+    await db["resumeapplications"].insert_one({"_id": fork, "accountId": ACC, "plainText": "fork text"})
+    copied = await add_iv(db, {"kind": "fixed", "resumeJobId": fork, "jobDescription": "JD fixed",
+                               "score": {"total": 88, "band": "strong", "knockouts": [], "missing": ["go"]}})
+    scored = await add_iv(db, {"kind": "none", "jobDescription": "JD none"})
+    dry = await sif.score_interview_fit(False, SINCE)
+    assert dry["copied"] == 1 and await fit(db, copied) is None  # dry run writes nothing
+    out = await sif.score_interview_fit(True, SINCE)
+    assert out["copied"] == 1 and out["scored"] == 1 and [c[0] for c in db.calls] == ["JD none"]
+    assert await fit(db, copied) == {"total": 88, "band": "strong"}
+    for i in (copied, scored):  # so the incremental applications sync picks the interview up
+        assert (await db["interviews"].find_one({"_id": i}))["updatedAt"] > WHEN

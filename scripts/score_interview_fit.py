@@ -5,9 +5,9 @@
 
 Candidates: interviews (created or scheduled since `--since`) linked as fixed / uploaded / none, with a job description
 on the link and no `fitScore` yet. The resume scored: a fixed link's fork text (resumeapplications.plainText, or its
-retention archive); an uploaded link's profile resume (Account.resumes[id == resumeLink.resumeId].markdown); else the
+retention archive); a link that already carries a score (resumeLink.score) is copied as is (`copied`, no LLM); an uploaded link's profile resume (Account.resumes[id == resumeLink.resumeId].markdown); else the
 profile's latest uploaded resume (Account.resumes, max uploadedAt). Scored like a Resume Generator resume
-(`tailored_score.score_manual`, for the profile's owner) and stored as `fitScore: {total, band}`; the applications
+(`tailored_score.score_manual`, for the profile's owner) and stored as `fitScore: {total, band}` with `updatedAt` bumped; the applications
 sync gives it to the matched row when that row has no tailored score. Idempotent: scored interviews are skipped, an
 unscorable one is retried next run. Connects without app.db.init_db, like scripts/build_applications.py.
 """
@@ -56,15 +56,26 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
         "$or": [{"createdAt": {"$gte": since_dt}}, {"scheduledAt": {"$gte": since_dt}}],
     }, {"accountId": 1, "resumeLink": 1}) if d["resumeLink"]["jobDescription"].strip()]
     counts = {"candidates": len(cands), "byKind": dict(Counter(d["resumeLink"]["kind"] for d in cands)),
-              "scored": 0, "noResume": 0, "unscorable": 0}
+              "scored": 0, "copied": 0, "noResume": 0, "unscorable": 0}
     accounts = {a["_id"]: a async for a in Account.get_motor_collection().find(
         {"_id": {"$in": list({d["accountId"] for d in cands})}}, {"resumes": 1, "createdBy": 1})}
     owners = {o.id: o for o in await UserExtra.find(
         {"_id": {"$in": list({a.get("createdBy") for a in accounts.values()} - {None})}}).to_list()}
     sem = asyncio.Semaphore(CONCURRENCY)
 
+    async def write(d: dict, total, band) -> None:
+        # updatedAt bumped so the incremental applications sync picks the interview up
+        await coll.update_one({"_id": d["_id"], "fitScore": {"$exists": False}},
+                              {"$set": {"fitScore": {"total": total, "band": band}, "updatedAt": datetime.utcnow()}})
+
     async def one(d: dict) -> None:
         link, account = d["resumeLink"], accounts.get(d["accountId"]) or {}
+        linked = link.get("score") or {}  # a TailoredMatch dict already scored when linked: no LLM call needed
+        if linked.get("total") is not None:
+            if apply:
+                await write(d, linked["total"], linked.get("band"))
+            counts["copied"] += 1
+            return
         async with sem:
             text = await _resume_text(link, account)
             if not text.strip():
@@ -81,8 +92,7 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
         if m is None:
             counts["unscorable"] += 1
             return
-        await coll.update_one({"_id": d["_id"], "fitScore": {"$exists": False}},
-                              {"$set": {"fitScore": {"total": m.total, "band": m.band}}})
+        await write(d, m.total, m.band)
         counts["scored"] += 1
 
     await asyncio.gather(*(one(d) for d in cands))
