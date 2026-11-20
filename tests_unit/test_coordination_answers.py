@@ -153,8 +153,10 @@ def replaced(rec) -> list[dict]:
     return [p for _, p in rec.replies if p.get("replace_original") is True]
 
 
-def submission(view: dict, *, note=None, date=None, time=None) -> dict:
+def submission(view: dict, *, note=None, date=None, time=None, reason=None) -> dict:
     values = {"note": {"note_input": {"type": "plain_text_input", "value": note}}}
+    if reason is not None:
+        values["reason"] = {"reason_input": {"type": "static_select", "selected_option": {"value": reason}}}
     if view["callback_id"] == "coord_reschedule":
         values["date"] = {"date_input": {"type": "datepicker", "selected_date": date}}
         values["time"] = {"time_input": {"type": "timepicker", "selected_time": time}}
@@ -518,6 +520,46 @@ async def test_rejected_submission_from_the_post_relies_on_the_rerender(slack, c
     assert status_of(await tip(iv)) == "rejected"
     assert slack.of("chat.update") == []
     slack.sync.assert_awaited()
+
+
+async def test_cancel_submission_saves_the_picked_reason(slack, cast):
+    iv = await make_interview(cast)
+    view = submission(modals.cancel_view(origin(iv), "Acme · Intro"), note="Role filled", reason="company")
+    await modals.process_coordination_submission(view, "U0PUMA0001")  # a manager, on someone else's round
+    entry = await tip(iv)
+    assert (status_of(entry), entry.statusReason, entry.statusNote) == ("canceled", "company", "Role filled")
+    assert slack.of("chat.postEphemeral") == []
+
+
+async def test_reject_submission_saves_the_picked_reason(slack, cast):
+    iv = await make_interview(cast, status="completed")
+    view = submission(modals.reject_view(origin(iv), "Acme · Intro"), reason="other_candidate")
+    await modals.process_coordination_submission(view, "U0JUSTIN01")
+    entry = await tip(iv)
+    assert (status_of(entry), entry.statusReason) == ("rejected", "other_candidate")
+
+
+async def test_reschedule_submission_logs_the_picked_reason(slack, cast):
+    iv = await make_interview(cast)
+    view = submission(
+        modals.reschedule_view(origin(iv), "Acme · Intro", start=START),
+        date="2026-11-18", time="10:15", note="Moved by recruiter", reason="caller",
+    )
+    await modals.process_coordination_submission(view, "U0PUMA0001")
+    entry = await tip(iv)
+    assert slack_bot._aware_utc(entry.scheduledAt) == NEW and entry.statusReason is None
+    [log] = entry.reschedules
+    assert (slack_bot._aware_utc(log.fromAt), slack_bot._aware_utc(log.toAt)) == (START, NEW)
+    assert (log.reason, log.note, log.by) == ("caller", "Moved by recruiter", cast.puma.id)
+    assert [b["text"] for b in slack.of("chat.postEphemeral")] == ["Rescheduled to Wed 11/18 10:15 AM EST (GMT−5:00)."]
+
+
+async def test_wrong_reason_in_a_submission_is_refused(slack, cast):
+    iv = await make_interview(cast)
+    view = submission(modals.cancel_view(origin(iv), "Acme · Intro"), reason="no_answer")  # a rejected key
+    await modals.process_coordination_submission(view, "U0JUSTIN01")
+    assert [b["text"] for b in slack.of("chat.postEphemeral")] == ["invalid statusReason"]
+    assert status_of(await tip(iv)) == "scheduled"
 
 
 async def test_submission_refused_tells_the_user(slack, cast):

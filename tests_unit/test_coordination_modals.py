@@ -23,9 +23,11 @@ UTC = timezone.utc
 NOW = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
 
 
-def submitted(callback_id, *, tz="America/Chicago", date=None, time=None, note=None, metadata=None):
+def submitted(callback_id, *, tz="America/Chicago", date=None, time=None, note=None, metadata=None, reason=None):
     origin = Origin("IV:R", "C1", "200.2", tz)
     values = {"note": {"note_input": {"type": "plain_text_input", "value": note}}}
+    if reason is not None:
+        values["reason"] = {"reason_input": {"type": "static_select", "selected_option": {"value": reason}}}
     if callback_id == "coord_reschedule":
         values["date"] = {"date_input": {"type": "datepicker", "selected_date": date}}
         values["time"] = {"time_input": {"type": "timepicker", "selected_time": time}}
@@ -57,7 +59,7 @@ def test_cancel_view_shape():
     assert view["close"] == {"type": "plain_text", "text": "Back"}
     note = next(b for b in view["blocks"] if b.get("block_id") == "note")
     assert note["optional"] is True
-    assert note["label"] == {"type": "plain_text", "text": "Reason (optional)"}
+    assert note["label"] == {"type": "plain_text", "text": "Details (optional)"}
     assert note["element"]["type"] == "plain_text_input"
     assert note["element"]["action_id"] == "note_input"
     assert note["element"]["multiline"] is True
@@ -73,7 +75,7 @@ def test_reject_view_shape_and_title_limits():
     assert reject["callback_id"] == "coord_reject"
     assert reject["title"]["text"] == "Rejected"
     note = next(b for b in reject["blocks"] if b.get("block_id") == "note")
-    assert note["label"]["text"] == "Feedback (optional)"
+    assert note["label"]["text"] == "Details (optional)"
     assert len(reject["blocks"][0]["elements"][0]["text"]) <= 200
     for view in (cancel_view(origin, "t"), reject, reschedule_view(origin, "t", start=NOW)):
         assert len(view["title"]["text"]) <= 24
@@ -98,7 +100,7 @@ def test_reschedule_view_defaults_to_the_current_time_in_the_owners_zone():
     assert time["element"]["action_id"] == "time_input"
     assert time["element"]["initial_time"] == "13:30"
     assert time["label"] == {"type": "plain_text", "text": "Time (America/New_York)"}
-    assert note["label"]["text"] == "Note (optional)"
+    assert note["label"]["text"] == "Details (optional)"
 
 
 def test_read_reschedule_in_the_owners_zone():
@@ -186,3 +188,43 @@ def test_unknown_zone_is_labelled_and_read_as_utc():
     assert time_block["element"]["initial_time"] == "18:30"
     answer = read_submission(submitted("coord_reschedule", tz="Mars/Foo", date="2026-11-18", time="09:15"))
     assert answer.new_start == datetime(2026, 11, 18, 9, 15, tzinfo=UTC)
+
+
+def reason_block(view):
+    return next(b for b in view["blocks"] if b.get("block_id") == "reason")
+
+
+def test_every_form_asks_for_a_required_reason():
+    from app.interview_reasons import CANCEL_REASON_HELP, CANCEL_REASONS, REJECT_REASONS
+
+    origin = Origin("IV:R", "C1", "200.2")
+    forms = (
+        (cancel_view(origin, "t"), "Why was it canceled?", CANCEL_REASONS),
+        (reschedule_view(origin, "t", start=NOW), "Why was it rescheduled?", CANCEL_REASONS),
+        (reject_view(origin, "t"), "Why was it rejected?", REJECT_REASONS),
+    )
+    for view, question, reasons in forms:
+        block = reason_block(view)
+        assert block["type"] == "input" and not block.get("optional")
+        assert block["label"] == {"type": "plain_text", "text": question}
+        assert block["element"]["type"] == "static_select" and block["element"]["action_id"] == "reason_input"
+        options = block["element"]["options"]
+        assert [(o["value"], o["text"]["text"]) for o in options] == list(reasons.items())
+        assert all(len(o["text"]["text"]) <= 75 and len(o.get("description", {}).get("text", "")) <= 75 for o in options)
+        ids = [b.get("block_id") for b in view["blocks"]]
+        assert ids.index("reason") < ids.index("note")
+    cancel_options = reason_block(forms[0][0])["element"]["options"]
+    assert [o["description"]["text"] for o in cancel_options] == list(CANCEL_REASON_HELP.values())
+    assert "description" not in reason_block(forms[2][0])["element"]["options"][0]
+
+
+def test_read_submission_reads_the_reason():
+    assert read_submission(submitted("coord_cancel", reason="company")).reason == "company"
+    assert read_submission(submitted("coord_reject", reason="no_answer", note="x")).reason == "no_answer"
+    moved = read_submission(submitted("coord_reschedule", date="2026-11-18", time="09:15", reason="caller"))
+    assert (moved.kind, moved.reason) == ("rescheduled", "caller")
+    # A form opened before the reason existed has no reason block: it still saves, without one.
+    assert read_submission(submitted("coord_cancel", note="x")).reason == ""
+    nothing_picked = submitted("coord_cancel")
+    nothing_picked["state"]["values"]["reason"] = {"reason_input": {"type": "static_select", "selected_option": None}}
+    assert read_submission(nothing_picked).reason == ""
