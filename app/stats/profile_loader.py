@@ -1,4 +1,5 @@
-"""DB reads for the Statistics "Your profiles" report and the coverage line (the `applications` table)."""
+"""DB reads for the Statistics "Your profiles" report, the coverage line (the `applications` table) and the
+Interviews report."""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +9,7 @@ from typing import Optional
 
 from app.applications.rows import interview_outcome
 from app.models import Application, Interview
+from app.stats.interview_report import interview_facts
 
 _ROW_FIELDS = ("key", "accountId", "ownerId", "appliedAt", "by", "bidStatus", "interviewId", "daysToInterview",
                "furthest", "firstRoundAt", "board", "scoreBand", "score", "area", "profileAgeDays", "bidderId",
@@ -31,8 +33,8 @@ async def _fetch(start: datetime, end: datetime, region: str) -> list[dict]:
     return await Application.get_motor_collection().find(q, {f: 1 for f in _ROW_FIELDS}).to_list(None)
 
 
-async def load_period_rows(start: datetime, end: datetime, region: str) -> list[dict]:
-    ck = (start, end, region)
+async def _cached(ck: tuple, load) -> list[dict]:
+    """`load()`'s list, shared for _TTL by every caller of the key `ck`."""
     now = time.monotonic()
     entry = _cache.get(ck)
     if not entry or now - entry[0] >= _TTL:
@@ -40,13 +42,46 @@ async def load_period_rows(start: datetime, end: datetime, region: str) -> list[
             del _cache[k]
         while len(_cache) >= _MAX:
             del _cache[min(_cache, key=lambda k: _cache[k][0])]
-        entry = _cache[ck] = (now, asyncio.ensure_future(_fetch(start, end, region)))
+        entry = _cache[ck] = (now, asyncio.ensure_future(load()))
     try:
         return await asyncio.shield(entry[1])  # one caller cancelled (client gone) must not cancel the others
     except Exception:
         if _cache.get(ck) is entry:
             del _cache[ck]
         raise
+
+
+async def load_period_rows(start: datetime, end: datetime, region: str) -> list[dict]:
+    return await _cached((start, end, region), lambda: _fetch(start, end, region))
+
+
+# what interview_report.interview_facts reads; never the transcripts and notes
+_ROUND_FIELDS = ("id", "stage", "at", "scheduledAt", "endsAt", "status", "statusReason", "statusAt", "reschedules",
+                 "followUps", "caller")
+_INTERVIEW_FIELDS = ("accountId", "createdBy", "scheduledAt", "endsAt", "stage", "status", "caller", "appliedBy",
+                     "fitScore", "resumeLink.kind", "resumeLink.score", "createdAt", "updatedAt",
+                     *(f"stageHistory.{f}" for f in _ROUND_FIELDS))
+
+
+async def _fetch_interviews(start: datetime, end: datetime) -> list[dict]:
+    # a round in [start, end) is a round near it: the day of slack covers timezone-free naive dates
+    near = {"$gte": start - timedelta(days=1), "$lt": end + timedelta(days=1)}
+    docs = await Interview.get_motor_collection().find(
+        {"$or": [{"scheduledAt": near}, {"stageHistory.scheduledAt": near}]}, {f: 1 for f in _INTERVIEW_FIELDS},
+    ).to_list(None)
+    apps: dict = {}
+    for a in await Application.get_motor_collection().find(
+            {"interviewId": {"$in": [d["_id"] for d in docs]}}, {f: 1 for f in ("interviewId", "by", "scoreBand", "area")},
+    ).to_list(None):
+        apps.setdefault(a["interviewId"], a)
+    now = datetime.utcnow()
+    return [interview_facts(Interview.model_validate(d), d["_id"], apps.get(d["_id"]), now) for d in docs]
+
+
+async def load_interview_facts(start: datetime, end: datetime) -> list[dict]:
+    """Statistics → Interviews: every interview with a round near [start, end), as interview_report.interview_facts.
+    One cached load per period for every region and scope (they filter by profile in memory)."""
+    return await _cached(("interviews", start, end), lambda: _fetch_interviews(start, end))
 
 
 async def count_unmatched_interviews(since: datetime, until: Optional[datetime] = None, owner_id=None,
