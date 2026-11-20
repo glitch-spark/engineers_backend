@@ -359,6 +359,18 @@ async def test_completed_round_that_has_not_ended_is_not_listed(client):
     assert (await needs(client, owner))["items"] == []
 
 
+async def test_completed_round_waits_seven_days_for_a_result(client):
+    """The company may not have answered yet: a held round asks for its result only once it ended 7 days ago."""
+    owner = await make_user()
+    now = datetime.now(UTC).replace(microsecond=0)
+    await make_interview(owner, rnd(status="completed", start=now - timedelta(days=3)), company="Recent")
+    await make_interview(owner, rnd(status="completed", start=now - timedelta(days=8)), company="Overdue")
+    await make_interview(owner, rnd(status="canceled", start=now - timedelta(days=1)), company="Canceled")  # no wait
+    out = await needs(client, owner)
+    assert [i["companyName"] for i in out["items"]] == ["Canceled", "Overdue"]
+    assert out["counts"] == {"result": 1, "reason": 1}
+
+
 async def test_rounds_before_the_data_start_are_not_listed(client):
     owner = await make_user()
     await make_interview(owner, rnd(status="completed", start=OLD), company="Old result")

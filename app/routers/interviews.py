@@ -1042,13 +1042,17 @@ async def applied_by_options(
     return {"bidders": [{"id": str(b.id), "name": b.name, "onProfile": b.profileId == account_oid} for b in bidders]}
 
 
+RESULT_WAIT = timedelta(days=7)  # a held round asks for its result only after this long (user, 2026-11-20)
+
+
 @router.get("/needs-input")
 async def needs_input(
     user: Annotated[UserExtra, Depends(get_current_user)],
     userId: str = Query("", description="admins: only this owner's rounds"),
 ) -> dict:
     """Rounds since the data start that still need something from the interview's owner: `result` (the latest round
-    was held and has ended, with no pass / reject yet) or `reason` (canceled / rejected with no statusReason).
+    was held and ended at least RESULT_WAIT ago, with no pass / reject yet: the company may still be deciding)
+    or `reason` (canceled / rejected with no statusReason).
     Newest first. A normal user gets their own; an admin everyone's, or one person's with `userId`."""
     cutoff = local_day_start_utc(DATA_START, app_tz())
     query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": cutoff}}}}
@@ -1072,7 +1076,7 @@ async def needs_input(
                 need = "reason"
             elif (
                 e is history[-1] and round_status == "completed" and stage not in _ROUND_COUNT_EXCLUDED
-                and _utc_naive(round_ends_at(start, _as_naive_utc(e.get("endsAt")))) <= now
+                and _utc_naive(round_ends_at(start, _as_naive_utc(e.get("endsAt")))) <= now - RESULT_WAIT
             ):
                 need = "result"
             else:

@@ -69,7 +69,7 @@ The free-text field stays (`statusNote`), labelled "Details (optional)" next to 
   `rescheduleReason` is saved as today and logs nothing (a typo fix, or an old client). Unknown key → 400.
 - `GET /interviews/needs-input?userId=` — rounds scheduled on or after 2026-10-06 (app timezone; reuse
   `app.stats.conversion_scope.DATA_START`) that need something from the owner (`Interview.createdBy`):
-  - `need: "result"` — the interview's latest round is `completed` and it has ended;
+  - `need: "result"` — the interview's latest round is `completed` and it ended at least 7 days ago (the company may still be deciding; user, 2026-11-20);
   - `need: "reason"` — a `canceled` or `rejected` round with no `statusReason`.
   Response: `{items: [{interviewId, roundId, companyName, profileName, ownerId, ownerName, stage, status,
   scheduledAt, need}], counts: {result, reason}}`, newest first. A normal user gets their own; an admin gets
