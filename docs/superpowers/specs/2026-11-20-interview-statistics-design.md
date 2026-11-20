@@ -95,6 +95,50 @@ Rejected:
 - Computing in the browser from `/interviews` — the evidence rules and outcome definitions belong in the tested
   backend, and the list endpoint hides other owners' rounds.
 
+## API contract (`GET /stats/interviews-report`)
+
+Query: the same parameters as `GET /stats/conversion` (`period`, `date`, `to`, `region`, `scope` = `team` | `me`,
+`user_id` for admins). Response (all keys always present; lists may be empty):
+
+```
+Group = {key, label, rounds, held, decided, passed, rejected, noAnswer, waiting, canceled, scheduled,
+         rate (number | null), few (bool), mark ("best" | "weak" | null),
+         members?: Group[], memberCount?: number}          // members only on a folded "Other …" row
+{
+  window: {start, end, startClamped},
+  totals: Group (key "all") + {companies, offers},
+  summary: {
+    cards: {
+      companies: {value, rank, of, median, vsMedian},
+      rounds:    {value, held, canceled, scheduled, rank, of, median, vsMedian},   // value = all rounds; rank on held
+      passRate:  {value, passed, decided, waiting, rank, of, teamRate},
+      offers:    {value, rank, of}
+    },                                    // scope team: rank / of / vsMedian null, median = per-person median
+    everyone: [{userId, name, companies, held, decided, passed, passRate, few, offers, isSubject,
+                ranks: {companies, held, passRate, offers}}]
+  },
+  findings: [{kind: "best" | "weak" | "reason" | "no_answer" | "none", text}],
+  byStage, byWho, byCaller, byProfile, byRegion, byArea, byScore, byAppliedBy, byWeekday, byHour: Group[],
+  reasons: {
+    canceled, rescheduled, rejected: [{key, label, count, share}],     // share = % of that list, one decimal;
+                                                                       // key "none" / label "Reason not filled in yet" last
+    rescheduleRate: {rescheduled, rounds, since: "2026-11-20"}
+  },
+  depth: {ended, avgRounds, endedAfter: [{label: "1 round" | "2 rounds" | "3 or more", count}],
+          daysBetweenRounds: {median, n}, daysToAnswer: {median, n}},
+  followUps: [{key: "followed_up" | "not_followed_up", label, rounds, passed, rejected, noAnswer, waiting}]
+}
+```
+
+- `byStage` in stage order (intro … final), stages with no rounds left out. `byWho`: Self, Caller. `byCaller` and
+  `byProfile`: rows with `few` are folded into one "Other callers" / "Other profiles" row with `members` (as
+  "Other sites" on the other tab). `byWeekday` Mon–Sun without empty days; `byHour` Morning, Afternoon, Evening.
+  `byScore` bands and labels as on the other tab, plus "No score". `byAppliedBy`: Self bid, Bidder bid, Unknown.
+- `followUps`: `followed_up` = held rounds in the period with at least one follow-up. `not_followed_up` = held
+  rounds with no follow-up that stayed without a result for 7 days after they ended (still `completed` and ended
+  7+ days ago, or `statusAt` 7+ days after the end; a round with no `statusAt` counts only while still `completed`).
+- `depth.ended` counts interviews with a round in the period whose latest round is rejected, no answer, or an offer.
+
 ## App
 
 `InterviewStatsTab` in Statistics (tab key `interviews`; the old `?tab=interviews` redirect to the conversion tab is
