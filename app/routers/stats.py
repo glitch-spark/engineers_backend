@@ -233,17 +233,13 @@ async def applications_timing(
     scope: Literal["me", "profile", "team"] = Query("me", description="me: the subject's profiles; team: every profile"),
     profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
 ) -> dict:
-    """"When to bid" (weekday, 3-hour blocks) and bidder quality; the loader returns rejected rows too, each count
-    drops them. `scope=team`: you == team and no bidder table."""
+    """"When to bid" (weekday, 3-hour blocks); the loader returns rejected rows too, each count drops them.
+    `scope=team`: you == team."""
     sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
     you, rows = sc["rows"], sc["teamRows"]
     win = await response_window(sc["today"])
     cutoff = sc["now"] - timedelta(days=win["matured_days"])
     tz = app_tz()
-    owners = list({a["ownerId"] for a in sc["accounts"].values()})  # an admin's scope=profile: that profile's owner
-    names = {} if scope == "team" or not owners else {d["_id"]: d["name"] async for d in Bidder.get_motor_collection(
-    ).find({"createdBy": {"$in": owners}}, {"name": 1})}
     return {"label": sc["label"], "subject": sc["subject"], "window": win,
-            "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz),
-            "bidders": timing.bidders(you, names, cutoff), "teamBidder": timing.team_bidder(rows, cutoff)}
+            "timezone": tz.key, **timing.by_time(you, rows, cutoff, tz)}
 

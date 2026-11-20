@@ -66,34 +66,6 @@ def test_too_few_and_matured_and_rejected():
     assert _grp(timing.by_time(rows, rows, TUE_0100 - timedelta(days=1), NY)["weekday"], "Mon")["you"]["matured"] == 0
 
 
-def test_bidders_rejected_share_and_per100():
-    a, b = ObjectId(), ObjectId()
-    rows = [_r(bidderId=a, iv=i < 2) for i in range(8)] + [_r(bidderId=a, bidStatus="rejected") for _ in range(2)]
-    rows += [_r(bidderId=b)]
-    rows += [_r(bidderId=ObjectId()) for _ in range(5)]  # not the subject's bidder
-    out = timing.bidders(rows, {a: "Al", b: "Bo"}, CUT)
-    assert [x["name"] for x in out] == ["Al", "Bo"]
-    assert out[0] == {"bidderId": str(a), "name": "Al", "bids": 8, "matured": 8, "interviews": 2, "per100": 25.0,
-                      "tooFew": True, "rejectedShare": 20}
-    assert out[1]["rejectedShare"] == 0
-
-
-def test_team_bidder_baseline():
-    ids = [ObjectId() for _ in range(4)]
-    rows = []
-    for i, p in zip(ids[:3], (3, 6, 9)):  # 30 matured each -> per100 10, 20, 30
-        rows += [_r(bidderId=i, iv=k < p) for k in range(30)]
-    rows += [_r(bidderId=ids[3]) for _ in range(5)]  # small bidders count too: pooled, not a median of rates
-    rows += [_r(bidderId=ids[0], iv=True, bidStatus="rejected"), _r(iv=True)]  # rejected / not a bidder: ignored
-    assert timing.team_bidder(rows, CUT) == {"per100": 18.9, "matured": 95, "interviews": 18}
-    assert timing.team_bidder(rows, TUE_0100 - timedelta(days=1)) == {"per100": None, "matured": 0, "interviews": 0}
-    assert timing.team_bidder([], CUT) == {"per100": None, "matured": 0, "interviews": 0}
-
-
-def test_no_bidders_empty():
-    assert timing.bidders([_r(bidderId=ObjectId())], {}, CUT) == []
-
-
 # ---- endpoint ----
 NOW = datetime.utcnow()
 Q = f"?period=custom&date={(NOW - timedelta(days=200)).date()}&to={(NOW + timedelta(days=1)).date()}"
@@ -148,17 +120,8 @@ async def test_timing_endpoint_shape_and_subject_rule(db):
     await _seed(ana, bid.id, 30, rejected=10, tag="a")
     await _seed(ben, bid2.id, 30, tag="b")
     out = (await _get(ana)).json()
-    assert set(out) == {"label", "subject", "window", "timezone", "weekday", "hours", "bidders", "teamBidder"}
+    assert set(out) == {"label", "subject", "window", "timezone", "weekday", "hours"}  # bidder quality removed
     assert out["subject"] == {"userId": str(ana.id), "name": "Ana"} and out["timezone"]
     assert sum(g["you"]["bids"] for g in out["weekday"]) == 30
     assert sum(g["team"]["bids"] for g in out["weekday"]) == 60
-    assert out["bidders"] == [{"bidderId": str(bid.id), "name": "Al", "bids": 30, "matured": 30, "interviews": 2,
-                               "per100": 6.7, "tooFew": False, "rejectedShare": 25}]
-    assert out["teamBidder"] == {"per100": 6.7, "matured": 60, "interviews": 4}
     assert (await _get(ana, Q + f"&user={ben.id}")).status_code == 403
-
-
-async def test_timing_no_bidders(db):
-    ana = await UserExtra(name="Ana", email="ana@x.io").insert()
-    out = (await _get(ana)).json()
-    assert out["bidders"] == [] and out["teamBidder"] == {"per100": None, "matured": 0, "interviews": 0}
