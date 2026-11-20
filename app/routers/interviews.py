@@ -40,6 +40,7 @@ from app.interview_caller import (
     CallerError,
     CallerIn,
     build_round_caller,
+    caller_assigned,
     caller_unassigned,
     confirmed_by_assignment,
     round_post_state,
@@ -51,7 +52,7 @@ from app.routers.callers import require_caller_manager
 from app.round_confirm import ConfirmError, confirm_round
 from app.caller_access import can_update_round, is_assigned_caller
 from app.dashboard_stats import app_tz, local_day_start_utc
-from app.interview_rounds import _ROUND_COUNT_EXCLUDED
+from app.interview_rounds import _ROUND_COUNT_EXCLUDED, merged_rounds
 from app.stats.conversion_scope import DATA_START
 
 log = logging.getLogger(__name__)
@@ -1097,6 +1098,66 @@ async def follow_ups_summary(uid: Any, day: date) -> dict:
             found = round_need(e.model_dump(), latest=e is iv.stageHistory[-1], now=now, cutoff=cutoff)
             to_do += found is not None and found[0] in ("follow_up", "heard_back")
     return {"doneToday": [name for _, name in sorted(done, key=lambda d: d[0])], "toDo": to_do}
+
+
+def _step_state(round_status: Optional[str]) -> str:
+    """An earlier round among a round's steps: `rejected` / `canceled` as marked, `passed` (marked passed, or held
+    and followed by the later round), else `held` (never marked)."""
+    if round_status in ("rejected", "canceled"):
+        return round_status
+    return "passed" if round_status in ("passed", "completed") else "held"
+
+
+async def day_interviews(uid: Any, day: date, now: datetime) -> list[dict]:
+    """The day view's `todayInterviews` (spec 2026-11-20-home-redesign-design.md): the rounds `uid` owns that start
+    on `day` (app timezone), plus the ones moved away from it (`rescheduled`: shown in the slot they left, with
+    `rescheduledTo` their new start), in time order. No AI interviews or home assessments. `now`: naive UTC."""
+    tz = app_tz()
+    lo, hi = local_day_start_utc(day, tz), local_day_start_utc(day + timedelta(days=1), tz)
+    on_day = {"$gte": lo, "$lt": hi}
+    ivs = await Interview.find({"createdBy": uid, "$or": [
+        {"scheduledAt": on_day}, {"stageHistory.scheduledAt": on_day}, {"stageHistory.reschedules.fromAt": on_day},
+    ]}).to_list()
+    rows = []
+    for iv in ivs:
+        entries = {e.id: e for e in iv.stageHistory}
+        rounds = [(_normalize_stage(r.stage), r) for r in merged_rounds(iv)]
+        rounds = [(stage, r) for stage, r in rounds if stage not in _ROUND_COUNT_EXCLUDED]
+        for i, (stage, r) in enumerate(rounds):
+            start, e = _utc_naive(r.at), entries.get(r.entry_id)
+            if start is None:
+                continue
+            left = [t for x in (e.reschedules if e else []) if x.fromAt and lo <= (t := _utc_naive(x.fromAt)) < hi]
+            here = lo <= start < hi
+            if not here and not left:
+                continue
+            round_status = normalize_status(r.status) or "scheduled"
+            end = _utc_naive(round_ends_at(start, _utc_naive(e.endsAt if e else iv.endsAt)))
+            if not here:
+                state, shown = "rescheduled", left[-1]
+            elif round_status != "scheduled":
+                state, shown = round_status, start
+            else:
+                state, shown = ("upcoming" if now < start else "now" if now < end else "unmarked"), start
+            assigned = caller_assigned(r.caller)
+            name = (r.caller.callerName or "").strip() if assigned else ""
+            rows.append({
+                "interviewId": str(iv.id), "roundId": r.entry_id, "companyName": iv.companyName,
+                "profileName": iv.accountId, "stage": stage,
+                "scheduledAt": _iso_utc(shown), "endsAt": _iso_utc(shown + (end - start)),
+                "status": round_status, "state": state, "rescheduledTo": None if here else _iso_utc(start),
+                "who": {"kind": "caller" if r.caller is not None and r.caller.enabled else "self",
+                        "name": name if name.upper() not in ("", "TBD") else None, "assigned": assigned,
+                        "confirmed": assigned and bool(e.confirmed if e else iv.confirmed)},
+                "steps": [{"stage": s, "state": _step_state(normalize_status(p.status))} for s, p in rounds[:i]]
+                + [{"stage": stage, "state": "today"}],
+            })
+    if rows:
+        names = {a["_id"]: a.get("name") async for a in Account.get_motor_collection().find(
+            {"_id": {"$in": list({r["profileName"] for r in rows})}}, {"name": 1})}
+        for r in rows:
+            r["profileName"] = names.get(r["profileName"])
+    return sorted(rows, key=lambda r: r["scheduledAt"])
 
 
 @router.get("/needs-input")

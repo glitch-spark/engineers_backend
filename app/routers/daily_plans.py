@@ -8,7 +8,7 @@ its items are the week's routines and weekly goals with that day's results (`app
 import asyncio
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
@@ -24,7 +24,7 @@ from app.plan_auto import (
 )
 from app.plan_profiles import owner_profiles
 from app.plan_save import DayIn, ProgressIn, save_day, save_progress
-from app.routers.interviews import follow_ups_summary
+from app.routers.interviews import day_interviews, follow_ups_summary
 from app.routers._plan_access import parse_body, parse_monday, parse_ymd, read_subject, require_writer
 from app.slack_bot import delete_daily_plan_message, sync_daily_plan_message
 
@@ -35,6 +35,11 @@ router = APIRouter(prefix="/daily-plans", tags=["daily-plans"])
 
 def _today() -> date:
     return datetime.now(app_tz()).date()
+
+
+def _now() -> datetime:
+    """Naive UTC now."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _midnight(d: date) -> datetime:
@@ -184,10 +189,13 @@ async def get_day(
     userId: Optional[str] = Query(None),
 ) -> dict:
     when = parse_ymd(day, "date")
-    return await _view(await read_subject(user, userId), when)
+    uid = await read_subject(user, userId)
+    return await _view(uid, when, rounds=uid == user.id or user.role == "admin")
 
 
-async def _view(uid, when: date) -> dict:
+async def _view(uid, when: date, rounds: bool = True) -> dict:
+    """`rounds`: list the day's interviews. They are the owner's own (and an admin's to read): a teammate reading
+    the plan gets none."""
     monday = monday_of(when)
     plans = await _week_days(uid, monday)
     plan = next((p for p in plans if p.date.date() == when), None)
@@ -195,6 +203,9 @@ async def _view(uid, when: date) -> dict:
     out = _day_out(uid, when, plan, auto_day, await week_or_draft(uid, monday), plans,
                    await plan_bidder.bidder_done(uid, when), await owner_profiles(uid))
     out["followUps"] = await follow_ups_summary(uid, when)  # read-only, never stored on the plan
+    out["todayInterviews"] = today = await day_interviews(uid, when, _now()) if rounds else []
+    out["interviewsMarked"] = {"marked": sum(r["state"] not in ("upcoming", "now", "unmarked") for r in today),
+                               "total": len(today)}
     return await _with_tracked(out, uid, when)
 
 
