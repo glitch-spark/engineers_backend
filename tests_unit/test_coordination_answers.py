@@ -176,7 +176,8 @@ def test_constants():
         ("coord_after_completed", "after_completed"), ("coord_after_canceled", "after_canceled"),
         ("coord_after_rescheduled", "after_rescheduled"), ("coord_result_passed", "result_passed"),
         ("coord_after_passed", "after_passed"), ("coord_after_rejected", "after_rejected"),
-        ("coord_result_rejected", "result_rejected"),
+        ("coord_result_rejected", "result_rejected"), ("coord_followed_up", "followed_up"),
+        ("coord_result_no_answer", "result_no_answer"),
     ]:
         assert actions.HANDLERS[action_id] is getattr(actions, name)
 
@@ -421,6 +422,76 @@ async def test_rejected_opens_the_form(slack, cast):
     view = slack.of("views.open")[0]["view"]
     assert view["callback_id"] == "coord_reject"
     assert Origin.from_metadata(view["private_metadata"]).ts == POST_TS
+
+
+# --- the follow-up step -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("who", ["U0JUSTIN01", "U0PUMA0001"])
+async def test_followed_up_records_it_and_rewrites_the_message(slack, cast, who):
+    iv = await make_interview(cast, status="completed")
+    await actions.process_coordination_click(click("coord_followed_up", iv, who))
+    saved = await tip(iv)
+    [entry] = saved.followUps
+    assert entry.by == (cast.justin.id if who == "U0JUSTIN01" else cast.puma.id)
+    assert status_of(saved) == "completed"
+    [shown] = replaced(slack)
+    assert shown["text"] == f"📨 <@{who}> followed up on {slack_time(entry.at)}."
+    assert [b["type"] for b in shown["blocks"]] == ["section"]  # no buttons left
+    assert ephemeral_texts(slack) == []
+
+
+async def test_followed_up_is_refused_for_strangers(slack, cast):
+    iv = await make_interview(cast, status="completed")
+    await actions.process_coordination_click(click("coord_followed_up", iv, "U0BOB00001"))
+    assert ephemeral_texts(slack) == [UPDATE_REFUSED]
+    assert (await tip(iv)).followUps == [] and replaced(slack) == []
+
+
+async def test_followed_up_twice_keeps_one_entry_and_settles_the_message(slack, cast):
+    """Followed up in the app (or by an earlier click): the stale button records nothing more."""
+    iv = await make_interview(cast, status="completed")
+    await actions.process_coordination_click(click("coord_followed_up", iv, "U0JUSTIN01"))
+    [first] = (await tip(iv)).followUps
+    await actions.process_coordination_click(click("coord_followed_up", iv, "U0PUMA0001"))
+    assert (await tip(iv)).followUps == [first]
+    assert ephemeral_texts(slack) == ["Already followed up."]
+    assert [p["text"] for p in replaced(slack)][-1] == f"📨 <@U0JUSTIN01> followed up on {slack_time(first.at)}."
+
+
+async def test_followed_up_on_a_round_with_a_result_settles_the_message(slack, cast):
+    iv = await make_interview(cast, status="passed")
+    await actions.process_coordination_click(click("coord_followed_up", iv, "U0JUSTIN01"))
+    assert ephemeral_texts(slack) == ["Result already set: Passed."]
+    assert [p["text"] for p in replaced(slack)] == ["Result already set: Passed"]
+    assert (await tip(iv)).followUps == []
+
+
+async def test_followed_up_before_completed(slack, cast):
+    iv = await make_interview(cast)
+    await actions.process_coordination_click(click("coord_followed_up", iv, "U0JUSTIN01"))
+    assert ephemeral_texts(slack) == [NEEDS_COMPLETED]
+    assert (await tip(iv)).followUps == []
+
+
+async def test_no_answer_closes_the_round_as_rejected_in_one_click(slack, cast):
+    iv = await make_interview(cast, status="completed")
+    await actions.process_coordination_click(click("coord_result_no_answer", iv, "U0JUSTIN01"))
+    saved = await tip(iv)
+    assert (status_of(saved), saved.statusReason) == ("rejected", "no_answer")
+    assert saved.statusAt is not None
+    assert slack.of("views.open") == []  # no form
+    assert [p["text"] for p in replaced(slack)] == ["❌ Rejected — by <@U0JUSTIN01> · No answer from the company"]
+
+
+async def test_no_answer_is_refused_for_strangers_and_on_a_settled_round(slack, cast):
+    iv = await make_interview(cast, status="completed")
+    await actions.process_coordination_click(click("coord_result_no_answer", iv, "U0BOB00001"))
+    assert status_of(await tip(iv)) == "completed"
+    done = await make_interview(cast, status="passed")
+    await actions.process_coordination_click(click("coord_result_no_answer", done, "U0JUSTIN01"))
+    assert status_of(await tip(done)) == "passed"
+    assert ephemeral_texts(slack) == [UPDATE_REFUSED, "Result already set: Passed."]
 
 
 # --- submissions ------------------------------------------------------------------------------------------

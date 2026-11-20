@@ -373,6 +373,9 @@ async def test_every_need_newest_first_and_a_saved_row_leaves(client):
         ("Outcome", "outcome"), ("Reason", "reason"), ("Follow up", "follow_up"), ("Heard back", "heard_back"),
     ]
     assert out["counts"] == {"outcome": 1, "follow_up": 1, "heard_back": 1, "reason": 1}
+    for item in out["items"]:  # every need carries the round's end (start + 1 h here)
+        start = datetime.fromisoformat(item["scheduledAt"].replace("Z", "+00:00"))
+        assert item["endsAt"] == naive(start + timedelta(hours=1)).isoformat() + "Z"
 
     assert (await follow_up(client, owner, held)).status_code == 200
     out = await needs(client, owner)

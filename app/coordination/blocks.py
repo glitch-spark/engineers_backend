@@ -23,11 +23,14 @@ COORD_AFTER_PASSED = "coord_after_passed"
 COORD_AFTER_REJECTED = "coord_after_rejected"
 COORD_RESULT_PASSED = "coord_result_passed"
 COORD_RESULT_REJECTED = "coord_result_rejected"
+COORD_FOLLOWED_UP = "coord_followed_up"
+COORD_RESULT_NO_ANSWER = "coord_result_no_answer"  # rejected, reason "no_answer", in one click
 
 # Every id the server acts on (the two URL buttons are only acknowledged). COORD_CONFIRM stays for old posts.
 COORD_ACTIONS = frozenset({
     COORD_CHOOSE_CALLER, COORD_CONFIRM, COORD_AFTER_COMPLETED, COORD_AFTER_CANCELED, COORD_AFTER_RESCHEDULED,
-    COORD_AFTER_PASSED, COORD_AFTER_REJECTED, COORD_RESULT_PASSED, COORD_RESULT_REJECTED,
+    COORD_AFTER_PASSED, COORD_AFTER_REJECTED, COORD_RESULT_PASSED, COORD_RESULT_REJECTED, COORD_FOLLOWED_UP,
+    COORD_RESULT_NO_ANSWER,
 })
 
 SELF = "self"  # the last part of the "No caller (Self)" option value
@@ -143,12 +146,38 @@ def ask_blocks(
 def result_reminder_blocks(
     ref: str, *, owner: Optional[UserExtra], company: str, stage: str, start: datetime,
 ) -> tuple[str, list[dict]]:
-    """The reminder posted in the thread when a completed round has had no result for 7 days."""
+    """The result ask posted in the thread when a round was already marked completed at the after-interview check."""
     text = (f"{_who(owner, 'Owner')} — {_short(company, MAX_NAME, '—')} {_stage_label(stage)} on "
             f"{slack_time(start)} has no result yet. How did it end?")
     return text, [_section(text), {"type": "actions", "elements": [
         _button("Passed", style="primary", action_id=COORD_RESULT_PASSED, value=ref),
         _button("Rejected", style="danger", action_id=COORD_RESULT_REJECTED, value=ref),
+    ]}]
+
+
+def follow_up_blocks(
+    ref: str, *, owner: Optional[UserExtra], company: str, stage: str, start: datetime,
+) -> tuple[str, list[dict]]:
+    """Step 2, posted in the thread when a completed round has had no result for 7 days."""
+    text = (f"{_who(owner, 'Owner')} — {_short(company, MAX_NAME, '—')} {_stage_label(stage)} on "
+            f"{slack_time(start)} has no result yet. Follow up with the company, then mark it here.")
+    return text, [_section(text), {"type": "actions", "elements": [
+        _button("I followed up", style="primary", action_id=COORD_FOLLOWED_UP, value=ref),
+        _button("Passed", action_id=COORD_RESULT_PASSED, value=ref),
+        _button("Rejected", action_id=COORD_RESULT_REJECTED, value=ref),
+    ]}]
+
+
+def heard_back_blocks(
+    ref: str, *, owner: Optional[UserExtra], company: str, stage: str, start: datetime,
+) -> tuple[str, list[dict]]:
+    """Step 3, posted in the thread 7 days after the follow-up while the round still has no result."""
+    text = (f"{_who(owner, 'Owner')} — {_short(company, MAX_NAME, '—')} {_stage_label(stage)} on "
+            f"{slack_time(start)}: did you hear back after your follow-up?")
+    return text, [_section(text), {"type": "actions", "elements": [
+        _button("No, close as rejected", action_id=COORD_RESULT_NO_ANSWER, value=ref),
+        _button("Passed", action_id=COORD_RESULT_PASSED, value=ref),
+        _button("Rejected", action_id=COORD_RESULT_REJECTED, value=ref),
     ]}]
 
 

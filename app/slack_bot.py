@@ -647,4 +647,5 @@ async def run_alert_tick() -> dict[str, Any]:
     return {
         "caller_reminders": reminders["sent"], "caller_daily": caller_daily, "standup_nudge": standup_nudge,
         "after_call_asks": chase.get("after_call_asks", 0), "result_reminders": chase.get("result_reminders", 0),
+        "heard_back_asks": chase.get("heard_back_asks", 0),
     }

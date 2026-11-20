@@ -103,6 +103,16 @@ def action_ids(post):
     return [e["action_id"] for b in post["blocks"] if b["type"] == "actions" for e in b["elements"]]
 
 
+def labels(post):
+    return [e["text"]["text"] for b in post["blocks"] if b["type"] == "actions" for e in b["elements"]]
+
+
+async def follow_up(iv, at, index=-1) -> Interview:
+    iv.stageHistory[index].followUps.append({"at": at, "by": iv.createdBy})
+    await iv.save()
+    return iv
+
+
 def values(post):
     return [e["value"] for b in post["blocks"] if b["type"] == "actions" for e in b["elements"]]
 
@@ -336,10 +346,12 @@ async def test_result_reminder_seven_days_after(slack, justin):
     assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 1, "failed": 0}
     [post] = slack.posts()
     assert post["channel"] == "C_DAILY" and "thread_ts" not in post
-    assert action_ids(post) == ["coord_result_passed", "coord_result_rejected"]
-    assert values(post) == [f"{iv.id}:{rid}"] * 2
+    assert action_ids(post) == ["coord_followed_up", "coord_result_passed", "coord_result_rejected"]
+    assert labels(post) == ["I followed up", "Passed", "Rejected"]
+    assert values(post) == [f"{iv.id}:{rid}"] * 3
     assert post["text"].startswith("<@U0JUSTIN01> — Acme Intro on <!date^")
-    assert post["text"].endswith(" has no result yet. How did it end?")
+    assert post["text"].endswith(" has no result yet. Follow up with the company, then mark it here.")
+    assert post["blocks"][0]["text"]["text"] == post["text"]
     assert await chase.run_result_reminders(utc(23, 19, 36)) == {"sent": 0, "failed": 0}
     assert len(slack.posts()) == 1
     assert [r.kind for r in await SlackAlertLog.find_all().to_list()] == [f"result-reminder:{rid}"]
@@ -355,7 +367,7 @@ async def test_a_round_stored_without_a_status_gets_the_reminder(slack, justin, 
     assert (await Interview.get(iv.id)).stageHistory[0].status.value == "completed"
     assert await chase.run_result_reminders(utc(23, 19, 29)) == {"sent": 0, "failed": 0}
     assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 1, "failed": 0}
-    assert action_ids(slack.posts()[0]) == ["coord_result_passed", "coord_result_rejected"]
+    assert action_ids(slack.posts()[0]) == ["coord_followed_up", "coord_result_passed", "coord_result_rejected"]
 
 
 async def test_result_reminder_covers_self_rounds_in_the_home_thread(slack, justin):
@@ -417,13 +429,111 @@ async def test_failed_reminder_releases_the_claim(slack, justin):
     assert await SlackAlertLog.find_all().to_list() == []
 
 
+async def test_a_round_already_followed_up_gets_no_follow_up_reminder(slack, justin):
+    """Followed up in the app before the 7-day mark: step 2 has nothing left to ask."""
+    await follow_up(await add(justin, status="completed"), utc(20, 12))
+    assert await chase.run_result_reminders(utc(23, 19, 31)) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
+
+
+# --- "did you hear back?", 7 days after the follow-up ------------------------------------------------
+
+FOLLOWED = utc(24, 12)  # its 7-day mark is Dec 1 12:00Z
+BEFORE = datetime(2026, 12, 1, 11, 59, tzinfo=UTC)
+DUE = datetime(2026, 12, 1, 12, 1, tzinfo=UTC)
+
+
+async def test_heard_back_seven_days_after_the_follow_up_once(slack, justin):
+    iv = await follow_up(await add(justin, status="completed"), FOLLOWED)
+    rid = iv.stageHistory[0].id
+
+    assert await chase.run_heard_back_asks(BEFORE) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 1, "failed": 0}
+    [post] = slack.posts()
+    assert post["channel"] == "C_DAILY"
+    assert post["text"].startswith("<@U0JUSTIN01> — Acme Intro on <!date^")
+    assert post["text"].endswith(": did you hear back after your follow-up?")
+    assert action_ids(post) == ["coord_result_no_answer", "coord_result_passed", "coord_result_rejected"]
+    assert labels(post) == ["No, close as rejected", "Passed", "Rejected"]
+    assert values(post) == [f"{iv.id}:{rid}"] * 3
+    assert await chase.run_heard_back_asks(DUE + timedelta(minutes=5)) == {"sent": 0, "failed": 0}
+    assert len(slack.posts()) == 1
+    assert [r.kind for r in await SlackAlertLog.find_all().to_list()] == [
+        f"heard-back:{rid}:{int(FOLLOWED.timestamp())}",
+    ]
+
+
+async def test_heard_back_is_asked_again_after_a_later_follow_up(slack, justin):
+    iv = await follow_up(await add(justin, status="completed"), FOLLOWED)
+    assert (await chase.run_heard_back_asks(DUE))["sent"] == 1
+    second = datetime(2026, 12, 2, 12, 0, tzinfo=UTC)
+    await follow_up(await Interview.get(iv.id), second)
+    assert (await chase.run_heard_back_asks(second + timedelta(days=6)))["sent"] == 0
+    assert (await chase.run_heard_back_asks(second + timedelta(days=7, minutes=1)))["sent"] == 1
+    assert len(slack.posts()) == 2
+
+
+async def test_heard_back_threads_under_the_rounds_home(slack, justin):
+    iv = await follow_up(await add(justin, status="completed"), FOLLOWED)
+    await home.record_home(iv.stageHistory[0].id, str(iv.id), START, "C_DAILY", "42.1")
+    assert (await chase.run_heard_back_asks(DUE))["sent"] == 1
+    assert slack.posts()[0]["thread_ts"] == "42.1"
+
+
+async def test_heard_back_skips_follow_ups_past_the_two_day_window(slack, justin):
+    await follow_up(await add(justin, status="completed"), FOLLOWED)
+    assert await chase.run_heard_back_asks(DUE + timedelta(days=2)) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
+
+
+@pytest.mark.parametrize("status", ["passed", "rejected", "canceled", "scheduled"])
+async def test_heard_back_is_not_asked_once_the_round_has_a_result(slack, justin, status):
+    iv = await follow_up(await add(justin, status="completed"), FOLLOWED)
+    iv.stageHistory[0].status = status
+    await iv.save()
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
+    assert await SlackAlertLog.find_all().to_list() == []
+
+
+async def test_heard_back_is_only_for_the_latest_round(slack, justin):
+    iv = await follow_up(await add(justin, status="completed"), FOLLOWED)
+    later = InterviewStageEvent(stage="final", at=DUE, scheduledAt=DUE + timedelta(days=30), status="scheduled")
+    iv.stageHistory.append(later)
+    await iv.save()
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
+
+
+async def test_heard_back_off_without_the_setting_and_for_rounds_before_the_cutoff(slack, justin, monkeypatch):
+    await follow_up(await add(justin, status="completed", company="Old", start=datetime(2026, 11, 1, 19, 0, tzinfo=UTC),
+                              end=datetime(2026, 11, 1, 20, 0, tzinfo=UTC)), FOLLOWED)
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 0, "failed": 0}
+    await follow_up(await add(justin, status="completed"), FOLLOWED)
+    monkeypatch.setattr(chase, "get_settings", lambda: settings(SLACK_CALLER_ASKS_FROM=None))
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 0, "failed": 0}
+    assert slack.posts() == []
+
+
+async def test_failed_heard_back_releases_the_claim(slack, justin):
+    await follow_up(await add(justin, status="completed"), FOLLOWED)
+    slack.errors = ["ratelimited"]
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 0, "failed": 1}
+    assert await SlackAlertLog.find_all().to_list() == []
+    assert await chase.run_heard_back_asks(DUE) == {"sent": 1, "failed": 0}
+
+
 # --- the tick ----------------------------------------------------------------------------------------
 
 
 async def test_chase_parts_are_isolated(slack, justin, monkeypatch):
     monkeypatch.setattr(chase, "run_after_call_asks", AsyncMock(side_effect=RuntimeError("boom")))
     monkeypatch.setattr(chase, "run_result_reminders", AsyncMock(return_value={"sent": 2, "failed": 0}))
-    assert await chase.run_coordination_chase(utc(16, 19, 31)) == {"after_call_asks": 0, "result_reminders": 2}
+    monkeypatch.setattr(chase, "run_heard_back_asks", AsyncMock(return_value={"sent": 3, "failed": 0}))
+    assert await chase.run_coordination_chase(utc(16, 19, 31)) == {
+        "after_call_asks": 0, "result_reminders": 2, "heard_back_asks": 3,
+    }
 
 
 async def test_roundup_is_no_longer_posted(slack, justin):
@@ -445,10 +555,11 @@ def _quiet_tick():
 
 def test_tick_reports_the_chase():
     a, b, c, d = _quiet_tick()
-    run = AsyncMock(return_value={"after_call_asks": 2, "result_reminders": 1})
+    run = AsyncMock(return_value={"after_call_asks": 2, "result_reminders": 1, "heard_back_asks": 3})
     with a, b, c, d, patch("app.coordination.chase.run_coordination_chase", run):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 0, "caller_daily": "already_sent", "standup_nudge": "skipped", "after_call_asks": 2, "result_reminders": 1}
+    assert out == {"caller_reminders": 0, "caller_daily": "already_sent", "standup_nudge": "skipped", "after_call_asks": 2, "result_reminders": 1,
+                   "heard_back_asks": 3}
     run.assert_awaited_once()
     assert run.await_args.args[0].tzinfo is not None
 
@@ -457,7 +568,7 @@ def test_tick_survives_a_chase_crash():
     a, b, c, d = _quiet_tick()
     with a, b, c, d, patch("app.coordination.chase.run_coordination_chase", AsyncMock(side_effect=RuntimeError("boom"))):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out["after_call_asks"] == 0 and out["result_reminders"] == 0
+    assert out["after_call_asks"] == 0 and out["result_reminders"] == 0 and out["heard_back_asks"] == 0
     assert out["caller_daily"] == "already_sent"
 
 
