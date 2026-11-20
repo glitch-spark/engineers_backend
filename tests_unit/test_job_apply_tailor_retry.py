@@ -108,7 +108,7 @@ def openai_on(monkeypatch):
     """OpenAI configured (the catalog hides its models without a key), today pinned to 2026-11-03; nothing is called."""
     from app import model_catalog
 
-    patched = model_catalog.get_settings().model_copy(update={"OPENAI_API_KEY": "sk-test"})
+    patched = model_catalog.get_settings().model_copy(update={"OPENAI_API_KEY": "sk-test", "ANTHROPIC_API_KEY": "sk-ant-test"})
     monkeypatch.setattr(model_catalog, "get_settings", lambda: patched)
     monkeypatch.setattr(model_catalog, "_today", lambda: date(2026, 11, 3))
 
@@ -166,14 +166,15 @@ async def test_job_applies_rejects_other_resume_models(db, openai_on, model):
     assert await ResumeApplication.find_all().count() == 1  # only _setup's
 
 
-async def test_resume_models_lists_the_cheap_openai_models(db, openai_on, monkeypatch):
+async def test_resume_models_lists_the_cheap_models(db, openai_on, monkeypatch):
     from app import model_catalog
 
     owner = await UserExtra(name="Athen", email="athen@x.io").insert()
     out = await list_resume_models(owner)
     assert out["defaultId"] == "openai:gpt-4o-mini"
     assert [m["id"] for m in out["models"]] == list(model_catalog.JOB_APPLIES_RESUME_MODELS)
-    assert out["providers"] == [{"id": "openai", "label": "OpenAI"}]
+    assert "anthropic:claude-haiku-5-5" in [m["id"] for m in out["models"]]  # a choice, not the default
+    assert out["providers"] == [{"id": "openai", "label": "OpenAI"}, {"id": "anthropic", "label": "Anthropic"}]
     assert [m["id"] for m in out["models"] if m["isDefault"]] == ["openai:gpt-4o-mini"]
 
     monkeypatch.setattr(model_catalog, "_today", lambda: date(2027, 1, 14))  # GPT-4o mini retired
