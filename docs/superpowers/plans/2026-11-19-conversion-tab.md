@@ -15,7 +15,7 @@
 ## Global Constraints
 
 - `DATA_START = date(2026, 10, 6)`: every stats period used by this tab starts no earlier; a range entirely before it returns an empty report with `startClamped: true`.
-- Rows = `applications` rows, non-rejected, `byInterviewOnly` excluded (already done by the loader). Matured = `appliedAt <= now - matured_days`; rate = matured interviews ÷ matured × 100 (one decimal), None when matured 0; `few` = matured < 30 or expected interviews at the team rate < 3 (`fewReason` matured / expected; final review I2).
+- Rows = `applications` rows, non-rejected, `byInterviewOnly` excluded (already done by the loader). Matured = `appliedAt <= now - matured_days`; rate = matured interviews ÷ matured × 100 (one decimal), None when matured 0; `few` = matured < 30 or (interviews < 3 and expected interviews at the team rate < 3) (changed 2026-11-19 after real data) (`fewReason` matured / expected; final review I2).
 - Scope rows: `me` = rows on the subject's **non-archived** profiles whose **current** Account region matches (`all` = any); `profile` = one of those (other users' → 403 like `_subject_id`; admin any); `team` = rows on all non-archived profiles of the region. Team baseline (grades, suggestions, "team" columns) = the `team` row set for the same period.
 - Bidder table omitted for `team`. Bidder group labels: `Self` (by == "self") first, then each bidder by bids desc (Bidder.name; missing name or bidderId → `Unnamed bidder`).
 - Score groups: `80+`, `65–79`, `50–64`, `Under 50`, `No score`. Site/area/age groups and labels as `app/stats/job_fit.py` (sites ranked by bids).

@@ -57,6 +57,17 @@ def test_few_at_29_and_30():
         assert g["fewReason"] == ("matured" if few else None)
 
 
+def test_few_needs_both_few_interviews_and_few_expected():
+    """Changed 2026-11-19 after real data: 20 interviews from 339 matured (team 0.6) is not few."""
+    def site(n, iv, rate):
+        rows = [_r(board="x.io", iv=i < iv) for i in range(n)]
+        g = conversion.report(rows, CUT, {}, False, rate)["bySite"][0]
+        return g["few"], g["fewReason"]
+    assert site(339, 20, 0.6) == (False, None)
+    assert site(271, 1, 0.6) == (True, "expected")   # 1 interview, 1.6 expected
+    assert site(29, 5, 0.6) == (True, "matured")
+
+
 def test_few_by_expected_interviews_at_team_rate():
     """I2: few also when matured x team rate / 100 < 3 (expected interviews), the grades' EXPECTED_MIN rule."""
     def site(n, rate):
@@ -64,6 +75,7 @@ def test_few_by_expected_interviews_at_team_rate():
     assert (site(600, 0.5)["few"], site(600, 0.5)["fewReason"]) == (False, None)        # 3.0 expected
     assert (site(300, 0.5)["few"], site(300, 0.5)["fewReason"]) == (True, "expected")   # 1.5 expected
     assert (site(29, 0.5)["few"], site(29, 0.5)["fewReason"]) == (True, "matured")
+    assert (site(600, 0.6)["few"], site(600, 0.6)["fewReason"]) == (False, None)        # 3.6 expected, 0 interviews
     assert (site(300, None)["few"], site(300, 0.0)["few"]) == (False, False)            # no team rate: matured only
     assert conversion.report([], CUT, {}, False, 0.54)["teamRate"] == 0.5
     assert conversion.report([], CUT, {}, False)["teamRate"] is None

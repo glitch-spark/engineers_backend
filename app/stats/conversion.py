@@ -11,18 +11,20 @@ def _rate(iv: int, matured: int) -> Optional[float]:
     return round(iv / matured * 100, 1) if matured else None
 
 
-def _few(matured: int, team_rate: Optional[float]) -> Optional[str]:
-    """Why a rate is too thin to read: under 30 matured bids, or the team rate would expect under 3 interviews
-    (the grades' EXPECTED_MIN rule); None when it's fine."""
+def _few(matured: int, interviews: int, team_rate: Optional[float]) -> Optional[str]:
+    """Why a rate is too thin to read: under 30 matured bids, or under 3 interviews behind it while the team rate
+    would also expect under 3 (changed 2026-11-19 after real data); None when it's fine."""
     if matured < MIN_MATURED:
         return "matured"
-    return "expected" if team_rate and matured * team_rate / 100 < EXPECTED_MIN else None
+    if interviews < EXPECTED_MIN and team_rate and matured * team_rate / 100 < EXPECTED_MIN:
+        return "expected"
+    return None
 
 
 def _counts(rows: list[dict], matured_before: datetime, team_rate: Optional[float] = None) -> dict:
     matured = [r for r in rows if r["appliedAt"] <= matured_before]
     iv = sum(1 for r in matured if r.get("interviewId"))
-    why = _few(len(matured), team_rate)
+    why = _few(len(matured), iv, team_rate)
     return {"bids": len(rows), "matured": len(matured), "interviews": iv, "rate": _rate(iv, len(matured)),
             "few": why is not None, "fewReason": why}
 
