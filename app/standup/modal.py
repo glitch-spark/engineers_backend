@@ -124,7 +124,9 @@ async def build_view(user: UserExtra, day: date) -> dict:
         if items:
             body.append({"type": "section", "text": {"type": "mrkdwn", "text": heading}})
             body += [_item_block(e, d["progress"]) for e in items]
-    room = MAX_BLOCKS - 3  # two context lines and Extra
+    follow_ups = slack_bot.follow_ups_line(d["followUps"], label="*Follow-ups*")
+    head = [_bids_line(d, day, names), _interviews_line(d), *([follow_ups] if follow_ups else [])]
+    room = MAX_BLOCKS - len(head) - 1  # the context lines and Extra
     if len(body) > room:
         hidden = len(body) - (room - 1)
         body = body[:room - 1] + [_context(f"{hidden} more lines don't fit here — open the app to fill them in.")]
@@ -139,8 +141,7 @@ async def build_view(user: UserExtra, day: date) -> dict:
         "submit": _plain("Post update"),
         "close": _plain("Cancel"),
         "blocks": [
-            _context(_bids_line(d, day, names)),
-            _context(_interviews_line(d)),
+            *(_context(line) for line in head),
             *body,
             {"type": "input", "block_id": "notes", "optional": True, "label": _plain("Extra"), "element": notes},
         ],

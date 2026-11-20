@@ -83,9 +83,10 @@ def findings(report: dict, team_rate: Optional[float], scope: str) -> list[dict]
     return [f for _, _, f in out[:MAX]] or [{"kind": "none", "text": FALLBACK, "evidence": {}}]
 
 
-def mark_groups(report: dict, team_rate: Optional[float]) -> None:
+def mark_groups(report: dict, team_rate: Optional[float], picks: Optional[dict] = None) -> None:
     """`mark` per breakdown table from the same rules, independent of the 4-line cap and the gap line: "best" on its
-    best group, "weak" on its weakest; everything else None. Other sites' members are never marked."""
-    for by, (best, weak) in _picks(report, team_rate).items():
+    best group, "weak" on its weakest; everything else None. Other sites' members are never marked. `picks`: another
+    report's own picks (the Interviews tab)."""
+    for by, (best, weak) in (_picks(report, team_rate) if picks is None else picks).items():
         for g in report.get(by, []):
             g["mark"] = "best" if g is best else "weak" if g is weak else None

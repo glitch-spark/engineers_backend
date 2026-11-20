@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Iterable, List, Literal, Optional
 from urllib.parse import urlsplit
@@ -31,7 +31,7 @@ from app.models import (
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.bidder import Bidder
 from app.models.interview import (
-    InterviewAppliedBy, InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus, Reschedule,
+    FollowUp, InterviewAppliedBy, InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus, Reschedule,
 )
 from app.interview_reasons import CANCEL_REASONS, valid_status_reason
 from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
@@ -278,6 +278,7 @@ def mark_previous_passed(history: list[InterviewStageEvent]) -> bool:
     tip = history[-1]
     if tip.status in (InterviewStatus.scheduled, InterviewStatus.completed):
         tip.status = InterviewStatus.passed
+        tip.statusAt = datetime.now(timezone.utc)
         return True
     return False
 
@@ -1042,7 +1043,60 @@ async def applied_by_options(
     return {"bidders": [{"id": str(b.id), "name": b.name, "onProfile": b.profileId == account_oid} for b in bidders]}
 
 
-RESULT_WAIT = timedelta(days=7)  # a held round asks for its result only after this long (user, 2026-11-20)
+RESULT_WAIT = timedelta(days=7)  # a held round asks for a follow-up, and a follow-up for its answer, after this long
+OUTCOME_WAIT = timedelta(minutes=15)  # a scheduled round is asked how it went this long after its end
+NEEDS = ("outcome", "follow_up", "heard_back", "reason")
+
+
+def round_need(
+    e: dict, *, latest: bool, now: datetime, cutoff: datetime,
+) -> Optional[tuple[str, datetime, datetime, Optional[datetime]]]:
+    """What a round (a stageHistory entry as a dict) still needs from its owner at `now` (naive UTC), as
+    `(need, start, end, latest follow-up)`; None when nothing, or when it started before `cutoff`. `latest`: it is
+    the interview's last round. The one rule behind needs-input and the standup's "still to do"."""
+    start = _as_naive_utc(e.get("scheduledAt"))
+    if start is None or start < cutoff:
+        return None
+    stage, round_status = _normalize_stage(e.get("stage")), normalize_status(e.get("status"))
+    end = _utc_naive(round_ends_at(start, _as_naive_utc(e.get("endsAt"))))
+    followed_up = max((_as_naive_utc(f.get("at")) for f in e.get("followUps") or []), default=None)
+    need = None
+    if round_status in ("canceled", "rejected"):
+        need = None if e.get("statusReason") else "reason"
+    elif stage in _ROUND_COUNT_EXCLUDED:
+        pass
+    elif round_status == "scheduled":
+        need = "outcome" if end <= now - OUTCOME_WAIT else None
+    elif round_status == "completed" and latest:
+        if followed_up is None:
+            need = "follow_up" if end <= now - RESULT_WAIT else None
+        else:
+            need = "heard_back" if followed_up <= now - RESULT_WAIT else None
+    return (need, start, end, followed_up) if need else None
+
+
+async def follow_ups_summary(uid: Any, day: date) -> dict:
+    """The standup's Follow-ups line for the interviews `uid` owns: `doneToday`, the company of each round followed
+    up on `day` (app timezone) in the order done ("—" without a name), and `toDo`, the rounds that need a follow-up
+    or a "did you hear back?" right now (the needs-input rules), whichever day is asked for. Read-only."""
+    tz = app_tz()
+    cutoff = local_day_start_utc(DATA_START, tz)
+    lo, hi = local_day_start_utc(day, tz), local_day_start_utc(day + timedelta(days=1), tz)
+    rows = await Interview.find({"createdBy": uid, "$or": [
+        {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": cutoff}}}},
+        {"stageHistory": {"$elemMatch": {"followUps": {"$elemMatch": {"at": {"$gte": lo, "$lt": hi}}}}}},
+    ]}).to_list()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    done: list[tuple[datetime, str]] = []
+    to_do = 0
+    for iv in rows:
+        for e in iv.stageHistory:
+            made = [t for f in e.followUps if lo <= (t := _utc_naive(f.at)) < hi]
+            if made:
+                done.append((min(made), (iv.companyName or "").strip() or "—"))
+            found = round_need(e.model_dump(), latest=e is iv.stageHistory[-1], now=now, cutoff=cutoff)
+            to_do += found is not None and found[0] in ("follow_up", "heard_back")
+    return {"doneToday": [name for _, name in sorted(done, key=lambda d: d[0])], "toDo": to_do}
 
 
 @router.get("/needs-input")
@@ -1050,9 +1104,11 @@ async def needs_input(
     user: Annotated[UserExtra, Depends(get_current_user)],
     userId: str = Query("", description="admins: only this owner's rounds"),
 ) -> dict:
-    """Rounds since the data start that still need something from the interview's owner: `result` (the latest round
-    was held and ended at least RESULT_WAIT ago, with no pass / reject yet: the company may still be deciding)
-    or `reason` (canceled / rejected with no statusReason).
+    """Rounds since the data start that still need something from the interview's owner (spec
+    2026-11-20-interview-followup-design.md): `outcome` (scheduled, ended OUTCOME_WAIT ago), `follow_up` (the latest
+    round, completed, ended RESULT_WAIT ago, not followed up), `heard_back` (the latest round, completed, last
+    followed up RESULT_WAIT ago; carries `followedUpAt`) or `reason` (canceled / rejected with no statusReason).
+    AI interviews and home assessments are only ever asked for a reason.
     Newest first. A normal user gets their own; an admin everyone's, or one person's with `userId`."""
     cutoff = local_day_start_utc(DATA_START, app_tz())
     query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": cutoff}}}}
@@ -1068,19 +1124,10 @@ async def needs_input(
         account, owner = iv.get("accountId"), iv.get("createdBy")
         history = iv.get("stageHistory") or []
         for e in history:
-            start = _as_naive_utc(e.get("scheduledAt"))
-            if start is None or start < cutoff:
+            found = round_need(e, latest=e is history[-1], now=now, cutoff=cutoff)
+            if found is None:
                 continue
-            stage, round_status = _normalize_stage(e.get("stage")), normalize_status(e.get("status"))
-            if round_status in ("canceled", "rejected") and not e.get("statusReason"):
-                need = "reason"
-            elif (
-                e is history[-1] and round_status == "completed" and stage not in _ROUND_COUNT_EXCLUDED
-                and _utc_naive(round_ends_at(start, _as_naive_utc(e.get("endsAt")))) <= now - RESULT_WAIT
-            ):
-                need = "result"
-            else:
-                continue
+            need, start, end, followed_up = found
             items.append({
                 "interviewId": str(iv.get("_id")),
                 "roundId": e.get("id"),
@@ -1088,13 +1135,15 @@ async def needs_input(
                 "profileName": account.get("name") if isinstance(account, dict) else None,
                 "ownerId": str(owner.get("_id")) if isinstance(owner, dict) else str(owner or ""),
                 "ownerName": iv.get("ownerName"),
-                "stage": stage,
-                "status": round_status,
+                "stage": _normalize_stage(e.get("stage")),
+                "status": normalize_status(e.get("status")),
                 "scheduledAt": _iso_utc(start),
+                "endsAt": _iso_utc(end),
                 "need": need,
+                **({"followedUpAt": _iso_utc(followed_up)} if need == "heard_back" else {}),
             })
     items.sort(key=lambda i: i["scheduledAt"], reverse=True)
-    return {"items": items, "counts": {need: sum(i["need"] == need for i in items) for need in ("result", "reason")}}
+    return {"items": items, "counts": {need: sum(i["need"] == need for i in items) for need in NEEDS}}
 
 
 @router.get("/{iv_id}")
@@ -1318,7 +1367,8 @@ async def update_interview(
                 iv, stage_val, by=user.id, source="manual",
                 previous=prev, previous_scheduled_at=prev_sched,
             )
-    iv.status = _carry_status(iv.status, appended=len(iv.stageHistory) > rounds_before)
+    appended = len(iv.stageHistory) > rounds_before
+    iv.status = _carry_status(iv.status, appended=appended)
     if body.status is not None:
         if body.status == "":
             iv.status = None
@@ -1330,6 +1380,8 @@ async def update_interview(
     if tip is not None:
         if _status_value(tip.status) != _status_value(iv.status):
             tip.statusReason = None  # it was about the previous status
+            if not appended:  # a new round starting scheduled is not a status change
+                tip.statusAt = datetime.now(timezone.utc)
         tip.status = iv.status
         if body.status is not None or _status_value(tip.status) in ENDED_STATUSES:
             _confirm_by_assignment(tip)  # called off: not confirmed; back on with a caller: confirmed again
@@ -1485,6 +1537,8 @@ async def update_interview_stage(
         entry.statusReason = _status_reason(body.statusReason, _status_value(entry.status))
     elif _status_value(entry.status) != old_status:
         entry.statusReason = None
+    if _status_value(entry.status) != old_status:
+        entry.statusAt = datetime.now(timezone.utc)
     if body.interviewerName is not None:
         entry.interviewerName = body.interviewerName.strip() or None
     transcript_changed = body.transcript is not None and body.transcript != entry.transcript
@@ -1561,10 +1615,31 @@ async def reject_awaiting_round(
     if _status_value(entry.status) != InterviewStatus.completed.value:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only a round awaiting its result can be rejected")
     entry.status = InterviewStatus.rejected
+    entry.statusAt = datetime.now(timezone.utc)
     entry.confirmed = False
     _sync_top_from_tip(iv)
     await _save_interview(iv)
     await _sync_caller_posts(iv, before)
+    return await _interview_out(iv)
+
+
+FOLLOW_UP_NEEDS_COMPLETED = "Only a completed round can be followed up"
+
+
+@router.post("/{iv_id}/stages/{stage_id}/follow-up")
+async def follow_up_round(
+    iv_id: str,
+    stage_id: str,
+    user: Annotated[UserExtra, Depends(get_current_user)],
+) -> dict:
+    """The owner chased the company about a held round with no result. Whoever may change the round's status may
+    record it (owner, admin, interview manager)."""
+    iv = await _load_round_editable(iv_id, user, {"status"})
+    entry = iv.stageHistory[_find_stage(iv, stage_id)]
+    if _status_value(entry.status) != InterviewStatus.completed.value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=FOLLOW_UP_NEEDS_COMPLETED)
+    entry.followUps.append(FollowUp(at=datetime.now(timezone.utc), by=user.id))
+    await _save_interview(iv)
     return await _interview_out(iv)
 
 

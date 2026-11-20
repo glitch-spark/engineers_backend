@@ -96,6 +96,17 @@ class Reschedule(BaseModel):
         return _utc_json(v)
 
 
+class FollowUp(BaseModel):
+    """The owner chased the company about a held round with no result (append-only)."""
+
+    at: datetime
+    by: Optional[PydanticObjectId] = None
+
+    @field_serializer("at", when_used="json")
+    def _times_utc(self, v: datetime) -> Optional[str]:
+        return _utc_json(v)
+
+
 class InterviewStageEvent(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     stage: str
@@ -112,6 +123,9 @@ class InterviewStageEvent(BaseModel):
     # A key of app.interview_reasons for a canceled or rejected round; None for any other status.
     statusReason: Optional[str] = None
     reschedules: List[Reschedule] = []
+    followUps: List[FollowUp] = []
+    # When the status last changed (not set by creating the round). Rounds from before the field have none.
+    statusAt: Optional[datetime] = None
     # Per-round details (phase 2). The interview-level interviewerName/caller
     # mirror the latest round's for one release.
     interviewerName: Optional[str] = None
@@ -121,7 +135,7 @@ class InterviewStageEvent(BaseModel):
     # Self, caller off) or calling the round off clears it. A new time keeps it.
     confirmed: bool = False
 
-    @field_serializer("at", "scheduledAt", "endsAt", when_used="json")
+    @field_serializer("at", "scheduledAt", "endsAt", "statusAt", when_used="json")
     def _times_utc(self, v: Optional[datetime]) -> Optional[str]:
         return _utc_json(v)
 

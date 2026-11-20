@@ -20,6 +20,8 @@ from app.coordination.blocks import (
     COORD_AFTER_RESCHEDULED,
     COORD_CHOOSE_CALLER,
     COORD_CONFIRM,
+    COORD_FOLLOWED_UP,
+    COORD_RESULT_NO_ANSWER,
     COORD_RESULT_PASSED,
     COORD_RESULT_REJECTED,
     answered_blocks,
@@ -27,6 +29,7 @@ from app.coordination.blocks import (
 from app.coordination.modals import Origin, cancel_view, reject_view, reschedule_view
 from app.interview_day.blocks import MAX_NAME, _short, _who
 from app.interview_normalize import interview_status_value
+from app.interview_reasons import REJECT_REASONS
 from app.models import Interview, ResultRoundupPost, UserExtra
 from app.models.round_slack_post import RoundSlackPost
 from app.models.interview import InterviewStageEvent
@@ -47,6 +50,7 @@ UPDATE_REFUSED = "Only the owner or an interview manager can update this round."
 NEEDS_COMPLETED = "Mark the round completed first."
 ALREADY = "Already updated: {Label}."
 ALREADY_CONFIRMED = "Already confirmed."
+ALREADY_FOLLOWED_UP = "Already followed up."
 MOVED = "This round was moved — answer the new ask after it ends."
 
 
@@ -414,6 +418,52 @@ async def result_rejected(click: Click, user: UserExtra) -> None:
     await _open_form(click, *found, reject_view)
 
 
+async def result_no_answer(click: Click, user: UserExtra) -> None:
+    """"No, close as rejected": the company never answered the follow-up. One click, no form."""
+    found = await _clicked_round(click, user)
+    if found is None or not await _result_open(click, *found):
+        return
+    iv, entry = found
+    try:
+        await set_round(str(iv.id), entry.id, user, status="rejected", statusReason="no_answer")
+    except HTTPException as exc:
+        await reply(click.response_url, str(exc.detail))
+        return
+    await show_answer(iv, channel=click.channel, ts=click.message_ts, response_url=click.response_url,
+                      line=f"{answer_line('rejected', user)} · {REJECT_REASONS['no_answer']}")
+
+
+async def _followed_up_line(entry: InterviewStageEvent, fallback: UserExtra) -> str:
+    last = entry.followUps[-1]
+    by = fallback if last.by == fallback.id else (await UserExtra.get(last.by) if last.by else None)
+    return f"📨 {_who(by)} followed up on {slack_bot.slack_time(last.at)}."
+
+
+async def followed_up(click: Click, user: UserExtra) -> None:
+    """"I followed up" on the 7-day reminder. A round already followed up (here or in the app) records nothing more;
+    its message is settled with the follow-up it has."""
+    from app.routers import interviews as ivr
+
+    found = await _clicked_round(click, user)
+    if found is None or not await _result_open(click, *found):
+        return
+    iv, entry = found
+    if entry.followUps:
+        await reply(click.response_url, ALREADY_FOLLOWED_UP)
+    else:
+        try:
+            await ivr.follow_up_round(str(iv.id), entry.id, user)
+        except HTTPException as exc:
+            await reply(click.response_url, str(exc.detail))
+            return
+        found = await _find_round(str(iv.id), entry.id)
+        if found is None:
+            return
+        iv, entry = found
+    await show_answer(iv, channel=click.channel, ts=click.message_ts, response_url=click.response_url,
+                      line=await _followed_up_line(entry, user))
+
+
 HANDLERS[COORD_AFTER_COMPLETED] = after_completed
 HANDLERS[COORD_AFTER_CANCELED] = after_canceled
 HANDLERS[COORD_AFTER_RESCHEDULED] = after_rescheduled
@@ -421,6 +471,8 @@ HANDLERS[COORD_AFTER_PASSED] = after_passed
 HANDLERS[COORD_AFTER_REJECTED] = after_rejected
 HANDLERS[COORD_RESULT_PASSED] = result_passed
 HANDLERS[COORD_RESULT_REJECTED] = result_rejected
+HANDLERS[COORD_RESULT_NO_ANSWER] = result_no_answer
+HANDLERS[COORD_FOLLOWED_UP] = followed_up
 
 
 async def process_coordination_click(click: Click) -> None:

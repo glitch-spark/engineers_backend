@@ -18,12 +18,14 @@ from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
 from app.stats import changes, conversion, conversion_findings, conversion_scope as cs, conversion_summary, timing
+from app.stats import interview_findings, interview_report
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.conversion_scope import bounds as _bounds
 from app.stats.frame import previous_window
 from app.stats.interviews import interviews_view
-from app.stats.profile_loader import accounts_with_rounds_since, count_unmatched_interviews, count_untied_interviews, load_period_rows
+from app.stats.profile_loader import (accounts_with_rounds_since, count_unmatched_interviews, count_untied_interviews,
+                                      load_interview_facts, load_period_rows)
 from app.stats.profile_report import grade, summarize, team_baseline
 
 router = APIRouter(prefix="/stats", tags=["stats"])
@@ -59,6 +61,41 @@ async def conversion_report(
             "subject": sc["subject"], **({"profile": profile} if scope == "profile" else {}),
             **rep, "totals": {**rep["totals"], "untied": untied}, "findings": found,
             "summary": await conversion_summary.summary(sc, region, rep["totals"])}
+
+
+@router.get("/interviews-report")
+async def interviews_report(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    period: Literal["week", "month", "custom"] = Query("month"),
+    date: str = Query("", description="YYYY-MM-DD: any day in the week or month; custom: the first day"),
+    to: str = Query("", description="YYYY-MM-DD: a custom range's last day"),
+    region: Literal["all", "Latam", "EU", "US"] = Query("all"),
+    user_id: Optional[str] = Query(None, alias="user", description="admin only: view this user"),
+    scope: Literal["me", "team"] = Query("team", description="me: the subject's interviews; team: everyone's"),
+) -> dict:
+    """The Interviews tab (docs/superpowers/specs/2026-11-20-interview-statistics-design.md): what happened to the
+    rounds scheduled in the period. A round belongs to the interview's creator; the team is every profile of the
+    region (and, for every region, the interviews on deleted profiles), and its pass rate is what the findings and marks compare with in both scopes."""
+    from app.routers.metrics import _display_name
+
+    sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope)
+    sid, now = sc["sid"], sc["now"]
+    loaded = await load_interview_facts(sc["start"], sc["end"]) if sc["end_d"] >= cs.DATA_START else []
+    team_rows = interview_report.period_rows(loaded, sc["teamAccounts"], sc["start"], sc["end"], now, app_tz(),
+                                             deleted=region == "all")
+    rows = team_rows if scope == "team" else [r for r in team_rows if r["ownerId"] == sid]
+    rep = interview_report.report(rows, now)
+    team_rate = interview_report.pass_rate(team_rows)
+    found = interview_findings.findings(rep, team_rate)
+    interview_findings.mark_groups(rep, team_rate)
+    users = {u.id: u for u in await UserExtra.find({"role": {"$ne": "admin"}}).to_list()}
+    names = {u: _display_name(x) for u, x in users.items()}
+    if sid not in names:  # an admin is not a member but can view their own
+        names[sid] = _display_name(user if sid == user.id else await UserExtra.get(sid))
+    return {"window": {"start": sc["start_d"].isoformat(), "end": sc["end_d"].isoformat(),
+                       "startClamped": sc["startClamped"]},
+            "summary": interview_report.summary(team_rows, names, set(users), sid, scope == "team", rep["totals"]),
+            "findings": found, **rep}
 
 
 @router.get("/{tab}")

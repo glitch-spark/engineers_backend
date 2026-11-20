@@ -25,7 +25,7 @@ def bounds(start_d: Date, end_d: Date) -> tuple[datetime, datetime]:
 async def conversion_scope(user: UserExtra, period: str, date: str, to: str, region: str, user_id: Optional[str],
                            scope: Literal["me", "profile", "team"] = "me", profile: Optional[str] = None) -> dict:
     """Query params -> subject, clamped bounds and the loader rows of the scope (`rows`) and of the team (`teamRows`,
-    every profile of the region: the baseline). Rows still include rejected bids; callers drop them."""
+    every profile of the region: the baseline; those profiles are `teamAccounts`). Rows still include rejected bids; callers drop them."""
     from app.routers.dashboard import _subject_id
     from app.routers.metrics import _stats_days
 
@@ -66,5 +66,5 @@ async def conversion_scope(user: UserExtra, period: str, date: str, to: str, reg
     return {"sid": sid, "subject": {"userId": str(sid), "name": subject.name}, "scope": scope,
             "start_d": start_d, "end_d": end_d, "start": start, "end": end, "label": label, "startClamped": clamped,
             "now": datetime.utcnow(), "today": datetime.now(tz).date(),
-            "accounts": {k: team[k] for k in ids}, "rows": [r for r in team_rows if str(r["accountId"]) in ids],
+            "accounts": {k: team[k] for k in ids}, "teamAccounts": team, "rows": [r for r in team_rows if str(r["accountId"]) in ids],
             "teamRows": team_rows}

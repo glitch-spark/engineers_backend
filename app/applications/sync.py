@@ -25,9 +25,10 @@ import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from bson import ObjectId
 from pymongo import UpdateOne
 
-from app.applications.area import job_title
+from app.applications.area import GENERAL, area_from_description, job_title
 from app.applications.rows import _key, build_rows, match_interviews
 from app.models import Account, Application, Bid, Interview, ResumeApplication
 from app.models.bidder import Bidder
@@ -45,6 +46,8 @@ _BID_FIELDS = ("kind", "bidderId", "accountId", "ownerId", "jobKey", "jobTitle",
 _RESUME_FIELDS = ("userId", "accountId", "jobUrl", "createdAt", "countsAsBid", "matchScore", "promptId",
                   "promptName", "templateName", "jobDescription")
 _TITLE_LINES = 5  # lines of jobDescription fetched for the title (leading blank lines are skipped)
+_AREA_LINES = 80  # of a job description, fetched to read the area of a row whose title names no speciality
+_AREA_BATCH = 1000
 _IV_FIELDS = ("accountId", "createdBy", "scheduledAt", "stage", "status", "jobUrl", "stageHistory", "resumeLink",
               "fitScore", "createdAt", "updatedAt")
 
@@ -72,6 +75,27 @@ def _profile(bid: dict, profiles: dict):
 async def _bulk_upsert(coll, ops: list[tuple[str, dict]]) -> None:
     """One bulk round trip of upserts by row key (a seam: mongomock cannot bulk_write)."""
     await coll.bulk_write([UpdateOne({"key": k}, u, upsert=True) for k, u in ops], ordered=False)
+
+
+async def _read_areas(resume_coll, rows: dict[str, dict]) -> None:
+    """Rows whose title names no speciality ("Senior Software Engineer") take the area their job description's
+    technologies point to, when one clearly leads (user, 2026-11-20). Only those rows' titling resume (its first
+    resume source, else the tailored resume that enriched a bid row) has the start of its description fetched:
+    reading it for every general-title resume was ~16k documents and did not fit the rebuild's time limit."""
+    want: dict = {}
+    for r in rows.values():
+        if r.get("area") != GENERAL:
+            continue
+        rid = next((s[len("resume:"):] for s in r["sources"] if s.startswith("resume:")), None) or r.get("tailoredResumeId")
+        if rid and ObjectId.is_valid(str(rid)):
+            want.setdefault(ObjectId(str(rid)), []).append(r)
+    ids = list(want)
+    for i in range(0, len(ids), _AREA_BATCH):
+        async for d in resume_coll.aggregate([{"$match": {"_id": {"$in": ids[i:i + _AREA_BATCH]}}}, {"$project": {
+                "lines": {"$slice": [{"$split": [{"$ifNull": ["$jobDescription", ""]}, "\n"]}, _AREA_LINES]}}}]):
+            area = area_from_description("\n".join(d.get("lines") or []))
+            for r in want[d["_id"]] if area else ():
+                r["area"] = area
 
 
 async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profiles: Optional[dict] = None) -> dict:
@@ -117,6 +141,7 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     accounts = {a["_id"]: {"region": a.get("region"), "createdAt": a.get("createdAt")}
                 async for a in Account.get_motor_collection().find({"_id": {"$in": list(ids)}}, {"region": 1, "createdAt": 1})}
     rows = build_rows(bids, resumes, accounts, tailored)
+    await _read_areas(resume_coll, rows)
     for r in rows.values():
         if r["sources"] and set(r["sources"]) <= unapplied:
             r["byInterviewOnly"] = True

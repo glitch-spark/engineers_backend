@@ -38,11 +38,36 @@ def test_classify_area_examples(title, area):
     ("JavaScript Developer", "Frontend"), ("Node.js Developer", "Backend"),
     ("Full Stack JavaScript Engineer", "Full stack"), ("Java Developer", "Backend"),
     ("Engineer II, Data Platform", "Data"), ("Data Analyst", "Data"), ("Business Intelligence Developer", "Data"),
-    ("UI/UX Designer", "Other"), ("Senior Software Engineer, Contract Testing", "Other"),
+    ("UI/UX Designer", "Other"), ("Senior Software Engineer, Contract Testing", "General software"),
     ("Test Automation Engineer", "QA"), ("QA Engineer", "QA"), ("SDET", "QA"),
-    ("Senior Software Engineer", "Other"), ("Python Developer", "Backend"), ("Cloud Engineer", "DevOps"),
+    ("Senior Software Engineer", "General software"), ("Python Developer", "Backend"), ("Cloud Engineer", "DevOps"),
+    ("Staff Software Engineer @ Bjak", "General software"), ("Software Developer", "General software"),
+    ("Senior Software Development Engineer (Game)", "General software"), ("Senior Developer | Careers | One North", "General software"),
+    ("Senior Dev Ops Engineer", "DevOps"), ("Senior Kubernetes & Reliability Engineer", "DevOps"),
+    ("Senior Salesforce Engineer", "Other"), ("Database Administrator", "Other"), ("Sign In", "Other"),
+    ("DevSecOps Engineer", "DevOps"),
     ("AI Engineer", "AI / ML"), ("React Native Developer", "Mobile"), ("Platform Engineer", "DevOps"),
     ("Maintenance Technician", "Other"), ("Javascript Instructor", "Frontend"), ("TypeScript Engineer", "Frontend"),
 ])
 def test_classify_area_regression(title, area):
     assert classify_area(title) == area
+
+
+BACKEND_JD = "We build services in Python and Django with Postgres. You will design REST APIs and microservices in Go."
+
+
+@pytest.mark.parametrize("text,area", [
+    (BACKEND_JD, "Backend"),
+    ("Our UI is React and TypeScript with Redux, HTML and CSS; you own the frontend.", "Frontend"),
+    ("You run Kubernetes, Terraform, Docker and Helm, and own CI/CD and observability. Some Python.", "DevOps"),
+    ("Python, Django, Postgres and REST on the server; React, TypeScript, CSS and HTML in the browser.", "Full stack"),
+    ("Join us as a full-stack engineer.", "Full stack"),
+    ("PyTorch, TensorFlow, LLMs and RAG pipelines; some Python.", "AI / ML"),
+    # no area clearly leads, or too little to go on: None (the title's area stands)
+    ("Python, Django and SQL; Spark, Airflow, Snowflake and Kafka.", None),
+    ("You will write Python.", None), ("", None), (None, None),
+    ("We value curiosity, ownership and kindness.", None),
+])
+def test_area_from_description(text, area):
+    from app.applications.area import area_from_description
+    assert area_from_description(text) == area

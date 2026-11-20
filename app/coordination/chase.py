@@ -1,13 +1,14 @@
-"""The interview follow-ups (spec 2026-11-17-interview-followups-daily-channel-design.md): the after-interview check
-(15 minutes after a round ends) and the 7-day result reminder, for caller and self rounds, each a reply in the round's
-home thread in the daily channel (app/interview_day/home.py). Off until SLACK_CALLER_ASKS_FROM is set; only rounds
+"""The interview follow-ups (specs 2026-11-17-interview-followups-daily-channel-design.md and
+2026-11-20-interview-followup-design.md): the after-interview check (15 minutes after a round ends), the 7-day
+"follow up with the company" reminder and, 7 days after the follow-up, "did you hear back?", for caller and self
+rounds, each a reply in the round's home thread in the daily channel (app/interview_day/home.py). Off until SLACK_CALLER_ASKS_FROM is set; only rounds
 that END after it, and at most 2 days before the check is due, are chased.
 
 The Friday result roundup is no longer posted; a roundup already in Slack is still edited in place as its rounds are
 answered (`refresh_latest_roundup`).
 
 Claims reuse SlackAlertLog (`slack_bot._reminder_claim`, claim before posting, release on failure):
-"after-call:<roundId>:<startEpoch>" and "result-reminder:<roundId>"."""
+"after-call:<roundId>:<startEpoch>", "result-reminder:<roundId>" and "heard-back:<roundId>:<followUpEpoch>"."""
 
 from __future__ import annotations
 
@@ -23,7 +24,9 @@ from beanie import PydanticObjectId
 
 from app import slack_bot
 from app.config import get_settings
-from app.coordination.blocks import RoundupRow, ask_blocks, result_reminder_blocks, roundup_blocks
+from app.coordination.blocks import (
+    RoundupRow, ask_blocks, follow_up_blocks, heard_back_blocks, result_reminder_blocks, roundup_blocks,
+)
 from app.interview_day.home import post_in_home
 from app.interview_normalize import interview_status_value, normalize_stage
 from app.models import Account, Interview, ResultRoundupPost, SlackAlertLog, UserExtra
@@ -163,9 +166,18 @@ def _ask(c: ChaseRound) -> tuple[str, list[dict]]:
                       stage=normalize_stage(c.entry.stage) or "", end=c.end)
 
 
-def _reminder(c: ChaseRound) -> tuple[str, list[dict]]:
-    return result_reminder_blocks(_ref(c), owner=c.owner, company=c.interview.companyName or "",
-                                  stage=normalize_stage(c.entry.stage) or "", start=c.start)
+def _round_message(build: Callable[..., tuple[str, list[dict]]]) -> Callable[[ChaseRound], tuple[str, list[dict]]]:
+    return lambda c: build(_ref(c), owner=c.owner, company=c.interview.companyName or "",
+                           stage=normalize_stage(c.entry.stage) or "", start=c.start)
+
+
+def _followed_up_at(c: ChaseRound) -> datetime:
+    return slack_bot._aware_utc(max(f.at for f in c.entry.followUps))
+
+
+def heard_back_key(c: ChaseRound) -> str:
+    """One ask per follow-up, so a later follow-up is asked about again."""
+    return f"heard-back:{c.entry.id}:{int(_followed_up_at(c).timestamp())}"
 
 
 async def run_after_call_asks(now: datetime) -> dict[str, int]:
@@ -177,19 +189,45 @@ async def run_after_call_asks(now: datetime) -> dict[str, int]:
     now = slack_bot._aware_utc(now)
     window = dict(ended_after=max(cutoff, now - MAX_AGE), ended_by=now - ASK_DELAY)
     asked = await _chase(await ended_rounds("scheduled", **window), after_call_key, _ask)
-    results = await _chase(await ended_rounds("completed", **window), after_call_key, _reminder)
+    results = await _chase(await ended_rounds("completed", **window), after_call_key,
+                           _round_message(result_reminder_blocks))
     return {k: asked[k] + results[k] for k in asked}
 
 
 async def run_result_reminders(now: datetime) -> dict[str, int]:
-    """Remind the owner once when a round has been completed for 7 days with no result."""
+    """Remind the owner once, when a round has been completed for 7 days with no result, to follow up with the
+    company. A round already followed up (in the app) is left to `run_heard_back_asks`."""
     cutoff = _active_cutoff()
     if cutoff is None:
         return {"sent": 0, "failed": 0}
     now = slack_bot._aware_utc(now)
     rounds = await ended_rounds("completed", ended_after=max(cutoff, now - RESULT_REMINDER_AFTER - MAX_AGE),
                                 ended_by=now - RESULT_REMINDER_AFTER)
-    return await _chase(rounds, result_reminder_key, _reminder)
+    return await _chase([c for c in rounds if not c.entry.followUps], result_reminder_key,
+                        _round_message(follow_up_blocks))
+
+
+async def run_heard_back_asks(now: datetime) -> dict[str, int]:
+    """Ask the owner once per follow-up, 7 days after it, whether the company answered: only while the round is still
+    completed and still the interview's latest. Same switches, cutoff and MAX_AGE rule as the reminders."""
+    cutoff = _active_cutoff()
+    if cutoff is None:
+        return {"sent": 0, "failed": 0}
+    now = slack_bot._aware_utc(now)
+    due = now - RESULT_REMINDER_AFTER
+    # Looser than the Python filter (any follow-up in the window), never tighter.
+    found = await Interview.find({"stageHistory": {"$elemMatch": {
+        "status": _status_query("completed"),
+        "followUps": {"$elemMatch": {"at": {"$gt": (due - MAX_AGE).replace(tzinfo=None),
+                                            "$lte": due.replace(tzinfo=None)}}},
+    }}}).to_list()
+    refs = [f"{iv.id}:{e.id}" for iv in found for e in iv.stageHistory[-1:] if e.followUps]
+    rounds = [
+        c for c in await _open_rounds(refs)
+        if normalize_stage(c.entry.stage) != InterviewStage.home_assessment.value and c.end > cutoff
+        and due - MAX_AGE < _followed_up_at(c) <= due
+    ]
+    return await _chase(rounds, heard_back_key, _round_message(heard_back_blocks))
 
 
 def _roundup_message(
@@ -295,6 +333,7 @@ async def run_coordination_chase(now: datetime) -> dict[str, Any]:
     """The tick's coordination step. Each part is isolated; a crash reports zero for that part."""
     parts: dict[str, Callable[[datetime], Awaitable[dict[str, int]]]] = {
         "after_call_asks": run_after_call_asks, "result_reminders": run_result_reminders,
+        "heard_back_asks": run_heard_back_asks,
     }
     out: dict[str, Any] = {}
     for name, run in parts.items():

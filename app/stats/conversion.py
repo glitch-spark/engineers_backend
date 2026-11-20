@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Callable, Optional
 
-from app.stats.job_fit import _AGES, _AREAS, _SCORES, BOARD_LABELS, TOP_SITES, _age
+from app.stats.job_fit import _AGES, _AREAS, _SCORES, BOARD_LABELS, NO_AREA, TOP_SITES, _age
 from app.stats.profile_report import EXPECTED_MIN, MIN_MATURED
 
 
@@ -88,6 +88,6 @@ def report(rows: list[dict], matured_before: datetime, bidder_names: dict, inclu
     other.update(members=members[:50], moreMembers=max(0, len(members) - 50), memberCount=len(members))
     out["byScore"] = _groups(rows, matured_before, team_rate, lambda r: r.get("scoreBand"), _SCORES)
     out["byArea"] = _groups(rows, matured_before, team_rate, lambda r: r.get("area"),
-                            [(a, a or "Unknown") for a in _AREAS], skip_empty=True)
+                            [(a, a or NO_AREA) for a in _AREAS], skip_empty=True)
     out["byAge"] = _groups(rows, matured_before, team_rate, lambda r: _age(r.get("profileAgeDays")), _AGES)
     return out
