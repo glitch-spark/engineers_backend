@@ -71,3 +71,12 @@ rules belong in the tested backend.
 
 No real-DB runs in tests; commits single line, no co-author / "Generated with" trailers; TDD; backend full suite with
 the usual ignores (2 known failures); app vitest + tsc.
+
+## Date range guidance (user, 2026-11-19)
+
+Data starts Oct 6, 2026; reliable statistics need a month or more.
+- Under the Date range control on the Conversion tab: `Data starts Oct 6, 2026 · pick a month or more for reliable numbers.`
+- Custom range pickers: minimum date 2026-10-06.
+- Range starting before Oct 6 (`startClamped`): note `Data starts Oct 6 — showing Oct 6 onward.`
+- Range shorter than 28 days: note at the top `Short period — rates can swing a lot. For reliable numbers, use Since Oct 6 or a range of a month or more.` with buttons **Since Oct 6** and **Last month**.
+- Default stays "Since Oct 6".
