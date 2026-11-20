@@ -17,7 +17,7 @@ from app.models import Account, Application, UserExtra
 from app.models.bidder import Bidder
 from app.routers.dashboard import _subject_id
 from app.routers.metrics import _stats_days
-from app.stats import changes, conversion, conversion_scope as cs, conversion_summary, timing
+from app.stats import changes, conversion, conversion_findings, conversion_scope as cs, conversion_summary, timing
 from app.stats.ai_usage import ai_usage_view
 from app.stats.bids import bids_view
 from app.stats.conversion_scope import bounds as _bounds
@@ -51,11 +51,13 @@ async def conversion_report(
     cutoff = sc["now"] - timedelta(days=win["matured_days"])
     team_rate = team_baseline(summarize(sc["teamRows"], cutoff), sc["teamRows"])["rate"]
     rep = conversion.report(sc["rows"], cutoff, {k: v for k, v in names.items() if v}, scope != "team", team_rate)
+    found = conversion_findings.findings(rep, team_rate, scope)
+    conversion_findings.mark_groups(rep, found)
     untied = await count_untied_interviews([PydanticObjectId(i) for i in sc["accounts"]], sc["start"], sc["end"]
                                            ) if sc["end_d"] >= cs.DATA_START else 0
     return {"label": sc["label"], "startClamped": sc["startClamped"], "window": win, "scope": scope,
             "subject": sc["subject"], **({"profile": profile} if scope == "profile" else {}),
-            **rep, "totals": {**rep["totals"], "untied": untied},
+            **rep, "totals": {**rep["totals"], "untied": untied}, "findings": found,
             "summary": await conversion_summary.summary(sc, region, rep["totals"])}
 
 

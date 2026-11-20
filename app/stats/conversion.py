@@ -35,7 +35,7 @@ def _groups(rows: list[dict], matured_before: datetime, team_rate: Optional[floa
     for key, label in order:
         mine = [r for r in rows if keyf(r) == key]
         if not (skip_empty and not mine):
-            out.append({"key": key, "label": label, **_counts(mine, matured_before, team_rate)})
+            out.append({"key": key, "label": label, **_counts(mine, matured_before, team_rate), "mark": None})
     return out
 
 

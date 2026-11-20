@@ -154,6 +154,9 @@ async def test_response_shape_and_bidders(db):
     assert [(g["label"], g["bids"]) for g in out["byBidder"]] == [("Self", 4), ("Bob", 2)]
     # team rate = the team rows' pooled matured rate (Ana 1 of 6, Ben 0 of 5); 11 matured < 30: few by "matured"
     assert out["teamRate"] == 9.1 and out["byBidder"][0]["fewReason"] == "matured"
+    assert out["findings"] == [{"kind": "none", "text": "No clear pattern yet in this period — try a longer date range.",
+                                "evidence": {}}]
+    assert all(g["mark"] is None for k in ("byWho", "bySite", "byScore", "byArea", "byAge") for g in out[k])
 
 
 async def test_team_scope_has_no_bidder_table(db):
