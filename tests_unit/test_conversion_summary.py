@@ -74,10 +74,11 @@ async def _iv(acct, owner, first, rounds=(), **kw):
     return (await Interview.get_motor_collection().insert_one(doc)).inserted_id
 
 
-async def _rows(acct, owner, n, iv=0, at=_d(4)):
+async def _rows(acct, owner, n, ivs=(), at=_d(4)):
+    """`n` rows on `acct`; the first ones carry the interview ids `ivs`."""
     await Application.get_motor_collection().insert_many([{
         "key": f"{acct.id}:{ObjectId()}", "accountId": acct.id, "ownerId": owner.id, "region": acct.region,
-        "appliedAt": at, "interviewId": ObjectId() if i < iv else None, "by": "self", "syncedAt": at}
+        "appliedAt": at, "interviewId": ivs[i] if i < len(ivs) else None, "by": "self", "syncedAt": at}
         for i in range(n)])
 
 
@@ -100,16 +101,17 @@ async def _team():
     await _bids(ben, 10)
     await _bids(cy, 60)
     await _bids(boss, 99)
-    await _iv(a, ana, _d(10), rounds=[("intro", _d(5))], stage="tech_round_1")    # started Nov 5, 2 rounds held
+    first = await _iv(a, ana, _d(10), rounds=[("intro", _d(5))], stage="tech_round_1")  # started Nov 5, 2 rounds held
     await _iv(a, ana, _d(6))                                               # started, 1 round
     await _iv(a, ana, _d(7), rounds=[("intro", datetime(2026, 10, 20))], stage="tech_round_1")  # started before: 1 round only
     await _iv(a, ana, _d(8), status="canceled")                            # canceled only: nothing
     await _iv(a, ana, _d(8), stage="ai_interview")                         # AI interview: nothing
-    await _iv(a, ben, _d(9))                                               # on Ana's profile, created by Ben: Ben's
+    by_ben = await _iv(a, ben, _d(9))                                      # on Ana's profile, created by Ben: Ben's
+    late = await _iv(a, ana, datetime(2026, 11, 20, 15))                   # from a bid in the period, starts after it
     await _iv(b, ben, _d(11))
     await _iv(d, dee, _d(12))
     await _iv(d, boss, _d(12))                                             # admins are not on the team
-    await _rows(a, ana, 30, iv=2)
+    await _rows(a, ana, 30, ivs=[first, late, by_ben])                     # interviewsAll 3
     await _rows(b, ben, 8)
     await _rows(c, cy, 50)
     return ana, ben, cy, dee, eve
@@ -162,9 +164,11 @@ async def test_everyone_rows_and_per100_needs_30_bids(db):
 async def test_coverage_reconciles(db):
     ana, *_ = await _team()
     me = (await _get(ana))["summary"]["coverage"]
-    assert me == {"rows": 30, "bids": 40, "matched": 2, "interviews": 2}
+    # matched = the scope's started interviews some row carries: `first` only; `late` starts after the period and
+    # `by_ben` is Ben's (created by him), though Ana's rows carry both
+    assert me == {"rows": 30, "bids": 40, "matched": 1, "interviews": 2}
     team = (await _get(ana, Q + "&scope=team"))["summary"]["coverage"]
-    assert team == {"rows": 88, "bids": 110, "matched": 2, "interviews": 5}
+    assert team == {"rows": 88, "bids": 110, "matched": 2, "interviews": 5}  # `by_ben` counts for the team
     for c in (me, team):
         assert c["rows"] <= c["bids"] and c["matched"] <= c["interviews"]
 
@@ -176,11 +180,11 @@ async def test_region_filter_applies_to_bids_interviews_and_everyone(db):
     ben_us = await _acct(ben, "BenUs", region="US")
     await _bids(ana, 50, us=20)
     await _bids(ben, 30, us=30)
-    await _iv(eu, ana, _d(5))
+    eu_iv = await _iv(eu, ana, _d(5))
     await _iv(gone, ana, _d(6))
     await _iv(us, ana, _d(7))
     await _iv(ben_us, ben, _d(8))
-    await _rows(eu, ana, 25, iv=1)
+    await _rows(eu, ana, 25, ivs=[eu_iv])
     await _rows(us, ana, 10)
     s = (await _get(ana, Q + "&region=EU"))["summary"]
     assert (s["cards"]["bids"]["value"], s["cards"]["interviews"]["value"]) == (30, 2)

@@ -19,16 +19,17 @@ def _per100(p: dict) -> Optional[float]:
     return round(p["interviews"] / p["bids"] * 100, 1) if p["bids"] else None
 
 
-def build(people: dict, subject_id, team_view: bool, rows: int, matched: int) -> dict:
-    """`people`: uid → {name, bids, bidder, interviews, rounds, member}; the subject is always in it.
-    `rows` / `matched`: the conversion report's job-level bids and interviews (coverage)."""
+def build(people: dict, subject_id, team_view: bool, rows: int) -> dict:
+    """`people`: uid → {name, bids, bidder, interviews, rounds, matched, member}; the subject is always in it.
+    `matched`: of the person's interviews started, those an applications row carries. `rows`: the conversion
+    report's job-level bids (coverage)."""
     members = [u for u, p in people.items() if p["member"]]
     pop = [u for u in members if people[u]["bids"] > 0]
     rated = [u for u in pop if people[u]["bids"] >= MIN_BIDS]
     bids_v, ivs_v = [people[u]["bids"] for u in pop], [people[u]["interviews"] for u in pop]
     rates_v = [_per100(people[u]) for u in rated]
     bids_med, ivs_med = frame.distribution(bids_v)["median"], frame.distribution(ivs_v)["median"]
-    total = {k: sum(people[u][k] for u in members) for k in ("bids", "bidder", "interviews", "rounds")}
+    total = {k: sum(people[u][k] for u in members) for k in ("bids", "bidder", "interviews", "rounds", "matched")}
     team_rate = _per100(total)
 
     def ranks(u) -> dict:
@@ -69,21 +70,26 @@ def build(people: dict, subject_id, team_view: bool, rows: int, matched: int) ->
                          "ranks": {k: v[0] for k, v in r.items()}})
     everyone.sort(key=lambda e: (-e["interviews"], -e["bids"], e["name"].lower()))
     return {"cards": cards, "everyone": everyone,
-            "coverage": {"rows": rows, "bids": me["bids"], "matched": matched, "interviews": me["interviews"]}}
+            "coverage": {"rows": rows, "bids": me["bids"], "matched": me["matched"], "interviews": me["interviews"]}}
 
 
 async def summary(sc: dict, region: str, totals: dict) -> dict:
     """`sc`: conversion_scope's result; `totals`: the conversion report's totals. scope=profile reads as the subject."""
+    from app.models import Application
     from app.routers.metrics import _display_name
 
     sid = sc["sid"]
     users, user_ids, regions, now = await team_counts(sid, sc["start_d"], sc["end_d"], region)
-    started = Counter(
-        d["createdBy"] for d in await interviews_started({"createdBy": {"$in": user_ids}}, sc["start"], sc["end"])
-        if region == "all" or regions.get(d["accountId"]) == region)
+    started = [d for d in await interviews_started({"createdBy": {"$in": user_ids}}, sc["start"], sc["end"])
+               if region == "all" or regions.get(d["accountId"]) == region]
+    carried = set(await Application.get_motor_collection().distinct(
+        "interviewId", {"interviewId": {"$in": [d["_id"] for d in started]}}))
+    by_owner = Counter(d["createdBy"] for d in started)
+    matched = Counter(d["createdBy"] for d in started if d["_id"] in carried)
     people = {}
     for u in user_ids:
         bids, rounds, bidder, _ = now.get(u, (0, 0, 0, 0))
         people[u] = {"name": _display_name(users[u]) if u in users else sc["subject"]["name"], "bids": bids,
-                     "bidder": bidder, "interviews": started[u], "rounds": rounds, "member": u in users}
-    return build(people, sid, sc["scope"] == "team", totals["bids"], totals["interviewsAll"])
+                     "bidder": bidder, "interviews": by_owner[u], "rounds": rounds,
+                     "matched": matched[u], "member": u in users}
+    return build(people, sid, sc["scope"] == "team", totals["bids"])
