@@ -81,6 +81,21 @@ def _utc_json(v: Optional[datetime]) -> Optional[str]:
     return (v if v.tzinfo else v.replace(tzinfo=dt_timezone.utc)).isoformat().replace("+00:00", "Z")
 
 
+class Reschedule(BaseModel):
+    """One logged move of a round's start (append-only; rounds moved before the log existed have none)."""
+
+    at: datetime
+    by: Optional[PydanticObjectId] = None
+    fromAt: Optional[datetime] = None
+    toAt: datetime
+    reason: str  # a key of app.interview_reasons.CANCEL_REASONS
+    note: str = ""
+
+    @field_serializer("at", "fromAt", "toAt", when_used="json")
+    def _times_utc(self, v: Optional[datetime]) -> Optional[str]:
+        return _utc_json(v)
+
+
 class InterviewStageEvent(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     stage: str
@@ -94,6 +109,9 @@ class InterviewStageEvent(BaseModel):
     note: str = ""
     # Why the round got its status: the recruiter's reason (canceled) or feedback (passed / rejected).
     statusNote: str = ""
+    # A key of app.interview_reasons for a canceled or rejected round; None for any other status.
+    statusReason: Optional[str] = None
+    reschedules: List[Reschedule] = []
     # Per-round details (phase 2). The interview-level interviewerName/caller
     # mirror the latest round's for one release.
     interviewerName: Optional[str] = None

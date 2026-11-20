@@ -31,8 +31,9 @@ from app.models import (
 from app.prompts import FAILURE_MODES, STAGE_DRILL_BANK
 from app.models.bidder import Bidder
 from app.models.interview import (
-    InterviewAppliedBy, InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus,
+    InterviewAppliedBy, InterviewCaller, InterviewStage, InterviewStageEvent, InterviewStatus, Reschedule,
 )
+from app.interview_reasons import CANCEL_REASONS, valid_status_reason
 from app.interview_normalize import normalize_stage, normalize_status, pending_question_updates, translate_legacy_write
 from app.interview_caller import (
     ENDED_STATUSES,
@@ -49,6 +50,9 @@ from app.caller_directory import resolve_caller
 from app.routers.callers import require_caller_manager
 from app.round_confirm import ConfirmError, confirm_round
 from app.caller_access import can_update_round, is_assigned_caller
+from app.dashboard_stats import app_tz, local_day_start_utc
+from app.interview_rounds import _ROUND_COUNT_EXCLUDED
+from app.stats.conversion_scope import DATA_START
 
 log = logging.getLogger(__name__)
 
@@ -144,6 +148,7 @@ class RoundIn(BaseModel):
     note: Optional[str] = ""
     transcript: Optional[str] = ""
     statusNote: Optional[str] = ""
+    statusReason: Optional[str] = None  # a key of app.interview_reasons for a canceled / rejected round
     caller: Optional[CallerIn] = None
 
 
@@ -191,6 +196,12 @@ class StagePatch(BaseModel):
     note: Optional[str] = None
     # The reason / feedback for the status. Absent with a new status = cleared (it described the old one).
     statusNote: Optional[str] = None
+    # A key of app.interview_reasons for the resulting status ("" clears it). Absent with a new status = cleared.
+    statusReason: Optional[str] = None
+    # Sent with a scheduledAt that moves the round: the move is logged in the round's `reschedules`. Absent = the
+    # time is saved and nothing is logged (a typo fix, or an old client).
+    rescheduleReason: Optional[str] = None
+    rescheduleNote: Optional[str] = None
     caller: Optional[CallerIn] = None
     # Caller rounds only; owner or admin.
     confirmed: Optional[bool] = None
@@ -282,6 +293,16 @@ def _status_note(raw: Optional[str]) -> str:
             detail=f"The reason / feedback can be at most {STATUS_NOTE_MAX} characters.",
         )
     return note
+
+
+def _status_reason(raw: Optional[str], status_val: Optional[str]) -> Optional[str]:
+    """The reason key to store for a round of this status: None when blank, 400 unless it is on that status's list."""
+    reason = (raw or "").strip()
+    if not reason:
+        return None
+    if not valid_status_reason(status_val, reason):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid statusReason")
+    return reason
 
 
 def round_ends_at(start: datetime, ends: Optional[datetime]) -> datetime:
@@ -507,7 +528,9 @@ async def _load_editable(iv_id: str, user: UserExtra) -> Interview:
 
 
 # What an interview manager may change on someone else's round.
-MANAGER_ROUND_FIELDS: frozenset[str] = frozenset({"status", "statusNote", "scheduledAt", "endsAt"})
+MANAGER_ROUND_FIELDS: frozenset[str] = frozenset({
+    "status", "statusNote", "statusReason", "scheduledAt", "endsAt", "rescheduleReason", "rescheduleNote",
+})
 MANAGER_FIELDS_ONLY = "Interview managers can change only the status, its reason and the time of someone else's round."
 
 
@@ -633,6 +656,7 @@ def trim_feed(items: list[dict], rounds: list[dict], user: UserExtra) -> list[di
         # Names only: the row builder falls back to an email when a name is missing.
         account, owner = iv.get("accountId"), iv.get("createdBy")
         r["statusNote"] = None
+        r["statusReason"] = None
         r["profileLabel"] = ((account.get("name") or "").strip() or None) if isinstance(account, dict) else None
         r["ownerName"] = ((owner.get("name") or "").strip() or None) if isinstance(owner, dict) else None
     return trim_for_viewer(items, user)
@@ -776,6 +800,7 @@ def flatten_rounds(
                 "stage": _normalize_stage(e.get("stage")),
                 "status": normalize_status(e.get("status")),
                 "statusNote": (e.get("statusNote") or "").strip() or None,
+                "statusReason": e.get("statusReason") or None,
                 "scheduledAt": _iso_utc(start),
                 "endsAt": _iso_utc(e.get("endsAt")),
                 "companyName": iv.get("companyName"),
@@ -1017,6 +1042,57 @@ async def applied_by_options(
     return {"bidders": [{"id": str(b.id), "name": b.name, "onProfile": b.profileId == account_oid} for b in bidders]}
 
 
+@router.get("/needs-input")
+async def needs_input(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    userId: str = Query("", description="admins: only this owner's rounds"),
+) -> dict:
+    """Rounds since the data start that still need something from the interview's owner: `result` (the latest round
+    was held and has ended, with no pass / reject yet) or `reason` (canceled / rejected with no statusReason).
+    Newest first. A normal user gets their own; an admin everyone's, or one person's with `userId`."""
+    cutoff = local_day_start_utc(DATA_START, app_tz())
+    query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": cutoff}}}}
+    if user.role != "admin":
+        query["createdBy"] = user.id
+    elif userId:
+        query["createdBy"] = to_object_id(userId)
+    # ponytail: unpaginated and filtered in Python; page it (or match the statuses in Mongo) if the list grows large.
+    rows = await Interview.find(query).to_list()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    items = []
+    for iv in await _populate_account(await populate_owner(rows, field="createdBy")):
+        account, owner = iv.get("accountId"), iv.get("createdBy")
+        history = iv.get("stageHistory") or []
+        for e in history:
+            start = _as_naive_utc(e.get("scheduledAt"))
+            if start is None or start < cutoff:
+                continue
+            stage, round_status = _normalize_stage(e.get("stage")), normalize_status(e.get("status"))
+            if round_status in ("canceled", "rejected") and not e.get("statusReason"):
+                need = "reason"
+            elif (
+                e is history[-1] and round_status == "completed" and stage not in _ROUND_COUNT_EXCLUDED
+                and _utc_naive(round_ends_at(start, _as_naive_utc(e.get("endsAt")))) <= now
+            ):
+                need = "result"
+            else:
+                continue
+            items.append({
+                "interviewId": str(iv.get("_id")),
+                "roundId": e.get("id"),
+                "companyName": iv.get("companyName"),
+                "profileName": account.get("name") if isinstance(account, dict) else None,
+                "ownerId": str(owner.get("_id")) if isinstance(owner, dict) else str(owner or ""),
+                "ownerName": iv.get("ownerName"),
+                "stage": stage,
+                "status": round_status,
+                "scheduledAt": _iso_utc(start),
+                "need": need,
+            })
+    items.sort(key=lambda i: i["scheduledAt"], reverse=True)
+    return {"items": items, "counts": {need: sum(i["need"] == need for i in items) for need in ("result", "reason")}}
+
+
 @router.get("/{iv_id}")
 async def get_interview(
     iv_id: str,
@@ -1073,6 +1149,7 @@ def _build_round(
         note=rnd.note or "",
         transcript=rnd.transcript or "",
         statusNote=_status_note(rnd.statusNote),
+        statusReason=_status_reason(rnd.statusReason, status_val),
     )
     if rnd.caller is not None:
         entry.caller = _round_caller(rnd.caller, starts_at=start, previous=None)
@@ -1247,6 +1324,8 @@ async def update_interview(
             iv.status = InterviewStatus(body.status)
     tip = _tip(iv)
     if tip is not None:
+        if _status_value(tip.status) != _status_value(iv.status):
+            tip.statusReason = None  # it was about the previous status
         tip.status = iv.status
         if body.status is not None or _status_value(tip.status) in ENDED_STATUSES:
             _confirm_by_assignment(tip)  # called off: not confirmed; back on with a caller: confirmed again
@@ -1362,6 +1441,7 @@ async def update_interview_stage(
         if sched is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid scheduledAt")
         old_start, old_end = entry.scheduledAt, entry.endsAt
+        moved = old_start is None or _utc_naive(old_start) != _utc_naive(sched)
         entry.scheduledAt = sched  # a new time keeps the assigned caller, so the round stays confirmed
         # Rescheduling keeps the round's duration unless a new end is sent.
         if body.endsAt is None and old_start is not None and old_end is not None:
@@ -1373,6 +1453,18 @@ async def update_interview_stage(
         if body.endsAt and ends is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid endsAt")
         entry.endsAt = round_ends_at(entry.scheduledAt, ends)
+    reschedule_reason = (body.rescheduleReason or "").strip()
+    if reschedule_reason:
+        if reschedule_reason not in CANCEL_REASONS:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid rescheduleReason")
+        if body.scheduledAt is None or not moved:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="rescheduleReason needs a new scheduledAt",
+            )
+        entry.reschedules.append(Reschedule(
+            at=datetime.now(timezone.utc), by=user.id, fromAt=old_start, toAt=sched, reason=reschedule_reason,
+            note=_status_note(body.rescheduleNote),
+        ))
     old_status = _status_value(entry.status)
     if body.status is not None:
         if body.status == "":
@@ -1385,6 +1477,10 @@ async def update_interview_stage(
         entry.statusNote = _status_note(body.statusNote)
     elif _status_value(entry.status) != old_status:
         entry.statusNote = ""  # the saved reason was about the previous status
+    if body.statusReason is not None:
+        entry.statusReason = _status_reason(body.statusReason, _status_value(entry.status))
+    elif _status_value(entry.status) != old_status:
+        entry.statusReason = None
     if body.interviewerName is not None:
         entry.interviewerName = body.interviewerName.strip() or None
     transcript_changed = body.transcript is not None and body.transcript != entry.transcript

@@ -14,6 +14,7 @@ from typing import Literal, Optional
 from zoneinfo import ZoneInfo
 
 from app.interview_day.blocks import _short
+from app.interview_reasons import CANCEL_REASON_HELP, CANCEL_REASONS, REJECT_REASONS
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +28,10 @@ NOTE_TOO_LONG = f"At most {MAX_NOTE} characters."
 FORM_ERROR = "Something went wrong. Try again from the app."
 
 _TITLES = {CANCEL_VIEW: "Canceled", RESCHEDULE_VIEW: "Rescheduled", REJECT_VIEW: "Rejected"}
-_NOTE_LABELS = {CANCEL_VIEW: "Reason (optional)", RESCHEDULE_VIEW: "Note (optional)", REJECT_VIEW: "Feedback (optional)"}
+_NOTE_LABEL = "Details (optional)"
+_REASON_LABELS = {
+    CANCEL_VIEW: "Why was it canceled?", RESCHEDULE_VIEW: "Why was it rescheduled?", REJECT_VIEW: "Why was it rejected?",
+}
 _KINDS = {CANCEL_VIEW: "canceled", RESCHEDULE_VIEW: "rescheduled", REJECT_VIEW: "rejected"}
 
 
@@ -66,6 +70,7 @@ class Answer:
     origin: Origin
     note: str  # stripped
     new_start: Optional[datetime]  # aware UTC; set only for a reschedule
+    reason: str = ""  # the picked reason key; "" from a form opened before the forms asked for one
 
 
 def _plain(text: str) -> dict:
@@ -85,9 +90,34 @@ def _note_block(callback_id: str) -> dict:
         "type": "input",
         "block_id": "note",
         "optional": True,
-        "label": _plain(_NOTE_LABELS[callback_id]),
+        "label": _plain(_NOTE_LABEL),
         "element": {"type": "plain_text_input", "action_id": "note_input", "multiline": True, "max_length": MAX_NOTE},
     }
+
+
+def _reason_block(callback_id: str) -> dict:
+    """The required reason select (app.interview_reasons): canceled and rescheduled share a list, with helper texts."""
+    reasons = REJECT_REASONS if callback_id == REJECT_VIEW else CANCEL_REASONS
+    options = [{"text": _plain(label), "value": key} for key, label in reasons.items()]
+    if reasons is CANCEL_REASONS:
+        for option in options:
+            option["description"] = _plain(CANCEL_REASON_HELP[option["value"]])
+    return {
+        "type": "input",
+        "block_id": "reason",
+        "label": _plain(_REASON_LABELS[callback_id]),
+        "element": {"type": "static_select", "action_id": "reason_input", "options": options},
+    }
+
+
+def _picked_reason(view: dict) -> str:
+    """The reason select's value; "" when the form has no reason block or nothing is picked."""
+    try:
+        option = view["state"]["values"]["reason"]["reason_input"].get("selected_option")
+    except (KeyError, TypeError, AttributeError):
+        return ""
+    value = option.get("value") if isinstance(option, dict) else None
+    return value if isinstance(value, str) else ""
 
 
 def _view(callback_id: str, origin: Origin, title_line: str, middle: list[dict]) -> dict:
@@ -100,6 +130,7 @@ def _view(callback_id: str, origin: Origin, title_line: str, middle: list[dict])
         "close": _plain("Back"),
         "blocks": [
             {"type": "context", "elements": [{"type": "mrkdwn", "text": _short(title_line, 200)}]},
+            _reason_block(callback_id),
             *middle,
             _note_block(callback_id),
         ],
@@ -170,7 +201,7 @@ def read_submission(view: dict) -> Answer:
         if not picked_date or not picked_time:
             raise ValueError("date or time missing")
         new_start = _new_start(origin, picked_date, picked_time)
-    return Answer(_KINDS[callback_id], origin, note, new_start)
+    return Answer(_KINDS[callback_id], origin, note, new_start, _picked_reason(view))
 
 
 def submission_errors(view: dict, now: datetime) -> dict[str, str]:
@@ -275,9 +306,13 @@ async def process_coordination_submission(view: dict, slack_user_id: str) -> Non
                 await actions.set_round(
                     iv_id, round_id, user, scheduledAt=answer.new_start.isoformat(),
                     **({"statusNote": answer.note} if answer.note else {}),
+                    **({"rescheduleReason": answer.reason, "rescheduleNote": answer.note} if answer.reason else {}),
                 )
             else:
-                await actions.set_round(iv_id, round_id, user, status=answer.kind, statusNote=answer.note)
+                await actions.set_round(
+                    iv_id, round_id, user, status=answer.kind, statusNote=answer.note,
+                    **({"statusReason": answer.reason} if answer.reason else {}),
+                )
         except HTTPException as exc:
             await tell(str(exc.detail))
             return
