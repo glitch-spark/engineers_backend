@@ -159,3 +159,10 @@ async def test_copied_score_without_band_gets_its_band(db):
     _id = await add_iv(db, {"kind": "uploaded", "jobDescription": "JD", "score": {"total": 82}})
     await sif.score_interview_fit(True, SINCE)
     assert await fit(db, _id) == {"total": 82, "band": "strong"}
+
+
+async def test_null_fit_score_is_a_candidate_and_gets_scored(db):
+    _id = await add_iv(db, {"kind": "none", "jobDescription": "JD"}, fitScore=None)
+    assert (await sif.score_interview_fit(False, SINCE))["candidates"] == 1
+    await sif.score_interview_fit(True, SINCE)
+    assert await fit(db, _id) == {"total": 72, "band": "good"}

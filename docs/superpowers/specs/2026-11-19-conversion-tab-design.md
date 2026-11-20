@@ -48,8 +48,8 @@ breakdown tables over a period long enough to mean something.
 
 ## Key definitions
 
-- **Bid** = a row of the `applications` table (non-rejected; `byInterviewOnly` rows excluded, as everywhere since the
-  survivor-bias fix).
+- **Bid** = a row of the `applications` table (non-rejected; `byInterviewOnly` rows are counted, see "Change 2026-11-19";
+  they carry `by: "unknown"`, shown as "No tracked bid").
 - **Matured** = applied at least `matured_days` ago (fixed **14 days** — user decision 2026-11-19; it was the team response-window p90, ~27 days). Rate =
   interviews among matured ÷ matured × 100, shown as a percent with one decimal (e.g. `0.7%`). Younger bids are
   "in play" and appear only in the Bids column and the totals line.

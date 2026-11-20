@@ -21,7 +21,7 @@ class Application(TimestampedDocument):
     title: Optional[str] = None
     area: Optional[str] = None
     profileAgeDays: Optional[int] = None  # appliedAt - the profile's createdAt, whole days
-    by: Literal["self", "bidder"] = "self"
+    by: Literal["self", "bidder", "unknown"] = "self"
     bidderId: Optional[PydanticObjectId] = None
     bidStatus: Optional[str] = None
     score: Optional[int] = None
@@ -36,7 +36,7 @@ class Application(TimestampedDocument):
     furthest: Optional[str] = None
     result: Optional[str] = None
     sources: list[str] = []
-    byInterviewOnly: Optional[bool] = None  # every source an unapplied resume an interview links: not a real bid
+    byInterviewOnly: Optional[bool] = None  # every source an unapplied resume an interview links: known only from its interview, no tracked bid
     syncedAt: datetime
 
     class Settings:

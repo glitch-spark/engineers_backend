@@ -186,7 +186,7 @@ async def applications_changes(
     profile: Optional[str] = Query(None, description="scope=profile: the profile (Account) id"),
 ) -> dict:
     """"What to change": up to 3 suggestions per profile of the scope (none for `scope=team`), from the pattern each
-    profile shows; team numbers from every active profile of the region."""
+    profile shows; team numbers from every profile of the region."""
     sc = await cs.conversion_scope(user, period, date, to, region, user_id, scope, profile)
     if scope == "team":
         return {"label": sc["label"], "subject": sc["subject"], "profiles": []}

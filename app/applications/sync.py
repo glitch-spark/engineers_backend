@@ -120,6 +120,7 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     for r in rows.values():
         if r["sources"] and set(r["sources"]) <= unapplied:
             r["byInterviewOnly"] = True
+            r["by"] = "unknown"  # nobody tracked who applied
     resume_row = {str(r["_id"]): _key(r.get("accountId"), r.get("jobUrl"), "resumeapplications", r["_id"])[0] for r in resumes}
     matched, unmatched = match_interviews(rows, [Interview.model_validate(d) for d in iv_docs], resume_row)
 

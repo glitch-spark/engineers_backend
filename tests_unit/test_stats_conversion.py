@@ -46,7 +46,7 @@ def test_totals_math():
     rows = [_r(iv=True), _r(), _r(), _r(iv=True, at=datetime(2026, 11, 1)), _r(at=datetime(2026, 11, 1)),
             _r(iv=True, bidStatus="rejected")]
     t = conversion.report(rows, CUT, {}, False)["totals"]
-    assert t == {"bids": 5, "matured": 3, "interviews": 1, "interviewsAll": 2, "inPlay": 2, "rate": 33.3}
+    assert t == {"bids": 5, "matured": 3, "interviews": 1, "interviewsAll": 2, "interviewOnly": 0, "inPlay": 2, "rate": 33.3}
     assert conversion.report([], CUT, {}, False)["totals"]["rate"] is None
 
 
@@ -215,6 +215,7 @@ async def test_interview_only_rows_count_in_conversion(db):
     await _rows(a, ana, 1, iv=1, byInterviewOnly=True)
     t = (await _get(ana)).json()["totals"]
     assert t["bids"] == 4 and t["interviews"] == 2 and t["interviewsAll"] == 2
+    assert t["interviewOnly"] == 1
 
 
 async def _iv(acct, owner, first, rounds=None, **kw):
@@ -273,3 +274,18 @@ def test_self_vs_bidder_in_every_scope():
         out = conversion.report(rows, CUT, {}, include_bidders)
         assert [(g["key"], g["label"], g["bids"], g["interviews"]) for g in out["byWho"]] == [
             ("self", "Self", 2, 1), ("bidder", "Bidder", 4, 1)]
+
+
+def test_unknown_bids_own_group_not_self():
+    rows = [_r(iv=True, by="self"), _r(by="bidder", bidderId=ObjectId()), _r(iv=True, by="unknown")]
+    out = conversion.report(rows, CUT, {}, True)
+    assert [(g["key"], g["label"], g["bids"], g["interviews"]) for g in out["byWho"]] == [
+        ("self", "Self", 1, 1), ("bidder", "Bidder", 1, 0), ("unknown", "No tracked bid", 1, 1)]
+    assert [g["key"] for g in out["byBidder"]][:2] == ["self", "unknown"]
+    assert _g(out["byBidder"], "self")["bids"] == 1
+
+
+def test_totals_interview_only_count():
+    rows = [_r(iv=True, byInterviewOnly=True), _r(iv=True), _r(byInterviewOnly=True),
+            _r(iv=True, byInterviewOnly=True, at=datetime(2026, 11, 1))]
+    assert conversion.report(rows, CUT, {}, False)["totals"]["interviewOnly"] == 2

@@ -11,7 +11,7 @@ from app.models import Application, Interview
 
 _ROW_FIELDS = ("key", "accountId", "ownerId", "appliedAt", "by", "bidStatus", "interviewId", "daysToInterview",
                "furthest", "firstRoundAt", "board", "scoreBand", "score", "area", "profileAgeDays", "bidderId",
-               "templateName")
+               "templateName", "byInterviewOnly")
 _TTL = 300  # seconds
 _MAX = 16
 # cached lists are shared between callers: read-only. Entries hold the load's task, so concurrent misses for one

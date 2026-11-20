@@ -46,22 +46,26 @@ def report(rows: list[dict], matured_before: datetime, bidder_names: dict, inclu
     t = _counts(rows, matured_before)
     all_iv = sum(1 for r in rows if r.get("interviewId"))
     out: dict = {"totals": {"bids": t["bids"], "matured": t["matured"], "interviews": t["interviews"],
-                            "interviewsAll": all_iv, "inPlay": t["bids"] - t["matured"], "rate": t["rate"]},
+                            "interviewsAll": all_iv,
+                            "interviewOnly": sum(1 for r in rows if r.get("interviewId") and r.get("byInterviewOnly")),
+                            "inPlay": t["bids"] - t["matured"], "rate": t["rate"]},
                  "teamRate": round(team_rate, 1) if team_rate is not None else None}
     if include_bidders:
         def who(r: dict) -> str:
-            if r.get("by") == "self":
-                return "self"
+            if r.get("by") in ("self", "unknown"):
+                return r["by"]
             return str(r["bidderId"]) if r.get("bidderId") in bidder_names else "unnamed"
 
         by_key = {str(k): n for k, n in bidder_names.items()}
-        keys = {who(r) for r in rows} - {"self"}
+        keys = {who(r) for r in rows} - {"self", "unknown"}
         groups = _groups(rows, matured_before, team_rate, who, [(k, by_key.get(k, "Unnamed bidder")) for k in keys])
         groups.sort(key=lambda g: (-g["bids"], g["label"]))
-        out["byBidder"] = _groups(rows, matured_before, team_rate, who, [("self", "Self")], skip_empty=True) + groups
+        out["byBidder"] = _groups(rows, matured_before, team_rate, who, [("self", "Self")], skip_empty=True) + _groups(
+            rows, matured_before, team_rate, who, [("unknown", "No tracked bid")], skip_empty=True) + groups
     # self vs bidder bids, every scope (no names, so Team total shows it too) — user, 2026-11-19
-    out["byWho"] = _groups(rows, matured_before, team_rate, lambda r: r.get("by") or "self",
-                           [("self", "Self"), ("bidder", "Bidder")])
+    by = lambda r: r.get("by") or "self"  # noqa: E731
+    out["byWho"] = _groups(rows, matured_before, team_rate, by, [("self", "Self"), ("bidder", "Bidder")]) + _groups(
+        rows, matured_before, team_rate, by, [("unknown", "No tracked bid")], skip_empty=True)
     counts: dict[str, int] = {}
     for r in rows:
         if r.get("board"):

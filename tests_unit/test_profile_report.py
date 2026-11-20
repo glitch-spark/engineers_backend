@@ -143,3 +143,8 @@ def test_early_reasons_distinguish_young_profile_from_missing_baseline():
     none_team = {"per100": None, "medianDays": None, "profiles": 0}
     assert grade(_s(50, 1, 2.0), none_team) == (
         "early", ["no team baseline yet (fewer than 30 matured bids on every profile)"])
+
+
+def test_unknown_by_not_counted_as_self_or_bidder():
+    s = summarize([row(by="self"), row(by="unknown", iv=True)], CUT)[str(A)]
+    assert (s["bidsSelf"], s["bidsBidder"]) == (1, 0) and s["matured"] == 2

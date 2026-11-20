@@ -319,6 +319,7 @@ async def test_interview_proven_unapplied_resume_row_flagged_by_interview_only(d
     await sync.full_rebuild(SINCE, apply=True)
     row = await db["applications"].find_one({})
     assert row["byInterviewOnly"] is True and "countsAsBid" not in row
+    assert row["by"] == "unknown"
 
 
 async def test_proven_unapplied_resume_with_bid_or_applied_resume_not_flagged(db):

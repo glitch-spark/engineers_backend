@@ -42,7 +42,7 @@ def profile_context(rows: list[dict], matured_before: datetime) -> dict:
     matured = [r for r in rows if r["appliedAt"] <= matured_before]
     split, sites, bidders = {}, {}, {}
     for by in ("self", "bidder"):
-        m = [r for r in matured if (r.get("by") == "self") == (by == "self")]
+        m = [r for r in matured if r.get("by") == by]
         iv = sum(1 for r in m if r.get("interviewId"))
         split[by] = {"matured": len(m), "interviews": iv, "per100": _per100(iv, len(m))}
     for r in matured:

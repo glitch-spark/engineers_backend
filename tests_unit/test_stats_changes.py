@@ -274,3 +274,10 @@ def test_quiet_candidate():
     assert not changes.quiet_candidate([recent | {"profileAgeDays": 48}], NOW, 30)  # 50 days: too young
     assert not changes.quiet_candidate([old, _row(days_ago=8)], NOW, 30)            # nothing in the last 7 days
     assert not changes.quiet_candidate([old, _row(days_ago=2, status="rejected")], NOW, 30)
+
+
+def test_profile_context_split_excludes_unknown():
+    rows = [{"appliedAt": CUTOFF - timedelta(days=1), "by": by, "interviewId": ObjectId() if by == "unknown" else None}
+            for by in ("self", "bidder", "unknown")]
+    sp = changes.profile_context(rows, CUTOFF)["split"]
+    assert (sp["self"]["matured"], sp["self"]["interviews"], sp["bidder"]["matured"], sp["bidder"]["interviews"]) == (1, 0, 1, 0)

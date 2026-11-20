@@ -24,7 +24,8 @@ def summarize(rows: list[dict], matured_before: datetime) -> dict[str, dict]:
         key = str(r["accountId"])
         s = out.setdefault(key, {"bidsSelf": 0, "bidsBidder": 0, "matured": 0, "maturedInterviews": 0, "interviews": 0,
                                  "reach": {"intro": 0, "tech": 0, "final": 0}, "stillInPlay": 0})
-        s["bidsSelf" if r.get("by") == "self" else "bidsBidder"] += 1
+        if r.get("by") in ("self", "bidder"):  # "unknown" (interview-only rows) is neither
+            s["bidsSelf" if r["by"] == "self" else "bidsBidder"] += 1
         matured = r["appliedAt"] <= matured_before
         has_iv = bool(r.get("interviewId"))
         s["matured"] += matured

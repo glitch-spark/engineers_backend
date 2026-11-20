@@ -52,7 +52,7 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
     since_dt = datetime(since.year, since.month, since.day)
     coll = Interview.get_motor_collection()
     cands = [d async for d in coll.find({
-        "fitScore": {"$exists": False}, "resumeLink.kind": {"$in": list(KINDS)},
+        "fitScore": None, "resumeLink.kind": {"$in": list(KINDS)},
         "resumeLink.jobDescription": {"$nin": [None, ""]},
         "$or": [{"createdAt": {"$gte": since_dt}}, {"scheduledAt": {"$gte": since_dt}}],
     }, {"accountId": 1, "resumeLink": 1}) if d["resumeLink"]["jobDescription"].strip()]
@@ -66,7 +66,7 @@ async def score_interview_fit(apply: bool, since: date = DATA_START) -> dict:
 
     async def write(d: dict, total, band) -> None:
         # updatedAt bumped so the incremental applications sync picks the interview up
-        await coll.update_one({"_id": d["_id"], "fitScore": {"$exists": False}},
+        await coll.update_one({"_id": d["_id"], "fitScore": None},
                               {"$set": {"fitScore": {"total": total, "band": band}, "updatedAt": datetime.utcnow()}})
 
     async def one(d: dict) -> None:
