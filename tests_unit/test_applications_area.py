@@ -51,3 +51,23 @@ def test_classify_area_examples(title, area):
 ])
 def test_classify_area_regression(title, area):
     assert classify_area(title) == area
+
+
+BACKEND_JD = "We build services in Python and Django with Postgres. You will design REST APIs and microservices in Go."
+
+
+@pytest.mark.parametrize("text,area", [
+    (BACKEND_JD, "Backend"),
+    ("Our UI is React and TypeScript with Redux, HTML and CSS; you own the frontend.", "Frontend"),
+    ("You run Kubernetes, Terraform, Docker and Helm, and own CI/CD and observability. Some Python.", "DevOps"),
+    ("Python, Django, Postgres and REST on the server; React, TypeScript, CSS and HTML in the browser.", "Full stack"),
+    ("Join us as a full-stack engineer.", "Full stack"),
+    ("PyTorch, TensorFlow, LLMs and RAG pipelines; some Python.", "AI / ML"),
+    # no area clearly leads, or too little to go on: None (the title's area stands)
+    ("Python, Django and SQL; Spark, Airflow, Snowflake and Kafka.", None),
+    ("You will write Python.", None), ("", None), (None, None),
+    ("We value curiosity, ownership and kindness.", None),
+])
+def test_area_from_description(text, area):
+    from app.applications.area import area_from_description
+    assert area_from_description(text) == area

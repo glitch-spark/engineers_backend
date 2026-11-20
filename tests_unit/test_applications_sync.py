@@ -372,6 +372,25 @@ async def test_title_from_a_long_description_with_leading_blank_lines(db):
     assert row["title"] == "Senior Backend Engineer" and row["area"] == "Backend"
 
 
+async def test_general_software_title_reads_the_area_from_the_job_description(db):
+    """Only resumes whose title names no speciality have more of the description fetched, to read the area from it."""
+    await add_resume(db, url="https://x.io/1", jobDescription="Senior Software Engineer\nAcme\n"
+                     "We build services in Python and Django with Postgres. You design REST APIs and microservices in Go.")
+    await add_resume(db, url="https://x.io/2", jobDescription="Software Engineer\nWe value curiosity and kindness.")
+    await sync.full_rebuild(SINCE, apply=True)
+    rows = {r["title"]: r["area"] for r in await db["applications"].find({}).to_list(None)}
+    assert rows == {"Senior Software Engineer": "Backend", "Software Engineer": "General software"}
+
+    # a bid row titled by an unapplied tailored resume reads that resume's description
+    await db["applications"].delete_many({}); await db["resumeapplications"].delete_many({})
+    await add_bid(db)
+    await add_resume(db, countsAsBid=False, jobDescription="Software Engineer\nYou run Kubernetes, Terraform, Docker "
+                     "and Helm and own CI/CD and observability.")
+    await sync.full_rebuild(SINCE, apply=True)
+    [row] = await db["applications"].find({}).to_list(None)
+    assert (row["title"], row["area"]) == ("Software Engineer", "DevOps")
+
+
 async def test_interview_fit_score_reaches_the_row(db):
     await add_bid(db)
     iv = await add_interview(db)
