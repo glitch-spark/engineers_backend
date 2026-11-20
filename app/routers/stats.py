@@ -52,7 +52,7 @@ async def conversion_report(
     team_rate = team_baseline(summarize(sc["teamRows"], cutoff), sc["teamRows"])["rate"]
     rep = conversion.report(sc["rows"], cutoff, {k: v for k, v in names.items() if v}, scope != "team", team_rate)
     found = conversion_findings.findings(rep, team_rate, scope)
-    conversion_findings.mark_groups(rep, found)
+    conversion_findings.mark_groups(rep, team_rate)
     untied = await count_untied_interviews([PydanticObjectId(i) for i in sc["accounts"]], sc["start"], sc["end"]
                                            ) if sc["end_d"] >= cs.DATA_START else 0
     return {"label": sc["label"], "startClamped": sc["startClamped"], "window": win, "scope": scope,

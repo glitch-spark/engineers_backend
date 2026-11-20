@@ -27,7 +27,7 @@ def _kinds(found):
 def test_best_fires_at_one_and_a_half_times_team_rate():
     _, found = _run(_rows(200, 3, scoreBand="strong"), 1.0)
     assert found == [{"kind": "best", "text": "80+ converts best for resume score: 1.5% (3 interviews from 200 "
-                                              "matured bids) vs 1.0% overall.",
+                                              "matured bids) vs 1.0% across all matured bids.",
                       "evidence": {"by": "byScore", "key": "strong", "label": "80+", "rate": 1.5, "interviews": 3,
                                    "matured": 200, "teamRate": 1.0}}]
 
@@ -100,7 +100,7 @@ def test_sparse_real_shaped_data_gives_no_chance_finding():
     for scope in ("team", "me"):
         rep, found = _run(rows, 0.5, scope)
         assert found == [{"kind": "none", "text": FALLBACK, "evidence": {}}]
-        mark_groups(rep, found)
+        mark_groups(rep, 0.5)
         assert not [g for k in ("byWho", "bySite", "byScore", "byArea", "byAge") for g in rep[k] if g["mark"]]
 
 
@@ -115,18 +115,63 @@ def test_at_most_four_ordered_by_effect():
         ("best", "strong"), ("best", "Backend"), ("weak", "b.io"), ("best", "0-2w")]
 
 
-def test_marks_match_findings_and_skip_members():
-    rows = (_rows(200, 6, scoreBand="strong", by="self") + _rows(100, 1, by="bidder")
-            + _rows(800, 0, board="x.io") + [{**r, "board": f"b{i}.io"} for i, r in enumerate(_rows(9))])
+def _marks(rep):
+    return {(k, g["key"]): g["mark"] for k in ("byWho", "bySite", "byScore", "byArea", "byAge", "byBidder")
+            for g in rep.get(k, []) if g["mark"]}
+
+
+def test_marks_come_from_the_rules_per_table_not_the_capped_sentences():
+    rows = (_rows(100, 6, scoreBand="strong", by="self")   # Self 6% and 80+ 6%
+            + _rows(100, 5, board="a.io")
+            + _rows(100, 4, area="Backend")
+            + _rows(100, 3, profileAgeDays=3)
+            + _rows(100, 2, scoreBand="good"))
+    rep, found = _run(rows, 1.0)
+    mark_groups(rep, 1.0)
+    assert len(found) == 4 and all(f["kind"] == "best" for f in found)
+    assert _marks(rep) == {("byScore", "strong"): "best", ("byWho", "self"): "best", ("bySite", "a.io"): "best",
+                           ("byArea", "Backend"): "best", ("byAge", "0-2w"): "best"}
+
+
+def test_one_weak_mark_per_table_the_largest_expected():
+    rows = _rows(800, 0, board="x.io") + _rows(700, 0, board="y.io") + _rows(100, 1, by="bidder")
+    rows += [{**r, "board": f"b{i}.io"} for i, r in enumerate(_rows(9))]
     rep, found = _run(rows, 0.5, "me")
-    mark_groups(rep, found)
-    marked = {(k, g["key"]): g["mark"] for k in ("byWho", "bySite", "byScore", "byArea", "byAge", "byBidder")
-              for g in rep[k] if g["mark"]}
-    assert _kinds(found) == [("best", "byScore", "strong"), ("weak", "bySite", "x.io"), ("gap", "byWho", None)]
-    # Bidder (1 of 100 at 0.5) is few by expected: the gap line stands, but few rows are never marked
-    assert marked == {("byScore", "strong"): "best", ("bySite", "x.io"): "weak", ("byWho", "self"): "best"}
+    mark_groups(rep, 0.5)
+    assert _kinds(found) == [("weak", "bySite", "x.io")]
+    assert _marks(rep) == {("bySite", "x.io"): "weak"}
     other = next(g for g in rep["bySite"] if g["key"] == "other")
     assert other["members"] and all("mark" not in m for m in other["members"])
+
+
+def test_gap_sentence_does_not_mark_self_or_bidder():
+    rows = _rows(100, 8, by="self") + _rows(100, 4, by="bidder")
+    rep, found = _run(rows, 1.0, "me")
+    mark_groups(rep, 1.0)
+    assert _kinds(found) == [("gap", "byWho", None)]
+    # Bidder at 4% beats the team: no warning; Self passes the best rule on its own
+    assert _marks(rep) == {("byWho", "self"): "best"}
+    rep, _ = _run(_rows(100, 3, by="self") + _rows(100, 1, by="bidder"), 2.5, "me")
+    mark_groups(rep, 2.5)
+    assert _marks(rep) == {}  # Self 3% < 1.5 x 2.5: gap sentence, but no star
+
+
+def test_area_other_is_a_catch_all():
+    for rows, team in ((_rows(100, 6, area="Other"), 1.0), (_rows(800, 0, area="Other"), 0.5)):
+        rep, found = _run(rows, team)
+        mark_groups(rep, team)
+        assert found[0]["kind"] == "none" and _marks(rep) == {}
+
+
+def test_thousands_separators_and_about_rounds_half_up():
+    assert _run(_rows(2008, 0, board="x.io"), 0.5)[1][0]["text"] == (
+        "x.io: 0 interviews from 2,008 matured bids — the team rate would give about 10.")
+    assert _run(_rows(900, 0, board="x.io"), 0.5)[1][0]["text"].endswith("about 5.")  # 4.5 expected
+    assert _run(_rows(2000, 30, scoreBand="strong"), 1.0)[1][0]["text"] == (
+        "80+ converts best for resume score: 1.5% (30 interviews from 2,000 matured bids) vs 1.0% across all "
+        "matured bids.")
+    assert _run(_rows(1500, 30, by="self") + _rows(1000, 1, by="bidder"), 1.0, "me")[1][0]["text"] == (
+        "Your bidder bids convert at 0.1% vs your self bids 2.0% (1 of 1,000 vs 30 of 1,500).")
 
 
 def test_report_groups_start_unmarked():

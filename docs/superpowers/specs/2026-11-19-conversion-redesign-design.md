@@ -53,13 +53,17 @@ Recent-interviews feed, trend chart, drill-down (deferred by the user).
 From the conversion report groups (team rows for Whole team; the subject's rows for All my profiles):
 - **Best group per breakdown** (score, site, area, age, self vs bidder): highest rate with `few == False` and
   ≥ 3 interviews and rate ≥ 1.5 × team rate → ★ `{label} converts best for {by}: {rate}% ({i} interviews from {m}
-  matured bids) vs {team}% overall.`
+  matured bids) vs {team}% across all matured bids.` (fix round 1: the basis is matured bids, not all bids)
 - **Weak big group**: matured × team rate / 100 ≥ 3 and 0 interviews → ⚠ `{label}: 0 interviews from {m} matured
   bids — the team rate would give about {e}.`
 - **Self vs bidder gap** (All my profiles): both ≥ 30 matured, self ≥ 3 interviews, self rate ≥ 2 × bidder rate → ⚠
   `Your bidder bids convert at {b}% vs your self bids {s}% ({bi} of {bm} vs {si} of {sm}).`
 - Ranked by size of effect; at most 4; none → `No clear pattern yet in this period — try a longer date range.`
-- Groups get `mark: "best" | "weak" | null` from the same rules (used for ★ / ⚠ in tables).
+- Groups get `mark: "best" | "weak" | null` from the same rules (used for ★ / ⚠ in tables): per table at most one ★
+  (its best group) and one ⚠ (its weak group with the largest expected), independent of the 4-sentence cap; the
+  self vs bidder gap sentence creates no marks.
+- Catch-alls (No score, No job link, Other sites, area Other, Unknown, No tracked bid) are never named or marked.
+  Counts use thousands separators (2,008); `about {e}` rounds half up.
 
 ## Approach
 
