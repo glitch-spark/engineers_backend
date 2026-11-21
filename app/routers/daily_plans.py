@@ -203,7 +203,7 @@ async def _view(uid, when: date, rounds: bool = True) -> dict:
     by_profile = await plan_bidder.bidder_done_by_profile(uid, when)
     out = _day_out(uid, when, plan, auto_day, await week_or_draft(uid, monday), plans,
                    sum(by_profile.values()), await owner_profiles(uid))
-    out.update(_bids_tables(out, by_profile))
+    out.update(_bids_tables(out, by_profile, when >= plan_bidder.RELEASE_DAY))
     out["followUps"] = await follow_ups_summary(uid, when)  # read-only, never stored on the plan
     out["todayInterviews"] = today = await day_interviews(uid, when, _now()) if rounds else []
     out["interviewsMarked"] = {"marked": sum(r["state"] not in ("upcoming", "now", "unmarked") for r in today),
@@ -211,11 +211,13 @@ async def _view(uid, when: date, rounds: bool = True) -> dict:
     return await _with_tracked(out, uid, when)
 
 
-def _bids_tables(out: dict, bidder_by_profile: dict) -> dict:
+def _bids_tables(out: dict, bidder_by_profile: dict, live: bool = True) -> dict:
     """The day view's `bidsByRegion` (US, EU, Latam; only the regions with a live profile, a target or a bid) and
     `bidsTotals`, from its `done`, `targets` and `profiles`. A bidder's bids are in the region of the profile it bids
-    for; a target of 0 is none (null)."""
+    for; a target of 0 is none (null). `live`: the bidder total is the count the regions are cut from, so the two
+    always agree (the saved `done.bidsBidder` can lag a write behind); a day before the release keeps its typed one."""
     done, targets = out["done"], out["targets"]
+    bidder_total = sum(bidder_by_profile.values()) if live else done["bidsBidder"]
     region_of = {p["id"]: p["region"] for p in out["profiles"]}
     live = {p["region"] for p in out["profiles"] if not p["archived"]}
     rows = []
@@ -227,8 +229,8 @@ def _bids_tables(out: dict, bidder_by_profile: dict) -> dict:
             rows.append(row)
     return {"bidsByRegion": rows, "bidsTotals": {
         "self": done["bidsSelf"], "selfTarget": targets["bidsSelf"] or None,
-        "bidder": done["bidsBidder"], "bidderTarget": targets["bidsBidder"] or None,
-        "total": done["bidsSelf"] + done["bidsBidder"],
+        "bidder": bidder_total, "bidderTarget": targets["bidsBidder"] or None,
+        "total": done["bidsSelf"] + bidder_total,
         "target": (targets["bidsSelf"] + targets["bidsBidder"]) or None}}
 
 

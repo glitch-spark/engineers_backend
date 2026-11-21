@@ -293,7 +293,7 @@ async def test_team_flags_are_cached_for_a_minute_and_interviews_are_not(boss, m
 # --- GET /daily-plans/{day}: bidsByRegion / bidsTotals --------------------------------------------------------
 
 
-async def test_bids_by_region_and_totals(me):
+async def test_bids_by_region_and_totals(me, monkeypatch):
     us, eu, latam = await profile(me, "Usa"), await profile(me, "Eur", "EU"), await profile(me, "Lat", "Latam",
                                                                                            archived=True)
     await week_plan(me, goal=Counts(bidsSelf=150, bidsSelfUs=100, bidsSelfEu=50, bidsBidder=50))
@@ -308,8 +308,13 @@ async def test_bids_by_region_and_totals(me):
         {"region": "US", "self": 15, "selfTarget": 20, "bidder": 2, "total": 17},
         {"region": "EU", "self": 10, "selfTarget": 10, "bidder": 1, "total": 11},
     ]  # Latam: an archived profile, no target, no bid
+    # before the release day (this file's default) the bidder total is the typed one
     assert out["bidsTotals"] == {"self": 25, "selfTarget": 30, "bidder": 3, "bidderTarget": 10, "total": 28,
                                  "target": 40}
+    # from the release day it is the live count the regions are cut from (2 + 1 + 4 on no profile), not the saved 3
+    monkeypatch.setattr(plan_bidder, "RELEASE_DAY", MON)
+    assert (await get_day(TUE.isoformat(), me, None))["bidsTotals"] == {
+        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 10, "total": 32, "target": 40}
     assert latam.region == "Latam"
 
 
@@ -584,9 +589,9 @@ async def test_week_of_last_week_reports_that_week_judged_against_today(me):
     out = await dashboard_week(me, None, TODAY, "2026-11-11")
     assert out["week"] == {"start": "2026-11-09", "end": "2026-11-14"}
     assert out["bids"]["byDay"] == [
-        {"date": "2026-11-09", "done": 100, "target": 100}, {"date": "2026-11-10", "done": 40, "target": 100},
-        {"date": "2026-11-11", "done": 0, "target": 100}, {"date": "2026-11-12", "done": 0, "target": 100},
-        {"date": "2026-11-13", "done": 0, "target": 100}]
+        {"date": "2026-11-09", "done": 100, "self": 100, "bidder": 0, "target": 100}, {"date": "2026-11-10", "done": 40, "self": 0, "bidder": 40, "target": 100},
+        {"date": "2026-11-11", "done": 0, "self": 0, "bidder": 0, "target": 100}, {"date": "2026-11-12", "done": 0, "self": 0, "bidder": 0, "target": 100},
+        {"date": "2026-11-13", "done": 0, "self": 0, "bidder": 0, "target": 100}]
     assert (out["bids"]["total"], out["bids"]["target"]) == (140, 500)
     [row] = out["routines"]["rows"]
     assert [d["state"] for d in row["days"]] == ["done", "missed", "missed", "missed", "missed"]
@@ -664,6 +669,16 @@ async def test_interviews_by_day_follows_the_outcomes_rule(me):
                                "scheduled": 4}
     for key, weekend in (("held", 0), ("canceled", 0), ("scheduled", 1)):  # a weekend round is in outcomes only
         assert sum(d[key] for d in out["byDay"]) + weekend == out["outcomes"][key]
+    # the week's rounds, one per working-day round in time order, for the Home week table
+    assert [(r["date"], r["companyName"], r["stage"], r["status"]) for r in out["rounds"]] == [
+        ("2026-11-16", "Unmarked", "intro", "scheduled"), ("2026-11-16", "Passed", "intro", "passed"),
+        ("2026-11-16", "Rejected", "intro", "rejected"), ("2026-11-17", "Went on", "intro", "passed"),
+        ("2026-11-17", "Waiting", "intro", "waiting"), ("2026-11-17", "Canceled", "intro", "canceled"),
+        ("2026-11-18", "Tonight", "intro", "scheduled"), ("2026-11-19", "Went on", "tech_round_1", "scheduled"),
+    ]
+    first = out["rounds"][0]
+    assert set(first) == {"date", "interviewId", "companyName", "stage", "at", "who", "callerName", "status"}
+    assert first["who"] == "self" and first["callerName"] is None and first["at"].endswith("Z")
 
 
 async def test_week_of_is_ones_own_and_user_id_stays_the_admins(boss, me):

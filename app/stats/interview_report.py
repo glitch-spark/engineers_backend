@@ -83,6 +83,7 @@ def interview_facts(iv, iv_id, app: Optional[dict], now: datetime, callers: tupl
             "status": r.status or ("scheduled" if at > now else "completed"),
             "reason": e.statusReason if e else None,
             "caller": caller_person(r.caller, callers),
+            "byCaller": bool(r.caller is not None and r.caller.enabled),  # a caller's round, assigned yet or not
             "reschedules": [x.reason for x in e.reschedules] if e else [],
             "followed": bool(e and e.followUps),
             "statusAt": _utc_naive(e.statusAt) if e else None,
