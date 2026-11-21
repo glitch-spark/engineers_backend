@@ -41,6 +41,7 @@ class TeamRowIn(BaseModel):
     goal: TeamGoalIn
     routines: PlanItemsIn
     weeklyGoals: PlanItemsIn
+    exists: bool = True  # False = the grid loaded a carry-over draft; an older client omits it
 
 
 class TeamSaveIn(BaseModel):
@@ -160,6 +161,8 @@ async def _save_team_row(raw: dict, monday: date) -> None:
     if user.role == "admin":
         raise HTTPException(status_code=422, detail="Admins have no plan")
     stored = (await weeks_or_drafts([user.id], monday)).get(user.id)  # the saved plan, else the carry-over draft
+    if not row.exists and stored is not None and stored.id is not None:  # the person (or another admin) saved meanwhile
+        raise HTTPException(status_code=409, detail="Saved since you loaded the grid — reload to see it")
     base = stored.goal if stored else Counts()
     empty = not (row.goal.bidsSelf or row.goal.bidsBidder or row.goal.interviewsSelf or row.routines or row.weeklyGoals)
     if (stored is not None and stored.id is not None) or not empty:  # nothing to plan yet: don't create an empty week

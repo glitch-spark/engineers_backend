@@ -200,3 +200,23 @@ async def test_team_save_partial_row_fails_and_changes_nothing(db, admin, ana):
     (p,) = await stored(ana)
     assert p.goal.bidsSelf == 5 and [(r.text, r.archived) for r in p.routines] == [("a", False)]
     assert (await UserExtra.get(ana.id)).plansOwnWeek is False
+
+
+async def test_team_save_carry_over_row_does_not_overwrite_a_plan_saved_since(db, admin, ana):
+    await UserExtra.find_one(UserExtra.id == ana.id).update({"$set": {"plansOwnWeek": True}})
+    mine = await plan(ana, WEEK, goal=Counts(bidsSelf=9), routines=[PlanItem(text="mine")])
+    out = await put(admin, row(ana, exists=False, goal={"bidsSelf": 3, "bidsBidder": 0, "interviewsSelf": 0},
+                               routines=[{"text": "draft"}]))
+    assert out["results"][0] == {"userId": str(ana.id), "ok": False,
+                                 "error": "Saved since you loaded the grid — reload to see it"}
+    (p,) = await stored(ana)
+    assert p.goal.bidsSelf == 9 and [(r.id, r.archived) for r in p.routines] == [(mine.routines[0].id, False)]
+    assert (await UserExtra.get(ana.id)).plansOwnWeek is True
+
+
+async def test_team_save_carry_over_row_over_a_draft_saves(db, admin, bo):
+    await plan(bo, PREV, routines=[PlanItem(text="r")])
+    out = await put(admin, row(bo, exists=False, goal={"bidsSelf": 3, "bidsBidder": 0, "interviewsSelf": 0}))
+    assert out["results"][0]["ok"] is True
+    (p,) = [p for p in await stored(bo) if p.weekStart == datetime.fromisoformat(WEEK)]
+    assert p.goal.bidsSelf == 3
