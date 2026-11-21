@@ -219,6 +219,15 @@ async def dashboard_week(
     rounds = interview_report.own_rows(week_ivs, iv_start, iv_end, _now(), tz)
     outcomes = interview_report.counts(rounds)
     rounds_by_day = {d: interview_report.counts([r for r in rounds if r["local"].date() == d]) for d in workdays}
+    companies = {iv.id: iv.companyName for iv in week_ivs}
+    # Home's week table: each working-day round with where it stands (a waiting round that was followed up says so)
+    round_list = [
+        {"date": r["local"].date().isoformat(), "interviewId": str(r["iid"]), "companyName": companies.get(r["iid"]),
+         "stage": r["stage"], "at": r["at"].isoformat() + "Z", "who": "caller" if r["byCaller"] else "self",
+         "callerName": r["caller"][1] if r["byCaller"] and r["caller"] else None,
+         "status": "followed_up" if r["outcome"] == "waiting" and r["followed"] else r["outcome"]}
+        for r in sorted(rounds, key=lambda r: r["at"]) if r["local"].date() in rounds_by_day
+    ]
 
     # Streak: consecutive working days (Mon-Sat) with a logged plan, looking
     # back up to 400 days (the helper itself caps the walk at 365).
@@ -263,6 +272,7 @@ async def dashboard_week(
             "percentile": percentile(bids_scores[sid], list(bids_scores.values())),
             "byDay": [
                 {"date": d.isoformat(), "done": (p.done.bidsSelf + p.done.bidsBidder) if (p := plans_by_day.get(d)) else 0,
+                 "self": p.done.bidsSelf if p else 0, "bidder": p.done.bidsBidder if p else 0,
                  "target": _target(day_target[d])}
                 for d in workdays
             ],
@@ -285,6 +295,7 @@ async def dashboard_week(
             # the same rounds per working day they are scheduled on (a weekend round is in `outcomes` only)
             "byDay": [{"date": d.isoformat(), **{k: rounds_by_day[d][k] for k in ("held", "canceled", "scheduled")}}
                       for d in workdays],
+            "rounds": round_list,
         },
         "stages": stages,
         "streak": streak_value,

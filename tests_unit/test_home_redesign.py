@@ -236,9 +236,9 @@ async def test_bids_by_day_with_a_target(me):
     await day_plan(me, 21, done=DoneCounts(bidsSelf=7))  # Saturday: in the total, not a working day
     out = await dashboard_week(me, None, TODAY)
     assert out["bids"]["byDay"] == [
-        {"date": "2026-11-16", "done": 120, "target": 200}, {"date": "2026-11-17", "done": 80, "target": 300},
-        {"date": "2026-11-18", "done": 0, "target": 200}, {"date": "2026-11-19", "done": 0, "target": 200},
-        {"date": "2026-11-20", "done": 0, "target": 200},
+        {"date": "2026-11-16", "done": 120, "self": 100, "bidder": 20, "target": 200}, {"date": "2026-11-17", "done": 80, "self": 0, "bidder": 80, "target": 300},
+        {"date": "2026-11-18", "done": 0, "self": 0, "bidder": 0, "target": 200}, {"date": "2026-11-19", "done": 0, "self": 0, "bidder": 0, "target": 200},
+        {"date": "2026-11-20", "done": 0, "self": 0, "bidder": 0, "target": 200},
     ]
     assert out["bids"]["total"] == 207 and out["bids"]["pace"]["expected"] == 700
 
@@ -247,8 +247,8 @@ async def test_bids_by_day_without_a_target(me):
     await day_plan(me, 16, done=DoneCounts(bidsSelf=100))
     out = await dashboard_week(me, None, TODAY)
     assert out["bids"]["target"] is None
-    assert out["bids"]["byDay"][:2] == [{"date": "2026-11-16", "done": 100, "target": None},
-                                        {"date": "2026-11-17", "done": 0, "target": None}]
+    assert out["bids"]["byDay"][:2] == [{"date": "2026-11-16", "done": 100, "self": 100, "bidder": 0, "target": None},
+                                        {"date": "2026-11-17", "done": 0, "self": 0, "bidder": 0, "target": None}]
     assert [d["date"] for d in out["bids"]["byDay"]] == [f"2026-11-{n}" for n in range(16, 21)]
 
 
