@@ -20,6 +20,11 @@ they are picked. Each name's dot, pending count and bids are filled in when `tea
 state. In the person's page the pipeline is grouped by status (Scheduled, Waiting for a result, No result for a week
 or more, Followed up, Passed, next round not set), each group foldable, only Scheduled open at first.
 
+**Second review (2026-11-21):** the person is picked with a normal `User` filter in a filter bar at the top, like
+the other pages, with `Day` (Today / Yesterday) beside it and Clear; there is no list down the side. The Team totals
+table is off for now. `GET /dashboard/team-today` is therefore not called by the app at present (kept for a later
+summary).
+
 - A switch **Me | Team** at the top, for admins only. An admin with no plan of their own lands on Team; otherwise the
   last choice is remembered (per browser), default Team.
 - **Team** = a list of people down the left (always visible), the picked person's page on the right. On a narrow
