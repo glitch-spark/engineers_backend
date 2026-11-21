@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 from app.bids.windows import schedule_from_settings
@@ -19,19 +20,35 @@ def _midnight(day: date) -> datetime:
     return datetime(day.year, day.month, day.day)
 
 
-async def bidder_done(owner_id, day: date) -> int:
-    ids = [b.id for b in await Bidder.find({"createdBy": owner_id}).to_list()]
-    if not ids:
-        return 0
+async def bids_by_day(bidder_ids: list, start: date, end: date) -> Counter:
+    """(bidder id, report day) -> approved and pending bids of these bidders on the Bid Track days in [start, end]."""
+    out: Counter = Counter()
+    if not bidder_ids:
+        return out
     sched = schedule_from_settings()
-    n = 0
+    # Report days don't align with UTC midnight: query a day wider on each side, then filter by report day.
     async for d in Bid.get_motor_collection().find(
-        {"bidderId": {"$in": ids}, "kind": {"$ne": "self"}, "status": {"$in": ["approved", "pending"]},
-         "firstAt": {"$gte": _midnight(day) - timedelta(days=1), "$lt": _midnight(day) + timedelta(days=2)}},
-        {"firstAt": 1},
+        {"bidderId": {"$in": bidder_ids}, "kind": {"$ne": "self"}, "status": {"$in": ["approved", "pending"]},
+         "firstAt": {"$gte": _midnight(start) - timedelta(days=1), "$lt": _midnight(end) + timedelta(days=2)}},
+        {"firstAt": 1, "bidderId": 1},
     ):
-        n += bid_report_day(d["firstAt"], sched) == day
-    return n
+        day = bid_report_day(d["firstAt"], sched)
+        if start <= day <= end:
+            out[(d["bidderId"], day)] += 1
+    return out
+
+
+async def bidder_done_by_profile(owner_id, day: date) -> Counter:
+    """The day's bids of the owner's bidders (archived ones too) per profile they bid for (None: on no profile)."""
+    profile_of = {b.id: b.profileId for b in await Bidder.find({"createdBy": owner_id}).to_list()}
+    out: Counter = Counter()
+    for (bidder_id, _day), n in (await bids_by_day(list(profile_of), day, day)).items():
+        out[profile_of[bidder_id]] += n
+    return out
+
+
+async def bidder_done(owner_id, day: date) -> int:
+    return sum((await bidder_done_by_profile(owner_id, day)).values())
 
 
 async def write_through_bidder(owner_id, day: date) -> None:

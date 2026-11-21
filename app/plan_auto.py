@@ -190,23 +190,35 @@ def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
     return out
 
 
-async def draft_week(uid, monday: date) -> Optional[WeeklyPlan]:
-    """Unsaved plan for `monday` carrying over last week's goal and live routines (no weekly goals)."""
-    prev = (await weekly_plans_for([uid], monday - timedelta(days=7))).get(uid)
-    if prev is None:
-        return None
+def _draft(prev: WeeklyPlan, monday: date) -> WeeklyPlan:
     start = _midnight(monday)
     year, week_number, _key = app_week_key(start)
     return WeeklyPlan(
-        userId=uid, weekStart=start, startDate=start, endDate=start + timedelta(days=7) - timedelta(milliseconds=1),
-        weekNumber=week_number, year=year,
+        userId=prev.userId, weekStart=start, startDate=start,
+        endDate=start + timedelta(days=7) - timedelta(milliseconds=1), weekNumber=week_number, year=year,
         goal=prev.goal.model_copy(), routines=[r.model_copy() for r in prev.routines if not r.archived],
     )
+
+
+async def draft_week(uid, monday: date) -> Optional[WeeklyPlan]:
+    """Unsaved plan for `monday` carrying over last week's goal and live routines (no weekly goals)."""
+    prev = (await weekly_plans_for([uid], monday - timedelta(days=7))).get(uid)
+    return _draft(prev, monday) if prev is not None else None
 
 
 async def week_or_draft(uid, monday: date) -> Optional[WeeklyPlan]:
     """The saved plan for `monday`, else the carry-over draft (None without either)."""
     return (await weekly_plans_for([uid], monday)).get(uid) or await draft_week(uid, monday)
+
+
+async def weeks_or_drafts(user_ids: list, monday: date) -> dict:
+    """{userId: `week_or_draft`} for many users in two queries (users with neither are left out)."""
+    out = await weekly_plans_for(user_ids, monday)
+    missing = [uid for uid in user_ids if uid not in out]
+    if missing:
+        prev = await weekly_plans_for(missing, monday - timedelta(days=7))
+        out.update({uid: _draft(p, monday) for uid, p in prev.items()})
+    return out
 
 
 def weekly_done(days: list, week_interviews: dict) -> Counts:

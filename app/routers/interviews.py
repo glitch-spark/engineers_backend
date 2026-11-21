@@ -1160,26 +1160,19 @@ async def day_interviews(uid: Any, day: date, now: datetime) -> list[dict]:
     return sorted(rows, key=lambda r: r["scheduledAt"])
 
 
-@router.get("/needs-input")
-async def needs_input(
-    user: Annotated[UserExtra, Depends(get_current_user)],
-    userId: str = Query("", description="admins: only this owner's rounds"),
-) -> dict:
-    """Rounds since the data start that still need something from the interview's owner (spec
-    2026-11-20-interview-followup-design.md): `outcome` (scheduled, ended OUTCOME_WAIT ago), `follow_up` (the latest
-    round, completed, ended RESULT_WAIT ago, not followed up), `heard_back` (the latest round, completed, last
-    followed up RESULT_WAIT ago; carries `followedUpAt`) or `reason` (canceled / rejected with no statusReason).
-    AI interviews and home assessments are only ever asked for a reason.
-    Newest first. A normal user gets their own; an admin everyone's, or one person's with `userId`."""
+def _now() -> datetime:
+    """Naive UTC now."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+async def needs_items(owner_ids: Optional[list], now: datetime) -> list[dict]:
+    """The needs-input rows (see `needs_input`) of these owners' interviews, everyone's when None; newest first."""
     cutoff = local_day_start_utc(DATA_START, app_tz())
     query: dict[str, Any] = {"stageHistory": {"$elemMatch": {"scheduledAt": {"$gte": cutoff}}}}
-    if user.role != "admin":
-        query["createdBy"] = user.id
-    elif userId:
-        query["createdBy"] = to_object_id(userId)
+    if owner_ids is not None:
+        query["createdBy"] = {"$in": owner_ids}
     # ponytail: unpaginated and filtered in Python; page it (or match the statuses in Mongo) if the list grows large.
     rows = await Interview.find(query).to_list()
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
     items = []
     for iv in await _populate_account(await populate_owner(rows, field="createdBy")):
         account, owner = iv.get("accountId"), iv.get("createdBy")
@@ -1204,7 +1197,79 @@ async def needs_input(
                 **({"followedUpAt": _iso_utc(followed_up)} if need == "heard_back" else {}),
             })
     items.sort(key=lambda i: i["scheduledAt"], reverse=True)
+    return items
+
+
+@router.get("/needs-input")
+async def needs_input(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    userId: str = Query("", description="admins: only this owner's rounds"),
+) -> dict:
+    """Rounds since the data start that still need something from the interview's owner (spec
+    2026-11-20-interview-followup-design.md): `outcome` (scheduled, ended OUTCOME_WAIT ago), `follow_up` (the latest
+    round, completed, ended RESULT_WAIT ago, not followed up), `heard_back` (the latest round, completed, last
+    followed up RESULT_WAIT ago; carries `followedUpAt`) or `reason` (canceled / rejected with no statusReason).
+    AI interviews and home assessments are only ever asked for a reason.
+    Newest first. A normal user gets their own; an admin everyone's, or one person's with `userId`."""
+    if user.role != "admin":
+        owners: Optional[list] = [user.id]
+    else:
+        owners = [to_object_id(userId)] if userId else None
+    items = await needs_items(owners, _now())
     return {"items": items, "counts": {need: sum(i["need"] == need for i in items) for need in NEEDS}}
+
+
+@router.get("/pipeline")
+async def pipeline(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    userId: str = Query("", description="admins: this owner's interviews"),
+) -> dict:
+    """The interviews still open (spec 2026-11-21-admin-home-design.md), by their latest round since the data start
+    (AI interviews and home assessments skipped): `scheduled` (`upcoming` while its start is ahead), `waiting`
+    (completed, under RESULT_WAIT after its end), `no_result` (from then on, with whole `days` since the end),
+    `followed_up` (completed and followed up; `followedUpAt` the latest) or `passed` (no later round yet). Rejected
+    and canceled ones are out. Soonest upcoming first, then most recent. One's own; an admin anyone's with `userId`."""
+    if userId and userId != str(user.id) and user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
+    uid = to_object_id(userId) if userId else user.id
+    now, cutoff = _now(), local_day_start_utc(DATA_START, app_tz())
+    ivs = await Interview.find({"createdBy": uid, "$or": [
+        {"scheduledAt": {"$gte": cutoff}}, {"stageHistory.scheduledAt": {"$gte": cutoff}},
+    ]}).to_list()
+    items = []
+    for iv in ivs:
+        rounds = [(stage, r) for r in merged_rounds(iv)
+                  if (stage := _normalize_stage(r.stage)) not in _ROUND_COUNT_EXCLUDED and r.at is not None]
+        if not rounds:
+            continue
+        stage, r = rounds[-1]
+        start = _utc_naive(r.at)
+        state = normalize_status(r.status) or "scheduled"
+        if start < cutoff or state not in ("scheduled", "completed", "passed"):
+            continue
+        e = next((e for e in iv.stageHistory if e.id == r.entry_id), None)
+        followed_up = max((_utc_naive(f.at) for f in (e.followUps if e else [])), default=None)
+        days = None
+        if state == "completed":
+            end = _utc_naive(round_ends_at(start, _utc_naive(e.endsAt if e else iv.endsAt)))
+            if followed_up is not None:
+                state = "followed_up"
+            elif end <= now - RESULT_WAIT:
+                state, days = "no_result", (now - end).days
+            else:
+                state = "waiting"
+        items.append({
+            "interviewId": str(iv.id), "companyName": iv.companyName, "profileName": iv.accountId, "stage": stage,
+            "at": _iso_utc(start), "upcoming": state == "scheduled" and start > now, "status": state, "days": days,
+            "followedUpAt": _iso_utc(followed_up),
+        })
+    if items:
+        names = {a["_id"]: a.get("name") async for a in Account.get_motor_collection().find(
+            {"_id": {"$in": list({i["profileName"] for i in items})}}, {"name": 1})}
+        for i in items:
+            i["profileName"] = names.get(i["profileName"])
+    ahead = sorted((i for i in items if i["upcoming"]), key=lambda i: i["at"])
+    return {"items": ahead + sorted((i for i in items if not i["upcoming"]), key=lambda i: i["at"], reverse=True)}
 
 
 @router.get("/{iv_id}")
