@@ -71,7 +71,7 @@ async def test_weekly_plan_notification_links_to_plans():
 
     from app import alerts_service
 
-    user = SimpleNamespace(id="u1", slackTimezone=None)
+    user = SimpleNamespace(id="u1", slackTimezone=None, plansOwnWeek=True)
     put = AsyncMock(return_value=True)
     with (
         patch.object(alerts_service, "_put_notification", put),
@@ -84,6 +84,26 @@ async def test_weekly_plan_notification_links_to_plans():
         )
     assert created == 1
     assert put.await_args.kwargs["href"] == "/plans"
+
+
+@pytest.mark.asyncio
+async def test_weekly_plan_alert_skips_admin_planned():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    from app import alerts_service
+
+    put = AsyncMock(return_value=True)
+    with (
+        patch.object(alerts_service, "_put_notification", put),
+        patch.object(alerts_service, "resolve_user_tz", lambda _u: ZoneInfo("UTC")),
+        patch.object(alerts_service.WeeklyPlan, "find_one", AsyncMock(return_value=None)),
+    ):
+        users = [SimpleNamespace(id="a", slackTimezone=None, plansOwnWeek=False),
+                 SimpleNamespace(id="b", slackTimezone=None, plansOwnWeek=True)]
+        created = await alerts_service._tick_weekly_plans(users, now=datetime(2026, 11, 16, 3, 0, tzinfo=timezone.utc))
+    assert created == 1 and put.await_args.kwargs["user_id"] == "b"
 
 
 @pytest.mark.asyncio

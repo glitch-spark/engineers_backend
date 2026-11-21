@@ -47,6 +47,8 @@ class UserExtra(TimestampedDocument):
     slackTimezone: Optional[str] = None  # IANA, e.g. America/New_York
     slackDigestHour: Optional[int] = None
     slackDigestMinute: Optional[int] = None
+    # False: the admin plans this person's week (Plans page setup grid)
+    plansOwnWeek: bool = False
 
     # Calendar colour when this user is taken as a caller (None = a stable colour derived from the id).
     callerColor: Optional[str] = None

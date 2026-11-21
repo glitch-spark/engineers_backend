@@ -20,11 +20,12 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
+from app.models.plan_common import Counts, PlanItem
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import daily_plans
 from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
 from app.routers.reports import team_report
-from app.routers.weekly_plans import get_week, put_week
+from app.routers.weekly_plans import delete_week, get_week, put_week
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -56,7 +57,12 @@ async def db(monkeypatch):
 
 @pytest.fixture
 async def me(db):
-    return await UserExtra(name="Ana", email="ana@x.io").insert()
+    return await UserExtra(name="Ana", email="ana@x.io", plansOwnWeek=True).insert()
+
+
+@pytest.fixture
+async def planned(db):
+    return await UserExtra(name="Pia", email="pia@x.io").insert()  # the admin plans her week
 
 
 def week_body(**kw):
@@ -393,3 +399,32 @@ async def test_log_tick_without_entries_is_not_done(db, me):
     rid = await _log_week(me)
     await put_day(TUE.isoformat(), me, {"results": {rid: {"done": True}}})
     assert (await _log_result(me, rid))["done"] is False
+
+
+async def test_admin_planned_person_cannot_change_week(db, planned):
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, planned, week_body())
+    assert e.value.status_code == 403 and e.value.detail == "Your week is planned by your admin"
+
+
+async def test_admin_planned_person_can_write_recap(db, planned):
+    plan = await WeeklyPlan(userId=planned.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                            startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                            goal=Counts(bidsSelf=600), routines=[PlanItem(text="Review")]).insert()
+    out = await put_week(WEEK, planned, week_body(goal={"bidsSelf": 10}, routines=[], recapNotes="good week"))
+    got = await WeeklyPlan.get(plan.id)
+    assert got.goal.bidsSelf == 600 and got.recapNotes == "good week"
+    assert [r.archived for r in got.routines] == [False]
+    assert out["recapNotes"] == "good week"
+
+
+async def test_admin_planned_person_cannot_delete_week(db, planned):
+    with pytest.raises(HTTPException) as e:
+        await delete_week(WEEK, planned)
+    assert e.value.status_code == 403
+
+
+async def test_get_week_tells_who_plans(db, me, planned):
+    assert (await get_week(WEEK, me, None))["plansOwnWeek"] is True
+    assert (await get_week(WEEK, planned, None))["plansOwnWeek"] is False
+    assert (await get_week(WEEK, me, str(planned.id)))["plansOwnWeek"] is False

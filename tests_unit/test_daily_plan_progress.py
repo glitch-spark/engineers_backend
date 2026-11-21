@@ -54,7 +54,7 @@ async def db(monkeypatch):
 
 @pytest.fixture
 async def me(db):
-    return await UserExtra(name="Ana", email="ana@x.io").insert()
+    return await UserExtra(name="Ana", email="ana@x.io", plansOwnWeek=True).insert()
 
 
 def week_body(**kw):

@@ -88,7 +88,7 @@ def slack(monkeypatch):
 
 @pytest.fixture
 async def me(db):
-    return await UserExtra(name="Ana", email="ana@x.io", slackUserId=SLACK_ID).insert()
+    return await UserExtra(name="Ana", email="ana@x.io", plansOwnWeek=True, slackUserId=SLACK_ID).insert()
 
 
 async def week(me, routines=None, goals=None):

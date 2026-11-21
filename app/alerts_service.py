@@ -217,6 +217,8 @@ async def _tick_card_renewals(*, today_by_user: dict[str, date]) -> int:
 async def _tick_weekly_plans(users: list[UserExtra], *, now: datetime) -> int:
     created = 0
     for user in users:
+        if not user.plansOwnWeek:
+            continue
         local = local_now(resolve_user_tz(user), now)
         if not monday_morning_window(local):
             continue
