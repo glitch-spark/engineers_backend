@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from math import ceil
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from beanie import PydanticObjectId
@@ -36,6 +36,7 @@ from app.dashboard_stats import (
     streak,
     week_window,
 )
+from app.bidder_alerts import bidder_alerts
 from app.deps import get_current_user
 from app.interview_rounds import (
     BREAKDOWN_ORDER,
@@ -43,7 +44,8 @@ from app.interview_rounds import (
     empty_breakdown,
     load_interviews_for_window,
 )
-from app.models import DailyPlan, Interview, Transaction, UserExtra
+from app.models import Account, DailyPlan, Interview, Transaction, UserExtra
+from app.models.plan_common import monday_of
 from app.plan_auto import (
     day_targets,
     goal_progress,
@@ -52,14 +54,18 @@ from app.plan_auto import (
     routines_grid,
     routines_tally,
     weekly_plans_for,
+    weeks_or_drafts,
 )
-from app.routers.interviews import follow_ups_summary
+from app.profile_alerts import profile_alerts
+from app.profile_metrics import ProfileSpan
+from app.routers.accounts import archive_status_query
+from app.routers.interviews import follow_ups_summary, needs_items
 from app.routers._util import to_object_id
 from app.routers.metrics import _display_name
 from app.routers.transactions import _TOTALS_GROUP
 from app.stats import interview_report
 from app.stats.conversion_scope import DATA_START
-from app.stats.profile_loader import load_interview_facts
+from app.stats.profile_loader import cached, load_interview_facts
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -592,3 +598,107 @@ async def dashboard_team(
         },
         "users": users,
     }
+
+
+def _local(now: datetime) -> datetime:
+    """A naive UTC time in the app timezone."""
+    return now.replace(tzinfo=timezone.utc).astimezone(app_tz())
+
+
+async def _flags(ids: list, today: date) -> dict:
+    """{userId: {"profiles", "bidders"}}: the Profiles page banners of each person's live profiles
+    (`app.profile_alerts`) and their bidders' flags (`app.bidder_alerts`), in a fixed number of reads for them all."""
+    out: dict = {uid: {"profiles": [], "bidders": []} for uid in ids}
+    accounts = await Account.find(
+        {**archive_status_query("active"), "createdBy": {"$in": ids}}).project(ProfileSpan).to_list()
+    owner = {str(a.id): a.createdBy for a in accounts}
+    alerts = await profile_alerts(accounts, today)
+    for kind, key in (("no_interviews", "noInterviews"), ("no_bids", "noApplies")):
+        for a in alerts[key]:
+            out[owner[a["accountId"]]]["profiles"].append({
+                "accountId": a["accountId"], "name": a["name"], "kind": kind, "idleDays": a["idleDays"],
+                "capped": a["capped"], "bids": a.get("bids"), "tailorScore": (a.get("tailorScore") or {}).get("avg")})
+    for uid, rows in (await bidder_alerts(ids, today)).items():
+        out[uid]["bidders"] = rows
+    return out
+
+
+FLAGS_TTL = 60  # seconds the team list keeps the profile and bidder flags (they move by the day)
+
+
+async def _pending(ids: list, now: datetime, *, cache: bool = False) -> dict:
+    """{userId: the `/dashboard/pending` body}: what waits on each person at `now` (naive UTC)."""
+    today = _local(now).date()
+    if cache:
+        flags = await cached(("team-flags", today, tuple(sorted(ids))), lambda: _flags(ids, today), FLAGS_TTL)
+    else:
+        flags = await _flags(ids, today)
+    rounds: dict = {str(uid): [] for uid in ids}
+    for item in await needs_items(ids, now):
+        rounds[item["ownerId"]].append(item)
+    out = {}
+    for uid in ids:
+        groups = {"interviews": rounds[str(uid)], **flags[uid]}
+        counts = {k: len(v) for k, v in groups.items()}
+        out[uid] = {**groups, "counts": {**counts, "total": sum(counts.values())}}
+    return out
+
+
+@router.get("/pending")
+async def dashboard_pending(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    userId: Optional[str] = Query(None),
+) -> dict:
+    """Pending items (spec 2026-11-21-admin-home-design.md), the subject's own: `interviews`, their needs-input
+    rows; `profiles`, the Profiles page banners (`no_interviews` / `no_bids`); `bidders`, `not_bidding` / `slowing`
+    (`app.bidder_alerts`); `counts` per group and their `total`."""
+    sid = await _subject_id(user, userId)
+    return (await _pending([sid], _now()))[sid]
+
+
+_STATE_ORDER = {"red": 0, "amber": 1, "green": 2}
+
+
+@router.get("/team-today")
+async def dashboard_team_today(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    day: Optional[str] = Query(None),
+) -> dict:
+    """The admin Home's list of people (spec 2026-11-21-admin-home-design.md), one row per active non-admin user for
+    `day` (default today): `bids`, the day view's done and target (null without one); `todos`, the day's routines
+    done / shown; `pending`, their `/dashboard/pending` total right now; `state`: `red` with a round that ended and
+    is not marked or any profile / bidder flag, else `amber` when the day's bids are under target (today: only from
+    midday in the app timezone) or a routine of the day is not done, else `green`. Red first, then amber, then
+    green; inside a colour most pending first, then by name. A fixed number of reads for the whole team; the flags
+    are cached for FLAGS_TTL."""
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
+    now = _now()
+    local = _local(now)
+    when = _parse_ymd(day, "day") or local.date()
+    bids_count = when < local.date() or (when == local.date() and local.hour >= 12)
+    members = await _active_members()
+    ids = [m.id for m in members]
+    weekly = await weeks_or_drafts(ids, monday_of(when))
+    plans = {p.userId: p for p in await DailyPlan.find({"userId": {"$in": ids}, "date": _midnight(when)}).to_list()}
+    pending = await _pending(ids, now, cache=True) if ids else {}
+    people = []
+    for m in members:
+        plan, week, waiting = plans.get(m.id), weekly.get(m.id), pending[m.id]
+        target = day_targets(plan, week, when)
+        target = _target(target.bidsSelf + target.bidsBidder)
+        done = (plan.done.bidsSelf + plan.done.bidsBidder) if plan else 0
+        todos_done, todos = routines_tally(week, {when: plan}, [when]) if week else (0, 0)
+        if (waiting["profiles"] or waiting["bidders"] or any(i["need"] == "outcome" for i in waiting["interviews"])):
+            state = "red"
+        elif (bids_count and target is not None and done < target) or todos_done < todos:
+            state = "amber"
+        else:
+            state = "green"
+        people.append({
+            "userId": str(m.id), "name": (m.name or m.email or "").strip() or _display_name(m),
+            "bids": {"done": done, "target": target}, "todos": {"done": todos_done, "total": todos},
+            "pending": waiting["counts"]["total"], "state": state,
+        })
+    people.sort(key=lambda p: (_STATE_ORDER[p["state"]], -p["pending"], p["name"].lower()))
+    return {"day": when.isoformat(), "people": people}

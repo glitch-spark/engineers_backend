@@ -33,11 +33,11 @@ async def _fetch(start: datetime, end: datetime, region: str) -> list[dict]:
     return await Application.get_motor_collection().find(q, {f: 1 for f in _ROW_FIELDS}).to_list(None)
 
 
-async def _cached(ck: tuple, load) -> list[dict]:
-    """`load()`'s list, shared for _TTL by every caller of the key `ck`."""
+async def cached(ck: tuple, load, ttl: float = _TTL):
+    """`load()`'s result, shared for `ttl` seconds by every caller of the key `ck`."""
     now = time.monotonic()
     entry = _cache.get(ck)
-    if not entry or now - entry[0] >= _TTL:
+    if not entry or now - entry[0] >= ttl:
         for k in [k for k, (t, _) in _cache.items() if now - t >= _TTL]:
             del _cache[k]
         while len(_cache) >= _MAX:
@@ -52,7 +52,7 @@ async def _cached(ck: tuple, load) -> list[dict]:
 
 
 async def load_period_rows(start: datetime, end: datetime, region: str) -> list[dict]:
-    return await _cached((start, end, region), lambda: _fetch(start, end, region))
+    return await cached((start, end, region), lambda: _fetch(start, end, region))
 
 
 # what interview_report.interview_facts reads; never the transcripts and notes
@@ -83,7 +83,7 @@ async def _fetch_interviews(start: datetime, end: datetime) -> list[dict]:
 async def load_interview_facts(start: datetime, end: datetime) -> list[dict]:
     """Statistics → Interviews: every interview with a round near [start, end), as interview_report.interview_facts.
     One cached load per period for every region and scope (they filter by profile in memory)."""
-    return await _cached(("interviews", start, end), lambda: _fetch_interviews(start, end))
+    return await cached(("interviews", start, end), lambda: _fetch_interviews(start, end))
 
 
 async def count_unmatched_interviews(since: datetime, until: Optional[datetime] = None, owner_id=None,
