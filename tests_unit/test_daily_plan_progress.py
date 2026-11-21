@@ -173,7 +173,7 @@ def _days(*specs):
 def test_goal_progress_done_on_and_week_total():
     from types import SimpleNamespace as N
     from app.plan_auto import goal_progress
-    weekly = N(weeklyGoals=[N(id="g1", target=250)])
+    weekly = N(weeklyGoals=[N(id="g1", target=250, kind="count")])
     out = goal_progress(weekly, _days((9, 100, False), (10, 150, False)))["g1"]
     assert out["done"] is True and out["doneOn"] is None and out["value"] == 250
     out = goal_progress(weekly, _days((9, 100, False), (10, 150, True)))["g1"]
@@ -183,7 +183,7 @@ def test_goal_progress_done_on_and_week_total():
 def test_goal_done_on_is_earliest_done_day():
     from types import SimpleNamespace as N
     from app.plan_auto import goal_progress
-    weekly = N(weeklyGoals=[N(id="g1", target=250)])
+    weekly = N(weeklyGoals=[N(id="g1", target=250, kind="count")])
     out = goal_progress(weekly, _days((11, 10, True), (10, 10, True)))["g1"]
     assert out["doneOn"] == "2026-11-10"
 
@@ -222,3 +222,14 @@ async def test_explicit_null_value_clears_stored_number(db, me, week):
     await put_day("2026-11-10", me, {"results": {"r2": {"value": 31}}}, submit=False)
     await put_day("2026-11-10", me, {"results": {"r2": {"value": None}}}, submit=False)
     assert (await _r2(me)).value is None
+
+
+async def test_progress_saves_entries(db, me):
+    rid = (await put_week(WEEK, me, week_body(routines=[{"text": "Profile review", "kind": "log"}, {"text": "Other"}])))["routines"][0]["id"]
+    other = (await WeeklyPlan.find_one({"userId": me.id})).routines[1].id
+    await put_day("2026-11-10", me, {"results": {other: {"done": True}}}, submit=False)
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [{"note": "fixed"}]}}}, submit=False)
+    res = (await DailyPlan.find_one({"userId": me.id})).results
+    assert res[rid].entries[0].note == "fixed" and res[rid].done is True and res[other].done is True
+    await put_day("2026-11-10", me, {"results": {rid: {}}}, submit=False)  # not sent: kept
+    assert (await DailyPlan.find_one({"userId": me.id})).results[rid].entries[0].note == "fixed"

@@ -341,3 +341,55 @@ async def test_first_post_claim_released_on_failure_and_stale_taken_over(me, db,
     await DailyPlan.get_motor_collection().update_one({"_id": plan.id}, {"$set": {"slackTs": live}})
     await daily_plans._sync_slack(await DailyPlan.get(plan.id), me, Counts(), {})  # in flight elsewhere: skip
     assert posts == [None, None] and (await DailyPlan.get(plan.id)).slackTs == live
+
+
+async def _log_week(me):
+    out = await put_week(WEEK, me, week_body(routines=[{"text": "Profile review", "kind": "log"}]))
+    return out["routines"][0]["id"]
+
+
+async def _log_result(me, rid):
+    item = next(i for i in (await get_day(TUE.isoformat(), me, None))["items"] if i["id"] == rid)
+    return item["result"]
+
+
+async def test_day_saves_log_entries(db, me):
+    rid = await _log_week(me)
+    pid = str((await Account(createdBy=me.id, name="John", region="US").insert()).id)
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": [{"profileId": pid, "note": "rewrote summary"}]}}})
+    r = await _log_result(me, rid)
+    assert r["done"] is True and r["entries"] == [{"profileId": pid, "note": "rewrote summary"}]
+
+
+async def test_entries_not_sent_are_kept(db, me):
+    rid = await _log_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": [{"note": "a"}]}}})
+    await put_day(TUE.isoformat(), me, {"results": {rid: {}}})
+    assert (await _log_result(me, rid))["entries"] == [{"profileId": None, "note": "a"}]
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": []}}})
+    r = await _log_result(me, rid)
+    assert r["entries"] == [] and r["done"] is False
+
+
+async def test_entries_reject_foreign_profile(db, me):
+    rid = await _log_week(me)
+    other = await UserExtra(name="Bo", email="bo@x.io").insert()
+    pid = str((await Account(createdBy=other.id, name="Eve", region="US").insert()).id)
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": [{"profileId": pid, "note": "x"}]}}})
+    assert e.value.status_code == 422 and e.value.detail == "Unknown profile"
+
+
+async def test_entries_drop_deleted_profile(db, me):
+    from bson import ObjectId
+
+    rid = await _log_week(me)
+    await put_day(TUE.isoformat(), me,
+                  {"results": {rid: {"entries": [{"profileId": str(ObjectId()), "note": "x"}, {"profileId": "junk", "note": "y"}]}}})
+    assert (await _log_result(me, rid))["entries"] == [{"profileId": None, "note": "x"}, {"profileId": None, "note": "y"}]
+
+
+async def test_log_tick_without_entries_is_not_done(db, me):
+    rid = await _log_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"done": True}}})
+    assert (await _log_result(me, rid))["done"] is False
