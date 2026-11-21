@@ -841,6 +841,25 @@ def _and_search(query: dict, q: str) -> None:
         query.setdefault("$and", []).append(cond)
 
 
+REGIONS = ("Latam", "EU", "Canada", "US", "Asia")  # Account.region
+
+
+async def _and_region(query: dict, region: str) -> None:
+    """Add the Region filter to `query`: interviews on a profile of that region; "none" = on a profile with no
+    region, or on one that no longer exists. An interview has no region of its own."""
+    if not region or not isinstance(region, str):  # a route called as a plain function leaves the Query default
+        return
+    if region != "none" and region not in REGIONS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid region")
+    coll = Account.get_motor_collection()
+    if region == "none":
+        ids = [a["_id"] async for a in coll.find({"region": {"$in": list(REGIONS)}}, {"_id": 1})]
+        cond = {"accountId": {"$nin": ids}}
+    else:
+        cond = {"accountId": {"$in": [a["_id"] async for a in coll.find({"region": region}, {"_id": 1})]}}
+    query.setdefault("$and", []).append(cond)
+
+
 _SORT_FIELDS = {"latest": "scheduledAt", "company": "companyName", "stage": "stage", "status": "status"}
 
 
@@ -859,6 +878,7 @@ async def list_interviews(
     sort: str = Query("latest"),
     dir: str = Query("desc"),
     q: str = Query("", description="company or position contains this (case-insensitive)"),
+    region: str = Query("", description="the profile's region, or none"),
 ) -> dict:
     # Every authenticated user can list/filter all interviews. Pass creatorId
     # to narrow to one owner; omit it to see everyone.
@@ -878,6 +898,7 @@ async def list_interviews(
     if callType:
         query["caller.enabled"] = _call_type_match(callType)
     _and_search(query, q)
+    await _and_region(query, region)
 
     # Legacy clients send sort=asc|desc (by date).
     if sort in ("asc", "desc"):
@@ -907,6 +928,53 @@ async def list_interviews(
     }
 
 
+@router.get("/summary")
+async def interviews_summary(
+    user: Annotated[UserExtra, Depends(get_current_user)],
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+    accountId: str = Query(""),
+    region: str = Query(""),
+    stage: str = Query(""),
+    status_: str = Query("", alias="status"),
+    creatorId: str = Query(""),
+    callerOnly: bool = Query(False),
+    callerId: str = Query(""),
+    callType: str = Query("", description="self | caller: who takes the round"),
+    q: str = Query("", description="company or position contains this (case-insensitive)"),
+) -> dict:
+    """The Interviews page's totals: the rounds its filters match, per status. `from` / `to` are optional and
+    inclusive, as on the list. `status` is accepted and not applied, so the breakdown keeps every status while one
+    is picked. Counts only, open like the feeds. Every filter is on the round itself (stage, who takes it, its date)."""
+    if status_ and status_ not in STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    f_dt, t_dt = parse_date(from_), parse_date(to, end_of_day=True)
+    if (from_ and f_dt is None) or (to and t_dt is None):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid from/to")
+    hi = _utc_naive(t_dt) + timedelta(microseconds=1) if t_dt is not None else None  # inclusive end
+    if callType:
+        _call_type_match(callType)  # 400 on a bad value
+    query: dict[str, Any] = {}
+    if f_dt is not None or hi is not None:
+        rng = {**({"$gte": f_dt} if f_dt is not None else {}), **({"$lt": hi} if hi is not None else {})}
+        query["stageHistory"] = {"$elemMatch": {"scheduledAt": rng}}
+    if accountId:
+        query["accountId"] = to_object_id(accountId)
+    if creatorId:
+        query["createdBy"] = to_object_id(creatorId)
+    _and_search(query, q)
+    await _and_region(query, region)
+    docs = await Interview.get_motor_collection().find(query, {
+        "stageHistory.scheduledAt": 1, "stageHistory.stage": 1, "stageHistory.status": 1, "stageHistory.caller": 1,
+    }).to_list(None)
+    rounds = flatten_rounds(docs, from_dt=f_dt, to_dt=hi, stage=stage, caller_only=callerOnly, caller_id=callerId,
+                            call_type=callType)
+    by = {s: 0 for s in ("scheduled", "completed", "passed", "rejected", "canceled")}
+    for r in rounds:
+        by[r["status"]] = by.get(r["status"], 0) + 1
+    return {"total": len(rounds), "byStatus": by}
+
+
 @router.get("/rounds")
 async def list_interview_rounds(
     user: Annotated[UserExtra, Depends(get_current_user)],
@@ -920,6 +988,7 @@ async def list_interview_rounds(
     callerId: str = Query(""),
     callType: str = Query("", description="self | caller: who takes the round"),
     q: str = Query("", description="company or position contains this (case-insensitive)"),
+    region: str = Query("", description="the profile's region, or none"),
 ) -> dict:
     """Calendar feed: every round dated in [from, to), flattened. Same visibility as the list.
     callerOnly / callerId narrow it to caller rounds (the Callers calendar); callType to self or caller rounds."""
@@ -941,6 +1010,7 @@ async def list_interview_rounds(
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
     _and_search(query, q)
+    await _and_region(query, region)
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(
@@ -967,6 +1037,7 @@ async def list_caller_rounds(
     limit: int = Query(20, ge=1, le=200),
     dir: str = Query("desc"),
     q: str = Query("", description="company or position contains this (case-insensitive)"),
+    region: str = Query("", description="the profile's region, or none"),
 ) -> dict:
     """Callers list: every user's caller rounds (or `creatorId`'s), one row per round, by start time (desc by
     default), paginated. `from` / `to` are optional (inclusive); same visibility as the calendar feed."""
@@ -989,6 +1060,7 @@ async def list_caller_rounds(
     if creatorId:
         query["createdBy"] = to_object_id(creatorId)
     _and_search(query, q)
+    await _and_region(query, region)
     rows = await Interview.find(query).to_list()
     out = _list_view(await _populate_account(await populate_owner(rows, field="createdBy")))
     rounds = flatten_rounds(out, from_dt=f_dt, to_dt=hi, stage=stage, status=status_, caller_only=True, caller_id=callerId)
