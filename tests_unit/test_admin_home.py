@@ -293,7 +293,7 @@ async def test_team_flags_are_cached_for_a_minute_and_interviews_are_not(boss, m
 # --- GET /daily-plans/{day}: bidsByRegion / bidsTotals --------------------------------------------------------
 
 
-async def test_bids_by_region_and_totals(me):
+async def test_bids_by_region_and_totals(me, monkeypatch):
     us, eu, latam = await profile(me, "Usa"), await profile(me, "Eur", "EU"), await profile(me, "Lat", "Latam",
                                                                                            archived=True)
     await week_plan(me, goal=Counts(bidsSelf=150, bidsSelfUs=100, bidsSelfEu=50, bidsBidder=50))
@@ -308,8 +308,13 @@ async def test_bids_by_region_and_totals(me):
         {"region": "US", "self": 15, "selfTarget": 20, "bidder": 2, "total": 17},
         {"region": "EU", "self": 10, "selfTarget": 10, "bidder": 1, "total": 11},
     ]  # Latam: an archived profile, no target, no bid
+    # before the release day (this file's default) the bidder total is the typed one
     assert out["bidsTotals"] == {"self": 25, "selfTarget": 30, "bidder": 3, "bidderTarget": 10, "total": 28,
                                  "target": 40}
+    # from the release day it is the live count the regions are cut from (2 + 1 + 4 on no profile), not the saved 3
+    monkeypatch.setattr(plan_bidder, "RELEASE_DAY", MON)
+    assert (await get_day(TUE.isoformat(), me, None))["bidsTotals"] == {
+        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 10, "total": 32, "target": 40}
     assert latam.region == "Latam"
 
 
