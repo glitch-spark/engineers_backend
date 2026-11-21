@@ -13,6 +13,13 @@ and the red flags on their profiles and bidders. People should see the same pend
 
 ## Admin Home
 
+**Changed after the user's review (2026-11-21), overriding the bullets below where they differ:** there is no
+Me | Team switch — an admin's Home is always the team, with the old Team overview table below it. The list shows the
+names at once (A–Z, from the shared team lookup); nobody is picked on arrival and a person's page is read only when
+they are picked. Each name's dot, pending count and bids are filled in when `team-today` arrives, with no loading
+state. In the person's page the pipeline is grouped by status (Scheduled, Waiting for a result, No result for a week
+or more, Followed up, Passed, next round not set), each group foldable, only Scheduled open at first.
+
 - A switch **Me | Team** at the top, for admins only. An admin with no plan of their own lands on Team; otherwise the
   last choice is remembered (per browser), default Team.
 - **Team** = a list of people down the left (always visible), the picked person's page on the right. On a narrow
