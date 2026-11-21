@@ -319,3 +319,44 @@ async def test_archived_item_with_result_is_read_only_and_kept(me, db, slack):
     assert "Citizen contact (removed)" in json.dumps(view["blocks"])
     await process_standup_submission(state(view), SLACK_ID)
     assert (await stored(me, TUE)).results[contact].value == 12
+
+
+async def test_form_shows_log_as_multiline(me):
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    john = await Account(name="John D.", createdBy=me.id, region="US").insert()
+    el = by_id(await build_view(me, TUE))[f"item:{rid}"]
+    assert el["optional"] is True and el["hint"]["text"] == "One line per profile: Profile name: what changed"
+    assert el["element"]["type"] == "plain_text_input" and el["element"]["multiline"] is True
+    assert el["element"]["action_id"] == "log" and "initial_value" not in el["element"]
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [
+        {"profileId": str(john.id), "note": "Rewrote summary"}, {"profileId": None, "note": "free line"}]}}})
+    el = by_id(await build_view(me, TUE))[f"item:{rid}"]
+    assert el["element"]["initial_value"] == "John D.: Rewrote summary\nfree line"
+
+
+def _log_view(text):
+    return {"private_metadata": json.dumps({"day": "2026-11-10"}),
+            "state": {"values": {"item:r1": {"log": {"type": "plain_text_input", "value": text}}}}}
+
+
+def test_form_roundtrip_log():
+    r = read_submission(_log_view("John: a\n\n  Maria: b  "))
+    assert [e.note for e in r.results["r1"].entries] == ["John: a", "Maria: b"]
+    assert all(e.profileId is None for e in r.results["r1"].entries)
+    assert read_submission(_log_view("")).results["r1"].entries == []
+    assert read_submission(_log_view(None)).results["r1"].entries == []
+
+
+async def test_keep_unshown_keeps_entries(me):
+    from app.standup.modal import _keep_unshown
+    from app.plan_save import DayIn
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [{"note": "kept"}]}}})
+    out = await _keep_unshown(me, TUE, DayIn())
+    assert [e.note for e in out.results[rid].entries] == ["kept"]
+
+
+def test_log_line_too_long_is_a_field_error():
+    assert submission_errors(_log_view("x" * 201)) == {"item:r1": "Each line is limited to 200 characters"}
+    assert submission_errors(_log_view("\n".join("a" * 5 for _ in range(21)))) == {"item:r1": "At most 20 lines"}
+    assert submission_errors(_log_view("ok\n\n" * 20)) == {}

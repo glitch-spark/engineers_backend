@@ -2,7 +2,7 @@
 (the same view the app's Daily plan reads), saved through `plan_save.save_day` like the app's Save.
 
 Block ids: `self:<profileId>` (self bids typed for an untracked profile), `item:<itemId>` (a routine or weekly goal:
-action `check` or `number`), `notes`."""
+action `check`, `number` or `log`), `notes`."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from app.config import get_settings
 from app.coordination import actions
 from app.interview_day.blocks import _short
 from app.models import UserExtra
-from app.models.plan_common import BidsIn, bids_of
+from app.models.plan_common import BidsIn, LogEntry, bids_of
 from app.plan_bidder import RELEASE_DAY
 from app.plan_save import DayIn, ItemResultIn, save_day
 from app.routers import daily_plans
@@ -31,6 +31,11 @@ STANDUP_VIEW = "standup_update"
 MAX_BLOCKS = 100
 MAX_NUMBER = 100000
 MAX_NOTES = 2000
+MAX_LOG_LINES = 20
+MAX_LOG_LINE = 200
+LOG_HINT = "One line per profile: Profile name: what changed"
+LOG_LINE_ERROR = f"Each line is limited to {MAX_LOG_LINE} characters"
+LOG_LINES_ERROR = f"At most {MAX_LOG_LINES} lines"
 NOT_LINKED = "Link your Slack ID in Profile first, then click again."
 FUTURE = "A day can be followed up from that day on."
 NUMBER_ERROR = f"Enter a number from 0 to {MAX_NUMBER}."
@@ -64,9 +69,18 @@ def _number_input(block_id: str, label: str, value, hint: str = "", *, decimal: 
     return block
 
 
-def _item_block(e: dict, progress: dict) -> dict:
+def _log_lines(text: Optional[str]) -> list[str]:
+    """A log field's lines: trimmed, blank ones dropped."""
+    return [ln for raw in (text or "").splitlines() if (ln := raw.strip())]
+
+
+def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
     result = e["result"] or {}
     unit = "h" if e["kind"] == "hours" else ""
+    if e["archived"] and e["kind"] == "log":
+        n = len(result.get("entries") or [])
+        return {"type": "context", "elements": [_plain(_short(
+            f"{e['text']} (removed) · {n} profile{'s' * (n != 1)}", 2000))]}
     if e["archived"]:  # removed from the week but holds a result: shown, not editable (resent by _keep_unshown)
         v = result.get("value")
         shown = f"{_fmt(v)}{unit}" if e["kind"] != "check" and v is not None else \
@@ -79,6 +93,14 @@ def _item_block(e: dict, progress: dict) -> dict:
             element["initial_options"] = [option]
         return {"type": "input", "block_id": f"item:{e['id']}", "optional": True,
                 "label": _plain(e["text"]), "element": element}
+    if e["kind"] == "log":
+        lines = [f"{name}: {en['note']}" if (name := (names or {}).get(en.get("profileId") or "")) else en["note"]
+                 for en in result.get("entries") or []]
+        element = {"type": "plain_text_input", "action_id": "log", "multiline": True}
+        if lines:
+            element["initial_value"] = "\n".join(lines)
+        return {"type": "input", "block_id": f"item:{e['id']}", "optional": True, "label": _plain(e["text"]),
+                "hint": _plain(LOG_HINT), "element": element}
     target = e["target"]
     if e["scope"] == "goal":
         so_far = (progress.get(e["id"]) or {}).get("value", 0)
@@ -123,7 +145,7 @@ async def build_view(user: UserExtra, day: date) -> dict:
         items = [e for e in d["items"] if e["scope"] == scope]
         if items:
             body.append({"type": "section", "text": {"type": "mrkdwn", "text": heading}})
-            body += [_item_block(e, d["progress"]) for e in items]
+            body += [_item_block(e, d["progress"], names) for e in items]
     follow_ups = slack_bot.follow_ups_line(d["followUps"], label="*Follow-ups*")
     head = [_bids_line(d, day, names), _interviews_line(d), *([follow_ups] if follow_ups else [])]
     room = MAX_BLOCKS - len(head) - 1  # the context lines and Extra
@@ -183,6 +205,9 @@ def read_submission(view: dict) -> DayIn:
     for block_id, acts in _values(view).items():
         if block_id.startswith("item:") and "check" in acts:
             results[block_id[5:]] = ItemResultIn(done=bool(acts["check"].get("selected_options")))
+        elif block_id.startswith("item:") and "log" in acts:  # blank -> [] (sent, clears the stored entries)
+            results[block_id[5:]] = ItemResultIn(
+                entries=[LogEntry(note=ln) for ln in _log_lines(acts["log"].get("value"))])
         elif block_id.startswith("item:"):
             results[block_id[5:]] = ItemResultIn(value=_parse(acts["number"].get("value"), whole=False))
         elif block_id.startswith("self:"):
@@ -209,6 +234,12 @@ def submission_errors(view: dict) -> dict[str, str]:
                     _parse(acts["number"].get("value"), whole=whole)
                 except ValueError:
                     errors[block_id] = WHOLE_ERROR if whole else NUMBER_ERROR
+            elif block_id.startswith("item:") and "log" in acts:
+                lines = _log_lines(acts["log"].get("value"))
+                if any(len(ln) > MAX_LOG_LINE for ln in lines):
+                    errors[block_id] = LOG_LINE_ERROR
+                elif len(lines) > MAX_LOG_LINES:
+                    errors[block_id] = LOG_LINES_ERROR
             elif block_id == "notes" and len((acts["notes"].get("value") or "").strip()) > MAX_NOTES:
                 errors[block_id] = NOTES_ERROR
         return errors
@@ -226,7 +257,7 @@ async def _keep_unshown(user: UserExtra, day: date, body: DayIn) -> DayIn:
     switched = await self_bids.switched_profiles(user.id, day)
     typed = {pid: n for pid, n in plan.done.bidsSelfByProfile.items() if pid not in switched}
     by = {**typed, **plan.done.bidsSelfOtherByProfile, **body.done.bidsSelfByProfile}
-    kept = {iid: ItemResultIn(done=r.done, value=r.value) for iid, r in plan.results.items()}
+    kept = {iid: ItemResultIn(done=r.done, value=r.value, entries=r.entries) for iid, r in plan.results.items()}
     return body.model_copy(update={
         "results": {**kept, **body.results},
         "focus": plan.focus,

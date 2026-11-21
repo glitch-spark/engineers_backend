@@ -144,6 +144,7 @@ async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: d
         items=day_items(weekly, plan, when), progress=goal_progress(weekly, days) if weekly else {},
         week_interviews=(sum(e["self"] + e["caller"] for e in held.values()), target),
         follow_ups=await follow_ups_summary(owner.id, when),
+        profile_names={p["id"]: p["name"] for p in await owner_profiles(owner.id)},
     )
     coll = DailyPlan.get_motor_collection()
     if claim is not None and not posted:  # the post failed: free the claim for the next save
