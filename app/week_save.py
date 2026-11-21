@@ -16,6 +16,7 @@ from app.plan_auto import draft_week, week_snapshot
 logger = logging.getLogger(__name__)
 
 Added = Literal["admin", "self"]
+PLANNED_BY_ADMIN = "Your week is planned by your admin"
 
 
 class PlanItemIn(PlanItem):
@@ -34,7 +35,7 @@ class WeekIn(BaseModel):
     recapNotes: str = Field(default="", max_length=4000)
 
 
-def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str, added_by: Added = "self",
+def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str, added_by: Added,
                  locked: bool = False) -> list[PlanItem]:
     """The sent items in order (ids kept), then the old ones left out, archived: items are never deleted.
 
@@ -88,10 +89,12 @@ async def save_week(
 
     `added_by` marks new items; `locked` = the admin-planned person's save (see `_merge_items`): the goal and the
     admin's items stay as stored."""
-    if locked:
-        goal = None
     t0 = time.monotonic()
     plan = (await week_snapshot([uid], monday))[uid]["plan"]
+    if locked:
+        goal = None
+        if plan is None:  # the admin deleted the week after the caller's check: no person-made plan
+            raise HTTPException(status_code=403, detail=PLANNED_BY_ADMIN)
     base = plan or await draft_week(uid, monday)  # a first save keeps the draft's routine ids
     if plan is None:
         start = _midnight(monday)

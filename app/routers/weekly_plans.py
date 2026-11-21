@@ -19,10 +19,8 @@ from app.models.plan_common import Counts
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import (day_targets, draft_week, goal_progress, items_tally, week_snapshot, weeks_or_drafts,
                            weekly_plans_for)
-from app.week_save import PlanItemIn, PlanItemsIn, WeekIn, _merge_items, save_week  # noqa: F401  (re-exported)
+from app.week_save import PLANNED_BY_ADMIN, PlanItemIn, PlanItemsIn, WeekIn, _merge_items, save_week  # noqa: F401  (re-exported)
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
-
-PLANNED_BY_ADMIN = "Your week is planned by your admin"
 
 log = logging.getLogger(__name__)
 

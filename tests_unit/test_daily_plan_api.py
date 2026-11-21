@@ -491,3 +491,40 @@ async def test_own_week_person_new_items_are_self(db, me):
     assert a["addedBy"] == "self"
     out = await put_week(WEEK, me, week_body(routines=[{"id": a["id"], "text": "Edited"}]))
     assert out["routines"][0]["text"] == "Edited"
+
+
+async def test_own_week_person_renames_admin_item_keeps_admin(db, me):
+    await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                     startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                     routines=[PlanItem(id="a1", text="Admin 1")]).insert()
+    out = await put_week(WEEK, me, week_body(routines=[{"id": "a1", "text": "Mine now"}]))
+    assert [(r["text"], r["addedBy"]) for r in out["routines"]] == [("Mine now", "admin")]
+
+
+async def test_planned_person_weekly_goals_locked_and_archived_admin_stays(db, planned):
+    await WeeklyPlan(userId=planned.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                     startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                     routines=[PlanItem(id="old", text="Gone", archived=True)],
+                     weeklyGoals=[PlanItem(id="g1", text="Outreach", kind="count", target=9)]).insert()
+    out = await put_week(WEEK, planned, week_body(routines=[{"id": "old", "text": "Back"}], weeklyGoals=[
+        {"id": "g1", "text": "Changed", "kind": "count", "target": 1}, {"text": "Own goal", "kind": "hours"}]))
+    assert [(g["text"], g["target"], g["addedBy"]) for g in out["weeklyGoals"]] == [
+        ("Outreach", 9, "admin"), ("Own goal", None, "self")]
+    got = await WeeklyPlan.find_one({"userId": planned.id})
+    assert [(r.text, r.archived) for r in got.routines] == [("Gone", True)]
+
+
+async def test_locked_save_without_saved_plan_is_403_and_inserts_nothing(db, planned):
+    from app.week_save import save_week
+    with pytest.raises(HTTPException) as e:
+        await save_week(planned.id, MON, goal=None, routines=[], weekly_goals=[], recap="", added_by="self",
+                        locked=True)
+    assert e.value.status_code == 403
+    assert await WeeklyPlan.find({"userId": planned.id}).to_list() == []
+
+
+async def test_day_items_return_added_by(db, planned):
+    await _admin_week(planned)
+    await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1"}, {"text": "Mine"}], weeklyGoals=[]))
+    day = await get_day(TUE.isoformat(), planned, None)
+    assert sorted(i["addedBy"] for i in day["items"]) == ["admin", "self"]
