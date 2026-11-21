@@ -31,6 +31,7 @@ STANDUP_VIEW = "standup_update"
 MAX_BLOCKS = 100
 MAX_NUMBER = 100000
 MAX_NOTES = 2000
+MAX_METADATA = 3000  # Slack's cap on private_metadata
 MAX_PREFILL = 3000  # Slack's cap on a text input's initial_value
 MAX_LOG_LINES = 20
 MAX_LOG_LINE = 200
@@ -191,6 +192,11 @@ async def build_view(user: UserExtra, day: date) -> dict:
     if len(body) > room:
         hidden = len(body) - (room - 1)
         body = body[:room - 1] + [_context(f"{hidden} more lines don't fit here — open the app to fill them in.")]
+    shown = {b.get("block_id") for b in body}
+    logs = {iid: m for iid, m in logs.items() if f"item:{iid}" in shown}
+    meta = {"day": day.isoformat(), "logs": logs}
+    while logs and len(json.dumps(meta)) > MAX_METADATA:  # an item without a map reads its lines as free text
+        del logs[max(logs, key=lambda i: len(json.dumps(logs[i])))]
     notes = {"type": "plain_text_input", "action_id": "notes", "multiline": True, "max_length": MAX_NOTES}
     if d["notes"]:
         notes["initial_value"] = d["notes"]

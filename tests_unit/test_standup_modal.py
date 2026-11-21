@@ -25,7 +25,7 @@ from app.routers import daily_plans
 from app.routers.daily_plans import put_day
 from app.routers.weekly_plans import put_week
 from app.standup.modal import (
-    STANDUP_VIEW, build_view, process_standup_click, process_standup_submission, read_submission, submission_errors,
+    STANDUP_VIEW, _day, build_view, process_standup_click, process_standup_submission, read_submission, submission_errors,
 )
 
 pytestmark = [
@@ -391,3 +391,18 @@ async def test_log_too_long_to_prefill_is_read_only_and_kept(me, db, slack):
     assert "Profile review · 20 profiles — edit them in the app" in json.dumps(view["blocks"], ensure_ascii=False)
     await process_standup_submission(state(view), SLACK_ID)
     assert len((await stored(me, TUE)).results[rid].entries) == 20
+
+
+async def test_private_metadata_stays_under_slacks_cap(me, db, slack):
+    (a, b, c), _ = await week(me, routines=[{"text": t, "kind": "log"} for t in "ABC"])
+    accounts = [await Account(name=f"Profile {i:02d} " + "x" * 50, createdBy=me.id, region="US").insert()
+                for i in range(20)]
+    entries = [{"profileId": str(x.id), "note": "n"} for x in accounts]
+    await put_day("2026-11-10", me, {"results": {i: {"entries": entries} for i in (a, b, c)}})
+    view = await build_view(me, TUE)
+    kept = json.loads(view["private_metadata"]).get("logs", {})
+    assert len(view["private_metadata"]) <= 3000 and len(kept) < 3
+    assert _day(view) == TUE
+    dropped = next(i for i in (a, b, c) if i not in kept)
+    got = read_submission(state(view)).results[dropped].entries
+    assert len(got) == 20 and all(e.profileId is None for e in got)
