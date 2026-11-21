@@ -77,3 +77,14 @@ the statuses. With no bids target or no round today the row counts as ticked.
 
 No runs against the real database; single-line commits without trailers; TDD; `npx vitest run`, `npx tsc --noEmit`.
 Dark mode; phone width (the table scrolls sideways inside its card). Nothing is pushed without the user's word.
+
+## Later the same day (user, 2026-11-21)
+
+- The **interview pipeline** is the last block of the page, folded to one line (`Interview pipeline · {n} open` and the
+  count per group); opened, it is the grouped table, each company linking to its interview. Hidden with none open.
+- **The admin Home shows this same page** for the picked person (User, Week and Day filters; no Admin / User view
+  switch; the old person page with tiles is removed). Only the day block differs: it shows the picked day, read-only
+  (the person's to-dos, goals and follow-ups are theirs to tick). Follow-up rows and the result buttons show only
+  when the day is today; on a past day the follow-ups are listed in Pending items instead. Pending items is open for
+  the admin, with its groups folding and listing 5 rows first. The week table and goals follow the picked week.
+- The day's `bidsTotals.bidder` is the live count the location rows are cut from (from the release day on).
