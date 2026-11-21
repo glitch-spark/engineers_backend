@@ -92,3 +92,32 @@ async def test_legacy_docs_still_load(_db):
         "dailyGoal": {"bidsSelf": 5}, "dailyGoalItems": [{"text": "b"}],
     })
     assert w.dailyGoal.bidsSelf == 5 and w.routines == []
+
+
+from app.models.plan_common import ItemResult, LogEntry, PlanItem, result_is_done  # noqa: E402
+
+
+def test_log_kind_and_entries():
+    assert PlanItem(text="Profile review", kind="log").kind == "log"
+    r = ItemResult(entries=[{"profileId": "a" * 24, "note": " rewrote summary "}])
+    assert r.entries[0].note == "rewrote summary"
+    assert ItemResult().entries == []  # old documents read fine
+
+
+def test_log_entry_limits():
+    with pytest.raises(ValueError):
+        LogEntry(note="   ")
+    with pytest.raises(ValueError):
+        LogEntry(note="x" * 201)
+    with pytest.raises(ValueError):
+        ItemResult(entries=[{"note": "n"}] * 21)
+
+
+def test_result_is_done():
+    assert result_is_done("log", ItemResult(entries=[{"note": "n"}]), None)
+    assert not result_is_done("log", ItemResult(done=True), None)  # a tick without entries is not done
+    assert not result_is_done("log", None, None)
+    assert result_is_done("check", ItemResult(done=True), None)
+    assert result_is_done("count", ItemResult(value=50), 50)
+    assert not result_is_done("count", ItemResult(value=49), 50)
+    assert result_is_done("hours", ItemResult(done=True, value=1), 2)  # ticked short

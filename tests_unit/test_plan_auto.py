@@ -244,3 +244,20 @@ def test_items_tally_counts_goals_only_when_touched():
         "untouched": ItemResult(), "valued": ItemResult(value=3), "ticked": ItemResult(done=True)})
     # routines: 1 of 2; goals: focus (not done), valued (done: value > 0), ticked (done); untouched left out
     assert items_tally(w, p, MON) == (3, 5)
+
+
+def test_log_routine_tally_and_goal_progress():
+    w = _week(routines=[PlanItem(id="r", text="Profile review", kind="log")],
+              weeklyGoals=[PlanItem(id="g", text="Profile work", kind="log")])
+    entry = {"note": "rewrote summary"}
+    with_entry = _day_plan(results={"r": ItemResult(entries=[entry])})
+    empty = _day_plan(results={"r": ItemResult(done=True)})
+    assert items_tally(w, with_entry, MON) == (1, 1)
+    assert items_tally(w, empty, MON) == (0, 1)
+    d1 = _day_plan(results={"g": ItemResult(entries=[entry, entry])})
+    d2 = _day_plan(results={"g": ItemResult(entries=[entry])})
+    prog = goal_progress(w, [d1, d2])["g"]
+    assert prog["value"] == 3 and prog["done"] is True and prog["target"] is None
+    assert goal_progress(w, [_day_plan(results={"g": ItemResult(done=True)})])["g"]["done"] is False
+    # a log goal with entries counts as touched in items_tally
+    assert items_tally(w, _day_plan(results={"g": ItemResult(entries=[entry])}), MON) == (1, 1)

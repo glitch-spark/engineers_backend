@@ -15,6 +15,7 @@ from pydantic import AfterValidator, BaseModel, Field, field_validator, model_va
 
 MAX_ITEMS = 20
 MAX_ITEM_LENGTH = 200
+MAX_LOG_ENTRIES = 20
 
 Count = Annotated[int, Field(ge=0)]
 
@@ -93,7 +94,7 @@ class PlanItem(BaseModel):
 
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     text: str
-    kind: Literal["check", "count", "hours"] = "check"
+    kind: Literal["check", "count", "hours", "log"] = "check"
     target: Optional[float] = Field(default=None, ge=0)
     archived: bool = False
 
@@ -103,12 +104,41 @@ class PlanItem(BaseModel):
         return ChecklistItem._text(v)
 
 
+class LogEntry(BaseModel):
+    """One line of a log item's day result: what changed, optionally on a profile."""
+
+    profileId: Optional[str] = None
+    note: str
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, v: str) -> str:
+        return ChecklistItem._text(v)
+
+
 class ItemResult(BaseModel):
-    """A day's result for one plan item (by PlanItem.id): done for checks, value for counts/hours."""
+    """A day's result for one plan item (by PlanItem.id): done for checks, value for counts/hours, entries for logs."""
 
     done: bool = False
     value: Optional[float] = Field(default=None, ge=0)
     target: Optional[float] = Field(default=None, ge=0)
+    entries: list[LogEntry] = []
+
+    @field_validator("entries")
+    @classmethod
+    def _entries(cls, v: list) -> list:
+        if len(v) > MAX_LOG_ENTRIES:
+            raise ValueError(f"at most {MAX_LOG_ENTRIES} log entries")
+        return v
+
+
+def result_is_done(kind: str, r: Optional[ItemResult], target: Optional[float]) -> bool:
+    """A day's result is done: log = has entries; otherwise ticked, or its value at / over `target`."""
+    if r is None:
+        return False
+    if kind == "log":
+        return bool(r.entries)
+    return bool(r.done or (r.value is not None and target is not None and r.value >= target))
 
 
 def check_items(items: list) -> list:
