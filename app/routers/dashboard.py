@@ -623,7 +623,8 @@ async def _flags(ids: list, today: date) -> dict:
     return out
 
 
-FLAGS_TTL = 60  # seconds the team list keeps the profile and bidder flags (they move by the day)
+FLAGS_TTL = 600  # seconds the team list keeps the profile and bidder flags: they move by the day, and reading them is
+# the slow part of the list (half a year of bids per profile), so ten minutes spares most loads that cost
 
 
 async def _pending(ids: list, now: datetime, *, cache: bool = False) -> dict:
