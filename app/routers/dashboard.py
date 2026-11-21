@@ -689,7 +689,9 @@ async def dashboard_team_today(
         target = _target(target.bidsSelf + target.bidsBidder)
         done = (plan.done.bidsSelf + plan.done.bidsBidder) if plan else 0
         todos_done, todos = routines_tally(week, {when: plan}, [when]) if week else (0, 0)
-        if (waiting["profiles"] or waiting["bidders"] or any(i["need"] == "outcome" for i in waiting["interviews"])):
+        # red = an interview ended and nobody marked it. Profile and bidder flags only add to `pending`: on real
+        # data everyone has a profile without an interview in two weeks, so they would paint the whole list red.
+        if any(i["need"] == "outcome" for i in waiting["interviews"]):
             state = "red"
         elif (bids_count and target is not None and done < target) or todos_done < todos:
             state = "amber"

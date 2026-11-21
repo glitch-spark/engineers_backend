@@ -18,7 +18,8 @@ and the red flags on their profiles and bidders. People should see the same pend
 - **Team** = a list of people down the left (always visible), the picked person's page on the right. On a narrow
   screen the list becomes a "Viewing" dropdown with previous / next arrows.
 - **List row**: status dot, name, pending count badge, `{bids} / {target} bids · {x} of {y} to-dos`, and a bids bar.
-  Dot: red = something overdue (an interview ended and not marked, or any red flag), amber = behind on bids or
+  Dot: red = an interview ended and was not marked (profile and bidder flags only add to the pending count: on
+  real data every person has one, so they would paint the whole list red), amber = behind on bids or
   to-dos for the day, green = otherwise. Order: red first, then amber, then green; inside a colour most pending
   first, then name. The first person is picked on arrival; the choice sits in the URL (`?user=`).
 - **Today | Yesterday** switch for the page's day (bids table, today's interviews, the to-dos summary).

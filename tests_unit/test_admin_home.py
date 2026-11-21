@@ -211,17 +211,18 @@ async def test_a_follow_up_due_is_pending_but_not_red(boss, me):
     assert (row["pending"], row["state"]) == (1, "green")
 
 
-async def test_a_profile_flag_is_red(boss, me):
+async def test_a_profile_flag_is_pending_but_not_red(boss, me):
+    """Nearly everyone has a profile with no interview in two weeks: a flag is counted, it does not colour the dot."""
     await profile(me, "Quiet")  # three weeks without a bid
     row = await one(boss, me)
-    assert (row["pending"], row["state"]) == (1, "red")
+    assert (row["pending"], row["state"]) == (1, "green")
 
 
-async def test_a_bidder_flag_is_red(boss, me):
+async def test_a_bidder_flag_is_pending_but_not_red(boss, me):
     bo = await bidder(me, "Bo")
     await bids(bo, WED - timedelta(days=5))
     row = await one(boss, me)
-    assert (row["pending"], row["state"]) == (1, "red")
+    assert (row["pending"], row["state"]) == (1, "green")
 
 
 @pytest.mark.parametrize("hh,mm,state", [(11, 59, "green"), (12, 0, "amber"), (17, 0, "amber")])
@@ -257,9 +258,9 @@ async def test_all_done_is_green(boss, me):
 
 async def test_order_is_red_amber_green_then_most_pending_then_name(boss, me):
     zed, bob, cat, dan, eve = [await user(n) for n in ("Zed", "bob", "Cat", "Dan", "Eve")]
-    await profile(zed, "Quiet")                                           # red, 1 pending
-    await profile(eve, "Quiet")
-    await profile(eve, "Quieter")                                         # red, 2 pending
+    await interview(zed, "Late", rnd(start=at(WED - timedelta(days=1), 10)))   # ended, not marked: red, 1 pending
+    await interview(eve, "Late", rnd(start=at(WED - timedelta(days=1), 10)))
+    await profile(eve, "Quiet")                                           # red, 2 pending (a flag adds to the count)
     await week_plan(dan, routines=[PlanItem(text="Review")])              # amber, 0 pending
     await week_plan(cat, routines=[PlanItem(text="Review")])
     await interview(cat, "Acme", rnd(status="completed", start=at(WED - timedelta(days=9))))  # amber, 1 pending
