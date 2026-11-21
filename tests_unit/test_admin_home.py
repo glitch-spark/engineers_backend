@@ -29,7 +29,7 @@ from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import dashboard, interviews
 from app.routers.daily_plans import get_day
-from app.routers.dashboard import dashboard_pending, dashboard_team_today
+from app.routers.dashboard import dashboard_pending, dashboard_team_today, dashboard_week
 from app.routers.interviews import needs_input, pipeline
 from app.stats import profile_loader
 
@@ -560,3 +560,119 @@ async def test_pending_is_never_another_persons_for_a_non_admin(boss, me):
         assert err.value.status_code == 403
     assert (await dashboard_pending(boss, str(ben.id)))["counts"] == {"interviews": 1, "profiles": 1, "bidders": 1,
                                                                     "total": 3}
+
+
+# --- GET /dashboard/week: weekOf, bids.week, interviews.byDay -------------------------------------------------
+
+TODAY = WED.isoformat()
+LAST_MON = MON - timedelta(days=7)
+
+
+async def last_week_plan(owner, **kw) -> None:
+    start = datetime(LAST_MON.year, LAST_MON.month, LAST_MON.day)
+    await WeeklyPlan(userId=owner.id, weekStart=start, weekNumber=46, year=2026, startDate=start,
+                     endDate=start + timedelta(days=6), **kw).insert()
+
+
+async def test_week_of_last_week_reports_that_week_judged_against_today(me):
+    await last_week_plan(me, goal=Counts(bidsSelf=500), routines=[PlanItem(id="r1", text="Review")])
+    await day_plan(me, LAST_MON, done=DoneCounts(bidsSelf=100), results={"r1": ItemResult(done=True)})
+    await day_plan(me, LAST_MON + timedelta(days=1), done=DoneCounts(bidsBidder=40))
+    await day_plan(me, MON, done=DoneCounts(bidsSelf=7))
+    await interview(me, "Then", rnd(status="passed", start=at(LAST_MON + timedelta(days=1))))
+    await interview(me, "Now", rnd(start=at(WED, 20)))
+    out = await dashboard_week(me, None, TODAY, "2026-11-11")
+    assert out["week"] == {"start": "2026-11-09", "end": "2026-11-14"}
+    assert out["bids"]["byDay"] == [
+        {"date": "2026-11-09", "done": 100, "target": 100}, {"date": "2026-11-10", "done": 40, "target": 100},
+        {"date": "2026-11-11", "done": 0, "target": 100}, {"date": "2026-11-12", "done": 0, "target": 100},
+        {"date": "2026-11-13", "done": 0, "target": 100}]
+    assert (out["bids"]["total"], out["bids"]["target"]) == (140, 500)
+    [row] = out["routines"]["rows"]
+    assert [d["state"] for d in row["days"]] == ["done", "missed", "missed", "missed", "missed"]
+    assert (row["doneDays"], row["totalDays"], out["routines"]["done"], out["routines"]["expected"]) == (1, 5, 1, 5)
+    assert out["interviews"]["outcomes"] == {
+        "held": 1, "passed": 1, "rejected": 0, "noAnswer": 0, "waiting": 0, "canceled": 0, "scheduled": 0}
+    assert out["interviews"]["byDay"][1] == {"date": "2026-11-10", "held": 1, "canceled": 0, "scheduled": 0}
+    assert out["interviews"]["done"] == 1
+    # the pace of a week that is over: everything expected, no day left to catch up
+    assert out["bids"]["pace"] == {"expected": 500, "behindBy": 360, "perDayNeeded": None, "onTrack": False}
+    assert out["interviews"]["pace"] is None  # no interviews target
+
+
+async def test_without_week_of_it_is_the_week_of_today(me):
+    await week_plan(me, goal=Counts(bidsSelf=500), routines=[PlanItem(id="r1", text="Review")])
+    await day_plan(me, MON, done=DoneCounts(bidsSelf=100))
+    out = await dashboard_week(me, None, TODAY)
+    assert out["week"] == {"start": "2026-11-16", "end": "2026-11-21"}
+    assert [d["state"] for d in out["routines"]["rows"][0]["days"]] == ["missed", "missed", "today", "future", "future"]
+    assert out["bids"]["pace"] == {"expected": 300, "behindBy": 200, "perDayNeeded": 200, "onTrack": False}
+    for same_week in (TODAY, "2026-11-16", "2026-11-22"):  # any date of the week, its Sunday too
+        assert await dashboard_week(me, None, TODAY, same_week) == out
+
+
+@pytest.mark.parametrize("week_of", ["2026-11-23", "2027-01-01", "11/09/2026", "2026-13-01", "last"])
+async def test_a_later_week_or_a_malformed_week_of_is_422(me, week_of):
+    with pytest.raises(HTTPException) as err:
+        await dashboard_week(me, None, TODAY, week_of)
+    assert err.value.status_code == 422
+
+
+async def test_bids_week_sums_the_working_days_and_their_targets(me):
+    await week_plan(me, goal=Counts(bidsSelf=500, bidsBidder=100))
+    await day_plan(me, MON, done=DoneCounts(bidsSelf=100, bidsBidder=20))
+    await day_plan(me, TUE, done=DoneCounts(bidsBidder=80), targetOverride=Counts(bidsSelf=300))
+    await day_plan(me, date(2026, 11, 21), done=DoneCounts(bidsSelf=7))  # Saturday: no working day
+    bids_out = (await dashboard_week(me, None, TODAY))["bids"]
+    assert bids_out["week"] == {"self": 100, "selfTarget": 700, "bidder": 100, "bidderTarget": 80, "total": 200,
+                                "target": 780}
+    assert bids_out["week"]["total"] == sum(d["done"] for d in bids_out["byDay"])
+    assert bids_out["week"]["target"] == sum(d["target"] for d in bids_out["byDay"])
+    assert bids_out["total"] == 207  # the existing total keeps the weekend's bids
+
+
+async def test_bids_week_targets_are_null_when_no_day_has_one(me):
+    await week_plan(me, goal=Counts(bidsSelf=500))
+    await day_plan(me, MON, done=DoneCounts(bidsSelf=5, bidsBidder=3))
+    assert (await dashboard_week(me, None, TODAY))["bids"]["week"] == {
+        "self": 5, "selfTarget": 500, "bidder": 3, "bidderTarget": None, "total": 8, "target": 500}
+    assert (await dashboard_week(me, None, TODAY, LAST_MON.isoformat()))["bids"]["week"] == {
+        "self": 0, "selfTarget": None, "bidder": 0, "bidderTarget": None, "total": 0, "target": None}
+
+
+async def test_interviews_by_day_follows_the_outcomes_rule(me):
+    ben = await user("Ben")
+    await interview(me, "Passed", rnd(status="passed", start=at(MON)))
+    await interview(me, "Rejected", rnd(status="rejected", start=at(MON), statusReason="pay"))
+    await interview(me, "Unmarked", rnd(start=at(MON, 9)))                 # ended, never marked: not held yet
+    await interview(me, "Waiting", rnd(status="completed", start=at(TUE)))
+    await interview(me, "Canceled", rnd(status="canceled", start=at(TUE)))
+    await interview(me, "Tonight", rnd(start=at(WED, 20)))
+    await interview(me, "Went on", rnd(status="completed", start=at(TUE, 9)), rnd("tech_round_1", start=at(WED + timedelta(days=1))))
+    await interview(me, "Weekend", rnd(start=at(date(2026, 11, 21))))
+    await interview(me, "Last week", rnd(status="passed", start=at(LAST_MON)))
+    await interview(ben, "Bens", rnd(status="passed", start=at(MON)))
+    out = (await dashboard_week(me, None, TODAY))["interviews"]
+    assert out["byDay"] == [
+        {"date": "2026-11-16", "held": 2, "canceled": 0, "scheduled": 1},
+        {"date": "2026-11-17", "held": 2, "canceled": 1, "scheduled": 0},
+        {"date": "2026-11-18", "held": 0, "canceled": 0, "scheduled": 1},
+        {"date": "2026-11-19", "held": 0, "canceled": 0, "scheduled": 1},
+        {"date": "2026-11-20", "held": 0, "canceled": 0, "scheduled": 0},
+    ]
+    assert out["outcomes"] == {"held": 4, "passed": 2, "rejected": 1, "noAnswer": 0, "waiting": 1, "canceled": 1,
+                               "scheduled": 4}
+    for key, weekend in (("held", 0), ("canceled", 0), ("scheduled", 1)):  # a weekend round is in outcomes only
+        assert sum(d[key] for d in out["byDay"]) + weekend == out["outcomes"][key]
+
+
+async def test_week_of_is_ones_own_and_user_id_stays_the_admins(boss, me):
+    ben = await user("Ben")
+    await day_plan(ben, LAST_MON, done=DoneCounts(bidsSelf=9))
+    await day_plan(me, LAST_MON, done=DoneCounts(bidsSelf=4))
+    assert (await dashboard_week(me, None, TODAY, LAST_MON.isoformat()))["bids"]["week"]["total"] == 4
+    assert (await dashboard_week(boss, str(ben.id), TODAY, LAST_MON.isoformat()))["bids"]["week"]["total"] == 9
+    for who in (str(ben.id), str(me.id)):
+        with pytest.raises(HTTPException) as err:
+            await dashboard_week(me, who, TODAY, LAST_MON.isoformat())
+        assert err.value.status_code == 403

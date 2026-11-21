@@ -166,11 +166,17 @@ async def dashboard_week(
     user: Annotated[UserExtra, Depends(get_current_user)],
     userId: Optional[str] = Query(None),
     today: Optional[str] = Query(None),
+    weekOf: Annotated[Optional[str], Query()] = None,
 ) -> dict:
+    """`weekOf` (any date in it; default the week of `today`) picks the Mon-Sun week reported, never a later one
+    than today's. `today` stays the real date: elapsed days, pace and the routines' day states are judged against
+    it, so a past week is all elapsed (pace: everything expected, `perDayNeeded` null)."""
     sid = await _subject_id(user, userId)
     day = _today(today)
     tz = app_tz()
-    monday, saturday, sunday = week_window(day)
+    monday, saturday, sunday = week_window(_parse_ymd(weekOf, "weekOf") or day)
+    if monday > day:
+        raise HTTPException(status_code=422, detail="invalid weekOf")
 
     # Actuals: every stored daily plan over the counting window (Mon-Sun), drafts included;
     # interviews come from interview records.
@@ -187,10 +193,11 @@ async def dashboard_week(
     workdays = [monday + timedelta(days=i) for i in range(5)]
     elapsed = [d for d in workdays if d <= day]
     days_left = len(workdays) - len(elapsed)
-    day_target = {}
-    for d in workdays:
-        t = day_targets(plans_by_day.get(d), weekly_plan, d)
-        day_target[d] = t.bidsSelf + t.bidsBidder
+    targets = {d: day_targets(plans_by_day.get(d), weekly_plan, d) for d in workdays}
+    day_target = {d: t.bidsSelf + t.bidsBidder for d, t in targets.items()}
+    # Mon-Fri sums from the sources `byDay` uses (the weekend's bids are in `total` only)
+    week_self = sum(p.done.bidsSelf for d in workdays if (p := plans_by_day.get(d)))
+    week_bidder = sum(p.done.bidsBidder for d in workdays if (p := plans_by_day.get(d)))
     bids_expected = sum(day_target[d] for d in elapsed)
     routines_done, routines_expected = routines_tally(weekly_plan, plans_by_day, elapsed) if weekly_plan else (0, 0)
     weekly_goals = []
@@ -209,7 +216,9 @@ async def dashboard_week(
     breakdown, canceled_total = _stage_counts(week_ivs, iv_start, iv_end - _TICK)
     stages = [{"key": key, "label": label, "count": breakdown.get(key, 0)} for key, label in BREAKDOWN_ORDER]
     stages.append({"key": "canceled", "label": "Canceled", "count": canceled_total})
-    outcomes = interview_report.counts(interview_report.own_rows(week_ivs, iv_start, iv_end, _now(), tz))
+    rounds = interview_report.own_rows(week_ivs, iv_start, iv_end, _now(), tz)
+    outcomes = interview_report.counts(rounds)
+    rounds_by_day = {d: interview_report.counts([r for r in rounds if r["local"].date() == d]) for d in workdays}
 
     # Streak: consecutive working days (Mon-Sat) with a logged plan, looking
     # back up to 400 days (the helper itself caps the walk at 365).
@@ -257,6 +266,11 @@ async def dashboard_week(
                  "target": _target(day_target[d])}
                 for d in workdays
             ],
+            "week": {
+                "self": week_self, "selfTarget": _target(sum(t.bidsSelf for t in targets.values())),
+                "bidder": week_bidder, "bidderTarget": _target(sum(t.bidsBidder for t in targets.values())),
+                "total": week_self + week_bidder, "target": _target(sum(day_target.values())),
+            },
         },
         "interviews": {
             "done": interviews_done,
@@ -268,6 +282,9 @@ async def dashboard_week(
             # rounds scheduled Mon-Sun by the Statistics → Interviews outcome rule; scheduled = not held yet
             "outcomes": {k: outcomes[k] for k in ("held", "passed", "rejected", "noAnswer", "waiting", "canceled",
                                                   "scheduled")},
+            # the same rounds per working day they are scheduled on (a weekend round is in `outcomes` only)
+            "byDay": [{"date": d.isoformat(), **{k: rounds_by_day[d][k] for k in ("held", "canceled", "scheduled")}}
+                      for d in workdays],
         },
         "stages": stages,
         "streak": streak_value,
