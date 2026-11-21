@@ -106,7 +106,7 @@ async def test_get_week_without_plan_returns_draft(me):
     nxt = await get_week("2026-11-16", me, None)
     assert nxt["draft"] is True and nxt["exists"] is False
     assert nxt["goal"]["bidsSelf"] == 100
-    assert [r["id"] for r in nxt["routines"]] == [review, contact] and nxt["weeklyGoals"] == []
+    assert [r["id"] for r in nxt["routines"]] == [review, contact] and [g["id"] for g in nxt["weeklyGoals"]] == [goal]
     assert nxt["days"][0]["goal"]["bidsSelf"] == 20  # targets derived from the draft
     assert await WeeklyPlan.find({"userId": me.id}).count() == 1  # nothing saved
     # The draft's ids are known when the week is saved for the first time.

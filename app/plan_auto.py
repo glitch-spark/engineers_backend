@@ -200,11 +200,12 @@ def _draft(prev: WeeklyPlan, monday: date) -> WeeklyPlan:
         userId=prev.userId, weekStart=start, startDate=start,
         endDate=start + timedelta(days=7) - timedelta(milliseconds=1), weekNumber=week_number, year=year,
         goal=prev.goal.model_copy(), routines=[r.model_copy() for r in prev.routines if not r.archived],
+        weeklyGoals=[g.model_copy() for g in prev.weeklyGoals if not g.archived and g.kind in ("count", "hours")],
     )
 
 
 async def draft_week(uid, monday: date) -> Optional[WeeklyPlan]:
-    """Unsaved plan for `monday` carrying over last week's goal and live routines (no weekly goals)."""
+    """Unsaved plan for `monday` carrying over last week's goal, live routines and live count / hours weekly goals."""
     prev = (await weekly_plans_for([uid], monday - timedelta(days=7))).get(uid)
     return _draft(prev, monday) if prev is not None else None
 

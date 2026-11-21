@@ -222,6 +222,19 @@ async def test_draft_week_copies_goal_and_routines_not_goals(db):
     assert d.goal.bidsSelf == 50 and [r.id for r in d.routines] == ["r"] and d.weeklyGoals == []
 
 
+async def test_draft_carries_count_and_hours_weekly_goals(db):
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, weeklyGoals=[
+        PlanItem(id="g1", text="Email outreach", kind="count", target=250),
+        PlanItem(id="g2", text="Research", kind="hours", target=4),
+        PlanItem(id="g3", text="Background check"),
+        PlanItem(id="g4", text="Profile audit", kind="log"),
+        PlanItem(id="g5", text="Old", kind="count", archived=True),
+    ]).insert()
+    d = await draft_week(uid, MON)
+    assert [g.id for g in d.weeklyGoals] == ["g1", "g2"] and [g.target for g in d.weeklyGoals] == [250, 4]
+
+
 async def test_draft_week_none_without_previous(db):
     assert await draft_week(PydanticObjectId(), MON) is None
 
