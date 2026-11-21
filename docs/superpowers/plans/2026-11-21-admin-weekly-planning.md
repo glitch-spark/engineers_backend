@@ -668,3 +668,101 @@ The app is at `http://localhost:5173`, backend at `http://localhost:8080` (produ
 - [ ] **Step 1:** Run both suites once more from clean: `cd engineers_backend && .venv/bin/pytest tests_unit -q` and `cd engineers_app && npm test && npm run lint`. Expected: PASS.
 - [ ] **Step 2:** Set the spec's status line and commit in the backend: `git commit -am "docs: admin weekly planning design marked implemented"`.
 - [ ] **Step 3:** Report to the user, without pushing: both branch names, the two things that change on deploy (everyone becomes admin-planned until switched; the Monday plan alert stops for them), and that backend and app must ship together (the app sends `entries` and calls `/weekly-plans/team/*`).
+
+---
+
+## Addendum tasks (spec Design §7, approved 2026-11-21) — run before Task 12
+
+### Task 13: Items record who added them; an admin-planned person edits only their own
+
+**Files:**
+- Modify: `engineers_backend/app/models/plan_common.py`, `engineers_backend/app/week_save.py`, `engineers_backend/app/routers/weekly_plans.py`
+- Test: `engineers_backend/tests_unit/test_daily_plan_api.py`, `engineers_backend/tests_unit/test_weekly_plan_team.py`, `engineers_backend/tests_unit/test_plan_auto.py`
+
+**Interfaces:**
+- Produces: `PlanItem.addedBy: Literal["admin", "self"] = "admin"` (also on `PlanItemIn`, but the server never trusts a sent value — see rules). `save_week(..., *, added_by: Literal["admin", "self"], locked: bool = False)` — `added_by` is what new items get; `locked=True` is the admin-planned person's save.
+- Every week read (`GET /weekly-plans/{week}`, team read, day items) returns `addedBy` per item.
+
+Rules (spec §7):
+- Known id → keeps its stored `addedBy`, whoever saves. New item → `added_by` of the save (team save: `"admin"`; person save: `"self"`). A kind change (remove + add) keeps the old item's `addedBy` on the new item.
+- `locked=True` (person, `plansOwnWeek` false, week has a saved plan): goal taken as stored; every stored `"admin"` item kept as stored, in place, whatever the body says (not archived when missing, not renamed / re-targeted / retyped when sent changed); `"self"` items follow the body; sending an `"admin"` item's id with changes is not an error (ignored). The 20-item limit applies to the merged list → 422 with the existing limit message. Week without a saved plan → 403 as today. Recap as today.
+- Carry-over draft keeps `addedBy`.
+
+- [ ] **Step 1: Failing tests**
+
+```python
+# test_plan_common / test_plan_auto
+def test_added_by_defaults_to_admin_and_carries():  # PlanItem(text="x").addedBy == "admin"; _draft keeps "self" on a routine
+
+# test_daily_plan_api (planned = plansOwnWeek False, week saved by the admin with routine a1 "admin")
+async def test_planned_person_adds_own_item(db, planned):       # body routines [a1 as stored, {text "Discord", kind check}] → new item addedBy "self", a1 unchanged
+async def test_planned_person_cannot_change_admin_items(db, planned):  # body renames a1, drops it, changes goal → a1 unchanged & live, goal unchanged
+async def test_planned_person_edits_and_archives_own(db, planned):     # own item s1: rename kept; omitted later → archived
+async def test_planned_person_limit_counts_both(db, planned):   # 15 admin + 6 own routines → 422
+async def test_own_week_person_new_items_are_self(db, me):      # plansOwnWeek True: new item addedBy "self", can edit admin items
+
+# test_weekly_plan_team
+async def test_team_save_keeps_added_by(db, admin, ana):        # ana has own item s1 ("self"); team save sends it (renamed) → still "self", renamed; new item → "admin"
+async def test_team_read_returns_added_by(db, admin, ana):
+```
+
+- [ ] **Step 2: Run, expect failure** — `.venv/bin/pytest tests_unit/test_daily_plan_api.py tests_unit/test_weekly_plan_team.py tests_unit/test_plan_auto.py tests_unit/test_plan_common.py -q`
+- [ ] **Step 3: Implement** — field; `_merge_items` gains the `added_by` / `locked` handling (one place); `put_week` calls `save_week(..., goal=None, routines=body.routines, weekly_goals=body.weeklyGoals, recap=body.recapNotes, added_by="self", locked=True)` for an admin-planned person with a saved plan; `plansOwnWeek` true → `added_by="self"`; team save → `added_by="admin"`. Update the 403-recap docstring / comments.
+- [ ] **Step 4: Run** the Step 2 files, then the full suite (constraints.md) — only known env failures.
+- [ ] **Step 5: Commit** — `feat: plan items record who added them and an admin-planned person can add and edit only their own`
+
+---
+
+### Task 14: Week panel — the planned person's own items
+
+**Files:**
+- Modify: `engineers_app/src/api/endpoints.ts`, `engineers_app/src/components/report/WeekPanel.tsx`, `engineers_app/src/components/report/PlanItemsEditor.tsx`
+- Test: `engineers_app/src/components/report/WeekPanel.test.tsx`, `engineers_app/src/components/report/PlanItemsEditor.test.tsx`
+
+**Interfaces:**
+- Consumes: Task 13 (`addedBy` on every item from week reads).
+- Produces: `PlanItem.addedBy: 'admin' | 'self'` (`PlanItemIn.addedBy?`); `PlanItemsEditor` prop `lockedFor?: (item: PlanItemIn) => boolean` — locked rows render read-only with a 🔒 and no archive button; unlocked rows edit as today; new rows are `addedBy: 'self'`.
+
+Behaviour (spec §7, prototype `person-view-v3.html` case A):
+- `own` mode, `plansOwnWeek` false, week exists: note "Planned by your admin"; targets read-only; routines and weekly goals use `PlanItemsEditor` with `lockedFor = (i) => i.addedBy !== 'self'`; "+ Add item" adds the person's own; Save sends the whole week (`putWeekPlan`) with recap. Week not saved: view only, as today.
+- `own` mode, `plansOwnWeek` true, and `admin` / `view` modes: unchanged.
+
+- [ ] **Step 1: Failing tests**
+
+```tsx
+it('planned person: admin items are locked, own items editable, Add item adds an own item, Save sends both', …)  // putWeekPlan body routines include the locked item unchanged + the new { addedBy: 'self' }
+it('planned person before the week is published: no Add item, no Save', …)
+it('PlanItemsEditor: a locked row has no inputs and no archive button', …)
+```
+
+- [ ] **Step 2: Run, expect failure** — `npx vitest run src/components/report`
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — `npx vitest run && npm run lint`
+- [ ] **Step 5: Commit** — `feat: a person the admin plans can add and edit their own items in the Week panel`
+
+---
+
+### Task 15: Setup grid — a person's own items
+
+**Files:**
+- Modify: `engineers_app/src/lib/teamGrid.ts`, `engineers_app/src/components/report/SetupGrid.tsx`
+- Test: `engineers_app/src/lib/teamGrid.test.ts`, `engineers_app/src/components/report/SetupGrid.test.tsx`
+
+**Interfaces:**
+- Consumes: Task 14 types.
+- Produces: `columnKey` / column derivation exclude `addedBy: 'self'` items — they are always own items (`ownItems` returns them with `addedBy`), never part of a shared column, even when an admin item or another person's own item has the same name. `rowsToSave` sends them back with their id unchanged.
+
+- [ ] **Step 1: Failing tests**
+
+```ts
+it('a person\'s own item never joins a column, even with the same name as an admin column', …)
+it('own items keep their id in rowsToSave and are not sent when untouched', …)
+```
+```tsx
+it('an own item chip reads "added by <name>" and can still be removed by the admin', …)
+```
+
+- [ ] **Step 2: Run, expect failure** — `npx vitest run src/lib/teamGrid.test.ts src/components/report/SetupGrid.test.tsx`
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — `npx vitest run && npm run lint`
+- [ ] **Step 5: Commit** — `feat: the setup grid shows a person's own items as their chips, never as shared columns`

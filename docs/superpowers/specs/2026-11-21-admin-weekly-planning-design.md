@@ -159,11 +159,34 @@ carry as today. Carried items keep their ids.
 - A week nobody touches reads as last week's carry-over (targets, routines, recurring weekly goals), so the standup
   is never empty.
 
+### 7. Addendum (2026-11-21, user decision): people add their own items under an admin plan
+
+The user decided that a person whose week the admin plans (`plansOwnWeek` false) can still add items of their own;
+the admin's targets and items stay locked for them. This replaces designer call #2 below.
+
+- `PlanItem.addedBy: Literal["admin", "self"] = "admin"`. Missing on old documents reads as `"admin"`, so items
+  that exist today become locked once the person is admin-planned. Carry-over keeps the field.
+- Team save (`PUT /weekly-plans/team/{week}`): an item with a known id keeps its stored `addedBy`; a new item is
+  `"admin"`. The admin can still rename, re-target or remove any item, including a person's own.
+- Person's save (`PUT /weekly-plans/{week}`) when `plansOwnWeek` is false and the week has a saved plan: targets
+  and `"admin"` items are taken as stored, whatever the body says (an admin item missing from the body is not
+  archived); `"self"` items follow the body (new ones created as `"self"`, missing ones archived, kind change =
+  remove + add); recap as before. A week without a saved plan stays 403 "Your week is planned by your admin".
+  The 20-item limit counts both kinds together. When `plansOwnWeek` is true, nothing changes: the person edits
+  everything, new items are `"self"`.
+- Week panel, own mode, admin-planned: targets and admin items read-only with a lock and the "Planned by your
+  admin" note; the person's items editable in the same lists with "+ Add item" (new rows are theirs); Save sends
+  the whole week as today. Before the week is published: view only, as today.
+- Setup grid: a person's own items show in "Only this person" with "added by <name>"; they never form a shared
+  column with the admin's items of the same name (the column key includes `addedBy`). Publish keeps them (ids
+  sent back unchanged).
+- Daily standup, Slack post and Home: no change — a person's items are routines / weekly goals like any other.
+
 ## Calls made by the designer (not decided by the user; please check)
 
 1. `plansOwnWeek` defaults to **false**: on release everyone becomes admin-planned and their Week panel turns
    view-only until the admin flips the switch. (The user said they will publish plans at first.)
-2. While admin-planned, a person cannot add items of their own; "Extra notes" in the standup covers ad hoc work.
+2. ~~While admin-planned, a person cannot add items of their own.~~ Replaced by the user's decision in Design §7.
 3. Recurring weekly goals (count / hours) now carry to the next week; check / log weekly goals do not.
 4. Slack log entries are free-text lines without a profile link; the app has the structured picker.
 5. Grid columns are matched by name, not by a stored shared id.
