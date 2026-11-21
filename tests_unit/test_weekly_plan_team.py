@@ -91,10 +91,14 @@ async def test_team_read_saved_draft_and_empty(db, admin, ana, bo, cy):
     assert c["exists"] is False and c["routines"] == [] and c["weeklyGoals"] == [] and c["goal"]["bidsSelf"] == 0
 
 
-async def test_team_read_is_admin_only(db, ana):
-    with pytest.raises(HTTPException) as err:
-        await require_admin(ana)
-    assert err.value.status_code == 403
+async def test_team_routes_require_admin():
+    from app.routers.weekly_plans import router
+    paths = {"GET": 0, "PUT": 0}
+    for r in router.routes:
+        if r.path == "/weekly-plans/team/{week_start}":
+            assert any(d.call is require_admin for d in r.dependant.dependencies)
+            paths[next(iter(r.methods))] += 1
+    assert paths == {"GET": 1, "PUT": 1}
 
 
 async def test_team_save_creates_and_updates(db, admin, ana, bo):
@@ -179,3 +183,20 @@ async def test_team_save_retype_is_remove_plus_add(db, admin, ana):
     await put(admin, row(ana, routines=[{"text": "same", "kind": "check"}]))
     (p,) = await stored(ana)
     assert [(r.id == r1.id, r.archived) for r in p.routines] == [(False, False), (True, True)]
+
+
+async def test_team_save_skips_empty_row_for_draft_only(db, admin, bo):
+    await plan(bo, PREV, goal=Counts(bidsSelf=7), routines=[PlanItem(text="r")])
+    out = await put(admin, row(bo, plansOwnWeek=True))
+    assert out["results"][0]["ok"] is True
+    assert [p.weekStart.isoformat()[:10] for p in await stored(bo)] == [PREV]
+    assert (await UserExtra.get(bo.id)).plansOwnWeek is True
+
+
+async def test_team_save_partial_row_fails_and_changes_nothing(db, admin, ana):
+    await plan(ana, WEEK, goal=Counts(bidsSelf=5), routines=[PlanItem(text="a")])
+    out = await put(admin, {"userId": str(ana.id)})
+    assert out["results"][0]["ok"] is False
+    (p,) = await stored(ana)
+    assert p.goal.bidsSelf == 5 and [(r.text, r.archived) for r in p.routines] == [("a", False)]
+    assert (await UserExtra.get(ana.id)).plansOwnWeek is False

@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from beanie import PydanticObjectId
 from pydantic import BaseModel, Field, ValidationError
 from app.deps import get_current_user, require_admin
 from app.models import UserExtra
@@ -29,17 +30,17 @@ router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
 
 
 class TeamGoalIn(BaseModel):
-    bidsSelf: int = Field(0, ge=0)
-    bidsBidder: int = Field(0, ge=0)
-    interviewsSelf: int = Field(0, ge=0)
+    bidsSelf: int = Field(ge=0)
+    bidsBidder: int = Field(ge=0)
+    interviewsSelf: int = Field(ge=0)
 
 
 class TeamRowIn(BaseModel):
     userId: str
-    plansOwnWeek: bool = False
-    goal: TeamGoalIn = Field(default_factory=TeamGoalIn)
-    routines: PlanItemsIn = []
-    weeklyGoals: PlanItemsIn = []
+    plansOwnWeek: bool
+    goal: TeamGoalIn
+    routines: PlanItemsIn
+    weeklyGoals: PlanItemsIn
 
 
 class TeamSaveIn(BaseModel):
@@ -153,10 +154,7 @@ async def put_team_week(
 
 async def _save_team_row(raw: dict, monday: date) -> None:
     row = TeamRowIn.model_validate(raw)
-    try:
-        user = await UserExtra.get(row.userId)
-    except Exception:  # not a valid id
-        user = None
+    user = await UserExtra.get(row.userId) if PydanticObjectId.is_valid(row.userId) else None
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     if user.role == "admin":
@@ -164,7 +162,7 @@ async def _save_team_row(raw: dict, monday: date) -> None:
     stored = (await weeks_or_drafts([user.id], monday)).get(user.id)  # the saved plan, else the carry-over draft
     base = stored.goal if stored else Counts()
     empty = not (row.goal.bidsSelf or row.goal.bidsBidder or row.goal.interviewsSelf or row.routines or row.weeklyGoals)
-    if stored is not None or not empty:  # nothing to plan yet: don't create an empty week
+    if (stored is not None and stored.id is not None) or not empty:  # nothing to plan yet: don't create an empty week
         if row.goal.bidsSelf == base.bidsSelf:  # total unchanged: keep the stored region split
             goal = base.model_copy(update={"bidsBidder": row.goal.bidsBidder, "interviewsSelf": row.goal.interviewsSelf})
         else:
