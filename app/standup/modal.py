@@ -31,6 +31,7 @@ STANDUP_VIEW = "standup_update"
 MAX_BLOCKS = 100
 MAX_NUMBER = 100000
 MAX_NOTES = 2000
+MAX_PREFILL = 3000  # Slack's cap on a text input's initial_value
 MAX_LOG_LINES = 20
 MAX_LOG_LINE = 200
 LOG_HINT = "One line per profile: Profile name: what changed"
@@ -74,6 +75,39 @@ def _log_lines(text: Optional[str]) -> list[str]:
     return [ln for raw in (text or "").splitlines() if (ln := raw.strip())]
 
 
+def _log_prefill(e: dict, names: Optional[dict]) -> tuple[list[str], dict[str, str]]:
+    """A log item's prefill lines ("Name: note" for a linked profile) and the {name: profileId} they carry."""
+    lines, links = [], {}
+    for en in (e["result"] or {}).get("entries") or []:
+        name = (names or {}).get(en.get("profileId") or "")
+        if name:
+            links.setdefault(name, en["profileId"])
+        lines.append(f"{name}: {en['note']}" if name else en["note"])
+    return lines, links
+
+
+def _log_entries(text: Optional[str], links: dict) -> list[tuple[Optional[str], str]]:
+    """(profileId, note) per non-blank line. A line starting "<prefilled name>: " keeps that profile's id."""
+    out = []
+    for ln in _log_lines(text):
+        for name in sorted(links, key=len, reverse=True):
+            note = ln[len(name) + 2:].strip() if ln.startswith(f"{name}: ") else ""
+            if note:
+                out.append((links[name], note))
+                break
+        else:
+            out.append((None, ln))
+    return out
+
+
+def _links(view: dict, item_id: str) -> dict:
+    """The {name: profileId} the form prefilled for a log item (none for a form opened before this existed)."""
+    try:
+        return json.loads(view.get("private_metadata") or "")["logs"][item_id]
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return {}
+
+
 def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
     result = e["result"] or {}
     unit = "h" if e["kind"] == "hours" else ""
@@ -94,8 +128,9 @@ def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
         return {"type": "input", "block_id": f"item:{e['id']}", "optional": True,
                 "label": _plain(e["text"]), "element": element}
     if e["kind"] == "log":
-        lines = [f"{name}: {en['note']}" if (name := (names or {}).get(en.get("profileId") or "")) else en["note"]
-                 for en in result.get("entries") or []]
+        lines, _ = _log_prefill(e, names)
+        if len("\n".join(lines)) > MAX_PREFILL:  # Slack refuses a longer initial_value: read-only, entries kept
+            return _context(f"{e['text']} · {len(lines)} profiles — edit them in the app")
         element = {"type": "plain_text_input", "action_id": "log", "multiline": True}
         if lines:
             element["initial_value"] = "\n".join(lines)
@@ -136,6 +171,7 @@ async def build_view(user: UserExtra, day: date) -> dict:
     names = {p["id"]: p["name"] for p in d["profiles"]}
     typed = d["done"].get("bidsSelfByProfile") or {}
     body: list[dict] = []
+    logs: dict[str, dict] = {}
     for p in d["profiles"]:
         if p["id"] in d["trackedProfiles"] or (p["archived"] and not typed.get(p["id"])):
             continue  # tracked profiles count themselves; archived ones only while they hold a number
@@ -145,7 +181,10 @@ async def build_view(user: UserExtra, day: date) -> dict:
         items = [e for e in d["items"] if e["scope"] == scope]
         if items:
             body.append({"type": "section", "text": {"type": "mrkdwn", "text": heading}})
-            body += [_item_block(e, d["progress"], names) for e in items]
+            for e in items:
+                body.append(_item_block(e, d["progress"], names))
+                if e["kind"] == "log" and not e["archived"] and body[-1]["type"] == "input":
+                    logs[e["id"]] = _log_prefill(e, names)[1]
     follow_ups = slack_bot.follow_ups_line(d["followUps"], label="*Follow-ups*")
     head = [_bids_line(d, day, names), _interviews_line(d), *([follow_ups] if follow_ups else [])]
     room = MAX_BLOCKS - len(head) - 1  # the context lines and Extra
@@ -158,7 +197,7 @@ async def build_view(user: UserExtra, day: date) -> dict:
     return {
         "type": "modal",
         "callback_id": STANDUP_VIEW,
-        "private_metadata": json.dumps({"day": day.isoformat()}),
+        "private_metadata": json.dumps({"day": day.isoformat(), **({"logs": logs} if logs else {})}),
         "title": _plain("Edit today's update" if d["submitted"] else "Daily standup"),
         "submit": _plain("Post update"),
         "close": _plain("Cancel"),
@@ -206,8 +245,9 @@ def read_submission(view: dict) -> DayIn:
         if block_id.startswith("item:") and "check" in acts:
             results[block_id[5:]] = ItemResultIn(done=bool(acts["check"].get("selected_options")))
         elif block_id.startswith("item:") and "log" in acts:  # blank -> [] (sent, clears the stored entries)
-            results[block_id[5:]] = ItemResultIn(
-                entries=[LogEntry(note=ln) for ln in _log_lines(acts["log"].get("value"))])
+            results[block_id[5:]] = ItemResultIn(entries=[
+                LogEntry(profileId=pid, note=note)
+                for pid, note in _log_entries(acts["log"].get("value"), _links(view, block_id[5:]))])
         elif block_id.startswith("item:"):
             results[block_id[5:]] = ItemResultIn(value=_parse(acts["number"].get("value"), whole=False))
         elif block_id.startswith("self:"):
@@ -235,8 +275,8 @@ def submission_errors(view: dict) -> dict[str, str]:
                 except ValueError:
                     errors[block_id] = WHOLE_ERROR if whole else NUMBER_ERROR
             elif block_id.startswith("item:") and "log" in acts:
-                lines = _log_lines(acts["log"].get("value"))
-                if any(len(ln) > MAX_LOG_LINE for ln in lines):
+                lines = _log_entries(acts["log"].get("value"), _links(view, block_id[5:]))
+                if any(len(note) > MAX_LOG_LINE for _, note in lines):
                     errors[block_id] = LOG_LINE_ERROR
                 elif len(lines) > MAX_LOG_LINES:
                     errors[block_id] = LOG_LINES_ERROR

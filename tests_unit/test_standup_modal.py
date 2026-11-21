@@ -360,3 +360,34 @@ def test_log_line_too_long_is_a_field_error():
     assert submission_errors(_log_view("x" * 201)) == {"item:r1": "Each line is limited to 200 characters"}
     assert submission_errors(_log_view("\n".join("a" * 5 for _ in range(21)))) == {"item:r1": "At most 20 lines"}
     assert submission_errors(_log_view("ok\n\n" * 20)) == {}
+
+
+async def test_log_prefill_roundtrip_keeps_profile_link(me, db, slack):
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    john = await Account(name="John D.", createdBy=me.id, region="US").insert()
+    note = "n" * 200
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [
+        {"profileId": str(john.id), "note": note}, {"note": "free"}]}}})
+    view = await build_view(me, TUE)
+    assert json.loads(view["private_metadata"])["logs"] == {rid: {"John D.": str(john.id)}}
+    sub = state(view)
+    assert submission_errors(sub) == {}  # 200-char note + "John D.: " prefix is fine
+    got = read_submission(sub).results[rid].entries
+    assert [(e.profileId, e.note) for e in got] == [(str(john.id), note), (None, "free")]
+    typed = state(view, **{f"item:{rid}": "John D.: a\nMaria: b"})
+    got = read_submission(typed).results[rid].entries
+    assert [(e.profileId, e.note) for e in got] == [(str(john.id), "a"), (None, "Maria: b")]
+
+
+def test_log_old_metadata_without_logs_still_reads():
+    assert read_submission(_log_view("A: x")).results["r1"].entries[0].profileId is None
+
+
+async def test_log_too_long_to_prefill_is_read_only_and_kept(me, db, slack):
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [{"note": "x" * 200}] * 20}}})
+    view = await build_view(me, TUE)
+    assert f"item:{rid}" not in by_id(view)
+    assert "Profile review · 20 profiles — edit them in the app" in json.dumps(view["blocks"], ensure_ascii=False)
+    await process_standup_submission(state(view), SLACK_ID)
+    assert len((await stored(me, TUE)).results[rid].entries) == 20
