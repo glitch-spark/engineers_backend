@@ -33,14 +33,19 @@ class WeekIn(BaseModel):
 
 
 def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str) -> list[PlanItem]:
-    """The sent items in order (ids kept), then the old ones left out, archived: items are never deleted."""
-    known = {i.id for i in old}
+    """The sent items in order (ids kept), then the old ones left out, archived: items are never deleted.
+
+    A kept id with a new kind is remove + add: past days keep the old item with its old kind."""
+    kinds = {i.id: i.kind for i in old}
+    seen: set[str] = set()
     out: list[PlanItem] = []
     for i in sent:
-        if i.id is not None and (i.id not in known or any(o.id == i.id for o in out)):
+        if i.id is not None and (i.id not in kinds or i.id in seen):
             raise HTTPException(status_code=422, detail=f"{what}: unknown or repeated item id {i.id}")
+        seen.add(i.id)
         fields = i.model_dump(exclude={"id"})
-        out.append(PlanItem(**fields, id=i.id) if i.id else PlanItem(**fields))
+        keep_id = i.id is not None and kinds[i.id] == i.kind
+        out.append(PlanItem(**fields, id=i.id) if keep_id else PlanItem(**fields))
     kept = {i.id for i in out}
     return out + [o.model_copy(update={"archived": True}) for o in old if o.id not in kept]
 

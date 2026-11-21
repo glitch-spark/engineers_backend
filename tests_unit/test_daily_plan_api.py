@@ -428,3 +428,13 @@ async def test_get_week_tells_who_plans(db, me, planned):
     assert (await get_week(WEEK, me, None))["plansOwnWeek"] is True
     assert (await get_week(WEEK, planned, None))["plansOwnWeek"] is False
     assert (await get_week(WEEK, me, str(planned.id)))["plansOwnWeek"] is False
+
+
+async def test_put_week_kind_change_is_remove_plus_add(me):
+    review, contact, goal = await saved_week(me)
+    await put_week(WEEK, me, week_body(routines=[{"id": review, "text": "Bidder review"},
+                                                 {"id": contact, "text": "Citizen contact", "kind": "log"}]))
+    plan = await WeeklyPlan.find_one({"userId": me.id})
+    assert [(r.id, r.kind, r.archived) for r in plan.routines] == [
+        (review, "check", False), (plan.routines[1].id, "log", False), (contact, "count", True)]
+    assert plan.routines[1].id not in (review, contact)

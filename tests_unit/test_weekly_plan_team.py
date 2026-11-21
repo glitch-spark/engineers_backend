@@ -220,3 +220,11 @@ async def test_team_save_carry_over_row_over_a_draft_saves(db, admin, bo):
     assert out["results"][0]["ok"] is True
     (p,) = [p for p in await stored(bo) if p.weekStart == datetime.fromisoformat(WEEK)]
     assert p.goal.bidsSelf == 3
+
+
+async def test_team_save_kind_change_with_kept_id_is_remove_plus_add(db, admin, ana):
+    r1 = PlanItem(text="calls", kind="count", target=5)
+    await plan(ana, WEEK, routines=[r1])
+    await put(admin, row(ana, routines=[{"id": r1.id, "text": "calls", "kind": "log"}]))
+    (p,) = await stored(ana)
+    assert [(r.id == r1.id, r.kind, r.archived) for r in p.routines] == [(False, "log", False), (True, "count", True)]
