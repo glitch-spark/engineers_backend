@@ -116,3 +116,51 @@ follow-up rows as today. Three groups, each left out when empty; the heading cou
 
 No runs against the real database; mongomock tests; single-line commits without trailers; TDD; backend full suite
 with the usual ignores (2 known failures); app `npx vitest run`, `npx tsc --noEmit`. Dark mode; phone width.
+
+## Third review (2026-11-21): clearer person page, any day of the week
+
+Approved by the user from `person-page-v2.html` (layout) and `person-page-v3.html` (week and day picker) in the same
+prototype folder; binding for layout and wording, their numbers are samples. Overrides the page layout above.
+
+### Filter bar
+
+`User` · `Week` (`‹ Nov 16 – Nov 20 ›`; back any number of weeks, never past the current week) · `Day` (five buttons
+Mon–Fri with the date; the picked day marked, today labelled, days still to come disabled) · `Back to today` (shown
+when another day or week is picked) · Clear. The day sits in the URL as `?day=YYYY-MM-DD` (absent = today; the old
+`day=yesterday` still works). Picking a week picks its Friday, or today in the current week.
+
+### Page, top to bottom
+
+1. **Four tiles**: `Bids today` (or `Bids on Wed, Nov 18`): `{done} of {target}`, bar, `{n} to go` today / `{n} short`
+   on a past day (`target reached` when met), `self {s} · bidder {b}`. `Bids this week`: `{total} of {target}`, bar,
+   `{n} to go` and `last day of the week` / `{n} days left` (a past week: `{n} short` or `target reached`).
+   `Interviews this week`: `{held} held · {scheduled} still to come`, stacked bar (passed, rejected, no answer,
+   waiting), `{p} passed · {r} rejected · {w} waiting · {c} canceled` (zero parts left out). `Pending`: the total,
+   `{i} interviews · {p} profiles · {b} bidders`, and in red `{n} interviews ended and aren't marked` when any.
+2. **Jump links**: Bids · Interviews · Daily to-dos · Weekly goals · Pending `{n}` (scroll to the section).
+3. **Bids** card, two halves: the picked day (`Today` or the date; `{done} of {target}`; the region table) and
+   `This week` (`{total} of {target}`; one bar per weekday with its number, a dashed line at the daily target, bars
+   green at or over target, amber under, today's in blue; clicking a past or current weekday's bar picks that day;
+   then one row `All regions` with Self, Bidder, Total, each `{done} / {target}` when a target exists, amber under).
+4. **Interviews** card, two halves: the picked day (`{n} rounds · {u} not marked`; that day's rounds as today) and
+   `This week` (`{held} held · {scheduled} to come`; a table Held / Canceled / Still to come × Mon–Fri + Week, `–` for
+   a day not reached yet in the Still to come row's past days; then the outcome bar with its legend). Below both:
+   `Pipeline` (`{n} open interviews`) with the foldable status groups as built.
+5. **Daily to-dos** and **Weekly goals** side by side, as built; a weekday's column head in the to-dos grid picks
+   that day; the summary reads `{x} of {y} today` (or `on {date}`) `· {d} of {e} this week`.
+6. **Pending items**: each group (Interviews, Profiles, Bidders) folds; open by default; a group lists its first 5
+   rows then `… {n} more` (a button that shows the rest).
+
+What follows the picked day: the day tile, the Bids day half, the Interviews day half, the to-dos day count. What
+follows the picked week: the week tiles, the week halves, the to-dos grid, weekly goals. Pipeline and Pending always
+show the current state.
+
+### API contract additions (binding)
+
+- `GET /dashboard/week` takes `weekOf=YYYY-MM-DD` (any date in the wanted week; absent = the week of `today`).
+  `today` stays the real current date: day states (`today`, `future`, `missed`), `byDay` and pace are judged against
+  it, so a past week has no `today` / `future` day and the current week is unchanged.
+- Its response adds `bids.week: {self, selfTarget, bidder, bidderTarget, total, target}` (targets null when unset;
+  the week's sums of the day targets) and `interviews.byDay: [{date, held, canceled, scheduled}]` for Mon–Fri
+  (`held` = passed + rejected + no answer + waiting as the outcomes rule counts them; `scheduled` = not held yet).
+- A non-admin's `weekOf` works for their own week; `userId` stays admin-only.
