@@ -228,3 +228,18 @@ async def test_team_save_kind_change_with_kept_id_is_remove_plus_add(db, admin, 
     await put(admin, row(ana, routines=[{"id": r1.id, "text": "calls", "kind": "log"}]))
     (p,) = await stored(ana)
     assert [(r.id == r1.id, r.kind, r.archived) for r in p.routines] == [(False, "log", False), (True, "count", True)]
+
+
+async def test_team_save_keeps_added_by(db, admin, ana):
+    s1 = PlanItem(text="mine", addedBy="self")
+    await plan(ana, WEEK, routines=[PlanItem(text="a"), s1])
+    r = row(ana, routines=[{"id": s1.id, "text": "mine 2", "addedBy": "admin"}, {"text": "new"}])
+    await put(admin, r)
+    (p,) = await stored(ana)
+    assert [(i.text, i.addedBy) for i in p.routines] == [("mine 2", "self"), ("new", "admin"), ("a", "admin")]
+
+
+async def test_team_read_returns_added_by(db, admin, ana):
+    await plan(ana, WEEK, routines=[PlanItem(text="a"), PlanItem(text="b", addedBy="self")])
+    (u,) = (await get_team_week(WEEK, admin))["users"]
+    assert [r["addedBy"] for r in u["routines"]] == ["admin", "self"]

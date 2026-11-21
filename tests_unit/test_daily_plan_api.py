@@ -438,3 +438,56 @@ async def test_put_week_kind_change_is_remove_plus_add(me):
     assert [(r.id, r.kind, r.archived) for r in plan.routines] == [
         (review, "check", False), (plan.routines[1].id, "log", False), (contact, "count", True)]
     assert plan.routines[1].id not in (review, contact)
+
+
+async def _admin_week(planned, n=1):
+    routines = [PlanItem(id=f"a{i}", text=f"Admin {i}") for i in range(1, n + 1)]
+    return await WeeklyPlan(userId=planned.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                            startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                            goal=Counts(bidsSelf=600), routines=routines).insert()
+
+
+async def test_planned_person_adds_own_item(db, planned):
+    await _admin_week(planned)
+    out = await put_week(WEEK, planned, week_body(routines=[
+        {"id": "a1", "text": "Admin 1"}, {"text": "Discord", "kind": "check", "addedBy": "admin"}]))
+    assert [(r["text"], r["addedBy"]) for r in out["routines"]] == [("Admin 1", "admin"), ("Discord", "self")]
+
+
+async def test_planned_person_cannot_change_admin_items(db, planned):
+    await _admin_week(planned)
+    await put_week(WEEK, planned, week_body(goal={"bidsSelf": 1}, routines=[{"id": "a1", "text": "Renamed",
+                                                                            "kind": "count", "target": 5}]))
+    await put_week(WEEK, planned, week_body(goal={"bidsSelf": 1}, routines=[]))
+    got = await WeeklyPlan.find_one({"userId": planned.id})
+    assert got.goal.bidsSelf == 600
+    assert [(r.id, r.text, r.kind, r.archived, r.addedBy) for r in got.routines] == [
+        ("a1", "Admin 1", "check", False, "admin")]
+
+
+async def test_planned_person_edits_and_archives_own(db, planned):
+    await _admin_week(planned)
+    out = await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1"}, {"text": "Mine"}]))
+    s1 = out["routines"][1]["id"]
+    out = await put_week(WEEK, planned, week_body(routines=[{"id": s1, "text": "Mine v2"}, {"id": "a1", "text": "x"}]))
+    assert [(r["text"], r["addedBy"]) for r in out["routines"]] == [("Mine v2", "self"), ("Admin 1", "admin")]
+    out = await put_week(WEEK, planned, week_body(routines=[]))
+    got = await WeeklyPlan.find_one({"userId": planned.id})
+    assert [(r.text, r.archived) for r in got.routines] == [("Admin 1", False), ("Mine v2", True)]
+
+
+async def test_planned_person_limit_counts_both(db, planned):
+    await _admin_week(planned, 15)
+    body = week_body(routines=[{"text": f"own {i}"} for i in range(6)])
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, planned, body)
+    assert e.value.status_code == 422 and "at most 20" in e.value.detail
+    await put_week(WEEK, planned, week_body(routines=[{"text": f"own {i}"} for i in range(5)]))
+
+
+async def test_own_week_person_new_items_are_self(db, me):
+    out = await put_week(WEEK, me, week_body(routines=[{"text": "Admin-made"}]))
+    a = out["routines"][0]
+    assert a["addedBy"] == "self"
+    out = await put_week(WEEK, me, week_body(routines=[{"id": a["id"], "text": "Edited"}]))
+    assert out["routines"][0]["text"] == "Edited"

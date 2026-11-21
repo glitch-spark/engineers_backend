@@ -171,7 +171,8 @@ async def _save_team_row(raw: dict, monday: date) -> None:
         else:
             goal = Counts(bidsSelf=row.goal.bidsSelf, bidsBidder=row.goal.bidsBidder,
                           interviewsSelf=row.goal.interviewsSelf, interviewsCaller=base.interviewsCaller)
-        await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None)
+        await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None,
+                        added_by="admin")
     if row.plansOwnWeek != user.plansOwnWeek:
         await UserExtra.find_one(UserExtra.id == user.id).update({"$set": {"plansOwnWeek": row.plansOwnWeek}})
 
@@ -200,11 +201,12 @@ async def put_week(
     body = parse_body(WeekIn, payload)
     if user.plansOwnWeek:
         await save_week(user.id, monday, goal=Counts(**body.goal.model_dump()), routines=body.routines,
-                        weekly_goals=body.weeklyGoals, recap=body.recapNotes)
-    else:  # the admin plans the week: only the recap, and only on a plan the admin saved
+                        weekly_goals=body.weeklyGoals, recap=body.recapNotes, added_by="self")
+    else:  # the admin plans the week: own items and the recap, only on a plan the admin saved
         if (await _snapshot(user.id, monday))["plan"] is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PLANNED_BY_ADMIN)
-        await save_week(user.id, monday, goal=None, routines=None, weekly_goals=None, recap=body.recapNotes)
+        await save_week(user.id, monday, goal=None, routines=body.routines, weekly_goals=body.weeklyGoals,
+                        recap=body.recapNotes, added_by="self", locked=True)
     return _week_out(user.id, monday, await _snapshot(user.id, monday), plans_own_week=user.plansOwnWeek)
 
 

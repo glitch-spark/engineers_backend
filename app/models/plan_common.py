@@ -97,6 +97,7 @@ class PlanItem(BaseModel):
     kind: Literal["check", "count", "hours", "log"] = "check"
     target: Optional[float] = Field(default=None, ge=0)
     archived: bool = False
+    addedBy: Literal["admin", "self"] = "admin"  # who added the item; stored items without it are the admin's
 
     @field_validator("text")
     @classmethod

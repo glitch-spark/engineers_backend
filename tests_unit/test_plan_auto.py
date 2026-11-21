@@ -274,3 +274,10 @@ def test_log_routine_tally_and_goal_progress():
     assert goal_progress(w, [_day_plan(results={"g": ItemResult(done=True)})])["g"]["done"] is False
     # a log goal with entries counts as touched in items_tally
     assert items_tally(w, _day_plan(results={"g": ItemResult(entries=[entry])}), MON) == (1, 1)
+
+
+async def test_added_by_defaults_to_admin_and_carries(db):
+    assert PlanItem(text="x").addedBy == "admin"
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, routines=[PlanItem(id="r1", text="Mine", addedBy="self")]).insert()
+    assert [r.addedBy for r in (await draft_week(uid, MON)).routines] == ["self"]
