@@ -1,6 +1,6 @@
 # Admin weekly planning: a team grid, a profile log item, and a per-person handover
 
-Date: 2026-11-21. Status: draft for approval. Repos: `engineers_backend` (model, API, Slack) and `engineers_app`
+Date: 2026-11-21. Status: implemented (branches `feat/admin-weekly-planning`, not merged). Repos: `engineers_backend` (model, API, Slack) and `engineers_app`
 (Plans page). Builds on `2026-11-17-plans-routines-and-standup-design.md` (weekly plan = targets + routines + weekly
 goals; the daily standup follows it).
 
