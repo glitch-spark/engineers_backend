@@ -182,6 +182,19 @@ the admin's targets and items stay locked for them. This replaces designer call 
   sent back unchanged).
 - Daily standup, Slack post and Home: no change — a person's items are routines / weekly goals like any other.
 
+### 8. Addendum (2026-11-21, user decision): "Move into column…" on a grid chip
+
+Real plans hold free-text items that mean the same thing under different names, so the grid shows almost only chips.
+Each admin-added chip ("Only this person") gets a "Move into column…" action: pick an existing column or type a new
+name (and type / daily-or-weekly for a new one). The chip's item becomes that person's cell in that column.
+
+- Same type and daily/weekly as the column: a rename — the item keeps its id, target and past results.
+- Different type or daily/weekly: remove + add (old item archived with its results, new item without id; a target
+  is kept when both types have one, else none) — the same rule as retype everywhere else.
+- Refused with a message when that person already has the column's item, or their destination list is at 20.
+- A new name pins a new column. People's own items (`addedBy: self`) have no such action (they never join columns).
+- App only: no backend change.
+
 ## Calls made by the designer (not decided by the user; please check)
 
 1. `plansOwnWeek` defaults to **false**: on release everyone becomes admin-planned and their Week panel turns

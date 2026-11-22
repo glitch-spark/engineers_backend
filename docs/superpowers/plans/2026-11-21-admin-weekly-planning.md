@@ -766,3 +766,36 @@ it('an own item chip reads "added by <name>" and can still be removed by the adm
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — `npx vitest run && npm run lint`
 - [ ] **Step 5: Commit** — `feat: the setup grid shows a person's own items as their chips, never as shared columns`
+
+---
+
+### Task 16: "Move into column…" on a grid chip (spec Design §8)
+
+**Files:**
+- Modify: `engineers_app/src/lib/teamGrid.ts`, `engineers_app/src/components/report/SetupGrid.tsx`
+- Test: `engineers_app/src/lib/teamGrid.test.ts`, `engineers_app/src/components/report/SetupGrid.test.tsx`
+
+**Interfaces:**
+- Produces: `moveToColumn(s: GridState, userId: string, scope: Scope, index: number, to: { text: string; kind: PlanItemKind; scope: Scope }): GridState` (index = position in that user's list for `scope`, like `removeOwnItem`); `moveBlocked(s, userId, scope, index, to): string | null` — `"<name> already has <text>"` or `"<name>'s list is full (20 items)"`, else null.
+
+Rules (spec §8): same kind and scope → rename only (id, target kept); else drop the id, move to the destination list, keep `target` when `hasTarget` of both kinds, else null; destination column pinned if not already a column; `addedBy: 'self'` items not movable (no menu).
+
+- [ ] **Step 1: Failing tests**
+
+```ts
+it('moving a chip into a same-kind column renames it and keeps id and target', …)   // Puma "Citizen Contact with Gmail" count weekly 250 → column "Citizen outreach" count weekly: cell(Puma) = {has, target 250}; rowsToSave item keeps id
+it('moving into a different kind or scope drops the id and keeps the target only when both have one', …)
+it('a new name pins a new column', …)
+it('blocked when the person already has the column item or the destination list is full', …)
+it('two people moved into one name form one column', …)
+```
+```tsx
+it('chip menu "Move into column…" lists existing columns and a new-name option; choosing one moves the chip into the column', …)
+it('own items (added by the person) have no Move action', …)
+it('a blocked move shows the message and changes nothing', …)
+```
+
+- [ ] **Step 2: Run, expect failure** — `npx vitest run src/lib/teamGrid.test.ts src/components/report/SetupGrid.test.tsx`
+- [ ] **Step 3: Implement** — chip gets the existing `ActionMenu` with "Move into column…" (and keeps ✕); the move form reuses the add-item form's fields (name with a list of existing column names, type, daily/weekly), pre-filled from the chip.
+- [ ] **Step 4: Run** — `npx vitest run && npm run lint`
+- [ ] **Step 5: Commit** — `feat: a grid chip moves into a shared column (rename when the type matches)`
