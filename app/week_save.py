@@ -36,14 +36,16 @@ class WeekIn(BaseModel):
 
 
 def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str, added_by: Added,
-                 locked: bool = False) -> list[PlanItem]:
+                 locked: bool = False, removed_ids: Optional[set[str]] = None) -> list[PlanItem]:
     """The sent items in order (ids kept), then the old ones left out, archived: items are never deleted.
 
     A kept id with a new kind is remove + add: past days keep the old item with its old kind.
     `addedBy` is never taken from the body: a known id keeps its stored value (a kind change too), a new item gets
     `added_by`. `locked` (an admin-planned person's save): stored admin items stay exactly as stored whatever the
     body says. Result = sent self / new items and stored admin items in body order, then stored admin items missing
-    from the body (live ones stay live), then the archived ones. Over MAX_ITEMS live items -> 422."""
+    from the body (live ones stay live), then the archived ones. `removed_ids` (the admin's team save; None = off):
+    a stored live self item missing from the body stays live unless its id is in the set (a stale grid must not
+    archive what the person added since). Over MAX_ITEMS live items -> 422."""
     by_id = {i.id: i for i in old}
     seen: set[str] = set()
     out: list[PlanItem] = []
@@ -64,6 +66,10 @@ def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str, added_b
     if locked:
         out += [o for o in rest if o.addedBy == "admin" and not o.archived]
         rest = [o for o in rest if o.addedBy != "admin" or o.archived]
+    if removed_ids is not None:
+        keep = [o for o in rest if o.addedBy == "self" and not o.archived and o.id not in removed_ids]
+        out += keep
+        rest = [o for o in rest if o not in keep]
     out += [o.model_copy(update={"archived": True}) for o in rest]
     if sum(not i.archived for i in out) > MAX_ITEMS:
         raise HTTPException(status_code=422, detail=f"{what}: at most {MAX_ITEMS} checklist items")
@@ -84,11 +90,12 @@ async def save_week(
     recap: Optional[str],
     added_by: Added,
     locked: bool = False,
+    removed_ids: Optional[set[str]] = None,
 ) -> WeeklyPlan:
     """Insert or update the week. None = leave as stored (or as the carry-over draft on a first save).
 
     `added_by` marks new items; `locked` = the admin-planned person's save (see `_merge_items`): the goal and the
-    admin's items stay as stored."""
+    admin's items stay as stored. `removed_ids`: see `_merge_items`."""
     t0 = time.monotonic()
     plan = (await week_snapshot([uid], monday))[uid]["plan"]
     if locked:
@@ -112,9 +119,9 @@ async def save_week(
     if goal is not None:
         plan.goal = goal
     if routines is not None:
-        plan.routines = _merge_items(routines, base.routines if base else [], "routines", added_by, locked)
+        plan.routines = _merge_items(routines, base.routines if base else [], "routines", added_by, locked, removed_ids)
     if weekly_goals is not None:
-        plan.weeklyGoals = _merge_items(weekly_goals, base.weeklyGoals if base else [], "weeklyGoals", added_by, locked)
+        plan.weeklyGoals = _merge_items(weekly_goals, base.weeklyGoals if base else [], "weeklyGoals", added_by, locked, removed_ids)
     if recap is not None:
         plan.recapNotes = recap
     if plan.id is None:

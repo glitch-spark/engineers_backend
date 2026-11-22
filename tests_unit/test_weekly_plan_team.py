@@ -243,3 +243,27 @@ async def test_team_read_returns_added_by(db, admin, ana):
     await plan(ana, WEEK, routines=[PlanItem(text="a"), PlanItem(text="b", addedBy="self")])
     (u,) = (await get_team_week(WEEK, admin))["users"]
     assert [r["addedBy"] for r in u["routines"]] == ["admin", "self"]
+
+
+async def test_team_save_stale_row_keeps_new_own_item(db, admin, ana):
+    a, s = PlanItem(text="a"), PlanItem(text="Discord", addedBy="self")
+    await plan(ana, WEEK, routines=[a, s])
+    await put(admin, row(ana, routines=[{"id": a.id, "text": "a"}]))  # loaded before "Discord" existed
+    p = (await stored(ana))[0]
+    assert [(i.text, i.archived) for i in p.routines] == [("a", False), ("Discord", False)]
+
+
+async def test_team_save_removed_ids_archives_own_item(db, admin, ana):
+    a, s = PlanItem(text="a"), PlanItem(text="Discord", addedBy="self")
+    await plan(ana, WEEK, routines=[a, s])
+    await put(admin, row(ana, routines=[{"id": a.id, "text": "a"}], removedIds=[s.id]))
+    p = (await stored(ana))[0]
+    assert [(i.text, i.archived) for i in p.routines] == [("a", False), ("Discord", True)]
+
+
+async def test_team_save_missing_admin_item_is_still_archived(db, admin, ana):
+    a, b = PlanItem(text="a"), PlanItem(text="b")
+    await plan(ana, WEEK, routines=[a, b])
+    await put(admin, row(ana, routines=[{"id": a.id, "text": "a"}]))
+    p = (await stored(ana))[0]
+    assert [(i.text, i.archived) for i in p.routines] == [("a", False), ("b", True)]

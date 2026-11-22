@@ -40,6 +40,7 @@ class TeamRowIn(BaseModel):
     routines: PlanItemsIn
     weeklyGoals: PlanItemsIn
     exists: bool = True  # False = the grid loaded a carry-over draft; an older client omits it
+    removedIds: list[str] = []  # own (self) items the admin removed; any other missing self item stays live
 
 
 class TeamSaveIn(BaseModel):
@@ -170,7 +171,7 @@ async def _save_team_row(raw: dict, monday: date) -> None:
             goal = Counts(bidsSelf=row.goal.bidsSelf, bidsBidder=row.goal.bidsBidder,
                           interviewsSelf=row.goal.interviewsSelf, interviewsCaller=base.interviewsCaller)
         await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None,
-                        added_by="admin")
+                        added_by="admin", removed_ids=set(row.removedIds))
     if row.plansOwnWeek != user.plansOwnWeek:
         await UserExtra.find_one(UserExtra.id == user.id).update({"$set": {"plansOwnWeek": row.plansOwnWeek}})
 
