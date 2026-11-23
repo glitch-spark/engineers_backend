@@ -602,3 +602,18 @@ async def test_progress_save_text_and_choice(db, me):
     assert e.value.detail == "Unknown option"
     await put_day(TUE.isoformat(), me, {"results": {t: {"text": ""}}}, submit=False)
     assert (await _res(me, t))["result"]["done"] is False
+
+
+async def test_week_get_returns_routine_days(db, me):
+    from app.models.plan_common import ItemResult
+
+    r = PlanItem(text="Check inbox")
+    await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), startDate=datetime(2026, 11, 9),
+                     endDate=datetime(2026, 11, 15), weekNumber=46, year=2026, routines=[r]).insert()
+    await DailyPlan(userId=me.id, date=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                    results={r.id: ItemResult(done=True)}).insert()
+    out = await get_week(WEEK, me, None, WED)
+    (row,) = out["routineDays"]
+    assert row["id"] == r.id
+    assert [c["state"] for c in row["days"][:4]] == ["done", "missed", "today", "future"]
+    assert (await get_week("2026-11-02", me, None, WED))["routineDays"] == []  # no plan, no draft

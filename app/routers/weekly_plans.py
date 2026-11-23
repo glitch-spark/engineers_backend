@@ -15,11 +15,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from beanie import PydanticObjectId
 from pydantic import BaseModel, Field, ValidationError
 from app.deps import get_current_user, require_admin
+from app.routers.daily_plans import _today
 from app.models import UserExtra
 from app.models.plan_common import Counts
 from app.models.weekly_plan import WeeklyPlan
-from app.plan_auto import (day_targets, draft_week, goal_progress, items_tally, week_snapshot, weeks_or_drafts,
-                           weekly_plans_for)
+from app.plan_auto import (day_targets, draft_week, goal_progress, items_tally, routines_grid, week_snapshot,
+                           weeks_or_drafts, weekly_plans_for)
 from app.week_save import PLANNED_BY_ADMIN, PlanItemIn, PlanItemsIn, WeekIn, _merge_items, save_week  # noqa: F401  (re-exported)
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
 
@@ -57,8 +58,10 @@ def _sum_stages(day_auto: dict) -> dict:
     return out
 
 
-def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None, *, plans_own_week: bool) -> dict:
-    """`draft` (carry-over from last week) stands in for a week without a saved plan."""
+def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None, *, plans_own_week: bool,
+              today: date) -> dict:
+    """`draft` (carry-over from last week) stands in for a week without a saved plan. `today` judges the routines'
+    day states (`routineDays`, as Home's grid)."""
     plan: Optional[WeeklyPlan] = snap["plan"] or draft
     by_date = {p.date.date(): p for p in snap["days"]}
     sunday = monday + timedelta(days=6)
@@ -77,6 +80,7 @@ def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None,
         "weeklyGoals": [i.model_dump() for i in (plan.weeklyGoals if plan else [])],
         "progress": goal_progress(plan, snap["days"]) if plan else {},
         "recapNotes": plan.recapNotes if plan else "",
+        "routineDays": routines_grid(plan, by_date, days, today) if plan else [],
         "done": snap["done"].model_dump(),
         "stages": _sum_stages(snap["dayAuto"]),
         "days": [
@@ -192,13 +196,16 @@ async def _save_team_row(raw: dict, monday: date, users: dict, known: dict) -> N
 async def get_week(
     week_start: str,
     user: Annotated[UserExtra, Depends(get_current_user)],
-    userId: Optional[str] = Query(None),
+    userId: Annotated[Optional[str], Query()] = None,
+    today: Annotated[Optional[date], Query()] = None,
 ) -> dict:
+    """`today` (the viewer's date; default the app's) judges the routines' day states."""
     monday = parse_monday(week_start)
     uid = await read_subject(user, userId)
     snap = await _snapshot(uid, monday)
     plans_own = user.plansOwnWeek if uid == user.id else (await UserExtra.get(uid)).plansOwnWeek
-    return _week_out(uid, monday, snap, None if snap["plan"] else await draft_week(uid, monday), plans_own_week=plans_own)
+    return _week_out(uid, monday, snap, None if snap["plan"] else await draft_week(uid, monday), plans_own_week=plans_own,
+                     today=today or _today())
 
 
 @router.put("/{week_start}")
@@ -218,7 +225,8 @@ async def put_week(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PLANNED_BY_ADMIN)
         await save_week(user.id, monday, goal=None, routines=body.routines, weekly_goals=body.weeklyGoals,
                         recap=body.recapNotes, added_by="self", locked=True)
-    return _week_out(user.id, monday, await _snapshot(user.id, monday), plans_own_week=user.plansOwnWeek)
+    return _week_out(user.id, monday, await _snapshot(user.id, monday), plans_own_week=user.plansOwnWeek,
+                     today=_today())
 
 
 @router.delete("/{week_start}")
