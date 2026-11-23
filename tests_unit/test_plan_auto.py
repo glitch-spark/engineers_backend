@@ -16,9 +16,9 @@ from beanie import PydanticObjectId, init_beanie  # noqa: E402
 from mongomock_motor import AsyncMongoMockClient  # noqa: E402
 
 from app.models import DailyPlan, WeeklyPlan  # noqa: E402
-from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem  # noqa: E402
+from app.models.plan_common import Counts, DoneCounts, ItemResult, PlanItem, SatGoal  # noqa: E402
 from app.plan_auto import (  # noqa: E402
-    day_items, day_targets, draft_week, effective_daily_done, goal_progress, items_tally, weekly_done,
+    day_items, day_targets, draft_week, effective_daily_done, goal_progress, items_tally, routines_grid, weekly_done,
 )
 
 UTC = ZoneInfo("UTC")
@@ -168,6 +168,29 @@ def test_targets_ceil_divide_mon_to_sat():
     assert day_targets(None, w, SUN).bidsSelf == 0
 
 
+def _bids(w, day):
+    t = day_targets(None, w, day)
+    return t.bidsSelf, t.bidsBidder
+
+
+def test_sat_goal_splits_rest_over_mon_to_fri():
+    w = _week(goal=Counts(bidsSelf=1000, bidsBidder=1000), satGoal=SatGoal(bidsSelf=100))
+    assert [_bids(w, MON + timedelta(days=n)) for n in range(7)] == [(180, 167)] * 5 + [(100, 167), (0, 0)]
+    w.satGoal = SatGoal(bidsSelf=0, bidsBidder=0)
+    assert [_bids(w, MON + timedelta(days=n)) for n in range(7)] == [(200, 200)] * 5 + [(0, 0), (0, 0)]
+    w.satGoal = None
+    assert [_bids(w, MON + timedelta(days=n)) for n in range(6)] == [(167, 167)] * 6
+
+
+def test_sat_goal_regions_follow_self_share():
+    w = _week(goal=Counts(bidsSelf=1000, bidsSelfUs=600, bidsSelfEu=300, bidsSelfLatam=100), satGoal=SatGoal(bidsSelf=100))
+    sat, mon = day_targets(None, w, SAT), day_targets(None, w, MON)
+    assert (sat.bidsSelfUs, sat.bidsSelfEu, sat.bidsSelfLatam) == (60, 30, 10)
+    assert (mon.bidsSelfUs, mon.bidsSelfEu, mon.bidsSelfLatam) == (108, 54, 18)
+    w.goal, w.satGoal = Counts(), SatGoal(bidsSelf=0)  # no self goal: regions 0, no division by zero
+    assert day_targets(None, w, SAT) == Counts()
+
+
 def test_override_wins():
     w = _week(goal=Counts(bidsSelf=100))
     p = _day_plan(targetOverride=Counts(bidsSelf=7))
@@ -191,6 +214,16 @@ def test_routines_skip_sunday_goals_do_not():
     w = _week(routines=[PlanItem(id="r", text="R")], weeklyGoals=[PlanItem(id="g", text="G")])
     assert [(i["item"].id, i["scope"]) for i in day_items(w, None, SAT)] == [("r", "routine"), ("g", "goal")]
     assert [(i["item"].id, i["scope"]) for i in day_items(w, None, SUN)] == [("g", "goal")]
+
+
+def test_routine_days_pick_the_weekdays_it_runs():
+    w = _week(routines=[PlanItem(id="wk", text="Weekdays", days=[0, 1, 2, 3, 4]), PlanItem(id="sat", text="Sat", days=[5])])
+    assert [i["item"].id for i in day_items(w, None, MON)] == ["wk"]
+    assert [i["item"].id for i in day_items(w, None, SAT)] == ["sat"]
+    p = _day_plan(day=SAT, results={"wk": ItemResult(done=True)})  # a result already there keeps it shown
+    assert [i["item"].id for i in day_items(w, p, SAT)] == ["wk", "sat"]
+    rows = {r["id"]: [c["state"] for c in r["days"]] for r in routines_grid(w, {}, [MON + timedelta(days=n) for n in range(6)], MON)}
+    assert rows == {"wk": ["today"] + ["future"] * 4 + ["off"], "sat": ["off"] * 5 + ["future"]}
 
 
 def test_frozen_result_target_wins_over_item():
@@ -235,6 +268,12 @@ async def test_draft_carries_count_and_hours_weekly_goals(db):
     ]).insert()
     d = await draft_week(uid, MON)
     assert [g.id for g in d.weeklyGoals] == ["g1", "g2"] and [g.target for g in d.weeklyGoals] == [250, 4]
+
+
+async def test_draft_carries_sat_goal(db):
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, goal=Counts(bidsSelf=50), satGoal=SatGoal(bidsBidder=3)).insert()
+    assert (await draft_week(uid, MON)).satGoal == SatGoal(bidsBidder=3)
 
 
 async def test_draft_week_none_without_previous(db):

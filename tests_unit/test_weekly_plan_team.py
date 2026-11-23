@@ -17,7 +17,7 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
-from app.models.plan_common import Counts, PlanItem
+from app.models.plan_common import Counts, PlanItem, SatGoal
 from app.models.weekly_plan import WeeklyPlan
 from app.deps import require_admin
 from app.routers.weekly_plans import get_team_week, put_team_week
@@ -301,3 +301,33 @@ async def test_team_save_kind_change_to_and_from_choice_is_remove_plus_add(db, a
 async def test_team_save_rejects_bad_options(db, admin, ana):
     out = await put(admin, row(ana, routines=[{"text": "s", "kind": "choice", "options": ["only"]}]))
     assert out["results"][0]["ok"] is False and await stored(ana) == []
+
+
+async def test_team_sat_goal_set_keep_clear_and_read(db, admin, ana):
+    goal = {"bidsSelf": 1000, "bidsBidder": 50, "interviewsSelf": 0}
+    out = await put(admin, row(ana, goal=goal, satGoal={"bidsSelf": 100}))
+    assert out["results"][0]["ok"] is True
+    assert (await get_team_week(WEEK, admin))["users"][0]["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    await put(admin, row(ana, goal=goal))  # absent (older client): kept
+    assert (await stored(ana))[0].satGoal == SatGoal(bidsSelf=100)
+    await put(admin, row(ana, goal=goal, satGoal=None))  # null: cleared
+    assert (await stored(ana))[0].satGoal is None
+
+
+async def test_team_sat_goal_over_week_total_is_refused(db, admin, ana):
+    out = await put(admin, row(ana, goal={"bidsSelf": 10, "bidsBidder": 5, "interviewsSelf": 0},
+                               satGoal={"bidsSelf": 10, "bidsBidder": 6}))
+    assert out["results"][0] == {"userId": str(ana.id), "ok": False, "error": "Saturday bids can't be more than the week's"}
+    assert await stored(ana) == []
+
+
+async def test_team_save_round_trips_days_and_weekly_goals_have_none(db, admin, ana):
+    await put(admin, row(ana, routines=[{"text": "Sat", "days": [5]}], weeklyGoals=[{"text": "G", "days": [1]}]))
+    (p,) = await stored(ana)
+    r = p.routines[0]
+    assert r.days == [5] and p.weeklyGoals[0].days is None
+    out = (await get_team_week(WEEK, admin))["users"][0]
+    assert out["routines"][0]["days"] == [5] and out["weeklyGoals"][0]["days"] is None
+    await put(admin, row(ana, routines=[{"id": r.id, "text": "Sat", "days": [0, 1, 2, 3, 4]}]))
+    (p,) = await stored(ana)
+    assert [(x.id, x.days, x.archived) for x in p.routines] == [(r.id, [0, 1, 2, 3, 4], False)]  # not a kind change

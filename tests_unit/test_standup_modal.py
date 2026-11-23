@@ -22,7 +22,7 @@ from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import daily_plans
-from app.routers.daily_plans import put_day
+from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, put_day
 from app.routers.weekly_plans import put_week
 from app.standup.modal import (
     STANDUP_VIEW, _day, build_view, process_standup_click, process_standup_submission, read_submission, submission_errors,
@@ -557,3 +557,22 @@ async def test_stale_list_survives_the_metadata_cap(me, db, slack):
     view = await build_view(me, TUE)
     meta = json.loads(view["private_metadata"])
     assert len(view["private_metadata"]) <= 3000 and len(meta["logs"]) < 3 and meta["stale"] == [c]
+
+
+async def test_saturday_form_and_post_list_only_routines_run_that_day(me, slack, monkeypatch):
+    (weekdays, sat), _ = await week(me, routines=[{"text": "Weekday review", "days": [0, 1, 2, 3, 4]},
+                                                  {"text": "Saturday sweep", "days": [5]}])
+    view = await build_view(me, SAT)
+    assert f"item:{sat}" in by_id(view) and f"item:{weekdays}" not in by_id(view)
+    assert f"item:{weekdays}" in by_id(await build_view(me, TUE)) and f"item:{sat}" not in by_id(await build_view(me, TUE))
+    posts = []
+
+    async def fake_post(plan, owner, **v):
+        posts.append(slack_bot.daily_plan_text(plan, owner, **v))
+        return "C1", "ts1"
+
+    monkeypatch.setattr(daily_plans, "_sync_slack", REAL_SYNC_SLACK)
+    monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
+    await process_standup_submission(state(view, **{f"item:{sat}": True}), SLACK_ID)
+    (post,) = posts
+    assert "Saturday sweep" in post and "Weekday review" not in post

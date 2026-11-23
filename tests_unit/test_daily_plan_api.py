@@ -20,7 +20,7 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
-from app.models.plan_common import Counts, PlanItem
+from app.models.plan_common import Counts, PlanItem, SatGoal
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import daily_plans
 from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
@@ -617,3 +617,38 @@ async def test_week_get_returns_routine_days(db, me):
     assert row["id"] == r.id
     assert [c["state"] for c in row["days"][:4]] == ["done", "missed", "today", "future"]
     assert (await get_week("2026-11-02", me, None, WED))["routineDays"] == []  # no plan, no draft
+
+
+async def test_put_week_sat_goal_set_keep_clear(db, me):
+    out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000, "bidsBidder": 60}, satGoal={"bidsSelf": 100}))
+    assert out["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    assert [d["goal"]["bidsSelf"] for d in out["days"]] == [180] * 5 + [100]
+    assert [d["goal"]["bidsBidder"] for d in out["days"]] == [10] * 6
+    assert (await get_week(WEEK, me, None))["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000}))  # absent (older client): kept
+    assert out["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000}, satGoal=None))
+    assert out["satGoal"] is None and [d["goal"]["bidsSelf"] for d in out["days"]] == [167] * 6
+
+
+async def test_put_week_sat_goal_over_week_total_is_422(db, me):
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, me, week_body(satGoal={"bidsBidder": 61}))
+    assert (e.value.status_code, e.value.detail) == (422, "Saturday bids can't be more than the week's")
+    assert await WeeklyPlan.find_one({"userId": me.id}) is None
+
+
+async def test_planned_person_cannot_change_sat_goal(db, planned):
+    plan = await _admin_week(planned)
+    plan.satGoal = SatGoal(bidsSelf=50)
+    await plan.save()
+    for sat in ({"bidsSelf": 0}, None):
+        await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1", "days": [5]}], satGoal=sat))
+        got = await WeeklyPlan.get(plan.id)
+        assert got.satGoal == SatGoal(bidsSelf=50) and got.routines[0].days is None  # admin item kept as stored
+
+
+async def test_put_week_days_kept_and_weekly_goals_forced_none(db, me):
+    out = await put_week(WEEK, me, week_body(routines=[{"text": "Sat sweep", "days": [5]}],
+                                             weeklyGoals=[{"text": "G", "days": [0]}]))
+    assert out["routines"][0]["days"] == [5] and out["weeklyGoals"][0]["days"] is None

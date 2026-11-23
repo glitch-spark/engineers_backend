@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from pydantic import AfterValidator, BaseModel, Field
 
 from app.alerts import app_week_key
-from app.models.plan_common import MAX_ITEMS, Counts, CountsIn, PlanItem, check_items
+from app.models.plan_common import MAX_ITEMS, Counts, CountsIn, PlanItem, SatGoal, check_items
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import week_or_draft
 
@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 Added = Literal["admin", "self"]
 PLANNED_BY_ADMIN = "Your week is planned by your admin"
 _LOAD = object()  # save_week(known=...) not given: load it
+KEEP = object()  # save_week(sat_goal=...) not given: keep as stored
+SAT_OVER = "Saturday bids can't be more than the week's"
+
+
+def sat_goal_of(body: BaseModel) -> object:
+    """A body's `satGoal`: KEEP when absent (older clients), else the value (None = clear)."""
+    return body.satGoal if "satGoal" in body.model_fields_set else KEEP
 
 
 class PlanItemIn(PlanItem):
@@ -34,6 +41,7 @@ class WeekIn(BaseModel):
     routines: PlanItemsIn = []
     weeklyGoals: PlanItemsIn = []
     recapNotes: str = Field(default="", max_length=4000)
+    satGoal: Optional[SatGoal] = None  # absent = keep stored (`sat_goal_of`), null = clear
 
 
 def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str, added_by: Added,
@@ -93,17 +101,19 @@ async def save_week(
     locked: bool = False,
     removed_ids: Optional[set[str]] = None,
     known: object = _LOAD,
+    sat_goal: object = KEEP,
 ) -> WeeklyPlan:
     """Insert or update the week. None = leave as stored (or as the carry-over draft on a first save).
 
     `added_by` marks new items; `locked` = the admin-planned person's save (see `_merge_items`): the goal and the
-    admin's items stay as stored. `removed_ids`: see `_merge_items`. `known`: `week_or_draft(uid, monday)` when the
-    caller already loaded it (the team save loads every row in one query)."""
+    admin's items stay as stored, and so does `sat_goal` (KEEP = as stored, None = clear; over the saved week's bid
+    total -> 422). Weekly goals never keep `days`. `removed_ids`: see `_merge_items`. `known`:
+    `week_or_draft(uid, monday)` when the caller already loaded it (the team save loads every row in one query)."""
     t0 = time.monotonic()
     base = await week_or_draft(uid, monday) if known is _LOAD else known  # a first save keeps the draft's routine ids
     plan = base if base is not None and base.id is not None else None  # a carry-over draft has no id
     if locked:
-        goal = None
+        goal, sat_goal = None, KEEP
         if plan is None:  # the admin deleted the week after the caller's check: no person-made plan
             raise HTTPException(status_code=403, detail=PLANNED_BY_ADMIN)
     if plan is None:
@@ -118,12 +128,19 @@ async def save_week(
             endDate=start + timedelta(days=7) - timedelta(milliseconds=1),
         )
         if base is not None:
-            plan.goal, plan.routines, plan.weeklyGoals = base.goal, base.routines, base.weeklyGoals
+            plan.goal, plan.satGoal = base.goal, base.satGoal
+            plan.routines, plan.weeklyGoals = base.routines, base.weeklyGoals
     if goal is not None:
         plan.goal = goal
+    if sat_goal is not KEEP:
+        if sat_goal is not None and any((getattr(sat_goal, f) or 0) > getattr(plan.goal, f)
+                                        for f in ("bidsSelf", "bidsBidder")):
+            raise HTTPException(status_code=422, detail=SAT_OVER)
+        plan.satGoal = sat_goal
     if routines is not None:
         plan.routines = _merge_items(routines, base.routines if base else [], "routines", added_by, locked, removed_ids)
     if weekly_goals is not None:
+        weekly_goals = [g.model_copy(update={"days": None}) for g in weekly_goals]  # weekly to-dos: the whole week
         plan.weeklyGoals = _merge_items(weekly_goals, base.weeklyGoals if base else [], "weeklyGoals", added_by, locked, removed_ids)
     if recap is not None:
         plan.recapNotes = recap

@@ -76,6 +76,13 @@ class CountsIn(Counts, _SelfTotal):
     """A typed goal (bids and interviews)."""
 
 
+class SatGoal(BaseModel):
+    """A week's Saturday share of its bid goal; None = the even Mon-Sat split (`plan_auto.day_targets`)."""
+
+    bidsSelf: Optional[Count] = None
+    bidsBidder: Optional[Count] = None
+
+
 class ChecklistItem(BaseModel):
     text: str
     done: bool = False
@@ -92,7 +99,8 @@ class ChecklistItem(BaseModel):
 
 
 class PlanItem(BaseModel):
-    """A routine (every working day) or weekly goal line; `target` is ignored for kind "check"."""
+    """A routine or weekly goal line; `target` is ignored for kind "check". `days`: the weekdays (0=Mon..5=Sat) a
+    routine runs on, None = every working day; weekly goals are for the whole week (always None)."""
 
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     text: str
@@ -101,11 +109,24 @@ class PlanItem(BaseModel):
     options: list[str] = []  # choice only: 2-6 options (stripped, unique ignoring case); [] for every other kind
     archived: bool = False
     addedBy: Literal["admin", "self"] = "admin"  # who added the item; stored items without it are the admin's
+    days: Optional[list[int]] = None
 
     @field_validator("text")
     @classmethod
     def _text(cls, v: str) -> str:
         return ChecklistItem._text(v)
+
+    @field_validator("days")
+    @classmethod
+    def _days(cls, v: Optional[list[int]]) -> Optional[list[int]]:
+        if v is None:
+            return None
+        v = sorted(set(v))
+        if not v:
+            raise ValueError("Pick at least one day")
+        if v[0] < 0 or v[-1] > 5:
+            raise ValueError("days are 0 (Mon) to 5 (Sat)")
+        return None if len(v) == 6 else v
 
     @model_validator(mode="after")
     def _options(self):

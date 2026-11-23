@@ -17,11 +17,12 @@ from pydantic import BaseModel, Field, ValidationError
 from app.deps import get_current_user, require_admin
 from app.routers.daily_plans import _today
 from app.models import UserExtra
-from app.models.plan_common import Counts
+from app.models.plan_common import Counts, SatGoal
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import (day_targets, draft_week, goal_progress, items_tally, routines_grid, week_snapshot,
                            weeks_or_drafts, weekly_plans_for)
 from app.week_save import PLANNED_BY_ADMIN, PlanItemIn, PlanItemsIn, WeekIn, _merge_items, save_week  # noqa: F401  (re-exported)
+from app.week_save import sat_goal_of
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class TeamRowIn(BaseModel):
     weeklyGoals: PlanItemsIn
     exists: bool = True  # False = the grid loaded a carry-over draft; an older client omits it
     removedIds: list[str] = []  # own (self) items the admin removed; any other missing self item stays live
+    satGoal: Optional[SatGoal] = None  # absent = keep stored (`sat_goal_of`), null = clear
 
 
 class TeamSaveIn(BaseModel):
@@ -76,6 +78,7 @@ def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None,
         "userId": str(uid),
         "plansOwnWeek": plans_own_week,
         "goal": (plan.goal if plan else Counts()).model_dump(),
+        "satGoal": plan.satGoal.model_dump() if plan and plan.satGoal else None,
         "routines": [i.model_dump() for i in (plan.routines if plan else [])],
         "weeklyGoals": [i.model_dump() for i in (plan.weeklyGoals if plan else [])],
         "progress": goal_progress(plan, snap["days"]) if plan else {},
@@ -118,6 +121,7 @@ async def get_team_week(week_start: str, admin: Annotated[UserExtra, Depends(req
             "plansOwnWeek": u.plansOwnWeek,
             "exists": plan is not None and plan.id is not None,  # a carry-over draft has no id
             "goal": {"bidsSelf": goal.bidsSelf, "bidsBidder": goal.bidsBidder, "interviewsSelf": goal.interviewsSelf},
+            "satGoal": plan.satGoal.model_dump() if plan and plan.satGoal else None,
             "routines": [i.model_dump() for i in plan.routines if not i.archived] if plan else [],
             "weeklyGoals": [i.model_dump() for i in plan.weeklyGoals if not i.archived] if plan else [],
         })
@@ -187,7 +191,7 @@ async def _save_team_row(raw: dict, monday: date, users: dict, known: dict) -> N
             goal = Counts(bidsSelf=row.goal.bidsSelf, bidsBidder=row.goal.bidsBidder,
                           interviewsSelf=row.goal.interviewsSelf, interviewsCaller=base.interviewsCaller)
         await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None,
-                        added_by="admin", removed_ids=set(row.removedIds), known=stored)
+                        added_by="admin", removed_ids=set(row.removedIds), known=stored, sat_goal=sat_goal_of(row))
     if row.plansOwnWeek != user.plansOwnWeek:
         await UserExtra.find_one(UserExtra.id == user.id).update({"$set": {"plansOwnWeek": row.plansOwnWeek}})
 
@@ -219,7 +223,7 @@ async def put_week(
     body = parse_body(WeekIn, payload)
     if user.plansOwnWeek:
         await save_week(user.id, monday, goal=Counts(**body.goal.model_dump()), routines=body.routines,
-                        weekly_goals=body.weeklyGoals, recap=body.recapNotes, added_by="self")
+                        weekly_goals=body.weeklyGoals, recap=body.recapNotes, added_by="self", sat_goal=sat_goal_of(body))
     else:  # the admin plans the week: own items and the recap, only on a plan the admin saved
         if (await _snapshot(user.id, monday))["plan"] is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PLANNED_BY_ADMIN)
