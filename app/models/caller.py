@@ -18,6 +18,8 @@ class Caller(TimestampedDocument):
     color: str = CALLER_COLORS[0]
     # Set when an admin archives the caller: kept on past rounds, not offered for new ones.
     archivedAt: Optional[datetime] = None
+    slackUserId: Optional[str] = None  # member ID in the callers' workspace, for @mentions
+    teamId: Optional[str] = None  # CallerTeam id
 
     class Settings:
         name = "callers"

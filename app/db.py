@@ -41,6 +41,7 @@ from app.models import (
     BidReport,
     Bidder,
     Caller,
+    CallerTeam,
     GlobalPrompt,
     Interview,
     InterviewChatLog,
@@ -66,6 +67,7 @@ from app.models import (
     ResumePromptEval,
 )
 from app.models.bid_report_post import BidReportPost
+from app.models.caller_team import TeamDayPost, TeamRoundPost
 from app.models.interview_day_post import InterviewDayPost
 from app.models.result_roundup_post import ResultRoundupPost
 from app.models.round_slack_post import RoundSlackPost
@@ -108,6 +110,9 @@ DOCUMENT_MODELS = [
     ResumePromptEval,
     AiUsageEvent,
     Caller,
+    CallerTeam,
+    TeamRoundPost,
+    TeamDayPost,
     Application,
 ]
 

@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -81,10 +81,14 @@ def _frontend_link(path: str) -> str:
     return f"{get_settings().FRONTEND_ORIGIN.rstrip('/')}{path}"
 
 
-async def _slack_api(method: str, body: dict[str, Any]) -> dict[str, Any]:
-    token = (get_settings().SLACK_BOT_TOKEN or "").strip()
+async def _slack_api(
+    method: str, body: dict[str, Any], *, workspace: Literal["main", "callers"] = "main"
+) -> dict[str, Any]:
+    settings = get_settings()
+    name = "SLACK_CALLERS_BOT_TOKEN" if workspace == "callers" else "SLACK_BOT_TOKEN"
+    token = (getattr(settings, name) or "").strip()
     if not token:
-        raise RuntimeError("SLACK_BOT_TOKEN is not configured")
+        raise RuntimeError(f"{name} is not configured")
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{_SLACK_API}/{method}",
