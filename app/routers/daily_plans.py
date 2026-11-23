@@ -49,7 +49,7 @@ def _midnight(d: date) -> datetime:
 def _item_out(e: dict) -> dict:
     item, result = e["item"], e["result"]
     return {"id": item.id, "text": item.text, "kind": item.kind, "scope": e["scope"], "target": item.target,
-            "archived": item.archived, "addedBy": item.addedBy, "result": result.model_dump() if result else None}
+            "options": item.options, "archived": item.archived, "addedBy": item.addedBy, "result": result.model_dump() if result else None}
 
 
 def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly, week_days: list,

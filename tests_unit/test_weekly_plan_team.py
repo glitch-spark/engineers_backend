@@ -267,3 +267,30 @@ async def test_team_save_missing_admin_item_is_still_archived(db, admin, ana):
     await put(admin, row(ana, routines=[{"id": a.id, "text": "a"}]))
     p = (await stored(ana))[0]
     assert [(i.text, i.archived) for i in p.routines] == [("a", False), ("b", True)]
+
+
+async def test_team_save_round_trips_options_and_edit_keeps_id(db, admin, ana):
+    await put(admin, row(ana, routines=[{"text": "State", "kind": "choice", "options": ["Done", "Blocked"]}]))
+    (p,) = await stored(ana)
+    r = p.routines[0]
+    assert r.options == ["Done", "Blocked"]
+    await put(admin, row(ana, routines=[{"id": r.id, "text": "State", "kind": "choice", "options": ["Yes", "No", "N/A"]}]))
+    (p,) = await stored(ana)
+    assert [(x.id == r.id, x.options, x.archived) for x in p.routines] == [(True, ["Yes", "No", "N/A"], False)]
+
+
+async def test_team_save_kind_change_to_and_from_choice_is_remove_plus_add(db, admin, ana):
+    r1 = PlanItem(text="s", kind="check")
+    await plan(ana, WEEK, routines=[r1])
+    await put(admin, row(ana, routines=[{"id": r1.id, "text": "s", "kind": "choice", "options": ["a", "b"]}]))
+    (p,) = await stored(ana)
+    new = p.routines[0]
+    assert (new.id == r1.id, new.kind, p.routines[1].archived) == (False, "choice", True)
+    await put(admin, row(ana, routines=[{"id": new.id, "text": "s", "kind": "text"}]))
+    (p,) = await stored(ana)
+    assert (p.routines[0].id == new.id, p.routines[0].kind, p.routines[0].options) == (False, "text", [])
+
+
+async def test_team_save_rejects_bad_options(db, admin, ana):
+    out = await put(admin, row(ana, routines=[{"text": "s", "kind": "choice", "options": ["only"]}]))
+    assert out["results"][0]["ok"] is False and await stored(ana) == []

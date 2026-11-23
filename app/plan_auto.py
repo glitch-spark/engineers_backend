@@ -121,7 +121,8 @@ def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[
     for e in day_items(weekly, plan, day):
         r = e["result"]
         if e["scope"] == "goal":
-            hit = r is not None and (bool(r.entries) if e["item"].kind == "log" else (r.done or (r.value or 0) > 0))
+            hit = r is not None and (result_is_done(e["item"].kind, r, None) if e["item"].kind in ("log", "text", "choice")
+                                     else (r.done or (r.value or 0) > 0))
             if hit or e["item"].id in focus:
                 total += 1
                 done += hit
@@ -184,6 +185,11 @@ def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
             done_days = sorted(str(d.date)[:10] for d, r in rs if r.entries)
             value = sum(len(r.entries) for _, r in rs)
             out[g.id] = {"value": value, "done": value > 0, "target": g.target,
+                         "doneOn": done_days[0] if done_days else None}
+            continue
+        if g.kind in ("text", "choice"):  # like a check goal: done when any day is; value = days answered
+            done_days = sorted(str(d.date)[:10] for d, r in rs if result_is_done(g.kind, r, None))
+            out[g.id] = {"value": len(done_days), "done": bool(done_days), "target": None,
                          "doneOn": done_days[0] if done_days else None}
             continue
         value = sum(r.value or 0 for _, r in rs)

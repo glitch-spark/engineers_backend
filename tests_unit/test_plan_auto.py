@@ -281,3 +281,25 @@ async def test_added_by_defaults_to_admin_and_carries(db):
     uid = PydanticObjectId()
     await _week(MON - timedelta(days=7), uid, routines=[PlanItem(id="r1", text="Mine", addedBy="self")]).insert()
     assert [r.addedBy for r in (await draft_week(uid, MON)).routines] == ["self"]
+
+
+def test_text_and_choice_goals_behave_like_check_goals():
+    w = _week(routines=[PlanItem(id="r", text="Note", kind="text")],
+              weeklyGoals=[PlanItem(id="t", text="Retro", kind="text"),
+                           PlanItem(id="c", text="State", kind="choice", options=["A", "B"])])
+    day = _day_plan(results={"r": ItemResult(text="hi"), "t": ItemResult(text="x"), "c": ItemResult(choice="A")})
+    assert items_tally(w, day, MON) == (3, 3)
+    empty = _day_plan(results={"r": ItemResult(), "t": ItemResult(), "c": ItemResult(text="note")})
+    assert items_tally(w, empty, MON) == (0, 1)
+    d2 = _day_plan(results={"t": ItemResult(text="y"), "c": ItemResult(choice="B")})
+    prog = goal_progress(w, [day, d2])
+    assert prog["t"]["value"] == 2 and prog["t"]["done"] and prog["t"]["doneOn"] is not None
+    assert prog["c"]["value"] == 2 and prog["c"]["done"]
+    assert not goal_progress(w, [empty])["c"]["done"]
+
+
+async def test_draft_does_not_carry_text_and_choice_goals(db):
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, weeklyGoals=[
+        PlanItem(id="g1", text="T", kind="text"), PlanItem(id="g2", text="C", kind="choice", options=["a", "b"])]).insert()
+    assert (await draft_week(uid, MON)).weeklyGoals == []

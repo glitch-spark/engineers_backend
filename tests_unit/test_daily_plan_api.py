@@ -528,3 +528,77 @@ async def test_day_items_return_added_by(db, planned):
     await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1"}, {"text": "Mine"}], weeklyGoals=[]))
     day = await get_day(TUE.isoformat(), planned, None)
     assert sorted(i["addedBy"] for i in day["items"]) == ["admin", "self"]
+
+
+async def _tc_week(me):
+    out = await put_week(WEEK, me, week_body(
+        routines=[{"text": "Standup note", "kind": "text"},
+                  {"text": "Client check", "kind": "choice", "options": ["Done", "Blocked", "N/A"]}], weeklyGoals=[]))
+    return out["routines"][0]["id"], out["routines"][1]["id"]
+
+
+async def _res(me, iid):
+    return next(i for i in (await get_day(TUE.isoformat(), me, None))["items"] if i["id"] == iid)
+
+
+async def test_day_items_carry_options(db, me):
+    t, c = await _tc_week(me)
+    assert (await _res(me, c))["options"] == ["Done", "Blocked", "N/A"] and (await _res(me, t))["options"] == []
+
+
+async def test_day_saves_text_keep_clear_and_limit(db, me):
+    t, _c = await _tc_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": "  set up roles "}}})
+    r = (await _res(me, t))["result"]
+    assert r["text"] == "set up roles" and r["done"] is True
+    await put_day(TUE.isoformat(), me, {"results": {t: {}}})  # not sent: kept
+    assert (await _res(me, t))["result"]["text"] == "set up roles"
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": None}}})
+    r = (await _res(me, t))["result"]
+    assert r["text"] is None and r["done"] is False
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {t: {"text": "x" * 501}}})
+    assert e.value.status_code == 422
+
+
+async def test_day_saves_choice_and_note(db, me):
+    _t, c = await _tc_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Blocked", "text": "waiting on client"}}})
+    r = (await _res(me, c))["result"]
+    assert (r["choice"], r["text"], r["done"]) == ("Blocked", "waiting on client", True)
+    await put_day(TUE.isoformat(), me, {"results": {c: {"text": "still waiting"}}})  # choice not sent: kept
+    r = (await _res(me, c))["result"]
+    assert (r["choice"], r["text"]) == ("Blocked", "still waiting")
+    await put_day(TUE.isoformat(), me, {"results": {c: {"choice": ""}}})
+    r = (await _res(me, c))["result"]
+    assert r["choice"] is None and r["done"] is False
+
+
+async def test_day_rejects_unknown_option_and_keeps_stale_choice(db, me):
+    _t, c = await _tc_week(me)
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Maybe"}}})
+    assert e.value.status_code == 422 and e.value.detail == "Unknown option"
+    await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Blocked"}}})
+    await put_week(WEEK, me, week_body(routines=[
+        {"id": _t, "text": "Standup note", "kind": "text"},
+        {"id": c, "text": "Client check", "kind": "choice", "options": ["Yes", "No"]}], weeklyGoals=[]))
+    await put_day(TUE.isoformat(), me, {"results": {c: {"text": "note"}}})  # stored choice no longer an option: kept
+    assert (await _res(me, c))["result"]["choice"] == "Blocked"
+    with pytest.raises(HTTPException):
+        await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Done"}}})
+
+
+async def test_progress_save_text_and_choice(db, me):
+    t, c = await _tc_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": "a"}, c: {"choice": "Done"}}}, submit=False)
+    assert (await _res(me, t))["result"]["done"] and (await _res(me, c))["result"]["choice"] == "Done"
+    await put_day(TUE.isoformat(), me, {"results": {t: {}, c: {"text": "n"}}}, submit=False)
+    assert (await _res(me, t))["result"]["text"] == "a"
+    r = (await _res(me, c))["result"]
+    assert (r["choice"], r["text"]) == ("Done", "n")
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Nope"}}}, submit=False)
+    assert e.value.detail == "Unknown option"
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": ""}}}, submit=False)
+    assert (await _res(me, t))["result"]["done"] is False

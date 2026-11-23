@@ -121,3 +121,30 @@ def test_result_is_done():
     assert result_is_done("count", ItemResult(value=50), 50)
     assert not result_is_done("count", ItemResult(value=49), 50)
     assert result_is_done("hours", ItemResult(done=True, value=1), 2)  # ticked short
+
+
+def test_choice_options_validated_and_stripped():
+    it = PlanItem(text="Status", kind="choice", options=[" Done ", "Blocked"], target=3)
+    assert it.options == ["Done", "Blocked"] and it.target is None
+    for bad in (["Only"], [str(i) for i in range(7)], ["A", "a"], ["A", " "], ["A", "x" * 41], []):
+        with pytest.raises(ValueError):
+            PlanItem(text="Status", kind="choice", options=bad)
+    assert len(PlanItem(text="s", kind="choice", options=list("abcdef")).options) == 6
+
+
+def test_other_kinds_force_options_empty():
+    assert PlanItem(text="x", kind="text", options=["a", "b"]).options == []
+    assert PlanItem(text="x", options=["a"]).options == []
+    assert PlanItem(text="x").options == []
+
+
+def test_text_and_choice_results():
+    assert ItemResult(text="  hi  ").text == "hi"
+    assert ItemResult(text="   ").text is None and ItemResult().choice is None
+    with pytest.raises(ValueError):
+        ItemResult(text="x" * 501)
+    assert result_is_done("text", ItemResult(text="a"), None)
+    assert not result_is_done("text", ItemResult(done=True), None)
+    assert not result_is_done("text", None, None)
+    assert result_is_done("choice", ItemResult(choice="Done"), None)
+    assert not result_is_done("choice", ItemResult(text="note only"), None)
