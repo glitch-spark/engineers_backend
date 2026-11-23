@@ -156,18 +156,25 @@ async def test_team_save_writes_the_switch(db, admin, ana, monkeypatch):
     assert calls == []
 
 
-async def test_team_save_row_failures_do_not_stop_the_rest(db, admin, ana):
+async def test_team_save_row_failures_do_not_stop_the_rest(db, admin, ana, bo):
     out = await put(
         admin,
         row(ana, plansOwnWeek=False) | {"userId": "6" * 24},
         row(admin),
-        row(ana, routines=[{"text": f"r{i}"} for i in range(21)]),
+        row(bo, routines=[{"text": f"r{i}"} for i in range(21)]),
         row(ana, goal={"bidsSelf": 5, "bidsBidder": 0, "interviewsSelf": 0}),
     )
     r = out["results"]
     assert [x["ok"] for x in r] == [False, False, False, True]
     assert r[0]["error"] == "User not found" and r[1]["error"] == "Admins have no plan"
     assert r[2]["error"] == "at most 20 checklist items"
+    assert (await stored(ana))[0].goal.bidsSelf == 5
+
+
+async def test_team_save_refuses_a_repeated_row(db, admin, ana):
+    out = await put(admin, row(ana, goal={"bidsSelf": 5, "bidsBidder": 0, "interviewsSelf": 0}),
+                    row(ana, goal={"bidsSelf": 9, "bidsBidder": 0, "interviewsSelf": 0}))
+    assert [(x["ok"], x["error"]) for x in out["results"]] == [(True, None), (False, "Repeated row for this person")]
     assert (await stored(ana))[0].goal.bidsSelf == 5
 
 

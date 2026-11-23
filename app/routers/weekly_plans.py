@@ -5,6 +5,7 @@ until the person saves. Done is computed from the week's daily plans and intervi
 (`app.plan_auto.week_snapshot`).
 """
 
+import asyncio
 import logging
 import time
 from datetime import date, timedelta
@@ -135,31 +136,42 @@ async def put_team_week(
     t0 = time.monotonic()
     monday = parse_monday(week_start)
     body = parse_body(TeamSaveIn, payload)
-    results: list[dict] = []
-    for raw in body.plans:
+    ids = list({PydanticObjectId(u) for raw in body.plans if PydanticObjectId.is_valid(u := str(raw.get("userId", "")))})
+    users = {u.id: u for u in await UserExtra.find({"_id": {"$in": ids}}).to_list()} if ids else {}
+    known = await weeks_or_drafts(list(users), monday) if users else {}
+    seen: set[str] = set()
+
+    async def one(raw: dict) -> dict:
         uid_str = str(raw.get("userId", ""))
         try:
-            await _save_team_row(raw, monday)
-            results.append({"userId": uid_str, "ok": True, "error": None})
+            if uid_str in seen:
+                raise HTTPException(status_code=422, detail="Repeated row for this person")
+            seen.add(uid_str)
+            await _save_team_row(raw, monday, users, known)
+            return {"userId": uid_str, "ok": True, "error": None}
         except (HTTPException, ValidationError) as exc:
-            results.append({"userId": uid_str, "ok": False, "error": _row_error(exc)})
+            return {"userId": uid_str, "ok": False, "error": _row_error(exc)}
         except Exception:
             log.exception("team week save: row failed week=%s user=%s", monday, uid_str)
-            results.append({"userId": uid_str, "ok": False, "error": "Could not save"})
+            return {"userId": uid_str, "ok": False, "error": "Could not save"}
+
+    # Rows are distinct people (repeats refused above, before any await), so they save concurrently.
+    results = await asyncio.gather(*(one(raw) for raw in body.plans))
     ok = sum(r["ok"] for r in results)
     log.info("team week save: admin=%s week=%s ok=%d failed=%d ms=%d", admin.id, monday, ok, len(results) - ok,
              (time.monotonic() - t0) * 1000)
-    return {"results": results}
+    return {"results": list(results)}
 
 
-async def _save_team_row(raw: dict, monday: date) -> None:
+async def _save_team_row(raw: dict, monday: date, users: dict, known: dict) -> None:
+    """`users` / `known`: the rows' people and their `week_or_draft`, loaded once for the whole save."""
     row = TeamRowIn.model_validate(raw)
-    user = await UserExtra.get(row.userId) if PydanticObjectId.is_valid(row.userId) else None
+    user = users.get(PydanticObjectId(row.userId)) if PydanticObjectId.is_valid(row.userId) else None
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     if user.role == "admin":
         raise HTTPException(status_code=422, detail="Admins have no plan")
-    stored = (await weeks_or_drafts([user.id], monday)).get(user.id)  # the saved plan, else the carry-over draft
+    stored = known.get(user.id)  # the saved plan, else the carry-over draft
     if not row.exists and stored is not None and stored.id is not None:  # the person (or another admin) saved meanwhile
         raise HTTPException(status_code=409, detail="Saved since you loaded the grid — reload to see it")
     base = stored.goal if stored else Counts()
@@ -171,7 +183,7 @@ async def _save_team_row(raw: dict, monday: date) -> None:
             goal = Counts(bidsSelf=row.goal.bidsSelf, bidsBidder=row.goal.bidsBidder,
                           interviewsSelf=row.goal.interviewsSelf, interviewsCaller=base.interviewsCaller)
         await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None,
-                        added_by="admin", removed_ids=set(row.removedIds))
+                        added_by="admin", removed_ids=set(row.removedIds), known=stored)
     if row.plansOwnWeek != user.plansOwnWeek:
         await UserExtra.find_one(UserExtra.id == user.id).update({"$set": {"plansOwnWeek": row.plansOwnWeek}})
 
