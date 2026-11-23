@@ -799,3 +799,72 @@ it('a blocked move shows the message and changes nothing', …)
 - [ ] **Step 3: Implement** — chip gets the existing `ActionMenu` with "Move into column…" (and keeps ✕); the move form reuses the add-item form's fields (name with a list of existing column names, type, daily/weekly), pre-filled from the chip.
 - [ ] **Step 4: Run** — `npx vitest run && npm run lint`
 - [ ] **Step 5: Commit** — `feat: a grid chip moves into a shared column (rename when the type matches)`
+
+---
+
+## Addendum tasks for spec Design §9 (approved 2026-11-23): grid split; Text and Choice types
+
+Prototype the user approved: `engineers_app/.superpowers/brainstorm/20365-1795438452/content/types-and-split.html`.
+Exact copy for the type picker (name — description):
+- Checkbox — "Tick when done."
+- Number — "Enter a count against a target, e.g. 40 / 50 emails."
+- Hours — "Enter time spent against a target, e.g. 1.5 / 2h."
+- Profile log — "Pick a profile and write what changed; one row per profile."
+- Text — "Write a short answer with details (up to 500 characters)."
+- Choice — "Pick one option you list, plus an optional note."
+Choice presets: "Done, Blocked, N/A" and "Yes, No".
+
+### Task 17: Text and Choice types in the backend model and day save
+
+**Files:** Modify `engineers_backend/app/models/plan_common.py`, `app/plan_save.py`, `app/plan_auto.py`, `app/week_save.py` (only if validation needs it). Test `tests_unit/test_plan_common.py`, `tests_unit/test_daily_plan_api.py`, `tests_unit/test_daily_plan_progress.py`, `tests_unit/test_plan_auto.py`, `tests_unit/test_weekly_plan_team.py`.
+
+**Interfaces (produces):**
+- `PlanItem.kind: Literal["check","count","hours","log","text","choice"]`; `PlanItem.options: list[str] = []` — for `choice`: 2–6 options, each stripped 1–40 chars, unique case-insensitively (422 otherwise); for other kinds forced to `[]`. `target` ignored for text/choice (like check).
+- `ItemResult.text: Optional[str] = None` (stripped, ≤500, empty → None); `ItemResult.choice: Optional[str] = None`.
+- `ItemResultIn` gains `text: Optional[str]`, `choice: Optional[str]` — not sent = keep stored; sent `null`/"" = clear.
+- `result_is_done`: text → `bool(r.text)`; choice → `r.choice is not None`.
+- Day save (`save_day`, `save_progress`): a sent `choice` must be one of the item's current options → else 422 `"Unknown option"`; a stored choice no longer in the options is kept when not re-sent. `done` computed by `result_is_done` for text/choice.
+- `items_tally`, `routines_grid`, `goal_progress`: text/choice weekly goals behave like check goals (done when any day is done; progress `value` = days answered). Carry-over (`_draft`) does not carry text/choice weekly goals (one-offs, like check).
+- Day reads (`_item_out`) include `options` per item; results include `text`, `choice`.
+
+- [ ] Failing tests: option validation (count, length, duplicates, forced empty for other kinds); done rules; save text (keep / clear / 501 chars → 422); save choice (valid, unknown → 422 "Unknown option", stale stored kept); progress and tally for text/choice weekly goals; draft does not carry them; team save and person save round-trip `options`; a kind change to/from choice is remove + add.
+- [ ] Implement. Run the touched files, then the full suite (only the known env failures may fail).
+- [ ] Commit: `feat: plan items gain Text and Choice types with a typed answer or a picked option per day`
+
+### Task 18: Text and Choice in the Slack post and the Slack form
+
+**Files:** Modify `engineers_backend/app/slack_bot.py` (`_item_line`), `app/standup/modal.py` (`_item_block`, `read_submission`, `submission_errors`, `_keep_unshown`). Test `tests_unit/test_slack_daily_plan.py`, `tests_unit/test_standup_modal.py`.
+
+- Post: routine/goal Text → `"✅ <text>"` (text truncated to 200 chars with "…"); Choice → `"<choice>"` or `"<choice> — <note>"`; empty → `"❌ not done"` for routines; weekly goals not touched today stay as other goal kinds do.
+- Form: Text → optional multiline `plain_text_input`, action_id `text`, max_length 500, prefilled. Choice → `static_select` action_id `choice` (options = item options; initial_option = stored choice if still an option) in one input block, and a second optional input block `note:<id>` (plain_text_input, action_id `note`, max 500) for the note. Archived text/choice items → context line `"<text> (removed) · <answer>"`.
+- `read_submission`: Text blank → `text=""` (clears); Choice none selected → `choice=None` (clears), note blank → clears. `submission_errors`: text/note over 500 → `"Up to 500 characters"`.
+- `_keep_unshown`: keeps `text` / `choice` of results the form did not show.
+- Respect the 100-block cap (a Choice item uses two blocks; count them in the existing room logic).
+- [ ] Failing tests for each line / block shape above, round trip, clearing, too long, keep-unshown, block counting.
+- [ ] Implement; run touched files + `tests_unit/test_slack_interactions.py tests_unit/test_standup_follow_ups.py`; full suite.
+- [ ] Commit: `feat: the standup post and Slack form show Text answers and Choice picks`
+
+### Task 19: Text and Choice in the day panel, Home and the item editor (app)
+
+**Files:** Modify `engineers_app/src/api/endpoints.ts`, `src/components/report/ItemRow.tsx`, `DayPanel.tsx`, `src/components/home/MyHome.tsx`, `src/components/report/PlanItemsEditor.tsx`. Tests next to each.
+
+- Types: `PlanItemKind` adds `'text' | 'choice'`; `PlanItem.options: string[]`; `ItemResult.text?`, `ItemResult.choice?`; inputs accept them. `hasTarget` false for both.
+- ItemRow: Text → read-only checkbox mirroring done + a textarea (maxLength 500, counter "N / 500"); Choice → read-only checkbox + one button per option (`aria-pressed`, clicking the picked one clears it) + optional note input (maxLength 500). Archived/disabled → read-only text.
+- DayPanel / MyHome: send `text` / `choice` for those kinds (trimmed; empty text sent as ""), draft saves too (Home's debounce must not drop a half-typed answer).
+- PlanItemsEditor: kind select offers Text and Choice; Choice shows an options input (comma separated) with the two presets; validation messages inline (2–6 options, ≤40 chars, no duplicates).
+- [ ] Failing tests: each row behaviour, payloads from DayPanel and Home, editor options validation and presets.
+- [ ] Implement; `npx vitest run && npm run lint`.
+- [ ] Commit: `feat: Text and Choice items in the day panel, on Home and in the item editor`
+
+### Task 20: Setup grid split into Daily routines / Weekly goals, with the type picker
+
+**Files:** Modify `engineers_app/src/lib/teamGrid.ts`, `src/components/report/SetupGrid.tsx`, `src/components/report/SetupItemForm.tsx`. Tests `src/lib/teamGrid.test.ts`, `src/components/report/SetupGrid.test.tsx`.
+
+- Grid header groups: Week targets | **Daily routines** (routine columns, then "Only this person" for routine own items, "+ add routine") | **Weekly goals** (goal columns, then "Only this person" for goal own items, "+ add goal"). Group headers show even with no columns. Distinct light tint per group (prototype).
+- Chips: no "· daily / · week" suffix; count/hours chips keep the target ("2h", "50"); "added by <name>" stays for own items.
+- Item form (add / column "Change type" / move): the six type cards with the exact copy above; Number/Hours show a target; Choice shows the options field + presets; the group select replaces "daily/weekly" wording ("Daily routine (every working day)" / "Weekly goal (once this week)"). "+ add routine/goal" preselects the group.
+- `teamGrid`: Choice columns carry `options`; setting options on a column updates every member's item (ids kept); a person's Choice item whose options differ from the column still joins it (the column shows the first member's options; saving the column options aligns them). `addColumn` / `moveToColumn` / `retypeColumn` take `options` for choice.
+- `Fill all` / cells: Text and Choice use the "has item" checkbox.
+- [ ] Failing tests: grouping and both "Only this person" cells; chip text; the picker copy and per-type fields; choice options on add / change type / move; column options edit keeps ids.
+- [ ] Implement; `npx vitest run && npm run lint`.
+- [ ] Commit: `feat: the setup grid splits daily routines from weekly goals and picks any of six item types`
