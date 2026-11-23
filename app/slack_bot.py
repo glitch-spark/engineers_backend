@@ -412,6 +412,11 @@ def _bids_line(label: str, field: str, done: Any, targets: Any, regions: bool = 
     return _plan_line(label, value)
 
 
+def _cut(text: str, limit: int) -> str:
+    text = text.strip()
+    return text[: limit - 1].rstrip() + "…" if len(text) > limit else text
+
+
 def _item_line(e: dict, progress: dict) -> Optional[str]:
     item, result = e["item"], e["result"]
     hours = item.kind == "hours"
@@ -420,6 +425,14 @@ def _item_line(e: dict, progress: dict) -> Optional[str]:
         if e["scope"] == "routine":
             return _plan_line(item.text, f"✅ {n} profile{'s' * (n != 1)}" if n else "❌ not done")
         return _plan_line(item.text, f"✅ {n} profile{'s' * (n != 1)} today" if n else "in focus")
+    if item.kind in ("text", "choice"):
+        said = (result.text if item.kind == "text" else result.choice) if result else None
+        if not said:
+            return _plan_line(item.text, "❌ not done" if e["scope"] == "routine" else "in focus")
+        if item.kind == "text":
+            return _plan_line(item.text, "✅ " + _plan_block_text(_cut(said, 200)))
+        note = f" — {_plan_block_text(_cut(result.text, 200))}" if result.text else ""
+        return _plan_line(item.text, _plan_block_text(said) + note)
     if item.kind != "check" and result and result.done and result.value is None:
         return _plan_line(item.text, "✅" if e["scope"] == "routine" else "✅ done today")  # migrated, no number
     if e["scope"] == "routine":

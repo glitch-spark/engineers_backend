@@ -33,6 +33,8 @@ MAX_NUMBER = 100000
 MAX_NOTES = 2000
 MAX_METADATA = 3000  # Slack's cap on private_metadata
 MAX_PREFILL = 3000  # Slack's cap on a text input's initial_value
+MAX_ANSWER = 500
+ANSWER_ERROR = f"Up to {MAX_ANSWER} characters"
 MAX_LOG_LINES = 20
 MAX_LOG_LINE = 200
 LOG_HINT = "One line per profile: Profile name: what changed"
@@ -109,6 +111,27 @@ def _links(view: dict, item_id: str) -> dict:
         return {}
 
 
+def _answer_input(block_id: str, label: str, action: str, value: Optional[str]) -> dict:
+    element = {"type": "plain_text_input", "action_id": action, "multiline": True, "max_length": MAX_ANSWER}
+    if value:
+        element["initial_value"] = value
+    return {"type": "input", "block_id": block_id, "optional": True, "label": _plain(label[:2000]), "element": element}
+
+
+def _item_blocks(e: dict, progress: dict, names: Optional[dict] = None) -> list[dict]:
+    """One item's blocks: two for a live Choice (the pick, then its note), one otherwise."""
+    result = e["result"] or {}
+    if e["kind"] == "choice" and not e["archived"]:
+        options = [{"text": _plain(o), "value": o} for o in e["options"]]
+        element = {"type": "static_select", "action_id": "choice", "placeholder": _plain("Pick one"), "options": options}
+        if (picked := next((o for o in options if o["value"] == result.get("choice")), None)):
+            element["initial_option"] = picked  # a stored pick no longer in the list has none: Slack would refuse it
+        return [{"type": "input", "block_id": f"item:{e['id']}", "optional": True, "label": _plain(e["text"][:2000]),
+                 "element": element},
+                _answer_input(f"note:{e['id']}", f"{e['text']} · note"[:2000], "note", result.get("text"))]
+    return [_item_block(e, progress, names)]
+
+
 def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
     result = e["result"] or {}
     unit = "h" if e["kind"] == "hours" else ""
@@ -116,6 +139,9 @@ def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
         n = len(result.get("entries") or [])
         return {"type": "context", "elements": [_plain(_short(
             f"{e['text']} (removed) · {n} profile{'s' * (n != 1)}", 2000))]}
+    if e["archived"] and e["kind"] in ("text", "choice"):
+        said = " — ".join(x for x in ((result.get("choice") if e["kind"] == "choice" else None), result.get("text")) if x)
+        return {"type": "context", "elements": [_plain(_short(f"{e['text']} (removed) · {said or 'not done'}", 2000))]}
     if e["archived"]:  # removed from the week but holds a result: shown, not editable (resent by _keep_unshown)
         v = result.get("value")
         shown = f"{_fmt(v)}{unit}" if e["kind"] != "check" and v is not None else \
@@ -128,6 +154,8 @@ def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
             element["initial_options"] = [option]
         return {"type": "input", "block_id": f"item:{e['id']}", "optional": True,
                 "label": _plain(e["text"]), "element": element}
+    if e["kind"] == "text":
+        return _answer_input(f"item:{e['id']}", e["text"], "text", result.get("text"))
     if e["kind"] == "log":
         lines, _ = _log_prefill(e, names)
         if len("\n".join(lines)) > MAX_PREFILL:  # Slack refuses a longer initial_value: read-only, entries kept
@@ -171,27 +199,34 @@ async def build_view(user: UserExtra, day: date) -> dict:
     d = await daily_plans._view(user.id, day)
     names = {p["id"]: p["name"] for p in d["profiles"]}
     typed = d["done"].get("bidsSelfByProfile") or {}
-    body: list[dict] = []
+    body: list[list[dict]] = []  # groups: a Choice item's two blocks are kept or cut together
     logs: dict[str, dict] = {}
     for p in d["profiles"]:
         if p["id"] in d["trackedProfiles"] or (p["archived"] and not typed.get(p["id"])):
             continue  # tracked profiles count themselves; archived ones only while they hold a number
         label = f"{p['name']} ({p['region']}) — self bids" if p.get("region") else f"{p['name']} — self bids"
-        body.append(_number_input(f"self:{p['id']}", label, typed.get(p["id"]) or None, decimal=False))
+        body.append([_number_input(f"self:{p['id']}", label, typed.get(p["id"]) or None, decimal=False)])
     for scope, heading in (("routine", "*Routines*"), ("goal", "*Weekly goals* (optional)")):
         items = [e for e in d["items"] if e["scope"] == scope]
         if items:
-            body.append({"type": "section", "text": {"type": "mrkdwn", "text": heading}})
+            body.append([{"type": "section", "text": {"type": "mrkdwn", "text": heading}}])
             for e in items:
-                body.append(_item_block(e, d["progress"], names))
-                if e["kind"] == "log" and not e["archived"] and body[-1]["type"] == "input":
+                body.append(_item_blocks(e, d["progress"], names))
+                if e["kind"] == "log" and not e["archived"] and body[-1][0]["type"] == "input":
                     logs[e["id"]] = _log_prefill(e, names)[1]
     follow_ups = slack_bot.follow_ups_line(d["followUps"], label="*Follow-ups*")
     head = [_bids_line(d, day, names), _interviews_line(d), *([follow_ups] if follow_ups else [])]
     room = MAX_BLOCKS - len(head) - 1  # the context lines and Extra
-    if len(body) > room:
-        hidden = len(body) - (room - 1)
-        body = body[:room - 1] + [_context(f"{hidden} more lines don't fit here — open the app to fill them in.")]
+    total = sum(map(len, body))
+    if total > room:
+        kept, used = [], 0
+        for g in body:
+            if used + len(g) > room - 1:
+                break
+            kept.append(g)
+            used += len(g)
+        body = [*kept, [_context(f"{total - used} more lines don't fit here — open the app to fill them in.")]]
+    body = [b for g in body for b in g]
     shown = {b.get("block_id") for b in body}
     logs = {iid: m for iid, m in logs.items() if f"item:{iid}" in shown}
     meta = {"day": day.isoformat(), "logs": logs}
@@ -247,8 +282,16 @@ def read_submission(view: dict) -> DayIn:
     results: dict[str, ItemResultIn] = {}
     by_profile: dict[str, int] = {}
     notes = ""
-    for block_id, acts in _values(view).items():
-        if block_id.startswith("item:") and "check" in acts:
+    values = _values(view)
+    for block_id, acts in values.items():
+        if block_id.startswith("item:") and "choice" in acts:  # the pick, plus the note block beside it
+            note = (values.get(f"note:{block_id[5:]}") or {}).get("note")
+            results[block_id[5:]] = ItemResultIn(
+                choice=((acts["choice"].get("selected_option") or {}).get("value")),
+                **({"text": note.get("value") or ""} if note is not None else {}))
+        elif block_id.startswith("item:") and "text" in acts:
+            results[block_id[5:]] = ItemResultIn(text=acts["text"].get("value") or "")
+        elif block_id.startswith("item:") and "check" in acts:
             results[block_id[5:]] = ItemResultIn(done=bool(acts["check"].get("selected_options")))
         elif block_id.startswith("item:") and "log" in acts:  # blank -> [] (sent, clears the stored entries)
             results[block_id[5:]] = ItemResultIn(entries=[
@@ -286,6 +329,9 @@ def submission_errors(view: dict) -> dict[str, str]:
                     errors[block_id] = LOG_LINE_ERROR
                 elif len(lines) > MAX_LOG_LINES:
                     errors[block_id] = LOG_LINES_ERROR
+            elif block_id.startswith(("item:", "note:")) and ("text" in acts or "note" in acts):
+                if len((acts.get("text") or acts["note"]).get("value") or "") > MAX_ANSWER:
+                    errors[block_id] = ANSWER_ERROR
             elif block_id == "notes" and len((acts["notes"].get("value") or "").strip()) > MAX_NOTES:
                 errors[block_id] = NOTES_ERROR
         return errors
@@ -303,6 +349,7 @@ async def _keep_unshown(user: UserExtra, day: date, body: DayIn) -> DayIn:
     switched = await self_bids.switched_profiles(user.id, day)
     typed = {pid: n for pid, n in plan.done.bidsSelfByProfile.items() if pid not in switched}
     by = {**typed, **plan.done.bidsSelfOtherByProfile, **body.done.bidsSelfByProfile}
+    # text / choice are left unsent here: plan_save keeps the stored ones (resending a stale choice would be refused)
     kept = {iid: ItemResultIn(done=r.done, value=r.value, entries=r.entries) for iid, r in plan.results.items()}
     return body.model_copy(update={
         "results": {**kept, **body.results},
