@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from pydantic import AfterValidator, BaseModel, Field
 
 from app.alerts import app_week_key
-from app.models.plan_common import MAX_ITEMS, Counts, CountsIn, PlanItem, SatGoal, check_items
+from app.models.plan_common import MAX_ITEMS, SELF_REGIONS, Counts, PlanItem, SatGoal, check_items
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import week_or_draft
 
@@ -20,6 +20,7 @@ PLANNED_BY_ADMIN = "Your week is planned by your admin"
 _LOAD = object()  # save_week(known=...) not given: load it
 KEEP = object()  # save_week(sat_goal=...) not given: keep as stored
 SAT_OVER = "Saturday bids can't be more than the week's"
+REGIONS_OVER = "Your region split is more than your self bids target"
 
 
 def sat_goal_of(body: BaseModel) -> object:
@@ -37,7 +38,7 @@ PlanItemsIn = Annotated[list[PlanItemIn], AfterValidator(check_items)]
 
 
 class WeekIn(BaseModel):
-    goal: CountsIn = Field(default_factory=CountsIn)
+    goal: Counts = Field(default_factory=Counts)  # as typed: the regions never replace the self total
     routines: PlanItemsIn = []
     weeklyGoals: PlanItemsIn = []
     recapNotes: str = Field(default="", max_length=4000)
@@ -102,12 +103,14 @@ async def save_week(
     removed_ids: Optional[set[str]] = None,
     known: object = _LOAD,
     sat_goal: object = KEEP,
+    self_regions: Optional[dict[str, int]] = None,
 ) -> WeeklyPlan:
     """Insert or update the week. None = leave as stored (or as the carry-over draft on a first save).
 
     `added_by` marks new items; `locked` = the admin-planned person's save (see `_merge_items`): the goal and the
     admin's items stay as stored, and so does `sat_goal` (KEEP = as stored, None = clear; over the saved week's bid
-    total -> 422). Weekly goals never keep `days`. `removed_ids`: see `_merge_items`. `known`:
+    total -> 422). `self_regions` (region field -> count): set onto the goal, `locked` too (the person splits the
+    admin's self total); the regions over the self total -> 422. Weekly goals never keep `days`. `removed_ids`: see `_merge_items`. `known`:
     `week_or_draft(uid, monday)` when the caller already loaded it (the team save loads every row in one query)."""
     t0 = time.monotonic()
     base = await week_or_draft(uid, monday) if known is _LOAD else known  # a first save keeps the draft's routine ids
@@ -132,6 +135,10 @@ async def save_week(
             plan.routines, plan.weeklyGoals = base.routines, base.weeklyGoals
     if goal is not None:
         plan.goal = goal
+    if self_regions:
+        plan.goal = plan.goal.model_copy(update=self_regions)
+    if (goal is not None or self_regions) and sum(getattr(plan.goal, f) for f in SELF_REGIONS) > plan.goal.bidsSelf:
+        raise HTTPException(status_code=422, detail=REGIONS_OVER)
     if sat_goal is not KEEP:
         if sat_goal is not None and any((getattr(sat_goal, f) or 0) > getattr(plan.goal, f)
                                         for f in ("bidsSelf", "bidsBidder")):

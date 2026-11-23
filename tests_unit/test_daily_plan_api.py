@@ -22,6 +22,7 @@ from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
 from app.models.plan_common import Counts, PlanItem, SatGoal
 from app.models.weekly_plan import WeeklyPlan
+from app.plan_auto import day_targets
 from app.routers import daily_plans
 from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
 from app.routers.reports import team_report
@@ -416,6 +417,31 @@ async def test_admin_planned_person_can_write_recap(db, planned):
     assert got.goal.bidsSelf == 600 and got.recapNotes == "good week"
     assert [r.archived for r in got.routines] == [False]
     assert out["recapNotes"] == "good week"
+
+
+async def test_admin_planned_person_splits_the_admin_total(db, planned):
+    plan = await _admin_week(planned)
+    plan.goal = Counts(bidsSelf=600, bidsBidder=60, interviewsSelf=3)
+    await plan.save()
+    split = {"bidsSelf": 10, "bidsBidder": 1, "bidsSelfUs": 300, "bidsSelfEu": 200, "bidsSelfLatam": 0}
+    await put_week(WEEK, planned, week_body(goal=split, routines=[{"id": "a1", "text": "Admin 1"}]))
+    g = (await WeeklyPlan.get(plan.id)).goal
+    assert g == Counts(bidsSelf=600, bidsSelfUs=300, bidsSelfEu=200, bidsBidder=60, interviewsSelf=3)
+    tue = day_targets(None, await WeeklyPlan.get(plan.id), TUE)
+    assert (tue.bidsSelf, tue.bidsSelfUs, tue.bidsSelfEu, tue.bidsSelfLatam) == (100, 50, 34, 0)
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, planned, week_body(goal={"bidsSelfUs": 401, "bidsSelfEu": 200}))
+    assert (e.value.status_code, e.value.detail) == (422, "Your region split is more than your self bids target")
+    assert (await WeeklyPlan.get(plan.id)).goal == g
+
+
+async def test_own_planner_regions_do_not_replace_the_total(db, me):
+    goal = {"bidsSelf": 1000, "bidsSelfUs": 300, "bidsSelfEu": 200, "bidsSelfLatam": 0}
+    out = await put_week(WEEK, me, week_body(goal=goal))
+    assert (out["goal"]["bidsSelf"], out["goal"]["bidsSelfUs"], out["goal"]["bidsSelfEu"]) == (1000, 300, 200)
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, me, week_body(goal={"bidsSelf": 400, "bidsSelfUs": 300, "bidsSelfEu": 200}))
+    assert (e.value.status_code, e.value.detail) == (422, "Your region split is more than your self bids target")
 
 
 async def test_admin_planned_person_cannot_delete_week(db, planned):

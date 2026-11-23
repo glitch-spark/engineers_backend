@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 from app.deps import get_current_user, require_admin
 from app.routers.daily_plans import _today
 from app.models import UserExtra
-from app.models.plan_common import Counts, SatGoal
+from app.models.plan_common import SELF_REGIONS, Counts, SatGoal
 from app.models.weekly_plan import WeeklyPlan
 from app.plan_auto import (day_targets, draft_week, goal_progress, items_tally, routines_grid, week_snapshot,
                            weeks_or_drafts, weekly_plans_for)
@@ -185,11 +185,9 @@ async def _save_team_row(raw: dict, monday: date, users: dict, known: dict) -> N
     base = stored.goal if stored else Counts()
     empty = not (row.goal.bidsSelf or row.goal.bidsBidder or row.goal.interviewsSelf or row.routines or row.weeklyGoals)
     if (stored is not None and stored.id is not None) or not empty:  # nothing to plan yet: don't create an empty week
-        if row.goal.bidsSelf == base.bidsSelf:  # total unchanged: keep the stored region split
-            goal = base.model_copy(update={"bidsBidder": row.goal.bidsBidder, "interviewsSelf": row.goal.interviewsSelf})
-        else:
-            goal = Counts(bidsSelf=row.goal.bidsSelf, bidsBidder=row.goal.bidsBidder,
-                          interviewsSelf=row.goal.interviewsSelf, interviewsCaller=base.interviewsCaller)
+        goal = base.model_copy(update=row.goal.model_dump())
+        if sum(getattr(base, f) for f in SELF_REGIONS) > row.goal.bidsSelf:  # the person's split no longer fits
+            goal = goal.model_copy(update=dict.fromkeys(SELF_REGIONS, 0))
         await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None,
                         added_by="admin", removed_ids=set(row.removedIds), known=stored, sat_goal=sat_goal_of(row))
     if row.plansOwnWeek != user.plansOwnWeek:
@@ -222,13 +220,14 @@ async def put_week(
     monday = parse_monday(week_start)
     body = parse_body(WeekIn, payload)
     if user.plansOwnWeek:
-        await save_week(user.id, monday, goal=Counts(**body.goal.model_dump()), routines=body.routines,
+        await save_week(user.id, monday, goal=body.goal, routines=body.routines,
                         weekly_goals=body.weeklyGoals, recap=body.recapNotes, added_by="self", sat_goal=sat_goal_of(body))
     else:  # the admin plans the week: own items and the recap, only on a plan the admin saved
         if (await _snapshot(user.id, monday))["plan"] is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PLANNED_BY_ADMIN)
+        regions = {f: getattr(body.goal, f) for f in SELF_REGIONS if f in body.goal.model_fields_set}
         await save_week(user.id, monday, goal=None, routines=body.routines, weekly_goals=body.weeklyGoals,
-                        recap=body.recapNotes, added_by="self", locked=True)
+                        recap=body.recapNotes, added_by="self", locked=True, self_regions=regions)
     return _week_out(user.id, monday, await _snapshot(user.id, monday), plans_own_week=user.plansOwnWeek,
                      today=_today())
 

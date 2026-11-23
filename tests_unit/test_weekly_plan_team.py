@@ -135,14 +135,17 @@ async def test_team_save_archives_removed_and_keeps_hidden_fields(db, admin, ana
     assert p.recapNotes == "r" and p.goal.interviewsCaller == 4
 
 
-async def test_team_save_keeps_split_when_total_unchanged(db, admin, ana):
+async def test_team_save_keeps_split_while_it_fits_the_total(db, admin, ana):
     await plan(ana, WEEK, goal=Counts(bidsSelf=600, bidsSelfUs=400, bidsSelfLatam=200))
     await put(admin, row(ana, goal={"bidsSelf": 600, "bidsBidder": 1, "interviewsSelf": 2}))
     g = (await stored(ana))[0].goal
     assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfLatam, g.bidsBidder, g.interviewsSelf) == (600, 400, 200, 1, 2)
-    await put(admin, row(ana, goal={"bidsSelf": 650, "bidsBidder": 0, "interviewsSelf": 0}))
+    await put(admin, row(ana, goal={"bidsSelf": 650, "bidsBidder": 0, "interviewsSelf": 0}))  # still fits
     g = (await stored(ana))[0].goal
-    assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfEu, g.bidsSelfLatam) == (650, 0, 0, 0)
+    assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfEu, g.bidsSelfLatam) == (650, 400, 0, 200)
+    await put(admin, row(ana, goal={"bidsSelf": 500, "bidsBidder": 0, "interviewsSelf": 0}))  # 600 > 500: cleared
+    g = (await stored(ana))[0].goal
+    assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfEu, g.bidsSelfLatam) == (500, 0, 0, 0)
 
 
 async def test_team_save_writes_the_switch(db, admin, ana, monkeypatch):
