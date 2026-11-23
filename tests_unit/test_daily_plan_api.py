@@ -20,8 +20,9 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
-from app.models.plan_common import Counts, PlanItem
+from app.models.plan_common import Counts, PlanItem, SatGoal
 from app.models.weekly_plan import WeeklyPlan
+from app.plan_auto import day_targets
 from app.routers import daily_plans
 from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
 from app.routers.reports import team_report
@@ -67,7 +68,7 @@ async def planned(db):
 
 def week_body(**kw):
     body = {
-        "goal": {"bidsSelf": 100, "bidsBidder": 50, "interviewsSelf": 5},
+        "goal": {"bidsSelf": 120, "bidsBidder": 60, "interviewsSelf": 5},  # 20 / 10 a day over Mon-Sat
         "routines": [{"text": "Bidder review"}, {"text": "Citizen contact", "kind": "count", "target": 50}],
         "weeklyGoals": [{"text": "Email outreach", "kind": "count", "target": 250}],
         "recapNotes": "",
@@ -111,7 +112,7 @@ async def test_get_week_without_plan_returns_draft(me):
     review, contact, goal = await saved_week(me)
     nxt = await get_week("2026-11-16", me, None)
     assert nxt["draft"] is True and nxt["exists"] is False
-    assert nxt["goal"]["bidsSelf"] == 100
+    assert nxt["goal"]["bidsSelf"] == 120
     assert [r["id"] for r in nxt["routines"]] == [review, contact] and [g["id"] for g in nxt["weeklyGoals"]] == [goal]
     assert nxt["days"][0]["goal"]["bidsSelf"] == 20  # targets derived from the draft
     assert await WeeklyPlan.find({"userId": me.id}).count() == 1  # nothing saved
@@ -127,7 +128,7 @@ async def test_get_day_has_targets_items_progress(me):
     review, contact, goal = await saved_week(me)
     await put_day(MON.isoformat(), me, {"results": {goal: {"value": 100}}})
     day = await get_day(TUE.isoformat(), me, None)
-    assert (day["targets"]["bidsSelf"], day["targets"]["bidsBidder"], day["targets"]["interviewsSelf"]) == (20, 10, 0)
+    assert (day["targets"]["bidsSelf"], day["targets"]["bidsBidder"], day["targets"]["interviewsSelf"]) == (20, 12, 0)
     assert [(i["id"], i["scope"], i["kind"], i["target"], i["result"]) for i in day["items"]] == [
         (review, "routine", "check", None, None), (contact, "routine", "count", 50, None),
         (goal, "goal", "count", 250, None)]
@@ -142,7 +143,7 @@ async def test_save_day_freezes_targets(me):
     review, contact, goal = await saved_week(me)
     await put_day(TUE.isoformat(), me, {"results": {contact: {"value": 30}, goal: {"value": 80}, review: {"done": True}}})
     plan = await stored(me, TUE)
-    assert (plan.targetOverride.bidsSelf, plan.targetOverride.bidsBidder) == (20, 10)
+    assert (plan.targetOverride.bidsSelf, plan.targetOverride.bidsBidder) == (20, 12)
     assert (plan.results[contact].target, plan.results[goal].target, plan.results[review].target) == (50, 250, None)
     assert plan.submittedAt is not None and plan.loggedAt is not None
     # An override sent with the day wins.
@@ -154,7 +155,7 @@ async def test_week_target_edit_keeps_submitted_days(me):
     review, contact, goal = await saved_week(me)
     await put_day(TUE.isoformat(), me, {"results": {contact: {"value": 30}}})
     await put_week(WEEK, me, week_body(
-        goal={"bidsSelf": 200, "bidsBidder": 50},
+        goal={"bidsSelf": 240, "bidsBidder": 60},
         routines=[{"id": review, "text": "Bidder review"},
                   {"id": contact, "text": "Citizen contact", "kind": "count", "target": 60}],
         weeklyGoals=[{"id": goal, "text": "Email outreach", "kind": "count", "target": 250}]))
@@ -231,7 +232,7 @@ async def test_reports_items_counts(me):
     await put_day(WED.isoformat(), me, {"results": {review: {"done": True}}})
     row = (await team_report(me, weekStart=WEEK))["users"][0]
     assert (row["itemsDone"], row["itemsTotal"]) == (3, 4)  # a touched weekly goal counts as done
-    assert row["goal"]["bidsSelf"] == 100  # the week's goal, as before
+    assert row["goal"]["bidsSelf"] == 120  # the week's goal, as before
     days = {d["date"]: d for d in (await get_week(WEEK, me, None))["days"]}
     assert (days[TUE.isoformat()]["itemsDone"], days[TUE.isoformat()]["itemsTotal"]) == (2, 3)
     assert days[TUE.isoformat()]["goal"]["bidsSelf"] == 20
@@ -251,7 +252,7 @@ async def test_real_sync_slack_builds_the_standup(db, me, monkeypatch):
                            submittedAt=datetime(2026, 11, 12, 20)).insert()
     await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), startDate=datetime(2026, 11, 9),
                      endDate=datetime(2026, 11, 15), weekNumber=46, year=2026,
-                     goal=Counts(bidsSelf=100, interviewsSelf=3, interviewsCaller=2)).insert()
+                     goal=Counts(bidsSelf=120, interviewsSelf=3, interviewsCaller=2)).insert()
     monkeypatch.setattr(daily_plans, "_sync_slack", REAL_SYNC_SLACK)  # the fixture faked it
     monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
     await daily_plans._sync_slack(plan, me, Counts(), {})
@@ -416,6 +417,31 @@ async def test_admin_planned_person_can_write_recap(db, planned):
     assert got.goal.bidsSelf == 600 and got.recapNotes == "good week"
     assert [r.archived for r in got.routines] == [False]
     assert out["recapNotes"] == "good week"
+
+
+async def test_admin_planned_person_splits_the_admin_total(db, planned):
+    plan = await _admin_week(planned)
+    plan.goal = Counts(bidsSelf=600, bidsBidder=60, interviewsSelf=3)
+    await plan.save()
+    split = {"bidsSelf": 10, "bidsBidder": 1, "bidsSelfUs": 300, "bidsSelfEu": 200, "bidsSelfLatam": 0}
+    await put_week(WEEK, planned, week_body(goal=split, routines=[{"id": "a1", "text": "Admin 1"}]))
+    g = (await WeeklyPlan.get(plan.id)).goal
+    assert g == Counts(bidsSelf=600, bidsSelfUs=300, bidsSelfEu=200, bidsBidder=60, interviewsSelf=3)
+    tue = day_targets(None, await WeeklyPlan.get(plan.id), TUE)
+    assert (tue.bidsSelf, tue.bidsSelfUs, tue.bidsSelfEu, tue.bidsSelfLatam) == (100, 50, 34, 0)
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, planned, week_body(goal={"bidsSelfUs": 401, "bidsSelfEu": 200}))
+    assert (e.value.status_code, e.value.detail) == (422, "Your region split is more than your self bids target")
+    assert (await WeeklyPlan.get(plan.id)).goal == g
+
+
+async def test_own_planner_regions_do_not_replace_the_total(db, me):
+    goal = {"bidsSelf": 1000, "bidsSelfUs": 300, "bidsSelfEu": 200, "bidsSelfLatam": 0}
+    out = await put_week(WEEK, me, week_body(goal=goal))
+    assert (out["goal"]["bidsSelf"], out["goal"]["bidsSelfUs"], out["goal"]["bidsSelfEu"]) == (1000, 300, 200)
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, me, week_body(goal={"bidsSelf": 400, "bidsSelfUs": 300, "bidsSelfEu": 200}))
+    assert (e.value.status_code, e.value.detail) == (422, "Your region split is more than your self bids target")
 
 
 async def test_admin_planned_person_cannot_delete_week(db, planned):
@@ -602,3 +628,53 @@ async def test_progress_save_text_and_choice(db, me):
     assert e.value.detail == "Unknown option"
     await put_day(TUE.isoformat(), me, {"results": {t: {"text": ""}}}, submit=False)
     assert (await _res(me, t))["result"]["done"] is False
+
+
+async def test_week_get_returns_routine_days(db, me):
+    from app.models.plan_common import ItemResult
+
+    r = PlanItem(text="Check inbox")
+    await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), startDate=datetime(2026, 11, 9),
+                     endDate=datetime(2026, 11, 15), weekNumber=46, year=2026, routines=[r]).insert()
+    await DailyPlan(userId=me.id, date=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                    results={r.id: ItemResult(done=True)}).insert()
+    out = await get_week(WEEK, me, None, WED)
+    (row,) = out["routineDays"]
+    assert row["id"] == r.id
+    assert [c["state"] for c in row["days"][:4]] == ["done", "missed", "today", "future"]
+    assert (await get_week("2026-11-02", me, None, WED))["routineDays"] == []  # no plan, no draft
+
+
+async def test_put_week_sat_goal_set_keep_clear(db, me):
+    out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000, "bidsBidder": 60}, satGoal={"bidsSelf": 100}))
+    assert out["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    assert [d["goal"]["bidsSelf"] for d in out["days"]] == [180] * 5 + [100]
+    assert [d["goal"]["bidsBidder"] for d in out["days"]] == [12] * 5 + [0]  # bidder: Mon-Fri only
+    assert (await get_week(WEEK, me, None))["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000}))  # absent (older client): kept
+    assert out["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000}, satGoal=None))
+    assert out["satGoal"] is None and [d["goal"]["bidsSelf"] for d in out["days"]] == [167] * 6
+
+
+async def test_put_week_sat_goal_over_week_total_is_422(db, me):
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, me, week_body(satGoal={"bidsBidder": 61}))
+    assert (e.value.status_code, e.value.detail) == (422, "Saturday bids can't be more than the week's")
+    assert await WeeklyPlan.find_one({"userId": me.id}) is None
+
+
+async def test_planned_person_cannot_change_sat_goal(db, planned):
+    plan = await _admin_week(planned)
+    plan.satGoal = SatGoal(bidsSelf=50)
+    await plan.save()
+    for sat in ({"bidsSelf": 0}, None):
+        await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1", "days": [5]}], satGoal=sat))
+        got = await WeeklyPlan.get(plan.id)
+        assert got.satGoal == SatGoal(bidsSelf=50) and got.routines[0].days is None  # admin item kept as stored
+
+
+async def test_put_week_days_kept_and_weekly_goals_forced_none(db, me):
+    out = await put_week(WEEK, me, week_body(routines=[{"text": "Sat sweep", "days": [5]}],
+                                             weeklyGoals=[{"text": "G", "days": [0]}]))
+    assert out["routines"][0]["days"] == [5] and out["weeklyGoals"][0]["days"] is None

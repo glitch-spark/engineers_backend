@@ -230,17 +230,17 @@ async def day_plan(owner, d, **kw):
 
 
 async def test_bids_by_day_with_a_target(me):
-    await week_plan(me, goal=Counts(bidsSelf=500, bidsBidder=500))
+    await week_plan(me, goal=Counts(bidsSelf=600, bidsBidder=600))  # self 100 a day Mon-Sat + bidder 120 Mon-Fri
     await day_plan(me, 16, done=DoneCounts(bidsSelf=100, bidsBidder=20))
     await day_plan(me, 17, done=DoneCounts(bidsBidder=80), targetOverride=Counts(bidsSelf=300))
-    await day_plan(me, 21, done=DoneCounts(bidsSelf=7))  # Saturday: in the total, not a working day
+    await day_plan(me, 22, done=DoneCounts(bidsSelf=7))  # Sunday: in the total, not a working day
     out = await dashboard_week(me, None, TODAY)
     assert out["bids"]["byDay"] == [
-        {"date": "2026-11-16", "done": 120, "self": 100, "bidder": 20, "target": 200}, {"date": "2026-11-17", "done": 80, "self": 0, "bidder": 80, "target": 300},
-        {"date": "2026-11-18", "done": 0, "self": 0, "bidder": 0, "target": 200}, {"date": "2026-11-19", "done": 0, "self": 0, "bidder": 0, "target": 200},
-        {"date": "2026-11-20", "done": 0, "self": 0, "bidder": 0, "target": 200},
+        {"date": "2026-11-16", "done": 120, "self": 100, "bidder": 20, "target": 220}, {"date": "2026-11-17", "done": 80, "self": 0, "bidder": 80, "target": 300},
+        {"date": "2026-11-18", "done": 0, "self": 0, "bidder": 0, "target": 220}, {"date": "2026-11-19", "done": 0, "self": 0, "bidder": 0, "target": 220},
+        {"date": "2026-11-20", "done": 0, "self": 0, "bidder": 0, "target": 220}, {"date": "2026-11-21", "done": 0, "self": 0, "bidder": 0, "target": 100},
     ]
-    assert out["bids"]["total"] == 207 and out["bids"]["pace"]["expected"] == 700
+    assert out["bids"]["total"] == 207 and out["bids"]["pace"]["expected"] == 740
 
 
 async def test_bids_by_day_without_a_target(me):
@@ -249,7 +249,7 @@ async def test_bids_by_day_without_a_target(me):
     assert out["bids"]["target"] is None
     assert out["bids"]["byDay"][:2] == [{"date": "2026-11-16", "done": 100, "self": 100, "bidder": 0, "target": None},
                                         {"date": "2026-11-17", "done": 0, "self": 0, "bidder": 0, "target": None}]
-    assert [d["date"] for d in out["bids"]["byDay"]] == [f"2026-11-{n}" for n in range(16, 21)]
+    assert [d["date"] for d in out["bids"]["byDay"]] == [f"2026-11-{n}" for n in range(16, 22)]
 
 
 async def test_week_interview_outcomes(me):
@@ -285,14 +285,14 @@ async def test_routines_grid_states_and_sums_equal_the_tally(me):
     await day_plan(me, 18, results={"r2": ItemResult(value=10, target=40)})
     out = (await dashboard_week(me, None, TODAY))["routines"]
     r1, r2, r3 = out["rows"]  # r4 was never shown this week
-    assert [d["date"] for d in r1["days"]] == [f"2026-11-{n}" for n in range(16, 21)]
+    assert [d["date"] for d in r1["days"]] == [f"2026-11-{n}" for n in range(16, 22)]
     assert (r1["id"], r1["text"], r1["doneDays"], r1["totalDays"]) == ("r1", "Review", 1, 3)
     assert cells(r1) == [("done", None, None), ("missed", None, None), ("today", None, None),
-                         ("future", None, None), ("future", None, None)]
+                         ("future", None, None), ("future", None, None), ("future", None, None)]
     assert cells(r2) == [("done", None, None), ("short", 49, 50), ("short", 10, 40),
-                         ("future", None, None), ("future", None, None)]
+                         ("future", None, None), ("future", None, None), ("future", None, None)]
     assert (r2["doneDays"], r2["totalDays"]) == (1, 3)
-    assert cells(r3) == [("done", None, None)] + [("off", None, None)] * 4
+    assert cells(r3) == [("done", None, None)] + [("off", None, None)] * 5
     assert (r3["doneDays"], r3["totalDays"]) == (1, 1)
     assert (out["done"], out["expected"]) == (3, 7)
     assert sum(r["doneDays"] for r in out["rows"]) == out["done"]
@@ -303,9 +303,9 @@ async def test_routines_grid_on_the_last_day_and_with_no_plan(me):
     assert (await dashboard_week(me, None, TODAY))["routines"] == {"done": 0, "expected": 0, "rows": []}
     await week_plan(me, routines=[PlanItem(id="r2", text="Contacts", kind="count", target=50)])
     await day_plan(me, 20, results={"r2": ItemResult(value=60)})
-    out = (await dashboard_week(me, None, "2026-11-21"))["routines"]  # Saturday: every working day is past
-    assert [d["state"] for d in out["rows"][0]["days"]] == ["missed"] * 4 + ["done"]
-    assert (out["rows"][0]["doneDays"], out["rows"][0]["totalDays"]) == (out["done"], out["expected"]) == (1, 5)
+    out = (await dashboard_week(me, None, "2026-11-22"))["routines"]  # Sunday: every working day is past
+    assert [d["state"] for d in out["rows"][0]["days"]] == ["missed"] * 4 + ["done", "missed"]
+    assert (out["rows"][0]["doneDays"], out["rows"][0]["totalDays"]) == (out["done"], out["expected"]) == (1, 6)
 
 
 # --- GET /dashboard/net-monthly -------------------------------------------------------------------------------

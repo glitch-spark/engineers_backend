@@ -77,11 +77,11 @@ def test_goal_vs_done_layout():
         "   Self              2   Intro(1) · Tech round 1(1)",
         "   Caller            1   Intro(1)",
         "   Week              3 / 15",
-        "3️⃣ Routines",
+        "3️⃣ Daily to-dos",
         "   Bidder review     ✅",
         "   Citizen contact   31 / 50  ⚠️",
         "   Interview prep    1.5h / 2h  ⚠️",
-        "4️⃣ Weekly goals (week so far)",
+        "4️⃣ Weekly to-dos (week so far)",
         "   Email outreach    180 / 250",
         "   Company Facebook  ✅ done today",
         "5️⃣ Extra",
@@ -130,7 +130,7 @@ def test_empty_sections_left_out():
         "1️⃣ Bids", "   Self              0", "   Bidder            0",
         "2️⃣ Interviews", "   Self              0", "   Caller            0",
         DIVIDER, "```",
-    ]  # no Week without a target, no Routines / Weekly goals / Extra
+    ]  # no Week without a target, no Daily to-dos / Weekly to-dos / Extra
 
 
 def test_other_regions_complete_the_self_total():

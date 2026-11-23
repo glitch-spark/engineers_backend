@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from app import slack_bot
 from app.config import get_settings
+from app.plan_auto import WORKDAYS
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ async def run_standup_nudge(now: datetime) -> str:
     if not channel or not (s.SLACK_BOT_TOKEN or "").strip():
         return "off"
     local = slack_bot._aware_utc(now).astimezone(NUDGE_TZ)
-    if local.weekday() >= 5 or local.time() < NUDGE_AT:
+    if local.weekday() >= WORKDAYS or local.time() < NUDGE_AT:
         return "skipped"
     day = local.date()
     key = f"standup-nudge:{day.isoformat()}"

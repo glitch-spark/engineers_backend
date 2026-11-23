@@ -252,7 +252,7 @@ async def _tick_daily_bids(users: list[UserExtra], *, now: datetime) -> int:
             continue
         day = local.date()
         today = await DailyPlan.find_one({"userId": user.id, "date": datetime(day.year, day.month, day.day)})
-        targets = day_targets(today, plan, day)  # the day's own target, else the week's split over Mon-Fri
+        targets = day_targets(today, plan, day)  # the day's own target, else the week's split over Mon-Sat
         target = targets.bidsSelf + targets.bidsBidder
         if target <= 0:
             continue

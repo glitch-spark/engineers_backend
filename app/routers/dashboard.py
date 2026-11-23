@@ -51,6 +51,7 @@ from app.plan_auto import (
     goal_progress,
     interviews_by_day,
     interviews_split,
+    WORKDAYS,
     routines_grid,
     routines_tally,
     weekly_plans_for,
@@ -190,12 +191,12 @@ async def dashboard_week(
 
     # This week's weekly plan Goal is the target (0 means none set).
     weekly_plan = (await weekly_plans_for([sid], monday)).get(sid)
-    workdays = [monday + timedelta(days=i) for i in range(5)]
+    workdays = [monday + timedelta(days=i) for i in range(WORKDAYS)]
     elapsed = [d for d in workdays if d <= day]
     days_left = len(workdays) - len(elapsed)
     targets = {d: day_targets(plans_by_day.get(d), weekly_plan, d) for d in workdays}
     day_target = {d: t.bidsSelf + t.bidsBidder for d, t in targets.items()}
-    # Mon-Fri sums from the sources `byDay` uses (the weekend's bids are in `total` only)
+    # Mon-Sat sums from the sources `byDay` uses (Sunday's bids are in `total` only)
     week_self = sum(p.done.bidsSelf for d in workdays if (p := plans_by_day.get(d)))
     week_bidder = sum(p.done.bidsBidder for d in workdays if (p := plans_by_day.get(d)))
     bids_expected = sum(day_target[d] for d in elapsed)
@@ -287,12 +288,12 @@ async def dashboard_week(
             "self": interviews[sid]["self"],
             "caller": interviews[sid]["caller"],
             "target": interviews_target,
-            "pace": plan_pace(interviews_done, interviews_target, ceil((interviews_target or 0) * len(elapsed) / 5), days_left),
+            "pace": plan_pace(interviews_done, interviews_target, ceil((interviews_target or 0) * len(elapsed) / WORKDAYS), days_left),
             "percentile": percentile(interviews_done, list(iv_scores.values())),
             # rounds scheduled Mon-Sun by the Statistics → Interviews outcome rule; scheduled = not held yet
             "outcomes": {k: outcomes[k] for k in ("held", "passed", "rejected", "noAnswer", "waiting", "canceled",
                                                   "scheduled")},
-            # the same rounds per working day they are scheduled on (a weekend round is in `outcomes` only)
+            # the same rounds per working day they are scheduled on (a Sunday round is in `outcomes` only)
             "byDay": [{"date": d.isoformat(), **{k: rounds_by_day[d][k] for k in ("held", "canceled", "scheduled")}}
                       for d in workdays],
             "rounds": round_list,

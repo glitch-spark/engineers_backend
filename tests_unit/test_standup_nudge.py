@@ -65,10 +65,12 @@ async def test_not_before_six(slack):
     slack.assert_not_awaited()
 
 
-async def test_not_on_weekends(slack):
+async def test_saturday_yes_sunday_no(slack):
     sat = datetime(2026, 11, 22, 0, 30, tzinfo=timezone.utc)  # Sat 18:30 Chicago
-    assert await nudge.run_standup_nudge(sat) == "skipped"
-    slack.assert_not_awaited()
+    sun = datetime(2026, 11, 23, 0, 30, tzinfo=timezone.utc)  # Sun 18:30 Chicago
+    assert await nudge.run_standup_nudge(sat) == "posted"
+    assert await nudge.run_standup_nudge(sun) == "skipped"
+    assert slack.await_count == 1
 
 
 async def test_off_without_channel_or_token(slack, monkeypatch):

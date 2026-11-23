@@ -17,7 +17,7 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
-from app.models.plan_common import Counts, PlanItem
+from app.models.plan_common import Counts, PlanItem, SatGoal
 from app.models.weekly_plan import WeeklyPlan
 from app.deps import require_admin
 from app.routers.weekly_plans import get_team_week, put_team_week
@@ -135,14 +135,17 @@ async def test_team_save_archives_removed_and_keeps_hidden_fields(db, admin, ana
     assert p.recapNotes == "r" and p.goal.interviewsCaller == 4
 
 
-async def test_team_save_keeps_split_when_total_unchanged(db, admin, ana):
+async def test_team_save_keeps_split_while_it_fits_the_total(db, admin, ana):
     await plan(ana, WEEK, goal=Counts(bidsSelf=600, bidsSelfUs=400, bidsSelfLatam=200))
     await put(admin, row(ana, goal={"bidsSelf": 600, "bidsBidder": 1, "interviewsSelf": 2}))
     g = (await stored(ana))[0].goal
     assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfLatam, g.bidsBidder, g.interviewsSelf) == (600, 400, 200, 1, 2)
-    await put(admin, row(ana, goal={"bidsSelf": 650, "bidsBidder": 0, "interviewsSelf": 0}))
+    await put(admin, row(ana, goal={"bidsSelf": 650, "bidsBidder": 0, "interviewsSelf": 0}))  # still fits
     g = (await stored(ana))[0].goal
-    assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfEu, g.bidsSelfLatam) == (650, 0, 0, 0)
+    assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfEu, g.bidsSelfLatam) == (650, 400, 0, 200)
+    await put(admin, row(ana, goal={"bidsSelf": 500, "bidsBidder": 0, "interviewsSelf": 0}))  # 600 > 500: cleared
+    g = (await stored(ana))[0].goal
+    assert (g.bidsSelf, g.bidsSelfUs, g.bidsSelfEu, g.bidsSelfLatam) == (500, 0, 0, 0)
 
 
 async def test_team_save_writes_the_switch(db, admin, ana, monkeypatch):
@@ -156,18 +159,25 @@ async def test_team_save_writes_the_switch(db, admin, ana, monkeypatch):
     assert calls == []
 
 
-async def test_team_save_row_failures_do_not_stop_the_rest(db, admin, ana):
+async def test_team_save_row_failures_do_not_stop_the_rest(db, admin, ana, bo):
     out = await put(
         admin,
         row(ana, plansOwnWeek=False) | {"userId": "6" * 24},
         row(admin),
-        row(ana, routines=[{"text": f"r{i}"} for i in range(21)]),
+        row(bo, routines=[{"text": f"r{i}"} for i in range(21)]),
         row(ana, goal={"bidsSelf": 5, "bidsBidder": 0, "interviewsSelf": 0}),
     )
     r = out["results"]
     assert [x["ok"] for x in r] == [False, False, False, True]
     assert r[0]["error"] == "User not found" and r[1]["error"] == "Admins have no plan"
     assert r[2]["error"] == "at most 20 checklist items"
+    assert (await stored(ana))[0].goal.bidsSelf == 5
+
+
+async def test_team_save_refuses_a_repeated_row(db, admin, ana):
+    out = await put(admin, row(ana, goal={"bidsSelf": 5, "bidsBidder": 0, "interviewsSelf": 0}),
+                    row(ana, goal={"bidsSelf": 9, "bidsBidder": 0, "interviewsSelf": 0}))
+    assert [(x["ok"], x["error"]) for x in out["results"]] == [(True, None), (False, "Repeated row for this person")]
     assert (await stored(ana))[0].goal.bidsSelf == 5
 
 
@@ -294,3 +304,33 @@ async def test_team_save_kind_change_to_and_from_choice_is_remove_plus_add(db, a
 async def test_team_save_rejects_bad_options(db, admin, ana):
     out = await put(admin, row(ana, routines=[{"text": "s", "kind": "choice", "options": ["only"]}]))
     assert out["results"][0]["ok"] is False and await stored(ana) == []
+
+
+async def test_team_sat_goal_set_keep_clear_and_read(db, admin, ana):
+    goal = {"bidsSelf": 1000, "bidsBidder": 50, "interviewsSelf": 0}
+    out = await put(admin, row(ana, goal=goal, satGoal={"bidsSelf": 100}))
+    assert out["results"][0]["ok"] is True
+    assert (await get_team_week(WEEK, admin))["users"][0]["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
+    await put(admin, row(ana, goal=goal))  # absent (older client): kept
+    assert (await stored(ana))[0].satGoal == SatGoal(bidsSelf=100)
+    await put(admin, row(ana, goal=goal, satGoal=None))  # null: cleared
+    assert (await stored(ana))[0].satGoal is None
+
+
+async def test_team_sat_goal_over_week_total_is_refused(db, admin, ana):
+    out = await put(admin, row(ana, goal={"bidsSelf": 10, "bidsBidder": 5, "interviewsSelf": 0},
+                               satGoal={"bidsSelf": 10, "bidsBidder": 6}))
+    assert out["results"][0] == {"userId": str(ana.id), "ok": False, "error": "Saturday bids can't be more than the week's"}
+    assert await stored(ana) == []
+
+
+async def test_team_save_round_trips_days_and_weekly_goals_have_none(db, admin, ana):
+    await put(admin, row(ana, routines=[{"text": "Sat", "days": [5]}], weeklyGoals=[{"text": "G", "days": [1]}]))
+    (p,) = await stored(ana)
+    r = p.routines[0]
+    assert r.days == [5] and p.weeklyGoals[0].days is None
+    out = (await get_team_week(WEEK, admin))["users"][0]
+    assert out["routines"][0]["days"] == [5] and out["weeklyGoals"][0]["days"] is None
+    await put(admin, row(ana, routines=[{"id": r.id, "text": "Sat", "days": [0, 1, 2, 3, 4]}]))
+    (p,) = await stored(ana)
+    assert [(x.id, x.days, x.archived) for x in p.routines] == [(r.id, [0, 1, 2, 3, 4], False)]  # not a kind change

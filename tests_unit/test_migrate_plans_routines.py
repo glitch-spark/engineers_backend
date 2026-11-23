@@ -102,13 +102,13 @@ async def test_existing_day_numbers_unchanged():
     await migrate(True, db)
     plan = DailyPlan.model_validate(await db["dailyplans"].find_one({}))
     weekly = WeeklyPlan.model_validate(await db["weeklyplans"].find_one({}))
-    assert day_targets(plan, weekly, TUE.date()).bidsSelf == 12  # the day's stored goal, not 50 / 5
+    assert day_targets(plan, weekly, TUE.date()).bidsSelf == 12  # the day's stored goal, not 50 / 6
     # a day without bids keeps the derived numbers
     await db["dailyplans"].insert_one(_day(date=datetime(2026, 11, 11), goalItems=[]))
     await migrate(True, db)
     plain = DailyPlan.model_validate(await db["dailyplans"].find_one({"date": datetime(2026, 11, 11)}))
     assert plain.targetOverride is None
-    assert day_targets(plain, weekly, datetime(2026, 11, 11).date()).bidsSelf == 10
+    assert day_targets(plain, weekly, datetime(2026, 11, 11).date()).bidsSelf == 9  # ceil(50 / 6)
 
 
 async def test_idempotent_and_dry_run_writes_nothing():

@@ -1,12 +1,12 @@
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 
 from beanie import PydanticObjectId
 from pydantic import Field, model_validator
 from pymongo import IndexModel
 
 from app.models.base import TimestampedDocument
-from app.models.plan_common import ChecklistItems, Counts, PlanItem, monday_of
+from app.models.plan_common import ChecklistItems, Counts, PlanItem, SatGoal, monday_of
 
 _LEGACY_KEYS = ("metrics", "nextInterviewTarget", "status", "content", "result")
 
@@ -58,6 +58,7 @@ class WeeklyPlan(TimestampedDocument):
     startDate: datetime
     endDate: datetime
     goal: Counts = Field(default_factory=Counts)
+    satGoal: Optional[SatGoal] = None  # Saturday's share of the bid goal (None = even split)
     goalItems: ChecklistItems = []  # deprecated: replaced by weeklyGoals (removed after the migration)
     # The goal for every working day of the week (bids + goal lines), set
     # once with the week; a day keeps its own copy once followed up.

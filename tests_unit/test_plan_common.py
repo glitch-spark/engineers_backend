@@ -148,3 +148,14 @@ def test_text_and_choice_results():
     assert not result_is_done("text", None, None)
     assert result_is_done("choice", ItemResult(choice="Done"), None)
     assert not result_is_done("choice", ItemResult(text="note only"), None)
+
+
+def test_plan_item_days_normalised():
+    assert PlanItem(text="R").days is None
+    assert PlanItem(text="R", days=[4, 0, 4]).days == [0, 4]
+    assert PlanItem(text="R", days=[5, 4, 3, 2, 1, 0]).days is None  # every working day
+    with pytest.raises(ValidationError, match="Pick at least one day"):
+        PlanItem(text="R", days=[])
+    for bad in ([6], [-1, 2]):
+        with pytest.raises(ValidationError):
+            PlanItem(text="R", days=bad)

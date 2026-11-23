@@ -18,8 +18,10 @@ from app.alerts import app_week_key
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
 from app.models import DailyPlan, WeeklyPlan
-from app.models.plan_common import BID_FIELDS, Counts, DoneCounts, bids_of, result_is_done
+from app.models.plan_common import BID_FIELDS, SELF_REGIONS, Counts, DoneCounts, bids_of, result_is_done
 
+
+WORKDAYS = 6  # a plan's working week is Mon-Sat; Sunday has no targets or routines
 
 def empty_day() -> dict:
     return {"self": 0, "caller": 0, "stages": {"self": {}, "caller": {}}, "rounds": {"self": {}, "caller": {}}}
@@ -79,17 +81,39 @@ def effective_daily_done(plan: Optional[Any], auto_day: dict) -> DoneCounts:
     )
 
 
+def _split(total: int, sat: Optional[int], day: date) -> int:
+    """`day`'s share of a Mon-Sat total: even (`sat` None), else Saturday gets `sat` and Mon-Fri split the rest."""
+    if sat is None:
+        return ceil(total / WORKDAYS)
+    sat = min(sat, total)
+    return sat if day.weekday() == WORKDAYS - 1 else ceil((total - sat) / (WORKDAYS - 1))
+
+
+def _sat_shares(weekly: Any) -> dict[str, Optional[int]]:
+    """Saturday's share per bid field (None = even split); regions follow self's Saturday share proportionally.
+    Bidder bids are Mon-Fri only: Saturday always 0, whatever `satGoal` says."""
+    sat = getattr(weekly, "satGoal", None)
+    s_self = sat.bidsSelf if sat is not None else None
+    goal = weekly.goal
+    out: dict[str, Optional[int]] = {"bidsSelf": s_self, "bidsBidder": 0}
+    for r in SELF_REGIONS:
+        out[r] = None if s_self is None else (round(getattr(goal, r) * s_self / goal.bidsSelf) if goal.bidsSelf else 0)
+    return out
+
+
 def day_targets(plan: Optional[Any], weekly: Optional[Any], day: date) -> Counts:
-    """A day's bid target: the day's own override, else the week's goal split over Mon-Fri (interviews 0)."""
+    """A day's bid target: the day's own override, else the week's goal split over Mon-Sat (Saturday's share per
+    `satGoal`, else even; bidder bids Mon-Fri only; interviews 0)."""
     if plan is not None and plan.targetOverride is not None:
         return plan.targetOverride
-    if weekly is None or day.weekday() >= 5:
+    if weekly is None or day.weekday() >= WORKDAYS:
         return Counts()
-    return Counts(**{f: ceil(getattr(weekly.goal, f) / 5) for f in BID_FIELDS})
+    sat = _sat_shares(weekly)
+    return Counts(**{f: _split(getattr(weekly.goal, f), sat[f], day) for f in BID_FIELDS})
 
 
 def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dict]:
-    """{item, scope, result} lines for a day: live routines (Mon-Fri) and weekly goals, plus archived
+    """{item, scope, result} lines for a day: live routines (Mon-Sat, on their `days`) and weekly goals, plus archived
     ones the day has a result for. A routine's frozen result target replaces the item's."""
     if weekly is None:
         return []
@@ -100,8 +124,9 @@ def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dic
             result = results.get(item.id)
             if item.archived and result is None:
                 continue
-            if scope == "routine" and day.weekday() >= 5 and result is None:
-                continue
+            if scope == "routine" and result is None and (
+                    day.weekday() >= WORKDAYS or (item.days is not None and day.weekday() not in item.days)):
+                continue  # Sunday / a day the routine doesn't run on, unless it already has a result
             if scope == "routine" and result is not None and result.target is not None:
                 item = item.model_copy(update={"target": result.target})
             out.append({"item": item, "scope": scope, "result": result})
@@ -205,7 +230,8 @@ def _draft(prev: WeeklyPlan, monday: date) -> WeeklyPlan:
     return WeeklyPlan(
         userId=prev.userId, weekStart=start, startDate=start,
         endDate=start + timedelta(days=7) - timedelta(milliseconds=1), weekNumber=week_number, year=year,
-        goal=prev.goal.model_copy(), routines=[r.model_copy() for r in prev.routines if not r.archived],
+        goal=prev.goal.model_copy(), satGoal=prev.satGoal.model_copy() if prev.satGoal else None,
+        routines=[r.model_copy() for r in prev.routines if not r.archived],
         weeklyGoals=[g.model_copy() for g in prev.weeklyGoals if not g.archived and g.kind in ("count", "hours")],
     )
 

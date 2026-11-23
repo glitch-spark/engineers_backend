@@ -173,14 +173,14 @@ async def test_team_today_lists_active_non_admin_members(boss, me):
 
 async def test_team_today_bids_and_todos_are_the_days(boss, me):
     review, calls = PlanItem(text="Review"), PlanItem(text="Calls", kind="count", target=5)
-    await week_plan(me, goal=Counts(bidsSelf=400, bidsBidder=100), routines=[review, calls],
+    await week_plan(me, goal=Counts(bidsSelf=480, bidsBidder=120), routines=[review, calls],
                     weeklyGoals=[PlanItem(text="Portfolio")])
     await day_plan(me, WED, done=DoneCounts(bidsSelf=60, bidsBidder=20),
                    results={review.id: ItemResult(done=True), calls.id: ItemResult(value=2)})
     await day_plan(me, TUE, done=DoneCounts(bidsSelf=100, bidsBidder=5), targetOverride=Counts(bidsSelf=90),
                    results={review.id: ItemResult(done=True), calls.id: ItemResult(value=5)})
     today, yesterday = await one(boss, me), await one(boss, me, TUE)
-    assert (today["bids"], today["todos"], today["state"]) == ({"done": 80, "target": 100}, {"done": 1, "total": 2},
+    assert (today["bids"], today["todos"], today["state"]) == ({"done": 80, "target": 104}, {"done": 1, "total": 2},
                                                                "amber")
     assert (yesterday["bids"], yesterday["todos"], yesterday["state"]) == (
         {"done": 105, "target": 90}, {"done": 2, "total": 2}, "green")
@@ -189,7 +189,7 @@ async def test_team_today_bids_and_todos_are_the_days(boss, me):
 async def test_team_today_uses_last_weeks_plan_until_this_week_is_saved(boss, me):
     await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), weekNumber=46, year=2026,
                      startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
-                     goal=Counts(bidsSelf=50), routines=[PlanItem(text="Review")]).insert()
+                     goal=Counts(bidsSelf=60), routines=[PlanItem(text="Review")]).insert()
     row = await one(boss, me)
     assert (row["bids"], row["todos"]) == ({"done": 0, "target": 10}, {"done": 0, "total": 1})
     assert row["bids"] == (lambda d: {"done": d["done"]["bidsSelf"] + d["done"]["bidsBidder"],
@@ -227,14 +227,14 @@ async def test_a_bidder_flag_is_pending_but_not_red(boss, me):
 
 @pytest.mark.parametrize("hh,mm,state", [(11, 59, "green"), (12, 0, "amber"), (17, 0, "amber")])
 async def test_bids_under_target_are_amber_from_midday(boss, me, monkeypatch, hh, mm, state):
-    await week_plan(me, goal=Counts(bidsSelf=500))
+    await week_plan(me, goal=Counts(bidsSelf=600))
     await day_plan(me, WED, done=DoneCounts(bidsSelf=99))
     clock(monkeypatch, at(WED, hh, mm))
     assert (await one(boss, me))["state"] == state
 
 
 async def test_yesterdays_bids_under_target_are_amber_whatever_the_time(boss, me, monkeypatch):
-    await week_plan(me, goal=Counts(bidsSelf=500))
+    await week_plan(me, goal=Counts(bidsSelf=600))
     await day_plan(me, TUE, done=DoneCounts(bidsSelf=99))
     clock(monkeypatch, at(WED, 8))
     assert (await one(boss, me, TUE))["state"] == "amber"
@@ -249,7 +249,7 @@ async def test_a_routine_not_done_is_amber_also_before_midday(boss, me, monkeypa
 
 async def test_all_done_is_green(boss, me):
     review = PlanItem(text="Review")
-    await week_plan(me, goal=Counts(bidsSelf=500), routines=[review])
+    await week_plan(me, goal=Counts(bidsSelf=600), routines=[review])
     await day_plan(me, WED, done=DoneCounts(bidsSelf=100), results={review.id: ItemResult(done=True)})
     row = await one(boss, me)
     assert row == {"userId": str(me.id), "name": "Ana", "bids": {"done": 100, "target": 100},
@@ -296,7 +296,7 @@ async def test_team_flags_are_cached_for_a_minute_and_interviews_are_not(boss, m
 async def test_bids_by_region_and_totals(me, monkeypatch):
     us, eu, latam = await profile(me, "Usa"), await profile(me, "Eur", "EU"), await profile(me, "Lat", "Latam",
                                                                                            archived=True)
-    await week_plan(me, goal=Counts(bidsSelf=150, bidsSelfUs=100, bidsSelfEu=50, bidsBidder=50))
+    await week_plan(me, goal=Counts(bidsSelf=180, bidsSelfUs=120, bidsSelfEu=60, bidsBidder=60))
     await day_plan(me, TUE, done=DoneCounts(bidsSelf=25, bidsSelfUs=15, bidsSelfEu=10, bidsBidder=3))
     on_us, on_eu, free = await bidder(me, "Uma", us), await bidder(me, "Eli", eu), await bidder(me, "Fay")
     await bids(on_us, TUE, 2)
@@ -309,12 +309,12 @@ async def test_bids_by_region_and_totals(me, monkeypatch):
         {"region": "EU", "self": 10, "selfTarget": 10, "bidder": 1, "total": 11},
     ]  # Latam: an archived profile, no target, no bid
     # before the release day (this file's default) the bidder total is the typed one
-    assert out["bidsTotals"] == {"self": 25, "selfTarget": 30, "bidder": 3, "bidderTarget": 10, "total": 28,
-                                 "target": 40}
+    assert out["bidsTotals"] == {"self": 25, "selfTarget": 30, "bidder": 3, "bidderTarget": 12, "total": 28,
+                                 "target": 42}
     # from the release day it is the live count the regions are cut from (2 + 1 + 4 on no profile), not the saved 3
     monkeypatch.setattr(plan_bidder, "RELEASE_DAY", MON)
     assert (await get_day(TUE.isoformat(), me, None))["bidsTotals"] == {
-        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 10, "total": 32, "target": 40}
+        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 12, "total": 32, "target": 42}
     assert latam.region == "Latam"
 
 
@@ -580,7 +580,7 @@ async def last_week_plan(owner, **kw) -> None:
 
 
 async def test_week_of_last_week_reports_that_week_judged_against_today(me):
-    await last_week_plan(me, goal=Counts(bidsSelf=500), routines=[PlanItem(id="r1", text="Review")])
+    await last_week_plan(me, goal=Counts(bidsSelf=600), routines=[PlanItem(id="r1", text="Review")])
     await day_plan(me, LAST_MON, done=DoneCounts(bidsSelf=100), results={"r1": ItemResult(done=True)})
     await day_plan(me, LAST_MON + timedelta(days=1), done=DoneCounts(bidsBidder=40))
     await day_plan(me, MON, done=DoneCounts(bidsSelf=7))
@@ -591,27 +591,27 @@ async def test_week_of_last_week_reports_that_week_judged_against_today(me):
     assert out["bids"]["byDay"] == [
         {"date": "2026-11-09", "done": 100, "self": 100, "bidder": 0, "target": 100}, {"date": "2026-11-10", "done": 40, "self": 0, "bidder": 40, "target": 100},
         {"date": "2026-11-11", "done": 0, "self": 0, "bidder": 0, "target": 100}, {"date": "2026-11-12", "done": 0, "self": 0, "bidder": 0, "target": 100},
-        {"date": "2026-11-13", "done": 0, "self": 0, "bidder": 0, "target": 100}]
-    assert (out["bids"]["total"], out["bids"]["target"]) == (140, 500)
+        {"date": "2026-11-13", "done": 0, "self": 0, "bidder": 0, "target": 100}, {"date": "2026-11-14", "done": 0, "self": 0, "bidder": 0, "target": 100}]
+    assert (out["bids"]["total"], out["bids"]["target"]) == (140, 600)
     [row] = out["routines"]["rows"]
-    assert [d["state"] for d in row["days"]] == ["done", "missed", "missed", "missed", "missed"]
-    assert (row["doneDays"], row["totalDays"], out["routines"]["done"], out["routines"]["expected"]) == (1, 5, 1, 5)
+    assert [d["state"] for d in row["days"]] == ["done", "missed", "missed", "missed", "missed", "missed"]
+    assert (row["doneDays"], row["totalDays"], out["routines"]["done"], out["routines"]["expected"]) == (1, 6, 1, 6)
     assert out["interviews"]["outcomes"] == {
         "held": 1, "passed": 1, "rejected": 0, "noAnswer": 0, "waiting": 0, "canceled": 0, "scheduled": 0}
     assert out["interviews"]["byDay"][1] == {"date": "2026-11-10", "held": 1, "canceled": 0, "scheduled": 0}
     assert out["interviews"]["done"] == 1
     # the pace of a week that is over: everything expected, no day left to catch up
-    assert out["bids"]["pace"] == {"expected": 500, "behindBy": 360, "perDayNeeded": None, "onTrack": False}
+    assert out["bids"]["pace"] == {"expected": 600, "behindBy": 460, "perDayNeeded": None, "onTrack": False}
     assert out["interviews"]["pace"] is None  # no interviews target
 
 
 async def test_without_week_of_it_is_the_week_of_today(me):
-    await week_plan(me, goal=Counts(bidsSelf=500), routines=[PlanItem(id="r1", text="Review")])
+    await week_plan(me, goal=Counts(bidsSelf=600), routines=[PlanItem(id="r1", text="Review")])
     await day_plan(me, MON, done=DoneCounts(bidsSelf=100))
     out = await dashboard_week(me, None, TODAY)
     assert out["week"] == {"start": "2026-11-16", "end": "2026-11-21"}
-    assert [d["state"] for d in out["routines"]["rows"][0]["days"]] == ["missed", "missed", "today", "future", "future"]
-    assert out["bids"]["pace"] == {"expected": 300, "behindBy": 200, "perDayNeeded": 200, "onTrack": False}
+    assert [d["state"] for d in out["routines"]["rows"][0]["days"]] == ["missed", "missed", "today", "future", "future", "future"]
+    assert out["bids"]["pace"] == {"expected": 300, "behindBy": 200, "perDayNeeded": 167, "onTrack": False}
     for same_week in (TODAY, "2026-11-16", "2026-11-22"):  # any date of the week, its Sunday too
         assert await dashboard_week(me, None, TODAY, same_week) == out
 
@@ -624,23 +624,23 @@ async def test_a_later_week_or_a_malformed_week_of_is_422(me, week_of):
 
 
 async def test_bids_week_sums_the_working_days_and_their_targets(me):
-    await week_plan(me, goal=Counts(bidsSelf=500, bidsBidder=100))
+    await week_plan(me, goal=Counts(bidsSelf=600, bidsBidder=120))
     await day_plan(me, MON, done=DoneCounts(bidsSelf=100, bidsBidder=20))
     await day_plan(me, TUE, done=DoneCounts(bidsBidder=80), targetOverride=Counts(bidsSelf=300))
-    await day_plan(me, date(2026, 11, 21), done=DoneCounts(bidsSelf=7))  # Saturday: no working day
+    await day_plan(me, date(2026, 11, 22), done=DoneCounts(bidsSelf=7))  # Sunday: no working day
     bids_out = (await dashboard_week(me, None, TODAY))["bids"]
-    assert bids_out["week"] == {"self": 100, "selfTarget": 700, "bidder": 100, "bidderTarget": 80, "total": 200,
-                                "target": 780}
+    assert bids_out["week"] == {"self": 100, "selfTarget": 800, "bidder": 100, "bidderTarget": 96, "total": 200,
+                                "target": 896}
     assert bids_out["week"]["total"] == sum(d["done"] for d in bids_out["byDay"])
     assert bids_out["week"]["target"] == sum(d["target"] for d in bids_out["byDay"])
-    assert bids_out["total"] == 207  # the existing total keeps the weekend's bids
+    assert bids_out["total"] == 207  # the existing total keeps Sunday's bids
 
 
 async def test_bids_week_targets_are_null_when_no_day_has_one(me):
-    await week_plan(me, goal=Counts(bidsSelf=500))
+    await week_plan(me, goal=Counts(bidsSelf=600))
     await day_plan(me, MON, done=DoneCounts(bidsSelf=5, bidsBidder=3))
     assert (await dashboard_week(me, None, TODAY))["bids"]["week"] == {
-        "self": 5, "selfTarget": 500, "bidder": 3, "bidderTarget": None, "total": 8, "target": 500}
+        "self": 5, "selfTarget": 600, "bidder": 3, "bidderTarget": None, "total": 8, "target": 600}
     assert (await dashboard_week(me, None, TODAY, LAST_MON.isoformat()))["bids"]["week"] == {
         "self": 0, "selfTarget": None, "bidder": 0, "bidderTarget": None, "total": 0, "target": None}
 
@@ -654,7 +654,7 @@ async def test_interviews_by_day_follows_the_outcomes_rule(me):
     await interview(me, "Canceled", rnd(status="canceled", start=at(TUE)))
     await interview(me, "Tonight", rnd(start=at(WED, 20)))
     await interview(me, "Went on", rnd(status="completed", start=at(TUE, 9)), rnd("tech_round_1", start=at(WED + timedelta(days=1))))
-    await interview(me, "Weekend", rnd(start=at(date(2026, 11, 21))))
+    await interview(me, "Sunday", rnd(start=at(date(2026, 11, 22))))
     await interview(me, "Last week", rnd(status="passed", start=at(LAST_MON)))
     await interview(ben, "Bens", rnd(status="passed", start=at(MON)))
     out = (await dashboard_week(me, None, TODAY))["interviews"]
@@ -664,11 +664,12 @@ async def test_interviews_by_day_follows_the_outcomes_rule(me):
         {"date": "2026-11-18", "held": 0, "canceled": 0, "scheduled": 1},
         {"date": "2026-11-19", "held": 0, "canceled": 0, "scheduled": 1},
         {"date": "2026-11-20", "held": 0, "canceled": 0, "scheduled": 0},
+        {"date": "2026-11-21", "held": 0, "canceled": 0, "scheduled": 0},
     ]
     assert out["outcomes"] == {"held": 4, "passed": 2, "rejected": 1, "noAnswer": 0, "waiting": 1, "canceled": 1,
                                "scheduled": 4}
-    for key, weekend in (("held", 0), ("canceled", 0), ("scheduled", 1)):  # a weekend round is in outcomes only
-        assert sum(d[key] for d in out["byDay"]) + weekend == out["outcomes"][key]
+    for key, sunday in (("held", 0), ("canceled", 0), ("scheduled", 1)):  # a Sunday round is in outcomes only
+        assert sum(d[key] for d in out["byDay"]) + sunday == out["outcomes"][key]
     # the week's rounds, one per working-day round in time order, for the Home week table
     assert [(r["date"], r["companyName"], r["stage"], r["status"]) for r in out["rounds"]] == [
         ("2026-11-16", "Unmarked", "intro", "scheduled"), ("2026-11-16", "Passed", "intro", "passed"),
