@@ -67,7 +67,7 @@ async def planned(db):
 
 def week_body(**kw):
     body = {
-        "goal": {"bidsSelf": 100, "bidsBidder": 50, "interviewsSelf": 5},
+        "goal": {"bidsSelf": 120, "bidsBidder": 60, "interviewsSelf": 5},  # 20 / 10 a day over Mon-Sat
         "routines": [{"text": "Bidder review"}, {"text": "Citizen contact", "kind": "count", "target": 50}],
         "weeklyGoals": [{"text": "Email outreach", "kind": "count", "target": 250}],
         "recapNotes": "",
@@ -111,7 +111,7 @@ async def test_get_week_without_plan_returns_draft(me):
     review, contact, goal = await saved_week(me)
     nxt = await get_week("2026-11-16", me, None)
     assert nxt["draft"] is True and nxt["exists"] is False
-    assert nxt["goal"]["bidsSelf"] == 100
+    assert nxt["goal"]["bidsSelf"] == 120
     assert [r["id"] for r in nxt["routines"]] == [review, contact] and [g["id"] for g in nxt["weeklyGoals"]] == [goal]
     assert nxt["days"][0]["goal"]["bidsSelf"] == 20  # targets derived from the draft
     assert await WeeklyPlan.find({"userId": me.id}).count() == 1  # nothing saved
@@ -154,7 +154,7 @@ async def test_week_target_edit_keeps_submitted_days(me):
     review, contact, goal = await saved_week(me)
     await put_day(TUE.isoformat(), me, {"results": {contact: {"value": 30}}})
     await put_week(WEEK, me, week_body(
-        goal={"bidsSelf": 200, "bidsBidder": 50},
+        goal={"bidsSelf": 240, "bidsBidder": 60},
         routines=[{"id": review, "text": "Bidder review"},
                   {"id": contact, "text": "Citizen contact", "kind": "count", "target": 60}],
         weeklyGoals=[{"id": goal, "text": "Email outreach", "kind": "count", "target": 250}]))
@@ -231,7 +231,7 @@ async def test_reports_items_counts(me):
     await put_day(WED.isoformat(), me, {"results": {review: {"done": True}}})
     row = (await team_report(me, weekStart=WEEK))["users"][0]
     assert (row["itemsDone"], row["itemsTotal"]) == (3, 4)  # a touched weekly goal counts as done
-    assert row["goal"]["bidsSelf"] == 100  # the week's goal, as before
+    assert row["goal"]["bidsSelf"] == 120  # the week's goal, as before
     days = {d["date"]: d for d in (await get_week(WEEK, me, None))["days"]}
     assert (days[TUE.isoformat()]["itemsDone"], days[TUE.isoformat()]["itemsTotal"]) == (2, 3)
     assert days[TUE.isoformat()]["goal"]["bidsSelf"] == 20
@@ -251,7 +251,7 @@ async def test_real_sync_slack_builds_the_standup(db, me, monkeypatch):
                            submittedAt=datetime(2026, 11, 12, 20)).insert()
     await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), startDate=datetime(2026, 11, 9),
                      endDate=datetime(2026, 11, 15), weekNumber=46, year=2026,
-                     goal=Counts(bidsSelf=100, interviewsSelf=3, interviewsCaller=2)).insert()
+                     goal=Counts(bidsSelf=120, interviewsSelf=3, interviewsCaller=2)).insert()
     monkeypatch.setattr(daily_plans, "_sync_slack", REAL_SYNC_SLACK)  # the fixture faked it
     monkeypatch.setattr(daily_plans, "sync_daily_plan_message", fake_post)
     await daily_plans._sync_slack(plan, me, Counts(), {})

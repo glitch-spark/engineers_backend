@@ -45,7 +45,7 @@ async def me(db):
         year=2026,
         startDate=datetime(2026, 11, 16),
         endDate=datetime(2026, 11, 22),
-        goal=Counts(bidsSelf=500, bidsBidder=500, interviewsSelf=10),
+        goal=Counts(bidsSelf=600, bidsBidder=600, interviewsSelf=10),  # 200 bids a day over Mon-Sat
         routines=[PlanItem(id="r1", text="Review"), PlanItem(id="r2", text="Contacts", kind="count", target=50)],
         weeklyGoals=[PlanItem(id="g1", text="Outreach", kind="count", target=250)],
     ).insert()
@@ -75,17 +75,17 @@ async def test_bid_pace_uses_day_targets_and_overrides(me):
     await day(me, 17, targetOverride=Counts(bidsSelf=300, bidsBidder=0))
     out = await dashboard_week(me, None, TODAY)
     assert out["bids"]["pace"]["expected"] == 200 + 300 + 200
-    assert out["bids"]["pace"]["perDayNeeded"] == ceil((1000 - out["bids"]["total"]) / 2)
+    assert out["bids"]["pace"]["perDayNeeded"] == ceil((1200 - out["bids"]["total"]) / 3)  # Thu, Fri, Sat left
 
 
-async def test_interview_pace_is_target_times_workdays_over_five(me):
+async def test_interview_pace_is_target_times_elapsed_workdays_over_six(me):
     out = await dashboard_week(me, None, TODAY)
-    assert out["interviews"]["pace"]["expected"] == 6  # ceil(10 * 3 / 5)
+    assert out["interviews"]["pace"]["expected"] == 5  # ceil(10 * 3 / 6)
 
 
-async def test_weekend_expected_is_full_week(me):
+async def test_saturday_expected_is_full_week(me):
     out = await dashboard_week(me, None, "2026-11-21")  # Saturday
-    assert out["bids"]["pace"]["expected"] == 1000 and out["bids"]["pace"]["perDayNeeded"] is None
+    assert out["bids"]["pace"]["expected"] == 1200 and out["bids"]["pace"]["perDayNeeded"] is None
 
 
 async def test_routines_and_weekly_goals(me):

@@ -521,7 +521,7 @@ def daily_plan_text(
 
     routines = _with_entries([e for e in items or [] if e["scope"] == "routine"], progress, profile_names)
     if routines:
-        sections.append(["Routines", *routines])
+        sections.append(["Daily to-dos", *routines])
     touched = set(plan.focus or [])
     goals = _with_entries([
         e for e in items or []
@@ -529,7 +529,7 @@ def daily_plan_text(
         and (e["item"].id in touched or (e["result"] and (e["result"].done or e["result"].value)))
     ], progress, profile_names)
     if goals:
-        sections.append(["Weekly goals (week so far)", *goals])
+        sections.append(["Weekly to-dos (week so far)", *goals])
 
     notes = [line.rstrip() for line in _plan_block_text(plan.notes).splitlines()]
     if notes:

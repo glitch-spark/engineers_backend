@@ -147,7 +147,7 @@ def test_weekly_done_empty_week():
     assert weekly_done([], {"self": 0, "caller": 0}) == Counts()
 
 
-MON, SAT = date(2026, 10, 5), date(2026, 10, 10)
+MON, SAT, SUN = date(2026, 10, 5), date(2026, 10, 10), date(2026, 10, 11)
 
 
 def _week(monday=MON, uid=None, **kw):
@@ -160,11 +160,12 @@ def _day_plan(day=MON, **kw):
     return DailyPlan(userId=PydanticObjectId(), date=datetime(day.year, day.month, day.day), year=2026, weekNumber=41, **kw)
 
 
-def test_targets_ceil_divide_mon_to_fri():
+def test_targets_ceil_divide_mon_to_sat():
     w = _week(goal=Counts(bidsSelf=601, interviewsSelf=9))
-    assert day_targets(None, w, MON).bidsSelf == 121
+    assert day_targets(None, w, MON).bidsSelf == 101
     assert day_targets(None, w, MON).interviewsSelf == 0
-    assert day_targets(None, w, SAT).bidsSelf == 0
+    assert day_targets(None, w, SAT).bidsSelf == 101
+    assert day_targets(None, w, SUN).bidsSelf == 0
 
 
 def test_override_wins():
@@ -186,9 +187,10 @@ def test_archived_routine_kept_where_it_has_a_result():
     assert day_items(w, p, MON)[0]["result"].done
 
 
-def test_routines_skip_weekend_goals_do_not():
+def test_routines_skip_sunday_goals_do_not():
     w = _week(routines=[PlanItem(id="r", text="R")], weeklyGoals=[PlanItem(id="g", text="G")])
-    assert [(i["item"].id, i["scope"]) for i in day_items(w, None, SAT)] == [("g", "goal")]
+    assert [(i["item"].id, i["scope"]) for i in day_items(w, None, SAT)] == [("r", "routine"), ("g", "goal")]
+    assert [(i["item"].id, i["scope"]) for i in day_items(w, None, SUN)] == [("g", "goal")]
 
 
 def test_frozen_result_target_wins_over_item():

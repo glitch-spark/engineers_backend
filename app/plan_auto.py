@@ -21,6 +21,8 @@ from app.models import DailyPlan, WeeklyPlan
 from app.models.plan_common import BID_FIELDS, Counts, DoneCounts, bids_of, result_is_done
 
 
+WORKDAYS = 6  # a plan's working week is Mon-Sat; Sunday has no targets or routines
+
 def empty_day() -> dict:
     return {"self": 0, "caller": 0, "stages": {"self": {}, "caller": {}}, "rounds": {"self": {}, "caller": {}}}
 
@@ -80,16 +82,16 @@ def effective_daily_done(plan: Optional[Any], auto_day: dict) -> DoneCounts:
 
 
 def day_targets(plan: Optional[Any], weekly: Optional[Any], day: date) -> Counts:
-    """A day's bid target: the day's own override, else the week's goal split over Mon-Fri (interviews 0)."""
+    """A day's bid target: the day's own override, else the week's goal split over Mon-Sat (interviews 0)."""
     if plan is not None and plan.targetOverride is not None:
         return plan.targetOverride
-    if weekly is None or day.weekday() >= 5:
+    if weekly is None or day.weekday() >= WORKDAYS:
         return Counts()
-    return Counts(**{f: ceil(getattr(weekly.goal, f) / 5) for f in BID_FIELDS})
+    return Counts(**{f: ceil(getattr(weekly.goal, f) / WORKDAYS) for f in BID_FIELDS})
 
 
 def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dict]:
-    """{item, scope, result} lines for a day: live routines (Mon-Fri) and weekly goals, plus archived
+    """{item, scope, result} lines for a day: live routines (Mon-Sat) and weekly goals, plus archived
     ones the day has a result for. A routine's frozen result target replaces the item's."""
     if weekly is None:
         return []
@@ -100,7 +102,7 @@ def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dic
             result = results.get(item.id)
             if item.archived and result is None:
                 continue
-            if scope == "routine" and day.weekday() >= 5 and result is None:
+            if scope == "routine" and day.weekday() >= WORKDAYS and result is None:
                 continue
             if scope == "routine" and result is not None and result.target is not None:
                 item = item.model_copy(update={"target": result.target})

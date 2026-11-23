@@ -217,7 +217,7 @@ async def build_view(user: UserExtra, day: date) -> dict:
             continue  # tracked profiles count themselves; archived ones only while they hold a number
         label = f"{p['name']} ({p['region']}) — self bids" if p.get("region") else f"{p['name']} — self bids"
         body.append([_number_input(f"self:{p['id']}", label, typed.get(p["id"]) or None, decimal=False)])
-    for scope, heading in (("routine", "*Routines*"), ("goal", "*Weekly goals* (optional)")):
+    for scope, heading in (("routine", "*Daily to-dos*"), ("goal", "*Weekly to-dos* (optional)")):
         items = [e for e in d["items"] if e["scope"] == scope]
         if items:
             body.append([{"type": "section", "text": {"type": "mrkdwn", "text": heading}}])
