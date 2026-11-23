@@ -510,7 +510,7 @@ async def test_keep_unshown_keeps_text_and_choice(me):
     out = await _keep_unshown(me, TUE, DayIn())
     await process_standup_submission({"private_metadata": json.dumps({"day": "2026-11-10"}), "state": {"values": {}}}, SLACK_ID)
     plan = await stored(me, TUE)
-    assert out.results[t].text == "calm" or "text" not in out.results[t].model_fields_set
+    assert "text" not in out.results[t].model_fields_set and "choice" not in out.results[c].model_fields_set
     assert plan.results[t].text == "calm" and plan.results[c].choice == "A" and plan.results[c].text == "why"
 
 
@@ -525,3 +525,35 @@ async def test_choice_item_uses_two_blocks_in_the_room(me, monkeypatch):
         if bid and bid.startswith("item:"):
             assert "note:" + bid[5:] in ids
     assert any("more lines" in b["elements"][0]["text"] for b in view["blocks"] if b["type"] == "context")
+
+
+async def _stale_setup(me, extra=()):
+    (c,), _ = await week(me, routines=[{"text": "Pick", "kind": "choice", "options": ["A", "B"]}])
+    await put_day("2026-11-10", me, {"results": {c: {"choice": "A", "text": "n"}}})
+    ids, _ = await week(me, routines=[{"id": c, "text": "Pick", "kind": "choice", "options": ["B", "C"]}, *extra])
+    return c, ids[1:]
+
+
+async def test_stale_choice_is_kept_on_untouched_submit(me, db, slack):
+    c, _ = await _stale_setup(me)
+    view = await build_view(me, TUE)
+    assert json.loads(view["private_metadata"])["stale"] == [c]
+    assert by_id(view)[f"item:{c}"]["hint"]["text"] == "Current: A (no longer an option)"
+    sub = {**view, "state": {"values": {f"item:{c}": {"choice": _pick(None)},
+                                        f"note:{c}": {"note": {"value": "n"}}}}}
+    await process_standup_submission(sub, SLACK_ID)
+    assert (await stored(me, TUE)).results[c].choice == "A"
+    sub["state"]["values"][f"item:{c}"] = {"choice": _pick("C")}
+    await process_standup_submission(sub, SLACK_ID)
+    assert (await stored(me, TUE)).results[c].choice == "C"
+
+
+async def test_stale_list_survives_the_metadata_cap(me, db, slack):
+    c, (a, b, d) = await _stale_setup(me, [{"text": t, "kind": "log"} for t in "ABC"])
+    accounts = [await Account(name=f"Profile {i:02d} " + "x" * 50, createdBy=me.id, region="US").insert()
+                for i in range(20)]
+    entries = [{"profileId": str(x.id), "note": "n"} for x in accounts]
+    await put_day("2026-11-10", me, {"results": {i: {"entries": entries} for i in (a, b, d)} | {c: {}}})
+    view = await build_view(me, TUE)
+    meta = json.loads(view["private_metadata"])
+    assert len(view["private_metadata"]) <= 3000 and len(meta["logs"]) < 3 and meta["stale"] == [c]

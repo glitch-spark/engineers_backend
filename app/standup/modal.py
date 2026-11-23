@@ -111,6 +111,14 @@ def _links(view: dict, item_id: str) -> dict:
         return {}
 
 
+def _stale(view: dict) -> list:
+    """Ids of Choice items the form showed with a stored pick that is no longer an option."""
+    try:
+        return json.loads(view.get("private_metadata") or "")["stale"]
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return []
+
+
 def _answer_input(block_id: str, label: str, action: str, value: Optional[str]) -> dict:
     element = {"type": "plain_text_input", "action_id": action, "multiline": True, "max_length": MAX_ANSWER}
     if value:
@@ -126,8 +134,11 @@ def _item_blocks(e: dict, progress: dict, names: Optional[dict] = None) -> list[
         element = {"type": "static_select", "action_id": "choice", "placeholder": _plain("Pick one"), "options": options}
         if (picked := next((o for o in options if o["value"] == result.get("choice")), None)):
             element["initial_option"] = picked  # a stored pick no longer in the list has none: Slack would refuse it
-        return [{"type": "input", "block_id": f"item:{e['id']}", "optional": True, "label": _plain(e["text"][:2000]),
-                 "element": element},
+        block = {"type": "input", "block_id": f"item:{e['id']}", "optional": True, "label": _plain(e["text"][:2000]),
+                 "element": element}
+        if result.get("choice") and "initial_option" not in element:
+            block["hint"] = _plain(_short(f"Current: {result['choice']} (no longer an option)", 2000))
+        return [block,
                 _answer_input(f"note:{e['id']}", f"{e['text']} · note"[:2000], "note", result.get("text"))]
     return [_item_block(e, progress, names)]
 
@@ -229,7 +240,10 @@ async def build_view(user: UserExtra, day: date) -> dict:
     body = [b for g in body for b in g]
     shown = {b.get("block_id") for b in body}
     logs = {iid: m for iid, m in logs.items() if f"item:{iid}" in shown}
-    meta = {"day": day.isoformat(), "logs": logs}
+    # a shown Choice whose stored pick is no longer an option: an untouched submit must keep it (never dropped: tiny)
+    stale = [b["block_id"][5:] for b in body if b.get("block_id", "").startswith("item:")
+             and b["element"]["type"] == "static_select" and "hint" in b]
+    meta = {"day": day.isoformat(), "logs": logs, **({"stale": stale} if stale else {})}
     while logs and len(json.dumps(meta)) > MAX_METADATA:  # an item without a map reads its lines as free text
         del logs[max(logs, key=lambda i: len(json.dumps(logs[i])))]
     notes = {"type": "plain_text_input", "action_id": "notes", "multiline": True, "max_length": MAX_NOTES}
@@ -238,7 +252,8 @@ async def build_view(user: UserExtra, day: date) -> dict:
     return {
         "type": "modal",
         "callback_id": STANDUP_VIEW,
-        "private_metadata": json.dumps({"day": day.isoformat(), **({"logs": logs} if logs else {})}),
+        "private_metadata": json.dumps({"day": day.isoformat(), **({"logs": logs} if logs else {}),
+                                        **({"stale": stale} if stale else {})}),
         "title": _plain("Edit today's update" if d["submitted"] else "Daily standup"),
         "submit": _plain("Post update"),
         "close": _plain("Cancel"),
@@ -286,8 +301,10 @@ def read_submission(view: dict) -> DayIn:
     for block_id, acts in values.items():
         if block_id.startswith("item:") and "choice" in acts:  # the pick, plus the note block beside it
             note = (values.get(f"note:{block_id[5:]}") or {}).get("note")
+            picked = (acts["choice"].get("selected_option") or {}).get("value")
+            keep = not picked and block_id[5:] in _stale(view)  # untouched: choice left unsent, plan_save keeps it
             results[block_id[5:]] = ItemResultIn(
-                choice=((acts["choice"].get("selected_option") or {}).get("value")),
+                **({} if keep else {"choice": picked}),
                 **({"text": note.get("value") or ""} if note is not None else {}))
         elif block_id.startswith("item:") and "text" in acts:
             results[block_id[5:]] = ItemResultIn(text=acts["text"].get("value") or "")
