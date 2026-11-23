@@ -49,7 +49,7 @@ def _midnight(d: date) -> datetime:
 def _item_out(e: dict) -> dict:
     item, result = e["item"], e["result"]
     return {"id": item.id, "text": item.text, "kind": item.kind, "scope": e["scope"], "target": item.target,
-            "archived": item.archived, "result": result.model_dump() if result else None}
+            "options": item.options, "archived": item.archived, "addedBy": item.addedBy, "result": result.model_dump() if result else None}
 
 
 def _day_out(uid, day: date, plan: Optional[DailyPlan], auto_day: dict, weekly, week_days: list,
@@ -144,6 +144,7 @@ async def _sync_slack(plan: DailyPlan, owner: UserExtra, done: Counts, rounds: d
         items=day_items(weekly, plan, when), progress=goal_progress(weekly, days) if weekly else {},
         week_interviews=(sum(e["self"] + e["caller"] for e in held.values()), target),
         follow_ups=await follow_ups_summary(owner.id, when),
+        profile_names={p["id"]: p["name"] for p in await owner_profiles(owner.id)},
     )
     coll = DailyPlan.get_motor_collection()
     if claim is not None and not posted:  # the post failed: free the claim for the next save

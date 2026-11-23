@@ -25,7 +25,7 @@ from app.routers import daily_plans
 from app.routers.daily_plans import put_day
 from app.routers.weekly_plans import put_week
 from app.standup.modal import (
-    STANDUP_VIEW, build_view, process_standup_click, process_standup_submission, read_submission, submission_errors,
+    STANDUP_VIEW, _day, build_view, process_standup_click, process_standup_submission, read_submission, submission_errors,
 )
 
 pytestmark = [
@@ -88,7 +88,7 @@ def slack(monkeypatch):
 
 @pytest.fixture
 async def me(db):
-    return await UserExtra(name="Ana", email="ana@x.io", slackUserId=SLACK_ID).insert()
+    return await UserExtra(name="Ana", email="ana@x.io", plansOwnWeek=True, slackUserId=SLACK_ID).insert()
 
 
 async def week(me, routines=None, goals=None):
@@ -319,3 +319,241 @@ async def test_archived_item_with_result_is_read_only_and_kept(me, db, slack):
     assert "Citizen contact (removed)" in json.dumps(view["blocks"])
     await process_standup_submission(state(view), SLACK_ID)
     assert (await stored(me, TUE)).results[contact].value == 12
+
+
+async def test_form_shows_log_as_multiline(me):
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    john = await Account(name="John D.", createdBy=me.id, region="US").insert()
+    el = by_id(await build_view(me, TUE))[f"item:{rid}"]
+    assert el["optional"] is True and el["hint"]["text"] == "One line per profile: Profile name: what changed"
+    assert el["element"]["type"] == "plain_text_input" and el["element"]["multiline"] is True
+    assert el["element"]["action_id"] == "log" and "initial_value" not in el["element"]
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [
+        {"profileId": str(john.id), "note": "Rewrote summary"}, {"profileId": None, "note": "free line"}]}}})
+    el = by_id(await build_view(me, TUE))[f"item:{rid}"]
+    assert el["element"]["initial_value"] == "John D.: Rewrote summary\nfree line"
+
+
+def _log_view(text):
+    return {"private_metadata": json.dumps({"day": "2026-11-10"}),
+            "state": {"values": {"item:r1": {"log": {"type": "plain_text_input", "value": text}}}}}
+
+
+def test_form_roundtrip_log():
+    r = read_submission(_log_view("John: a\n\n  Maria: b  "))
+    assert [e.note for e in r.results["r1"].entries] == ["John: a", "Maria: b"]
+    assert all(e.profileId is None for e in r.results["r1"].entries)
+    assert read_submission(_log_view("")).results["r1"].entries == []
+    assert read_submission(_log_view(None)).results["r1"].entries == []
+
+
+async def test_keep_unshown_keeps_entries(me):
+    from app.standup.modal import _keep_unshown
+    from app.plan_save import DayIn
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [{"note": "kept"}]}}})
+    out = await _keep_unshown(me, TUE, DayIn())
+    assert [e.note for e in out.results[rid].entries] == ["kept"]
+
+
+def test_log_line_too_long_is_a_field_error():
+    assert submission_errors(_log_view("x" * 201)) == {"item:r1": "Each line is limited to 200 characters"}
+    assert submission_errors(_log_view("\n".join("a" * 5 for _ in range(21)))) == {"item:r1": "At most 20 lines"}
+    assert submission_errors(_log_view("ok\n\n" * 20)) == {}
+
+
+async def test_log_prefill_roundtrip_keeps_profile_link(me, db, slack):
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    john = await Account(name="John D.", createdBy=me.id, region="US").insert()
+    note = "n" * 200
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [
+        {"profileId": str(john.id), "note": note}, {"note": "free"}]}}})
+    view = await build_view(me, TUE)
+    assert json.loads(view["private_metadata"])["logs"] == {rid: {"John D.": str(john.id)}}
+    sub = state(view)
+    assert submission_errors(sub) == {}  # 200-char note + "John D.: " prefix is fine
+    got = read_submission(sub).results[rid].entries
+    assert [(e.profileId, e.note) for e in got] == [(str(john.id), note), (None, "free")]
+    typed = state(view, **{f"item:{rid}": "John D.: a\nMaria: b"})
+    got = read_submission(typed).results[rid].entries
+    assert [(e.profileId, e.note) for e in got] == [(str(john.id), "a"), (None, "Maria: b")]
+
+
+def test_log_old_metadata_without_logs_still_reads():
+    assert read_submission(_log_view("A: x")).results["r1"].entries[0].profileId is None
+
+
+async def test_log_too_long_to_prefill_is_read_only_and_kept(me, db, slack):
+    (rid,), _ = await week(me, routines=[{"text": "Profile review", "kind": "log"}])
+    await put_day("2026-11-10", me, {"results": {rid: {"entries": [{"note": "x" * 200}] * 20}}})
+    view = await build_view(me, TUE)
+    assert f"item:{rid}" not in by_id(view)
+    assert "Profile review · 20 profiles — edit them in the app" in json.dumps(view["blocks"], ensure_ascii=False)
+    await process_standup_submission(state(view), SLACK_ID)
+    assert len((await stored(me, TUE)).results[rid].entries) == 20
+
+
+async def test_private_metadata_stays_under_slacks_cap(me, db, slack):
+    (a, b, c), _ = await week(me, routines=[{"text": t, "kind": "log"} for t in "ABC"])
+    accounts = [await Account(name=f"Profile {i:02d} " + "x" * 50, createdBy=me.id, region="US").insert()
+                for i in range(20)]
+    entries = [{"profileId": str(x.id), "note": "n"} for x in accounts]
+    await put_day("2026-11-10", me, {"results": {i: {"entries": entries} for i in (a, b, c)}})
+    view = await build_view(me, TUE)
+    kept = json.loads(view["private_metadata"]).get("logs", {})
+    assert len(view["private_metadata"]) <= 3000 and len(kept) < 3
+    assert _day(view) == TUE
+    dropped = next(i for i in (a, b, c) if i not in kept)
+    got = read_submission(state(view)).results[dropped].entries
+    assert len(got) == 20 and all(e.profileId is None for e in got)
+
+
+def _pick(value):
+    return {"type": "static_select", "selected_option": {"value": value} if value else None}
+
+
+def _tc_view(text=None, choice="__", note=None, note_sent=True):
+    values = {}
+    if text is not None:
+        values["item:t1"] = {"text": {"type": "plain_text_input", "value": text}}
+    if choice != "__":
+        values["item:c1"] = {"choice": _pick(choice)}
+        if note_sent:
+            values["note:c1"] = {"note": {"type": "plain_text_input", "value": note}}
+    return {"private_metadata": json.dumps({"day": "2026-11-10"}), "state": {"values": values}}
+
+
+def test_form_roundtrip_text_and_choice():
+    r = read_submission(_tc_view(text="  did it ", choice="Yes", note=" fine "))
+    assert r.results["t1"].text == "did it"
+    assert (r.results["c1"].choice, r.results["c1"].text) == ("Yes", "fine")
+
+
+def test_form_clears_text_choice_and_note():
+    r = read_submission(_tc_view(text="", choice=None, note=None))
+    assert r.results["t1"].text is None and "text" in r.results["t1"].model_fields_set
+    assert r.results["c1"].choice is None and "choice" in r.results["c1"].model_fields_set
+    assert "text" in r.results["c1"].model_fields_set
+    only_note = read_submission(_tc_view(choice=None, note="just a note")).results["c1"]
+    assert (only_note.choice, only_note.text) == (None, "just a note")
+
+
+def test_text_and_note_over_500_are_field_errors():
+    assert submission_errors(_tc_view(text="x" * 501, choice="Yes", note="y" * 501)) == {
+        "item:t1": "Up to 500 characters", "note:c1": "Up to 500 characters"}
+    assert submission_errors(_tc_view(text="x" * 500, choice="Yes", note="y" * 500)) == {}
+
+
+async def test_view_shows_text_and_choice(me):
+    (t, c), _ = await week(me, routines=[{"text": "Mood", "kind": "text"},
+                                         {"text": "Blockers?", "kind": "choice", "options": ["Yes", "No", "Maybe"]}])
+    await put_day("2026-11-10", me, {"results": {t: {"text": "calm"}, c: {"choice": "No", "text": "later"}}})
+    blocks = by_id(await build_view(me, TUE))
+    el = blocks[f"item:{t}"]["element"]
+    assert (el["type"], el["action_id"], el["multiline"], el["max_length"], el["initial_value"]) == (
+        "plain_text_input", "text", True, 500, "calm")
+    assert blocks[f"item:{t}"]["optional"] is True
+    sel = blocks[f"item:{c}"]["element"]
+    assert sel["type"] == "static_select" and sel["action_id"] == "choice" and blocks[f"item:{c}"]["optional"]
+    assert [o["value"] for o in sel["options"]] == ["Yes", "No", "Maybe"]
+    assert sel["initial_option"]["value"] == "No"
+    note = blocks[f"note:{c}"]
+    assert note["optional"] is True and note["element"]["action_id"] == "note"
+    assert note["element"]["max_length"] == 500 and note["element"]["initial_value"] == "later"
+
+
+async def test_choice_no_longer_an_option_has_no_initial_option(me):
+    (c,), _ = await week(me, routines=[{"text": "Pick", "kind": "choice", "options": ["A", "B"]}])
+    await put_day("2026-11-10", me, {"results": {c: {"choice": "A"}}})
+    await week(me, routines=[{"id": c, "text": "Pick", "kind": "choice", "options": ["B", "C"]}])
+    blocks = by_id(await build_view(me, TUE))
+    assert "initial_option" not in blocks[f"item:{c}"]["element"]
+
+
+async def test_text_choice_roundtrip_saves(me, db, slack):
+    (t, c), _ = await week(me, routines=[{"text": "Mood", "kind": "text"},
+                                         {"text": "Pick", "kind": "choice", "options": ["A", "B"]}])
+    view = await build_view(me, TUE)
+    values = {f"item:{t}": {"text": {"type": "plain_text_input", "value": "ok"}},
+              f"item:{c}": {"choice": _pick("B")},
+              f"note:{c}": {"note": {"type": "plain_text_input", "value": "why"}}}
+    sub = {**view, "state": {"values": values}}
+    assert submission_errors(sub) == {}
+    await process_standup_submission(sub, SLACK_ID)
+    plan = await stored(me, TUE)
+    assert plan.results[t].text == "ok" and plan.results[c].choice == "B" and plan.results[c].text == "why"
+    again = await build_view(me, TUE)
+    assert again["blocks"] and by_id(again)[f"item:{c}"]["element"]["initial_option"]["value"] == "B"
+    cleared = {**view, "state": {"values": {
+        f"item:{t}": {"text": {"value": ""}}, f"item:{c}": {"choice": _pick(None)}, f"note:{c}": {"note": {"value": ""}}}}}
+    await process_standup_submission(cleared, SLACK_ID)
+    plan = await stored(me, TUE)
+    assert plan.results[t].text is None and plan.results[c].choice is None and plan.results[c].text is None
+
+
+async def test_archived_text_and_choice_show_a_removed_line(me):
+    (t, c), _ = await week(me, routines=[{"text": "Mood", "kind": "text"},
+                                         {"text": "Pick", "kind": "choice", "options": ["A", "B"]}])
+    await put_day("2026-11-10", me, {"results": {t: {"text": "calm"}, c: {"choice": "A", "text": "why"}}})
+    await week(me, routines=[{"text": "Other"}])
+    ctx = [b["elements"][0]["text"] for b in (await build_view(me, TUE))["blocks"] if b["type"] == "context"]
+    assert "Mood (removed) · calm" in ctx and "Pick (removed) · A — why" in ctx
+
+
+async def test_keep_unshown_keeps_text_and_choice(me):
+    from app.plan_save import DayIn
+    from app.standup.modal import _keep_unshown
+    (t, c), _ = await week(me, routines=[{"text": "Mood", "kind": "text"},
+                                         {"text": "Pick", "kind": "choice", "options": ["A", "B"]}])
+    await put_day("2026-11-10", me, {"results": {t: {"text": "calm"}, c: {"choice": "A", "text": "why"}}})
+    await week(me, routines=[{"id": c, "text": "Pick", "kind": "choice", "options": ["B", "C"]}])  # A no longer an option
+    out = await _keep_unshown(me, TUE, DayIn())
+    await process_standup_submission({"private_metadata": json.dumps({"day": "2026-11-10"}), "state": {"values": {}}}, SLACK_ID)
+    plan = await stored(me, TUE)
+    assert "text" not in out.results[t].model_fields_set and "choice" not in out.results[c].model_fields_set
+    assert plan.results[t].text == "calm" and plan.results[c].choice == "A" and plan.results[c].text == "why"
+
+
+async def test_choice_item_uses_two_blocks_in_the_room(me, monkeypatch):
+    monkeypatch.setattr("app.standup.modal.MAX_BLOCKS", 12)  # 3 context lines + Extra leave 8: 4 choices fit with the cut line
+    items = [{"text": f"Pick {i}", "kind": "choice", "options": ["A", "B"]} for i in range(20)]
+    await week(me, routines=items, goals=[{"text": f"G{i}", "kind": "choice", "options": ["A", "B"]} for i in range(20)])
+    view = await build_view(me, TUE)
+    assert len(view["blocks"]) <= 12
+    ids = {b.get("block_id") for b in view["blocks"]}
+    for bid in ids:  # a choice never loses its note block
+        if bid and bid.startswith("item:"):
+            assert "note:" + bid[5:] in ids
+    assert any("more lines" in b["elements"][0]["text"] for b in view["blocks"] if b["type"] == "context")
+
+
+async def _stale_setup(me, extra=()):
+    (c,), _ = await week(me, routines=[{"text": "Pick", "kind": "choice", "options": ["A", "B"]}])
+    await put_day("2026-11-10", me, {"results": {c: {"choice": "A", "text": "n"}}})
+    ids, _ = await week(me, routines=[{"id": c, "text": "Pick", "kind": "choice", "options": ["B", "C"]}, *extra])
+    return c, ids[1:]
+
+
+async def test_stale_choice_is_kept_on_untouched_submit(me, db, slack):
+    c, _ = await _stale_setup(me)
+    view = await build_view(me, TUE)
+    assert json.loads(view["private_metadata"])["stale"] == [c]
+    assert by_id(view)[f"item:{c}"]["hint"]["text"] == "Current: A (no longer an option)"
+    sub = {**view, "state": {"values": {f"item:{c}": {"choice": _pick(None)},
+                                        f"note:{c}": {"note": {"value": "n"}}}}}
+    await process_standup_submission(sub, SLACK_ID)
+    assert (await stored(me, TUE)).results[c].choice == "A"
+    sub["state"]["values"][f"item:{c}"] = {"choice": _pick("C")}
+    await process_standup_submission(sub, SLACK_ID)
+    assert (await stored(me, TUE)).results[c].choice == "C"
+
+
+async def test_stale_list_survives_the_metadata_cap(me, db, slack):
+    c, (a, b, d) = await _stale_setup(me, [{"text": t, "kind": "log"} for t in "ABC"])
+    accounts = [await Account(name=f"Profile {i:02d} " + "x" * 50, createdBy=me.id, region="US").insert()
+                for i in range(20)]
+    entries = [{"profileId": str(x.id), "note": "n"} for x in accounts]
+    await put_day("2026-11-10", me, {"results": {i: {"entries": entries} for i in (a, b, d)} | {c: {}}})
+    view = await build_view(me, TUE)
+    meta = json.loads(view["private_metadata"])
+    assert len(view["private_metadata"]) <= 3000 and len(meta["logs"]) < 3 and meta["stale"] == [c]

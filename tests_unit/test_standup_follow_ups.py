@@ -57,7 +57,7 @@ async def db(monkeypatch):
 
 @pytest.fixture
 async def me(db):
-    return await UserExtra(name="Ana", email="ana@x.io", slackUserId="U0ANA0001").insert()
+    return await UserExtra(name="Ana", email="ana@x.io", plansOwnWeek=True, slackUserId="U0ANA0001").insert()
 
 
 def at(day: date, hh=12, mm=0) -> datetime:

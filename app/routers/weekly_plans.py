@@ -5,54 +5,46 @@ until the person saves. Done is computed from the week's daily plans and intervi
 (`app.plan_auto.week_snapshot`).
 """
 
-from datetime import date, datetime, timedelta
+import logging
+import time
+from datetime import date, timedelta
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
-from pydantic import AfterValidator, BaseModel, Field
-
-from app.alerts import app_week_key
-from app.deps import get_current_user
+from beanie import PydanticObjectId
+from pydantic import BaseModel, Field, ValidationError
+from app.deps import get_current_user, require_admin
 from app.models import UserExtra
-from app.models.plan_common import Counts, CountsIn, PlanItem, check_items
+from app.models.plan_common import Counts
 from app.models.weekly_plan import WeeklyPlan
-from app.plan_auto import day_targets, draft_week, goal_progress, items_tally, week_snapshot
+from app.plan_auto import (day_targets, draft_week, goal_progress, items_tally, week_snapshot, weeks_or_drafts,
+                           weekly_plans_for)
+from app.week_save import PLANNED_BY_ADMIN, PlanItemIn, PlanItemsIn, WeekIn, _merge_items, save_week  # noqa: F401  (re-exported)
 from app.routers._plan_access import parse_body, parse_monday, read_subject, require_writer
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/weekly-plans", tags=["weekly-plans"])
 
 
-class PlanItemIn(PlanItem):
-    """A routine / weekly goal as sent: no id = new item (the server assigns one)."""
-
-    id: Optional[str] = None
-
-
-PlanItemsIn = Annotated[list[PlanItemIn], AfterValidator(check_items)]
+class TeamGoalIn(BaseModel):
+    bidsSelf: int = Field(ge=0)
+    bidsBidder: int = Field(ge=0)
+    interviewsSelf: int = Field(ge=0)
 
 
-class WeekIn(BaseModel):
-    goal: CountsIn = Field(default_factory=CountsIn)
-    routines: PlanItemsIn = []
-    weeklyGoals: PlanItemsIn = []
-    recapNotes: str = Field(default="", max_length=4000)
+class TeamRowIn(BaseModel):
+    userId: str
+    plansOwnWeek: bool
+    goal: TeamGoalIn
+    routines: PlanItemsIn
+    weeklyGoals: PlanItemsIn
+    exists: bool = True  # False = the grid loaded a carry-over draft; an older client omits it
+    removedIds: list[str] = []  # own (self) items the admin removed; any other missing self item stays live
 
 
-def _merge_items(sent: list[PlanItemIn], old: list[PlanItem], what: str) -> list[PlanItem]:
-    """The sent items in order (ids kept), then the old ones left out, archived: items are never deleted."""
-    known = {i.id for i in old}
-    out: list[PlanItem] = []
-    for i in sent:
-        if i.id is not None and (i.id not in known or any(o.id == i.id for o in out)):
-            raise HTTPException(status_code=422, detail=f"{what}: unknown or repeated item id {i.id}")
-        fields = i.model_dump(exclude={"id"})
-        out.append(PlanItem(**fields, id=i.id) if i.id else PlanItem(**fields))
-    kept = {i.id for i in out}
-    return out + [o.model_copy(update={"archived": True}) for o in old if o.id not in kept]
-
-
-def _midnight(d: date) -> datetime:
-    return datetime(d.year, d.month, d.day)
+class TeamSaveIn(BaseModel):
+    plans: list[dict] = Field(min_length=1, max_length=100)
 
 
 def _sum_stages(day_auto: dict) -> dict:
@@ -64,7 +56,7 @@ def _sum_stages(day_auto: dict) -> dict:
     return out
 
 
-def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None) -> dict:
+def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None, *, plans_own_week: bool) -> dict:
     """`draft` (carry-over from last week) stands in for a week without a saved plan."""
     plan: Optional[WeeklyPlan] = snap["plan"] or draft
     by_date = {p.date.date(): p for p in snap["days"]}
@@ -78,6 +70,7 @@ def _week_out(uid, monday: date, snap: dict, draft: Optional[WeeklyPlan] = None)
         "exists": snap["plan"] is not None,
         "draft": snap["plan"] is None and draft is not None,
         "userId": str(uid),
+        "plansOwnWeek": plans_own_week,
         "goal": (plan.goal if plan else Counts()).model_dump(),
         "routines": [i.model_dump() for i in (plan.routines if plan else [])],
         "weeklyGoals": [i.model_dump() for i in (plan.weeklyGoals if plan else [])],
@@ -104,6 +97,85 @@ async def _snapshot(uid, monday: date) -> dict:
     return (await week_snapshot([uid], monday))[uid]
 
 
+@router.get("/team/{week_start}")
+async def get_team_week(week_start: str, admin: Annotated[UserExtra, Depends(require_admin)]) -> dict:
+    monday = parse_monday(week_start)
+    users = await UserExtra.find({"role": {"$ne": "admin"}, "isActive": {"$ne": False}}).to_list()
+    users.sort(key=lambda u: (not u.name, (u.name or "").lower()))
+    plans = await weeks_or_drafts([u.id for u in users], monday)
+    out = []
+    for u in users:
+        plan = plans.get(u.id)
+        goal = plan.goal if plan else Counts()
+        out.append({
+            "userId": str(u.id),
+            "name": u.name,
+            "plansOwnWeek": u.plansOwnWeek,
+            "exists": plan is not None and plan.id is not None,  # a carry-over draft has no id
+            "goal": {"bidsSelf": goal.bidsSelf, "bidsBidder": goal.bidsBidder, "interviewsSelf": goal.interviewsSelf},
+            "routines": [i.model_dump() for i in plan.routines if not i.archived] if plan else [],
+            "weeklyGoals": [i.model_dump() for i in plan.weeklyGoals if not i.archived] if plan else [],
+        })
+    return {"weekStart": monday.isoformat(), "users": out}
+
+
+def _row_error(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        msg = exc.errors()[0].get("msg", "Invalid row")
+        return msg.removeprefix("Value error, ")
+    return str(exc.detail)
+
+
+@router.put("/team/{week_start}")
+async def put_team_week(
+    week_start: str,
+    admin: Annotated[UserExtra, Depends(require_admin)],
+    payload: Annotated[dict[str, Any], Body()] = None,
+) -> dict:
+    t0 = time.monotonic()
+    monday = parse_monday(week_start)
+    body = parse_body(TeamSaveIn, payload)
+    results: list[dict] = []
+    for raw in body.plans:
+        uid_str = str(raw.get("userId", ""))
+        try:
+            await _save_team_row(raw, monday)
+            results.append({"userId": uid_str, "ok": True, "error": None})
+        except (HTTPException, ValidationError) as exc:
+            results.append({"userId": uid_str, "ok": False, "error": _row_error(exc)})
+        except Exception:
+            log.exception("team week save: row failed week=%s user=%s", monday, uid_str)
+            results.append({"userId": uid_str, "ok": False, "error": "Could not save"})
+    ok = sum(r["ok"] for r in results)
+    log.info("team week save: admin=%s week=%s ok=%d failed=%d ms=%d", admin.id, monday, ok, len(results) - ok,
+             (time.monotonic() - t0) * 1000)
+    return {"results": results}
+
+
+async def _save_team_row(raw: dict, monday: date) -> None:
+    row = TeamRowIn.model_validate(raw)
+    user = await UserExtra.get(row.userId) if PydanticObjectId.is_valid(row.userId) else None
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role == "admin":
+        raise HTTPException(status_code=422, detail="Admins have no plan")
+    stored = (await weeks_or_drafts([user.id], monday)).get(user.id)  # the saved plan, else the carry-over draft
+    if not row.exists and stored is not None and stored.id is not None:  # the person (or another admin) saved meanwhile
+        raise HTTPException(status_code=409, detail="Saved since you loaded the grid — reload to see it")
+    base = stored.goal if stored else Counts()
+    empty = not (row.goal.bidsSelf or row.goal.bidsBidder or row.goal.interviewsSelf or row.routines or row.weeklyGoals)
+    if (stored is not None and stored.id is not None) or not empty:  # nothing to plan yet: don't create an empty week
+        if row.goal.bidsSelf == base.bidsSelf:  # total unchanged: keep the stored region split
+            goal = base.model_copy(update={"bidsBidder": row.goal.bidsBidder, "interviewsSelf": row.goal.interviewsSelf})
+        else:
+            goal = Counts(bidsSelf=row.goal.bidsSelf, bidsBidder=row.goal.bidsBidder,
+                          interviewsSelf=row.goal.interviewsSelf, interviewsCaller=base.interviewsCaller)
+        await save_week(user.id, monday, goal=goal, routines=row.routines, weekly_goals=row.weeklyGoals, recap=None,
+                        added_by="admin", removed_ids=set(row.removedIds))
+    if row.plansOwnWeek != user.plansOwnWeek:
+        await UserExtra.find_one(UserExtra.id == user.id).update({"$set": {"plansOwnWeek": row.plansOwnWeek}})
+
+
 @router.get("/{week_start}")
 async def get_week(
     week_start: str,
@@ -113,7 +185,8 @@ async def get_week(
     monday = parse_monday(week_start)
     uid = await read_subject(user, userId)
     snap = await _snapshot(uid, monday)
-    return _week_out(uid, monday, snap, None if snap["plan"] else await draft_week(uid, monday))
+    plans_own = user.plansOwnWeek if uid == user.id else (await UserExtra.get(uid)).plansOwnWeek
+    return _week_out(uid, monday, snap, None if snap["plan"] else await draft_week(uid, monday), plans_own_week=plans_own)
 
 
 @router.put("/{week_start}")
@@ -125,31 +198,15 @@ async def put_week(
     require_writer(user)
     monday = parse_monday(week_start)
     body = parse_body(WeekIn, payload)
-    plan = (await _snapshot(user.id, monday))["plan"]
-    base = plan or await draft_week(user.id, monday)  # a first save keeps the draft's routine ids
-    routines = _merge_items(body.routines, base.routines if base else [], "routines")
-    weekly_goals = _merge_items(body.weeklyGoals, base.weeklyGoals if base else [], "weeklyGoals")
-    if plan is None:
-        start = _midnight(monday)
-        year, week_number, _key = app_week_key(start)
-        plan = WeeklyPlan(
-            userId=user.id,
-            weekStart=start,
-            year=year,
-            weekNumber=week_number,
-            startDate=start,
-            endDate=start + timedelta(days=7) - timedelta(milliseconds=1),
-        )
-    plan.goal = Counts(**body.goal.model_dump())
-    plan.routines = routines
-    plan.weeklyGoals = weekly_goals
-    plan.recapNotes = body.recapNotes
-    if plan.id is None:
-        await plan.insert()
-    else:
-        # Replaces the whole document, so a legacy plan is rewritten in the new shape.
-        await plan.save()
-    return _week_out(user.id, monday, await _snapshot(user.id, monday))
+    if user.plansOwnWeek:
+        await save_week(user.id, monday, goal=Counts(**body.goal.model_dump()), routines=body.routines,
+                        weekly_goals=body.weeklyGoals, recap=body.recapNotes, added_by="self")
+    else:  # the admin plans the week: own items and the recap, only on a plan the admin saved
+        if (await _snapshot(user.id, monday))["plan"] is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PLANNED_BY_ADMIN)
+        await save_week(user.id, monday, goal=None, routines=body.routines, weekly_goals=body.weeklyGoals,
+                        recap=body.recapNotes, added_by="self", locked=True)
+    return _week_out(user.id, monday, await _snapshot(user.id, monday), plans_own_week=user.plansOwnWeek)
 
 
 @router.delete("/{week_start}")
@@ -158,6 +215,8 @@ async def delete_week(
     user: Annotated[UserExtra, Depends(get_current_user)],
 ) -> dict:
     require_writer(user)
+    if not user.plansOwnWeek:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PLANNED_BY_ADMIN)
     monday = parse_monday(week_start)
     plan = (await _snapshot(user.id, monday))["plan"]
     if plan is None:

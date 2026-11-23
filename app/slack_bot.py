@@ -412,9 +412,27 @@ def _bids_line(label: str, field: str, done: Any, targets: Any, regions: bool = 
     return _plan_line(label, value)
 
 
+def _cut(text: str, limit: int) -> str:
+    text = text.strip()
+    return text[: limit - 1].rstrip() + "…" if len(text) > limit else text
+
+
 def _item_line(e: dict, progress: dict) -> Optional[str]:
     item, result = e["item"], e["result"]
     hours = item.kind == "hours"
+    if item.kind == "log":
+        n = len(result.entries) if result else 0
+        if e["scope"] == "routine":
+            return _plan_line(item.text, f"✅ {n} profile{'s' * (n != 1)}" if n else "❌ not done")
+        return _plan_line(item.text, f"✅ {n} profile{'s' * (n != 1)} today" if n else "in focus")
+    if item.kind in ("text", "choice"):
+        said = (result.text if item.kind == "text" else result.choice) if result else None
+        if not said:
+            return _plan_line(item.text, "❌ not done" if e["scope"] == "routine" else "in focus")
+        if item.kind == "text":
+            return _plan_line(item.text, "✅ " + _plan_block_text(_cut(said, 200)))
+        note = f" — {_plan_block_text(_cut(result.text, 200))}" if result.text else ""
+        return _plan_line(item.text, _plan_block_text(said) + note)
     if item.kind != "check" and result and result.done and result.value is None:
         return _plan_line(item.text, "✅" if e["scope"] == "routine" else "✅ done today")  # migrated, no number
     if e["scope"] == "routine":
@@ -430,6 +448,24 @@ def _item_line(e: dict, progress: dict) -> Optional[str]:
     p = progress.get(item.id) or {"value": 0, "target": item.target}
     text = f"{_n(p['value'], hours)} / {_n(p['target'], hours)}" if p["target"] else _n(p["value"], hours)
     return _plan_line(item.text, text + ("  ✅" if p.get("done") else ""))
+
+
+def _entry_lines(e: dict, profile_names: dict) -> list[str]:
+    """A log item's entries, one bullet each: `• Profile name: note` (no name when free text or unknown)."""
+    out = []
+    for en in (e["result"].entries if e["result"] else []):
+        name = profile_names.get(en.profileId or "")
+        out.append(f"     • {_plan_block_text(f'{name}: {en.note}' if name else en.note)}")
+    return out
+
+
+def _with_entries(entries: list, progress: dict, profile_names: dict) -> list[str]:
+    """The item lines, each log item's entry bullets right after its line."""
+    out = []
+    for e in entries:
+        if ln := _item_line(e, progress):
+            out += [ln, *(_entry_lines(e, profile_names) if e["item"].kind == "log" else [])]
+    return out
 
 
 FOLLOW_UPS_SHOWN = 5
@@ -452,6 +488,7 @@ def daily_plan_text(
     plan: Any, owner: Optional[UserExtra], *, done: Any = None, rounds: Optional[dict] = None,
     targets: Any = None, items: Optional[list] = None, progress: Optional[dict] = None,
     week_interviews: Optional[tuple] = None, follow_ups: Optional[dict] = None,
+    profile_names: dict[str, str] = {},
 ) -> str:
     """The day's Goal vs Done standup: bids, interviews, routines, weekly goals (those touched today), extra.
 
@@ -459,7 +496,8 @@ def daily_plan_text(
     report link stay outside it. `done` defaults to what the plan stores; `rounds` is {"self": {stage: n},
     "caller": {stage: n}}; `items` are `plan_auto.day_items` lines; `progress` is `goal_progress`;
     `week_interviews` is (held Monday..today, week target), the Week line is left out without a target;
-    `follow_ups` is the day view's `followUps`, one line closing the Interviews section when it says anything.
+    `follow_ups` is the day view's `followUps`, one line closing the Interviews section when it says anything;
+    `profile_names` is profile id -> name, for a log item's entries.
     """
     targets = targets if targets is not None else Counts()
     done = done if done is not None else plan.done
@@ -481,16 +519,15 @@ def daily_plan_text(
         interviews.append(f"{_PLAN_INDENT}{_plan_block_text(line)}")
     sections.append(["Interviews", *interviews])
 
-    routines = [ln for e in items or [] if e["scope"] == "routine" and (ln := _item_line(e, progress))]
+    routines = _with_entries([e for e in items or [] if e["scope"] == "routine"], progress, profile_names)
     if routines:
         sections.append(["Routines", *routines])
     touched = set(plan.focus or [])
-    goals = [
-        ln for e in items or []
+    goals = _with_entries([
+        e for e in items or []
         if e["scope"] == "goal"
         and (e["item"].id in touched or (e["result"] and (e["result"].done or e["result"].value)))
-        and (ln := _item_line(e, progress))
-    ]
+    ], progress, profile_names)
     if goals:
         sections.append(["Weekly goals (week so far)", *goals])
 

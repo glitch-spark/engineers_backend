@@ -253,7 +253,7 @@ async def test_old_shape_day_is_folded_before_reading_lines():
                       "todayItems": ["bidder management"], "createdAt": datetime(2026, 11, 10, 20)})
     await migrate(True, db)
     week, day = await db["weeklyplans"].find_one({}), await db["dailyplans"].find_one({})
-    assert day["results"] == {week["routines"][0]["id"]: {"done": True, "value": None, "target": None}}
+    assert day["results"] == {week["routines"][0]["id"]: {"done": True, "value": None, "target": None, "entries": [], "text": None, "choice": None}}
     assert day["submittedAt"] == datetime(2026, 11, 10, 20)
 
 

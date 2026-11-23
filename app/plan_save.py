@@ -6,14 +6,16 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import DuplicateKeyError
 
 from app import plan_bidder, self_bids
 from app.alerts import app_week_key
-from app.models import UserExtra
+from beanie import PydanticObjectId
+
+from app.models import Account, UserExtra
 from app.models.daily_plan import DailyPlan
-from app.models.plan_common import BidsIn, Counts, CountsIn, DoneCounts, ItemResult, bids_of, monday_of
+from app.models.plan_common import BidsIn, Counts, CountsIn, DoneCounts, ItemResult, LogEntry, bids_of, clean_answer, monday_of, result_is_done
 from app.plan_auto import (
     day_items, day_targets, effective_daily_done, empty_day, week_or_draft, weekly_plans_for,
 )
@@ -25,6 +27,19 @@ log = logging.getLogger(__name__)
 class ItemResultIn(BaseModel):
     done: bool = False
     value: Optional[float] = Field(default=None, ge=0)
+    entries: Optional[list[LogEntry]] = None  # log items: None = not sent (keep stored), [] = clear
+    text: Optional[str] = None  # text answer / choice note: not sent = keep stored, null or "" = clear
+    choice: Optional[str] = None  # choice items: same; must be one of the item's options
+
+    @field_validator("text")
+    @classmethod
+    def _answer(cls, v: Optional[str]) -> Optional[str]:
+        return clean_answer(v)
+
+    @field_validator("choice")
+    @classmethod
+    def _choice(cls, v: Optional[str]) -> Optional[str]:
+        return (v or "").strip() or None
 
 
 class DayIn(BaseModel):
@@ -63,6 +78,37 @@ def result_done(kind: str, value: Optional[float], sent_done: Optional[bool], ta
     return base or reached(value)
 
 
+def typed_answer(item, r: "ItemResultIn", prev: Optional[ItemResult]) -> ItemResult:
+    """A text / choice item's result: sent fields replace the stored ones, unsent are kept. A sent choice must be one
+    of the item's current options (a stored one that no longer is stays while not re-sent)."""
+    sent = r.model_fields_set
+    text = r.text if "text" in sent else prev.text if prev else None
+    choice = r.choice if "choice" in sent else prev.choice if prev else None
+    if item.kind == "text":
+        choice = None
+    elif "choice" in sent and choice is not None and choice not in item.options:
+        raise HTTPException(status_code=422, detail="Unknown option")
+    out = ItemResult(text=text, choice=choice)
+    out.done = result_is_done(item.kind, out, None)
+    return out
+
+
+async def _clean_entries(user_id, sent: list[LogEntry]) -> list[LogEntry]:
+    """Own profiles are kept; another user's profile is a 422; an id of no account (deleted, or not an id) is dropped
+    to profileId None so the entry still saves."""
+    own = {p["id"] for p in await owner_profiles(user_id)}
+    foreign = [PydanticObjectId(e.profileId) for e in sent
+               if e.profileId and e.profileId not in own and PydanticObjectId.is_valid(e.profileId)]
+    theirs = {str(a["_id"]) for a in await Account.get_motor_collection().find(
+        {"_id": {"$in": foreign}}, {"_id": 1}).to_list(None)} if foreign else set()
+    out = []
+    for e in sent:
+        if e.profileId in theirs:
+            raise HTTPException(status_code=422, detail="Unknown profile")
+        out.append(e if e.profileId in own else LogEntry(note=e.note))
+    return out
+
+
 def _midnight(d: date) -> datetime:
     return datetime(d.year, d.month, d.day)
 
@@ -88,12 +134,22 @@ async def save_day(user: UserExtra, when: date, body: DayIn, *, _retry: bool = T
     def frozen(iid: str) -> Optional[float]:
         return old[iid].target if iid in old and old[iid].target is not None else items[iid]["item"].target
 
-    plan.results = {
-        iid: ItemResult(
-            done=result_done(items[iid]["item"].kind, r.value, _sent_done(r), frozen(iid), old.get(iid)),
-            value=r.value, target=frozen(iid))
-        for iid, r in body.results.items() if iid in items
-    }
+    results = {}
+    for iid, r in body.results.items():
+        if iid not in items:
+            continue
+        kind = items[iid]["item"].kind
+        if kind in ("text", "choice"):
+            results[iid] = typed_answer(items[iid]["item"], r, old.get(iid))
+            continue
+        entries = []
+        if kind == "log":
+            entries = await _clean_entries(user.id, r.entries) if r.entries is not None else (
+                old[iid].entries if iid in old else [])
+        results[iid] = ItemResult(
+            done=bool(entries) if kind == "log" else result_done(kind, r.value, _sent_done(r), frozen(iid), old.get(iid)),
+            value=None if kind == "log" else r.value, target=None if kind == "log" else frozen(iid), entries=entries)
+    plan.results = results
     plan.focus = [i for i in dict.fromkeys(body.focus) if i in items and items[i]["scope"] == "goal"]
     # Freeze the day's targets (a day saved before the week has a plan keeps deriving them).
     if body.targetOverride is not None:
@@ -175,10 +231,19 @@ async def save_progress(user: UserExtra, when: date, body: ProgressIn) -> None:
     for iid, r in body.results.items():
         prev = old.get(iid)
         frozen = prev.target if prev and prev.target is not None else items[iid]["item"].target
+        kind = items[iid]["item"].kind
+        if kind in ("text", "choice"):
+            fields[f"results.{iid}"] = typed_answer(items[iid]["item"], r, prev).model_dump()
+            continue
+        if kind == "log":
+            entries = await _clean_entries(user.id, r.entries) if r.entries is not None else (prev.entries if prev else [])
+            fields[f"results.{iid}"] = ItemResult(done=bool(entries), entries=entries).model_dump()
+            continue
         value = r.value if "value" in r.model_fields_set or prev is None else prev.value  # unsent keeps the amount
         fields[f"results.{iid}"] = ItemResult(
-            done=result_done(items[iid]["item"].kind, value, _sent_done(r), frozen, prev),
-            value=value, target=prev.target if prev else None).model_dump()
+            done=result_done(kind, value, _sent_done(r), frozen, prev),
+            value=value, target=prev.target if prev else None,
+            entries=prev.entries if prev else []).model_dump()
     if focus is not None:
         fields["focus"] = focus
     year, week_number, _key = app_week_key(_midnight(when))

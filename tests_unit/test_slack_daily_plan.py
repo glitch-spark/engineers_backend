@@ -309,3 +309,60 @@ def test_done_weekly_count_goal_shows_done_mark():
     items = [_e("Mail", "count", "goal", 250, ItemResult(value=10), iid="m")]
     text = daily_plan_text(_plan(), _owner(), items=items, progress={"m": {"value": 140, "done": True, "target": 250}})
     assert "   Mail              140 / 250  ✅" in text
+
+
+def _log(entries):
+    from app.models.plan_common import LogEntry
+    result = ItemResult(done=True, entries=[LogEntry(**e) for e in entries]) if entries else None
+    return _e("Profile review", "log", "routine", result=result)
+
+
+def test_log_routine_lists_entries():
+    items = [_log([{"profileId": "P1", "note": "Rewrote summary"}, {"profileId": None, "note": "Maria: new headline"}])]
+    body = _body(daily_plan_text(_plan(), _owner(), items=items, profile_names={"P1": "John D."}))
+    i = next(n for n, ln in enumerate(body) if "Profile review" in ln)
+    assert body[i].endswith("✅ 2 profiles")
+    assert body[i + 1] == "     • John D.: Rewrote summary"
+    assert body[i + 2] == "     • Maria: new headline"
+
+
+def test_log_routine_without_entries_is_not_done():
+    body = _body(daily_plan_text(_plan(), _owner(), items=[_log(None)]))
+    assert any("Profile review" in ln and ln.endswith("❌ not done") for ln in body)
+
+
+def test_log_one_entry_is_singular():
+    body = _body(daily_plan_text(_plan(), _owner(), items=[_log([{"note": "x"}])]))
+    assert any(ln.endswith("✅ 1 profile") for ln in body)
+
+
+def _tc(kind, scope, **result):
+    item = PlanItem(id="x", text="Q", kind=kind, options=["Yes", "No"] if kind == "choice" else [])
+    return {"item": item, "scope": scope, "result": ItemResult(**result) if result else None}
+
+
+def _line(item):
+    body = _body(daily_plan_text(_plan(), _owner(), items=[item]))
+    return next(ln for ln in body if ln.lstrip().startswith("Q"))
+
+
+def test_text_routine_line():
+    assert _line(_tc("text", "routine", text="Reviewed two <PRs>")).endswith("✅ Reviewed two &lt;PRs&gt;")
+    assert _line(_tc("text", "routine", text="x" * 300)).endswith("✅ " + "x" * 199 + "…")
+    assert _line(_tc("text", "routine")).endswith("❌ not done")
+
+
+def test_choice_routine_line():
+    assert _line(_tc("choice", "routine", choice="Yes")).endswith("Yes")
+    assert _line(_tc("choice", "routine", choice="Yes", text="all good")).endswith("Yes — all good")
+    assert _line(_tc("choice", "routine")).endswith("❌ not done")
+
+
+def test_text_and_choice_goals():
+    assert _line(_tc("text", "goal", text="shipped", done=True)).endswith("✅ shipped")
+    assert _line(_tc("choice", "goal", choice="No", text="blocked", done=True)).endswith("No — blocked")
+    for kind in ("text", "choice"):  # not answered today: only listed when in focus, as "in focus"
+        item = _tc(kind, "goal")
+        item["item"].id = "q"
+        body = _body(daily_plan_text(_plan(focus=["q"]), _owner(), items=[item]))
+        assert next(ln for ln in body if ln.lstrip().startswith("Q")).endswith("in focus")

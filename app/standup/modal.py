@@ -2,7 +2,7 @@
 (the same view the app's Daily plan reads), saved through `plan_save.save_day` like the app's Save.
 
 Block ids: `self:<profileId>` (self bids typed for an untracked profile), `item:<itemId>` (a routine or weekly goal:
-action `check` or `number`), `notes`."""
+action `check`, `number` or `log`), `notes`."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from app.config import get_settings
 from app.coordination import actions
 from app.interview_day.blocks import _short
 from app.models import UserExtra
-from app.models.plan_common import BidsIn, bids_of
+from app.models.plan_common import BidsIn, LogEntry, bids_of
 from app.plan_bidder import RELEASE_DAY
 from app.plan_save import DayIn, ItemResultIn, save_day
 from app.routers import daily_plans
@@ -31,6 +31,15 @@ STANDUP_VIEW = "standup_update"
 MAX_BLOCKS = 100
 MAX_NUMBER = 100000
 MAX_NOTES = 2000
+MAX_METADATA = 3000  # Slack's cap on private_metadata
+MAX_PREFILL = 3000  # Slack's cap on a text input's initial_value
+MAX_ANSWER = 500
+ANSWER_ERROR = f"Up to {MAX_ANSWER} characters"
+MAX_LOG_LINES = 20
+MAX_LOG_LINE = 200
+LOG_HINT = "One line per profile: Profile name: what changed"
+LOG_LINE_ERROR = f"Each line is limited to {MAX_LOG_LINE} characters"
+LOG_LINES_ERROR = f"At most {MAX_LOG_LINES} lines"
 NOT_LINKED = "Link your Slack ID in Profile first, then click again."
 FUTURE = "A day can be followed up from that day on."
 NUMBER_ERROR = f"Enter a number from 0 to {MAX_NUMBER}."
@@ -64,9 +73,86 @@ def _number_input(block_id: str, label: str, value, hint: str = "", *, decimal: 
     return block
 
 
-def _item_block(e: dict, progress: dict) -> dict:
+def _log_lines(text: Optional[str]) -> list[str]:
+    """A log field's lines: trimmed, blank ones dropped."""
+    return [ln for raw in (text or "").splitlines() if (ln := raw.strip())]
+
+
+def _log_prefill(e: dict, names: Optional[dict]) -> tuple[list[str], dict[str, str]]:
+    """A log item's prefill lines ("Name: note" for a linked profile) and the {name: profileId} they carry."""
+    lines, links = [], {}
+    for en in (e["result"] or {}).get("entries") or []:
+        name = (names or {}).get(en.get("profileId") or "")
+        if name:
+            links.setdefault(name, en["profileId"])
+        lines.append(f"{name}: {en['note']}" if name else en["note"])
+    return lines, links
+
+
+def _log_entries(text: Optional[str], links: dict) -> list[tuple[Optional[str], str]]:
+    """(profileId, note) per non-blank line. A line starting "<prefilled name>: " keeps that profile's id."""
+    out = []
+    for ln in _log_lines(text):
+        for name in sorted(links, key=len, reverse=True):
+            note = ln[len(name) + 2:].strip() if ln.startswith(f"{name}: ") else ""
+            if note:
+                out.append((links[name], note))
+                break
+        else:
+            out.append((None, ln))
+    return out
+
+
+def _links(view: dict, item_id: str) -> dict:
+    """The {name: profileId} the form prefilled for a log item (none for a form opened before this existed)."""
+    try:
+        return json.loads(view.get("private_metadata") or "")["logs"][item_id]
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return {}
+
+
+def _stale(view: dict) -> list:
+    """Ids of Choice items the form showed with a stored pick that is no longer an option."""
+    try:
+        return json.loads(view.get("private_metadata") or "")["stale"]
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return []
+
+
+def _answer_input(block_id: str, label: str, action: str, value: Optional[str]) -> dict:
+    element = {"type": "plain_text_input", "action_id": action, "multiline": True, "max_length": MAX_ANSWER}
+    if value:
+        element["initial_value"] = value
+    return {"type": "input", "block_id": block_id, "optional": True, "label": _plain(label[:2000]), "element": element}
+
+
+def _item_blocks(e: dict, progress: dict, names: Optional[dict] = None) -> list[dict]:
+    """One item's blocks: two for a live Choice (the pick, then its note), one otherwise."""
+    result = e["result"] or {}
+    if e["kind"] == "choice" and not e["archived"]:
+        options = [{"text": _plain(o), "value": o} for o in e["options"]]
+        element = {"type": "static_select", "action_id": "choice", "placeholder": _plain("Pick one"), "options": options}
+        if (picked := next((o for o in options if o["value"] == result.get("choice")), None)):
+            element["initial_option"] = picked  # a stored pick no longer in the list has none: Slack would refuse it
+        block = {"type": "input", "block_id": f"item:{e['id']}", "optional": True, "label": _plain(e["text"][:2000]),
+                 "element": element}
+        if result.get("choice") and "initial_option" not in element:
+            block["hint"] = _plain(_short(f"Current: {result['choice']} (no longer an option)", 2000))
+        return [block,
+                _answer_input(f"note:{e['id']}", f"{e['text']} · note"[:2000], "note", result.get("text"))]
+    return [_item_block(e, progress, names)]
+
+
+def _item_block(e: dict, progress: dict, names: Optional[dict] = None) -> dict:
     result = e["result"] or {}
     unit = "h" if e["kind"] == "hours" else ""
+    if e["archived"] and e["kind"] == "log":
+        n = len(result.get("entries") or [])
+        return {"type": "context", "elements": [_plain(_short(
+            f"{e['text']} (removed) · {n} profile{'s' * (n != 1)}", 2000))]}
+    if e["archived"] and e["kind"] in ("text", "choice"):
+        said = " — ".join(x for x in ((result.get("choice") if e["kind"] == "choice" else None), result.get("text")) if x)
+        return {"type": "context", "elements": [_plain(_short(f"{e['text']} (removed) · {said or 'not done'}", 2000))]}
     if e["archived"]:  # removed from the week but holds a result: shown, not editable (resent by _keep_unshown)
         v = result.get("value")
         shown = f"{_fmt(v)}{unit}" if e["kind"] != "check" and v is not None else \
@@ -79,6 +165,17 @@ def _item_block(e: dict, progress: dict) -> dict:
             element["initial_options"] = [option]
         return {"type": "input", "block_id": f"item:{e['id']}", "optional": True,
                 "label": _plain(e["text"]), "element": element}
+    if e["kind"] == "text":
+        return _answer_input(f"item:{e['id']}", e["text"], "text", result.get("text"))
+    if e["kind"] == "log":
+        lines, _ = _log_prefill(e, names)
+        if len("\n".join(lines)) > MAX_PREFILL:  # Slack refuses a longer initial_value: read-only, entries kept
+            return _context(f"{e['text']} · {len(lines)} profiles — edit them in the app")
+        element = {"type": "plain_text_input", "action_id": "log", "multiline": True}
+        if lines:
+            element["initial_value"] = "\n".join(lines)
+        return {"type": "input", "block_id": f"item:{e['id']}", "optional": True, "label": _plain(e["text"]),
+                "hint": _plain(LOG_HINT), "element": element}
     target = e["target"]
     if e["scope"] == "goal":
         so_far = (progress.get(e["id"]) or {}).get("value", 0)
@@ -113,30 +210,50 @@ async def build_view(user: UserExtra, day: date) -> dict:
     d = await daily_plans._view(user.id, day)
     names = {p["id"]: p["name"] for p in d["profiles"]}
     typed = d["done"].get("bidsSelfByProfile") or {}
-    body: list[dict] = []
+    body: list[list[dict]] = []  # groups: a Choice item's two blocks are kept or cut together
+    logs: dict[str, dict] = {}
     for p in d["profiles"]:
         if p["id"] in d["trackedProfiles"] or (p["archived"] and not typed.get(p["id"])):
             continue  # tracked profiles count themselves; archived ones only while they hold a number
         label = f"{p['name']} ({p['region']}) — self bids" if p.get("region") else f"{p['name']} — self bids"
-        body.append(_number_input(f"self:{p['id']}", label, typed.get(p["id"]) or None, decimal=False))
+        body.append([_number_input(f"self:{p['id']}", label, typed.get(p["id"]) or None, decimal=False)])
     for scope, heading in (("routine", "*Routines*"), ("goal", "*Weekly goals* (optional)")):
         items = [e for e in d["items"] if e["scope"] == scope]
         if items:
-            body.append({"type": "section", "text": {"type": "mrkdwn", "text": heading}})
-            body += [_item_block(e, d["progress"]) for e in items]
+            body.append([{"type": "section", "text": {"type": "mrkdwn", "text": heading}}])
+            for e in items:
+                body.append(_item_blocks(e, d["progress"], names))
+                if e["kind"] == "log" and not e["archived"] and body[-1][0]["type"] == "input":
+                    logs[e["id"]] = _log_prefill(e, names)[1]
     follow_ups = slack_bot.follow_ups_line(d["followUps"], label="*Follow-ups*")
     head = [_bids_line(d, day, names), _interviews_line(d), *([follow_ups] if follow_ups else [])]
     room = MAX_BLOCKS - len(head) - 1  # the context lines and Extra
-    if len(body) > room:
-        hidden = len(body) - (room - 1)
-        body = body[:room - 1] + [_context(f"{hidden} more lines don't fit here — open the app to fill them in.")]
+    total = sum(map(len, body))
+    if total > room:
+        kept, used = [], 0
+        for g in body:
+            if used + len(g) > room - 1:
+                break
+            kept.append(g)
+            used += len(g)
+        body = [*kept, [_context(f"{total - used} more lines don't fit here — open the app to fill them in.")]]
+    body = [b for g in body for b in g]
+    shown = {b.get("block_id") for b in body}
+    logs = {iid: m for iid, m in logs.items() if f"item:{iid}" in shown}
+    # a shown Choice whose stored pick is no longer an option: an untouched submit must keep it (never dropped: tiny)
+    stale = [b["block_id"][5:] for b in body if b.get("block_id", "").startswith("item:")
+             and b["element"]["type"] == "static_select" and "hint" in b]
+    meta = {"day": day.isoformat(), "logs": logs, **({"stale": stale} if stale else {})}
+    while logs and len(json.dumps(meta)) > MAX_METADATA:  # an item without a map reads its lines as free text
+        del logs[max(logs, key=lambda i: len(json.dumps(logs[i])))]
     notes = {"type": "plain_text_input", "action_id": "notes", "multiline": True, "max_length": MAX_NOTES}
     if d["notes"]:
         notes["initial_value"] = d["notes"]
     return {
         "type": "modal",
         "callback_id": STANDUP_VIEW,
-        "private_metadata": json.dumps({"day": day.isoformat()}),
+        "private_metadata": json.dumps({"day": day.isoformat(), **({"logs": logs} if logs else {}),
+                                        **({"stale": stale} if stale else {})}),
         "title": _plain("Edit today's update" if d["submitted"] else "Daily standup"),
         "submit": _plain("Post update"),
         "close": _plain("Cancel"),
@@ -180,9 +297,23 @@ def read_submission(view: dict) -> DayIn:
     results: dict[str, ItemResultIn] = {}
     by_profile: dict[str, int] = {}
     notes = ""
-    for block_id, acts in _values(view).items():
-        if block_id.startswith("item:") and "check" in acts:
+    values = _values(view)
+    for block_id, acts in values.items():
+        if block_id.startswith("item:") and "choice" in acts:  # the pick, plus the note block beside it
+            note = (values.get(f"note:{block_id[5:]}") or {}).get("note")
+            picked = (acts["choice"].get("selected_option") or {}).get("value")
+            keep = not picked and block_id[5:] in _stale(view)  # untouched: choice left unsent, plan_save keeps it
+            results[block_id[5:]] = ItemResultIn(
+                **({} if keep else {"choice": picked}),
+                **({"text": note.get("value") or ""} if note is not None else {}))
+        elif block_id.startswith("item:") and "text" in acts:
+            results[block_id[5:]] = ItemResultIn(text=acts["text"].get("value") or "")
+        elif block_id.startswith("item:") and "check" in acts:
             results[block_id[5:]] = ItemResultIn(done=bool(acts["check"].get("selected_options")))
+        elif block_id.startswith("item:") and "log" in acts:  # blank -> [] (sent, clears the stored entries)
+            results[block_id[5:]] = ItemResultIn(entries=[
+                LogEntry(profileId=pid, note=note)
+                for pid, note in _log_entries(acts["log"].get("value"), _links(view, block_id[5:]))])
         elif block_id.startswith("item:"):
             results[block_id[5:]] = ItemResultIn(value=_parse(acts["number"].get("value"), whole=False))
         elif block_id.startswith("self:"):
@@ -209,6 +340,15 @@ def submission_errors(view: dict) -> dict[str, str]:
                     _parse(acts["number"].get("value"), whole=whole)
                 except ValueError:
                     errors[block_id] = WHOLE_ERROR if whole else NUMBER_ERROR
+            elif block_id.startswith("item:") and "log" in acts:
+                lines = _log_entries(acts["log"].get("value"), _links(view, block_id[5:]))
+                if any(len(note) > MAX_LOG_LINE for _, note in lines):
+                    errors[block_id] = LOG_LINE_ERROR
+                elif len(lines) > MAX_LOG_LINES:
+                    errors[block_id] = LOG_LINES_ERROR
+            elif block_id.startswith(("item:", "note:")) and ("text" in acts or "note" in acts):
+                if len((acts.get("text") or acts["note"]).get("value") or "") > MAX_ANSWER:
+                    errors[block_id] = ANSWER_ERROR
             elif block_id == "notes" and len((acts["notes"].get("value") or "").strip()) > MAX_NOTES:
                 errors[block_id] = NOTES_ERROR
         return errors
@@ -226,7 +366,8 @@ async def _keep_unshown(user: UserExtra, day: date, body: DayIn) -> DayIn:
     switched = await self_bids.switched_profiles(user.id, day)
     typed = {pid: n for pid, n in plan.done.bidsSelfByProfile.items() if pid not in switched}
     by = {**typed, **plan.done.bidsSelfOtherByProfile, **body.done.bidsSelfByProfile}
-    kept = {iid: ItemResultIn(done=r.done, value=r.value) for iid, r in plan.results.items()}
+    # text / choice are left unsent here: plan_save keeps the stored ones (resending a stale choice would be refused)
+    kept = {iid: ItemResultIn(done=r.done, value=r.value, entries=r.entries) for iid, r in plan.results.items()}
     return body.model_copy(update={
         "results": {**kept, **body.results},
         "focus": plan.focus,

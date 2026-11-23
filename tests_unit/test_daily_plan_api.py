@@ -20,11 +20,12 @@ from app.models.bidder import Bidder
 from app.models.daily_plan import DailyPlan
 from app.models.interview import Interview
 from app.models.interview_question import InterviewQuestion
+from app.models.plan_common import Counts, PlanItem
 from app.models.weekly_plan import WeeklyPlan
 from app.routers import daily_plans
 from app.routers.daily_plans import _sync_slack as REAL_SYNC_SLACK, get_day, list_week, put_day
 from app.routers.reports import team_report
-from app.routers.weekly_plans import get_week, put_week
+from app.routers.weekly_plans import delete_week, get_week, put_week
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow:DeprecationWarning"),
@@ -56,7 +57,12 @@ async def db(monkeypatch):
 
 @pytest.fixture
 async def me(db):
-    return await UserExtra(name="Ana", email="ana@x.io").insert()
+    return await UserExtra(name="Ana", email="ana@x.io", plansOwnWeek=True).insert()
+
+
+@pytest.fixture
+async def planned(db):
+    return await UserExtra(name="Pia", email="pia@x.io").insert()  # the admin plans her week
 
 
 def week_body(**kw):
@@ -106,7 +112,7 @@ async def test_get_week_without_plan_returns_draft(me):
     nxt = await get_week("2026-11-16", me, None)
     assert nxt["draft"] is True and nxt["exists"] is False
     assert nxt["goal"]["bidsSelf"] == 100
-    assert [r["id"] for r in nxt["routines"]] == [review, contact] and nxt["weeklyGoals"] == []
+    assert [r["id"] for r in nxt["routines"]] == [review, contact] and [g["id"] for g in nxt["weeklyGoals"]] == [goal]
     assert nxt["days"][0]["goal"]["bidsSelf"] == 20  # targets derived from the draft
     assert await WeeklyPlan.find({"userId": me.id}).count() == 1  # nothing saved
     # The draft's ids are known when the week is saved for the first time.
@@ -341,3 +347,258 @@ async def test_first_post_claim_released_on_failure_and_stale_taken_over(me, db,
     await DailyPlan.get_motor_collection().update_one({"_id": plan.id}, {"$set": {"slackTs": live}})
     await daily_plans._sync_slack(await DailyPlan.get(plan.id), me, Counts(), {})  # in flight elsewhere: skip
     assert posts == [None, None] and (await DailyPlan.get(plan.id)).slackTs == live
+
+
+async def _log_week(me):
+    out = await put_week(WEEK, me, week_body(routines=[{"text": "Profile review", "kind": "log"}]))
+    return out["routines"][0]["id"]
+
+
+async def _log_result(me, rid):
+    item = next(i for i in (await get_day(TUE.isoformat(), me, None))["items"] if i["id"] == rid)
+    return item["result"]
+
+
+async def test_day_saves_log_entries(db, me):
+    rid = await _log_week(me)
+    pid = str((await Account(createdBy=me.id, name="John", region="US").insert()).id)
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": [{"profileId": pid, "note": "rewrote summary"}]}}})
+    r = await _log_result(me, rid)
+    assert r["done"] is True and r["entries"] == [{"profileId": pid, "note": "rewrote summary"}]
+
+
+async def test_entries_not_sent_are_kept(db, me):
+    rid = await _log_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": [{"note": "a"}]}}})
+    await put_day(TUE.isoformat(), me, {"results": {rid: {}}})
+    assert (await _log_result(me, rid))["entries"] == [{"profileId": None, "note": "a"}]
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": []}}})
+    r = await _log_result(me, rid)
+    assert r["entries"] == [] and r["done"] is False
+
+
+async def test_entries_reject_foreign_profile(db, me):
+    rid = await _log_week(me)
+    other = await UserExtra(name="Bo", email="bo@x.io").insert()
+    pid = str((await Account(createdBy=other.id, name="Eve", region="US").insert()).id)
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {rid: {"entries": [{"profileId": pid, "note": "x"}]}}})
+    assert e.value.status_code == 422 and e.value.detail == "Unknown profile"
+
+
+async def test_entries_drop_deleted_profile(db, me):
+    from bson import ObjectId
+
+    rid = await _log_week(me)
+    await put_day(TUE.isoformat(), me,
+                  {"results": {rid: {"entries": [{"profileId": str(ObjectId()), "note": "x"}, {"profileId": "junk", "note": "y"}]}}})
+    assert (await _log_result(me, rid))["entries"] == [{"profileId": None, "note": "x"}, {"profileId": None, "note": "y"}]
+
+
+async def test_log_tick_without_entries_is_not_done(db, me):
+    rid = await _log_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {rid: {"done": True}}})
+    assert (await _log_result(me, rid))["done"] is False
+
+
+async def test_admin_planned_person_cannot_change_week(db, planned):
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, planned, week_body())
+    assert e.value.status_code == 403 and e.value.detail == "Your week is planned by your admin"
+
+
+async def test_admin_planned_person_can_write_recap(db, planned):
+    plan = await WeeklyPlan(userId=planned.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                            startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                            goal=Counts(bidsSelf=600), routines=[PlanItem(text="Review")]).insert()
+    out = await put_week(WEEK, planned, week_body(goal={"bidsSelf": 10}, routines=[], recapNotes="good week"))
+    got = await WeeklyPlan.get(plan.id)
+    assert got.goal.bidsSelf == 600 and got.recapNotes == "good week"
+    assert [r.archived for r in got.routines] == [False]
+    assert out["recapNotes"] == "good week"
+
+
+async def test_admin_planned_person_cannot_delete_week(db, planned):
+    with pytest.raises(HTTPException) as e:
+        await delete_week(WEEK, planned)
+    assert e.value.status_code == 403
+
+
+async def test_get_week_tells_who_plans(db, me, planned):
+    assert (await get_week(WEEK, me, None))["plansOwnWeek"] is True
+    assert (await get_week(WEEK, planned, None))["plansOwnWeek"] is False
+    assert (await get_week(WEEK, me, str(planned.id)))["plansOwnWeek"] is False
+
+
+async def test_put_week_kind_change_is_remove_plus_add(me):
+    review, contact, goal = await saved_week(me)
+    await put_week(WEEK, me, week_body(routines=[{"id": review, "text": "Bidder review"},
+                                                 {"id": contact, "text": "Citizen contact", "kind": "log"}]))
+    plan = await WeeklyPlan.find_one({"userId": me.id})
+    assert [(r.id, r.kind, r.archived) for r in plan.routines] == [
+        (review, "check", False), (plan.routines[1].id, "log", False), (contact, "count", True)]
+    assert plan.routines[1].id not in (review, contact)
+
+
+async def _admin_week(planned, n=1):
+    routines = [PlanItem(id=f"a{i}", text=f"Admin {i}") for i in range(1, n + 1)]
+    return await WeeklyPlan(userId=planned.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                            startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                            goal=Counts(bidsSelf=600), routines=routines).insert()
+
+
+async def test_planned_person_adds_own_item(db, planned):
+    await _admin_week(planned)
+    out = await put_week(WEEK, planned, week_body(routines=[
+        {"id": "a1", "text": "Admin 1"}, {"text": "Discord", "kind": "check", "addedBy": "admin"}]))
+    assert [(r["text"], r["addedBy"]) for r in out["routines"]] == [("Admin 1", "admin"), ("Discord", "self")]
+
+
+async def test_planned_person_cannot_change_admin_items(db, planned):
+    await _admin_week(planned)
+    await put_week(WEEK, planned, week_body(goal={"bidsSelf": 1}, routines=[{"id": "a1", "text": "Renamed",
+                                                                            "kind": "count", "target": 5}]))
+    await put_week(WEEK, planned, week_body(goal={"bidsSelf": 1}, routines=[]))
+    got = await WeeklyPlan.find_one({"userId": planned.id})
+    assert got.goal.bidsSelf == 600
+    assert [(r.id, r.text, r.kind, r.archived, r.addedBy) for r in got.routines] == [
+        ("a1", "Admin 1", "check", False, "admin")]
+
+
+async def test_planned_person_edits_and_archives_own(db, planned):
+    await _admin_week(planned)
+    out = await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1"}, {"text": "Mine"}]))
+    s1 = out["routines"][1]["id"]
+    out = await put_week(WEEK, planned, week_body(routines=[{"id": s1, "text": "Mine v2"}, {"id": "a1", "text": "x"}]))
+    assert [(r["text"], r["addedBy"]) for r in out["routines"]] == [("Mine v2", "self"), ("Admin 1", "admin")]
+    out = await put_week(WEEK, planned, week_body(routines=[]))
+    got = await WeeklyPlan.find_one({"userId": planned.id})
+    assert [(r.text, r.archived) for r in got.routines] == [("Admin 1", False), ("Mine v2", True)]
+
+
+async def test_planned_person_limit_counts_both(db, planned):
+    await _admin_week(planned, 15)
+    body = week_body(routines=[{"text": f"own {i}"} for i in range(6)])
+    with pytest.raises(HTTPException) as e:
+        await put_week(WEEK, planned, body)
+    assert e.value.status_code == 422 and "at most 20" in e.value.detail
+    await put_week(WEEK, planned, week_body(routines=[{"text": f"own {i}"} for i in range(5)]))
+
+
+async def test_own_week_person_new_items_are_self(db, me):
+    out = await put_week(WEEK, me, week_body(routines=[{"text": "Admin-made"}]))
+    a = out["routines"][0]
+    assert a["addedBy"] == "self"
+    out = await put_week(WEEK, me, week_body(routines=[{"id": a["id"], "text": "Edited"}]))
+    assert out["routines"][0]["text"] == "Edited"
+
+
+async def test_own_week_person_renames_admin_item_keeps_admin(db, me):
+    await WeeklyPlan(userId=me.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                     startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                     routines=[PlanItem(id="a1", text="Admin 1")]).insert()
+    out = await put_week(WEEK, me, week_body(routines=[{"id": "a1", "text": "Mine now"}]))
+    assert [(r["text"], r["addedBy"]) for r in out["routines"]] == [("Mine now", "admin")]
+
+
+async def test_planned_person_weekly_goals_locked_and_archived_admin_stays(db, planned):
+    await WeeklyPlan(userId=planned.id, weekStart=datetime(2026, 11, 9), year=2026, weekNumber=46,
+                     startDate=datetime(2026, 11, 9), endDate=datetime(2026, 11, 15),
+                     routines=[PlanItem(id="old", text="Gone", archived=True)],
+                     weeklyGoals=[PlanItem(id="g1", text="Outreach", kind="count", target=9)]).insert()
+    out = await put_week(WEEK, planned, week_body(routines=[{"id": "old", "text": "Back"}], weeklyGoals=[
+        {"id": "g1", "text": "Changed", "kind": "count", "target": 1}, {"text": "Own goal", "kind": "hours"}]))
+    assert [(g["text"], g["target"], g["addedBy"]) for g in out["weeklyGoals"]] == [
+        ("Outreach", 9, "admin"), ("Own goal", None, "self")]
+    got = await WeeklyPlan.find_one({"userId": planned.id})
+    assert [(r.text, r.archived) for r in got.routines] == [("Gone", True)]
+
+
+async def test_locked_save_without_saved_plan_is_403_and_inserts_nothing(db, planned):
+    from app.week_save import save_week
+    with pytest.raises(HTTPException) as e:
+        await save_week(planned.id, MON, goal=None, routines=[], weekly_goals=[], recap="", added_by="self",
+                        locked=True)
+    assert e.value.status_code == 403
+    assert await WeeklyPlan.find({"userId": planned.id}).to_list() == []
+
+
+async def test_day_items_return_added_by(db, planned):
+    await _admin_week(planned)
+    await put_week(WEEK, planned, week_body(routines=[{"id": "a1", "text": "Admin 1"}, {"text": "Mine"}], weeklyGoals=[]))
+    day = await get_day(TUE.isoformat(), planned, None)
+    assert sorted(i["addedBy"] for i in day["items"]) == ["admin", "self"]
+
+
+async def _tc_week(me):
+    out = await put_week(WEEK, me, week_body(
+        routines=[{"text": "Standup note", "kind": "text"},
+                  {"text": "Client check", "kind": "choice", "options": ["Done", "Blocked", "N/A"]}], weeklyGoals=[]))
+    return out["routines"][0]["id"], out["routines"][1]["id"]
+
+
+async def _res(me, iid):
+    return next(i for i in (await get_day(TUE.isoformat(), me, None))["items"] if i["id"] == iid)
+
+
+async def test_day_items_carry_options(db, me):
+    t, c = await _tc_week(me)
+    assert (await _res(me, c))["options"] == ["Done", "Blocked", "N/A"] and (await _res(me, t))["options"] == []
+
+
+async def test_day_saves_text_keep_clear_and_limit(db, me):
+    t, _c = await _tc_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": "  set up roles "}}})
+    r = (await _res(me, t))["result"]
+    assert r["text"] == "set up roles" and r["done"] is True
+    await put_day(TUE.isoformat(), me, {"results": {t: {}}})  # not sent: kept
+    assert (await _res(me, t))["result"]["text"] == "set up roles"
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": None}}})
+    r = (await _res(me, t))["result"]
+    assert r["text"] is None and r["done"] is False
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {t: {"text": "x" * 501}}})
+    assert e.value.status_code == 422
+
+
+async def test_day_saves_choice_and_note(db, me):
+    _t, c = await _tc_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Blocked", "text": "waiting on client"}}})
+    r = (await _res(me, c))["result"]
+    assert (r["choice"], r["text"], r["done"]) == ("Blocked", "waiting on client", True)
+    await put_day(TUE.isoformat(), me, {"results": {c: {"text": "still waiting"}}})  # choice not sent: kept
+    r = (await _res(me, c))["result"]
+    assert (r["choice"], r["text"]) == ("Blocked", "still waiting")
+    await put_day(TUE.isoformat(), me, {"results": {c: {"choice": ""}}})
+    r = (await _res(me, c))["result"]
+    assert r["choice"] is None and r["done"] is False
+
+
+async def test_day_rejects_unknown_option_and_keeps_stale_choice(db, me):
+    _t, c = await _tc_week(me)
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Maybe"}}})
+    assert e.value.status_code == 422 and e.value.detail == "Unknown option"
+    await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Blocked"}}})
+    await put_week(WEEK, me, week_body(routines=[
+        {"id": _t, "text": "Standup note", "kind": "text"},
+        {"id": c, "text": "Client check", "kind": "choice", "options": ["Yes", "No"]}], weeklyGoals=[]))
+    await put_day(TUE.isoformat(), me, {"results": {c: {"text": "note"}}})  # stored choice no longer an option: kept
+    assert (await _res(me, c))["result"]["choice"] == "Blocked"
+    with pytest.raises(HTTPException):
+        await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Done"}}})
+
+
+async def test_progress_save_text_and_choice(db, me):
+    t, c = await _tc_week(me)
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": "a"}, c: {"choice": "Done"}}}, submit=False)
+    assert (await _res(me, t))["result"]["done"] and (await _res(me, c))["result"]["choice"] == "Done"
+    await put_day(TUE.isoformat(), me, {"results": {t: {}, c: {"text": "n"}}}, submit=False)
+    assert (await _res(me, t))["result"]["text"] == "a"
+    r = (await _res(me, c))["result"]
+    assert (r["choice"], r["text"]) == ("Done", "n")
+    with pytest.raises(HTTPException) as e:
+        await put_day(TUE.isoformat(), me, {"results": {c: {"choice": "Nope"}}}, submit=False)
+    assert e.value.detail == "Unknown option"
+    await put_day(TUE.isoformat(), me, {"results": {t: {"text": ""}}}, submit=False)
+    assert (await _res(me, t))["result"]["done"] is False

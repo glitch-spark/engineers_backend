@@ -18,7 +18,7 @@ from app.alerts import app_week_key
 from app.dashboard_stats import app_tz, local_day_start_utc
 from app.interview_rounds import load_interviews_for_window, split_rounds_by_day
 from app.models import DailyPlan, WeeklyPlan
-from app.models.plan_common import BID_FIELDS, Counts, DoneCounts, bids_of
+from app.models.plan_common import BID_FIELDS, Counts, DoneCounts, bids_of, result_is_done
 
 
 def empty_day() -> dict:
@@ -110,10 +110,7 @@ def day_items(weekly: Optional[Any], plan: Optional[Any], day: date) -> list[dic
 
 def _routine_done(item: Any, r: Optional[Any]) -> bool:
     """A routine's day is done: ticked, or its value at / over the target (the result's frozen one, else the item's)."""
-    if r is None:
-        return False
-    target = r.target if r.target is not None else item.target
-    return bool(r.done or (r.value is not None and target is not None and r.value >= target))
+    return result_is_done(item.kind, r, r.target if r is not None and r.target is not None else item.target)
 
 
 def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[int, int]:
@@ -124,7 +121,8 @@ def items_tally(weekly: Optional[Any], plan: Optional[Any], day: date) -> tuple[
     for e in day_items(weekly, plan, day):
         r = e["result"]
         if e["scope"] == "goal":
-            hit = r is not None and (r.done or (r.value or 0) > 0)
+            hit = r is not None and (result_is_done(e["item"].kind, r, None) if e["item"].kind in ("log", "text", "choice")
+                                     else (r.done or (r.value or 0) > 0))
             if hit or e["item"].id in focus:
                 total += 1
                 done += hit
@@ -183,6 +181,17 @@ def goal_progress(weekly: Any, days: list) -> dict[str, dict]:
     out = {}
     for g in weekly.weeklyGoals:
         rs = [(d, r) for d in days if (r := d.results.get(g.id)) is not None]
+        if g.kind == "log":
+            done_days = sorted(str(d.date)[:10] for d, r in rs if r.entries)
+            value = sum(len(r.entries) for _, r in rs)
+            out[g.id] = {"value": value, "done": value > 0, "target": g.target,
+                         "doneOn": done_days[0] if done_days else None}
+            continue
+        if g.kind in ("text", "choice"):  # like a check goal: done when any day is; value = days answered
+            done_days = sorted(str(d.date)[:10] for d, r in rs if result_is_done(g.kind, r, None))
+            out[g.id] = {"value": len(done_days), "done": bool(done_days), "target": None,
+                         "doneOn": done_days[0] if done_days else None}
+            continue
         value = sum(r.value or 0 for _, r in rs)
         done_days = sorted(str(d.date)[:10] for d, r in rs if r.done)
         out[g.id] = {"value": value, "done": bool(done_days) or bool(g.target and value >= g.target),
@@ -197,11 +206,12 @@ def _draft(prev: WeeklyPlan, monday: date) -> WeeklyPlan:
         userId=prev.userId, weekStart=start, startDate=start,
         endDate=start + timedelta(days=7) - timedelta(milliseconds=1), weekNumber=week_number, year=year,
         goal=prev.goal.model_copy(), routines=[r.model_copy() for r in prev.routines if not r.archived],
+        weeklyGoals=[g.model_copy() for g in prev.weeklyGoals if not g.archived and g.kind in ("count", "hours")],
     )
 
 
 async def draft_week(uid, monday: date) -> Optional[WeeklyPlan]:
-    """Unsaved plan for `monday` carrying over last week's goal and live routines (no weekly goals)."""
+    """Unsaved plan for `monday` carrying over last week's goal, live routines and live count / hours weekly goals."""
     prev = (await weekly_plans_for([uid], monday - timedelta(days=7))).get(uid)
     return _draft(prev, monday) if prev is not None else None
 

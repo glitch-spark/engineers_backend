@@ -222,6 +222,19 @@ async def test_draft_week_copies_goal_and_routines_not_goals(db):
     assert d.goal.bidsSelf == 50 and [r.id for r in d.routines] == ["r"] and d.weeklyGoals == []
 
 
+async def test_draft_carries_count_and_hours_weekly_goals(db):
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, weeklyGoals=[
+        PlanItem(id="g1", text="Email outreach", kind="count", target=250),
+        PlanItem(id="g2", text="Research", kind="hours", target=4),
+        PlanItem(id="g3", text="Background check"),
+        PlanItem(id="g4", text="Profile audit", kind="log"),
+        PlanItem(id="g5", text="Old", kind="count", archived=True),
+    ]).insert()
+    d = await draft_week(uid, MON)
+    assert [g.id for g in d.weeklyGoals] == ["g1", "g2"] and [g.target for g in d.weeklyGoals] == [250, 4]
+
+
 async def test_draft_week_none_without_previous(db):
     assert await draft_week(PydanticObjectId(), MON) is None
 
@@ -244,3 +257,49 @@ def test_items_tally_counts_goals_only_when_touched():
         "untouched": ItemResult(), "valued": ItemResult(value=3), "ticked": ItemResult(done=True)})
     # routines: 1 of 2; goals: focus (not done), valued (done: value > 0), ticked (done); untouched left out
     assert items_tally(w, p, MON) == (3, 5)
+
+
+def test_log_routine_tally_and_goal_progress():
+    w = _week(routines=[PlanItem(id="r", text="Profile review", kind="log")],
+              weeklyGoals=[PlanItem(id="g", text="Profile work", kind="log")])
+    entry = {"note": "rewrote summary"}
+    with_entry = _day_plan(results={"r": ItemResult(entries=[entry])})
+    empty = _day_plan(results={"r": ItemResult(done=True)})
+    assert items_tally(w, with_entry, MON) == (1, 1)
+    assert items_tally(w, empty, MON) == (0, 1)
+    d1 = _day_plan(results={"g": ItemResult(entries=[entry, entry])})
+    d2 = _day_plan(results={"g": ItemResult(entries=[entry])})
+    prog = goal_progress(w, [d1, d2])["g"]
+    assert prog["value"] == 3 and prog["done"] is True and prog["target"] is None
+    assert goal_progress(w, [_day_plan(results={"g": ItemResult(done=True)})])["g"]["done"] is False
+    # a log goal with entries counts as touched in items_tally
+    assert items_tally(w, _day_plan(results={"g": ItemResult(entries=[entry])}), MON) == (1, 1)
+
+
+async def test_added_by_defaults_to_admin_and_carries(db):
+    assert PlanItem(text="x").addedBy == "admin"
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, routines=[PlanItem(id="r1", text="Mine", addedBy="self")]).insert()
+    assert [r.addedBy for r in (await draft_week(uid, MON)).routines] == ["self"]
+
+
+def test_text_and_choice_goals_behave_like_check_goals():
+    w = _week(routines=[PlanItem(id="r", text="Note", kind="text")],
+              weeklyGoals=[PlanItem(id="t", text="Retro", kind="text"),
+                           PlanItem(id="c", text="State", kind="choice", options=["A", "B"])])
+    day = _day_plan(results={"r": ItemResult(text="hi"), "t": ItemResult(text="x"), "c": ItemResult(choice="A")})
+    assert items_tally(w, day, MON) == (3, 3)
+    empty = _day_plan(results={"r": ItemResult(), "t": ItemResult(), "c": ItemResult(text="note")})
+    assert items_tally(w, empty, MON) == (0, 1)
+    d2 = _day_plan(results={"t": ItemResult(text="y"), "c": ItemResult(choice="B")})
+    prog = goal_progress(w, [day, d2])
+    assert prog["t"]["value"] == 2 and prog["t"]["done"] and prog["t"]["doneOn"] is not None
+    assert prog["c"]["value"] == 2 and prog["c"]["done"]
+    assert not goal_progress(w, [empty])["c"]["done"]
+
+
+async def test_draft_does_not_carry_text_and_choice_goals(db):
+    uid = PydanticObjectId()
+    await _week(MON - timedelta(days=7), uid, weeklyGoals=[
+        PlanItem(id="g1", text="T", kind="text"), PlanItem(id="g2", text="C", kind="choice", options=["a", "b"])]).insert()
+    assert (await draft_week(uid, MON)).weeklyGoals == []
