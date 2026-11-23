@@ -195,6 +195,38 @@ name (and type / daily-or-weekly for a new one). The chip's item becomes that pe
 - A new name pins a new column. People's own items (`addedBy: self`) have no such action (they never join columns).
 - App only: no backend change.
 
+### 9. Addendum (2026-11-23, user decisions): routines / weekly goals split in the grid; Text and Choice types
+
+**Grid split.** The setup grid shows two groups after the week targets: **Daily routines** and **Weekly goals**.
+Each group has its shared columns followed by its own "Only this person" cell; the group headers always show, even
+with no shared column. Chips drop the "· daily / · week" suffix (the group says it) and keep their target
+("Interview prep · 2h"). Each cell's "+ add" adds to that group. "Move into column…" lists that group's columns
+first and can still switch group.
+
+**Item types** (picked per item, everywhere a type is picked, each with a one-line description):
+
+| Type | Person enters each day | Done when |
+|---|---|---|
+| Checkbox | tick | ticked |
+| Number | number vs target | target reached (or ticked) |
+| Hours | hours vs target | target reached (or ticked) |
+| Profile log | rows: profile + what changed | at least one row |
+| **Text** (new) | a free-text answer, up to 500 characters | not empty |
+| **Choice** (new) | one option from the item's list, plus an optional note (up to 500) | an option picked |
+
+- `PlanItem.kind` gains `"text"` and `"choice"`. `PlanItem.options: list[str]` — Choice only: 2–6 options, each
+  1–40 characters, unique (case-insensitive); empty for other kinds. Examples the UI offers as presets:
+  "Done / Blocked / N/A", "Yes / No".
+- `ItemResult` gains `text: Optional[str]` (Text answer, or Choice note) and `choice: Optional[str]` (must be one of
+  the item's options at save time; a result keeps its choice even if the option is later removed). Done is
+  computed server-side by `result_is_done`.
+- Changing a Choice item's options is a plain edit (keeps id); changing kind is remove + add as everywhere.
+- App day panel and Home: Text = text box under the item; Choice = option buttons + optional note.
+- Slack form: Text = multiline input; Choice = a select plus an optional note input. Slack post:
+  `Company work  ✅ Set up Discord roles` / `Client check  Blocked — waiting on client` / `❌ not done` when empty.
+- Grid: Text and Choice columns use the "has item" checkbox; Choice options are set in the item form
+  (add / column "Change type" / move) as comma-separated text with the presets.
+
 ## Calls made by the designer (not decided by the user; please check)
 
 1. `plansOwnWeek` defaults to **false**: on release everyone becomes admin-planned and their Week panel turns
