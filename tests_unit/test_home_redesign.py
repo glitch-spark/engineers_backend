@@ -230,17 +230,17 @@ async def day_plan(owner, d, **kw):
 
 
 async def test_bids_by_day_with_a_target(me):
-    await week_plan(me, goal=Counts(bidsSelf=600, bidsBidder=600))  # 200 a day over Mon-Sat
+    await week_plan(me, goal=Counts(bidsSelf=600, bidsBidder=600))  # self 100 a day Mon-Sat + bidder 120 Mon-Fri
     await day_plan(me, 16, done=DoneCounts(bidsSelf=100, bidsBidder=20))
     await day_plan(me, 17, done=DoneCounts(bidsBidder=80), targetOverride=Counts(bidsSelf=300))
     await day_plan(me, 22, done=DoneCounts(bidsSelf=7))  # Sunday: in the total, not a working day
     out = await dashboard_week(me, None, TODAY)
     assert out["bids"]["byDay"] == [
-        {"date": "2026-11-16", "done": 120, "self": 100, "bidder": 20, "target": 200}, {"date": "2026-11-17", "done": 80, "self": 0, "bidder": 80, "target": 300},
-        {"date": "2026-11-18", "done": 0, "self": 0, "bidder": 0, "target": 200}, {"date": "2026-11-19", "done": 0, "self": 0, "bidder": 0, "target": 200},
-        {"date": "2026-11-20", "done": 0, "self": 0, "bidder": 0, "target": 200}, {"date": "2026-11-21", "done": 0, "self": 0, "bidder": 0, "target": 200},
+        {"date": "2026-11-16", "done": 120, "self": 100, "bidder": 20, "target": 220}, {"date": "2026-11-17", "done": 80, "self": 0, "bidder": 80, "target": 300},
+        {"date": "2026-11-18", "done": 0, "self": 0, "bidder": 0, "target": 220}, {"date": "2026-11-19", "done": 0, "self": 0, "bidder": 0, "target": 220},
+        {"date": "2026-11-20", "done": 0, "self": 0, "bidder": 0, "target": 220}, {"date": "2026-11-21", "done": 0, "self": 0, "bidder": 0, "target": 100},
     ]
-    assert out["bids"]["total"] == 207 and out["bids"]["pace"]["expected"] == 700
+    assert out["bids"]["total"] == 207 and out["bids"]["pace"]["expected"] == 740
 
 
 async def test_bids_by_day_without_a_target(me):

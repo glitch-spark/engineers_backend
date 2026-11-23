@@ -45,7 +45,7 @@ async def me(db):
         year=2026,
         startDate=datetime(2026, 11, 16),
         endDate=datetime(2026, 11, 22),
-        goal=Counts(bidsSelf=600, bidsBidder=600, interviewsSelf=10),  # 200 bids a day over Mon-Sat
+        goal=Counts(bidsSelf=600, bidsBidder=600, interviewsSelf=10),  # self 100 a day Mon-Sat + bidder 120 Mon-Fri
         routines=[PlanItem(id="r1", text="Review"), PlanItem(id="r2", text="Contacts", kind="count", target=50)],
         weeklyGoals=[PlanItem(id="g1", text="Outreach", kind="count", target=250)],
     ).insert()
@@ -74,7 +74,7 @@ async def test_bid_pace_uses_day_targets_and_overrides(me):
     await day(me, 16, logged=True, done=DoneCounts(bidsSelf=100))
     await day(me, 17, targetOverride=Counts(bidsSelf=300, bidsBidder=0))
     out = await dashboard_week(me, None, TODAY)
-    assert out["bids"]["pace"]["expected"] == 200 + 300 + 200
+    assert out["bids"]["pace"]["expected"] == 220 + 300 + 220
     assert out["bids"]["pace"]["perDayNeeded"] == ceil((1200 - out["bids"]["total"]) / 3)  # Thu, Fri, Sat left
 
 

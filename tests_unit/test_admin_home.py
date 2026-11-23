@@ -180,7 +180,7 @@ async def test_team_today_bids_and_todos_are_the_days(boss, me):
     await day_plan(me, TUE, done=DoneCounts(bidsSelf=100, bidsBidder=5), targetOverride=Counts(bidsSelf=90),
                    results={review.id: ItemResult(done=True), calls.id: ItemResult(value=5)})
     today, yesterday = await one(boss, me), await one(boss, me, TUE)
-    assert (today["bids"], today["todos"], today["state"]) == ({"done": 80, "target": 100}, {"done": 1, "total": 2},
+    assert (today["bids"], today["todos"], today["state"]) == ({"done": 80, "target": 104}, {"done": 1, "total": 2},
                                                                "amber")
     assert (yesterday["bids"], yesterday["todos"], yesterday["state"]) == (
         {"done": 105, "target": 90}, {"done": 2, "total": 2}, "green")
@@ -309,12 +309,12 @@ async def test_bids_by_region_and_totals(me, monkeypatch):
         {"region": "EU", "self": 10, "selfTarget": 10, "bidder": 1, "total": 11},
     ]  # Latam: an archived profile, no target, no bid
     # before the release day (this file's default) the bidder total is the typed one
-    assert out["bidsTotals"] == {"self": 25, "selfTarget": 30, "bidder": 3, "bidderTarget": 10, "total": 28,
-                                 "target": 40}
+    assert out["bidsTotals"] == {"self": 25, "selfTarget": 30, "bidder": 3, "bidderTarget": 12, "total": 28,
+                                 "target": 42}
     # from the release day it is the live count the regions are cut from (2 + 1 + 4 on no profile), not the saved 3
     monkeypatch.setattr(plan_bidder, "RELEASE_DAY", MON)
     assert (await get_day(TUE.isoformat(), me, None))["bidsTotals"] == {
-        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 10, "total": 32, "target": 40}
+        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 12, "total": 32, "target": 42}
     assert latam.region == "Latam"
 
 
@@ -629,8 +629,8 @@ async def test_bids_week_sums_the_working_days_and_their_targets(me):
     await day_plan(me, TUE, done=DoneCounts(bidsBidder=80), targetOverride=Counts(bidsSelf=300))
     await day_plan(me, date(2026, 11, 22), done=DoneCounts(bidsSelf=7))  # Sunday: no working day
     bids_out = (await dashboard_week(me, None, TODAY))["bids"]
-    assert bids_out["week"] == {"self": 100, "selfTarget": 800, "bidder": 100, "bidderTarget": 100, "total": 200,
-                                "target": 900}
+    assert bids_out["week"] == {"self": 100, "selfTarget": 800, "bidder": 100, "bidderTarget": 96, "total": 200,
+                                "target": 896}
     assert bids_out["week"]["total"] == sum(d["done"] for d in bids_out["byDay"])
     assert bids_out["week"]["target"] == sum(d["target"] for d in bids_out["byDay"])
     assert bids_out["total"] == 207  # the existing total keeps Sunday's bids

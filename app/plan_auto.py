@@ -90,11 +90,12 @@ def _split(total: int, sat: Optional[int], day: date) -> int:
 
 
 def _sat_shares(weekly: Any) -> dict[str, Optional[int]]:
-    """Saturday's share per bid field (None = even split); regions follow self's Saturday share proportionally."""
+    """Saturday's share per bid field (None = even split); regions follow self's Saturday share proportionally.
+    Bidder bids are Mon-Fri only: Saturday always 0, whatever `satGoal` says."""
     sat = getattr(weekly, "satGoal", None)
     s_self = sat.bidsSelf if sat is not None else None
     goal = weekly.goal
-    out: dict[str, Optional[int]] = {"bidsSelf": s_self, "bidsBidder": sat.bidsBidder if sat is not None else None}
+    out: dict[str, Optional[int]] = {"bidsSelf": s_self, "bidsBidder": 0}
     for r in SELF_REGIONS:
         out[r] = None if s_self is None else (round(getattr(goal, r) * s_self / goal.bidsSelf) if goal.bidsSelf else 0)
     return out
@@ -102,7 +103,7 @@ def _sat_shares(weekly: Any) -> dict[str, Optional[int]]:
 
 def day_targets(plan: Optional[Any], weekly: Optional[Any], day: date) -> Counts:
     """A day's bid target: the day's own override, else the week's goal split over Mon-Sat (Saturday's share per
-    `satGoal`, else even; interviews 0)."""
+    `satGoal`, else even; bidder bids Mon-Fri only; interviews 0)."""
     if plan is not None and plan.targetOverride is not None:
         return plan.targetOverride
     if weekly is None or day.weekday() >= WORKDAYS:

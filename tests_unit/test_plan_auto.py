@@ -175,11 +175,18 @@ def _bids(w, day):
 
 def test_sat_goal_splits_rest_over_mon_to_fri():
     w = _week(goal=Counts(bidsSelf=1000, bidsBidder=1000), satGoal=SatGoal(bidsSelf=100))
-    assert [_bids(w, MON + timedelta(days=n)) for n in range(7)] == [(180, 167)] * 5 + [(100, 167), (0, 0)]
+    assert [_bids(w, MON + timedelta(days=n)) for n in range(7)] == [(180, 200)] * 5 + [(100, 0), (0, 0)]
     w.satGoal = SatGoal(bidsSelf=0, bidsBidder=0)
     assert [_bids(w, MON + timedelta(days=n)) for n in range(7)] == [(200, 200)] * 5 + [(0, 0), (0, 0)]
     w.satGoal = None
-    assert [_bids(w, MON + timedelta(days=n)) for n in range(6)] == [(167, 167)] * 6
+    assert [_bids(w, MON + timedelta(days=n)) for n in range(6)] == [(167, 200)] * 5 + [(167, 0)]
+
+
+def test_bidder_bids_are_mon_to_fri_only():
+    w = _week(goal=Counts(bidsBidder=1000))
+    assert [day_targets(None, w, MON + timedelta(days=n)).bidsBidder for n in range(7)] == [200] * 5 + [0, 0]
+    w.satGoal = SatGoal(bidsBidder=300)  # a stored Saturday bidder share is ignored
+    assert [day_targets(None, w, MON + timedelta(days=n)).bidsBidder for n in range(7)] == [200] * 5 + [0, 0]
 
 
 def test_sat_goal_regions_follow_self_share():

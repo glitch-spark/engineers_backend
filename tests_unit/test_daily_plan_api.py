@@ -127,7 +127,7 @@ async def test_get_day_has_targets_items_progress(me):
     review, contact, goal = await saved_week(me)
     await put_day(MON.isoformat(), me, {"results": {goal: {"value": 100}}})
     day = await get_day(TUE.isoformat(), me, None)
-    assert (day["targets"]["bidsSelf"], day["targets"]["bidsBidder"], day["targets"]["interviewsSelf"]) == (20, 10, 0)
+    assert (day["targets"]["bidsSelf"], day["targets"]["bidsBidder"], day["targets"]["interviewsSelf"]) == (20, 12, 0)
     assert [(i["id"], i["scope"], i["kind"], i["target"], i["result"]) for i in day["items"]] == [
         (review, "routine", "check", None, None), (contact, "routine", "count", 50, None),
         (goal, "goal", "count", 250, None)]
@@ -142,7 +142,7 @@ async def test_save_day_freezes_targets(me):
     review, contact, goal = await saved_week(me)
     await put_day(TUE.isoformat(), me, {"results": {contact: {"value": 30}, goal: {"value": 80}, review: {"done": True}}})
     plan = await stored(me, TUE)
-    assert (plan.targetOverride.bidsSelf, plan.targetOverride.bidsBidder) == (20, 10)
+    assert (plan.targetOverride.bidsSelf, plan.targetOverride.bidsBidder) == (20, 12)
     assert (plan.results[contact].target, plan.results[goal].target, plan.results[review].target) == (50, 250, None)
     assert plan.submittedAt is not None and plan.loggedAt is not None
     # An override sent with the day wins.
@@ -623,7 +623,7 @@ async def test_put_week_sat_goal_set_keep_clear(db, me):
     out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000, "bidsBidder": 60}, satGoal={"bidsSelf": 100}))
     assert out["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
     assert [d["goal"]["bidsSelf"] for d in out["days"]] == [180] * 5 + [100]
-    assert [d["goal"]["bidsBidder"] for d in out["days"]] == [10] * 6
+    assert [d["goal"]["bidsBidder"] for d in out["days"]] == [12] * 5 + [0]  # bidder: Mon-Fri only
     assert (await get_week(WEEK, me, None))["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
     out = await put_week(WEEK, me, week_body(goal={"bidsSelf": 1000}))  # absent (older client): kept
     assert out["satGoal"] == {"bidsSelf": 100, "bidsBidder": None}
