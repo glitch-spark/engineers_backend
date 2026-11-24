@@ -12,11 +12,12 @@ from zoneinfo import ZoneInfo
 from pymongo.errors import DuplicateKeyError
 
 from app import slack_bot
+from app.caller_teams import files as team_files
 from app.caller_teams import slack
 from app.caller_teams.blocks import cc, when, who
 from app.caller_teams.sync import STALE_CLAIM, TeamRound, _directory, _utc, team_round
 from app.interview_caller import ENDED_STATUSES
-from app.interview_day.blocks import MAX_BLOCKS, MAX_LINK, MAX_NAME, _method_part, _plural, _section, _short
+from app.interview_day.blocks import MAX_LINK, MAX_NAME, _method_part, _plural, _section, _short
 from app.interview_normalize import normalize_status
 from app.models.account import Account
 from app.models.caller import Caller
@@ -113,72 +114,124 @@ DAY_READY_ASK = ("Please react with :white_check_mark: once you've reviewed toda
                  "your calls.")
 
 
-def _messages(day: date, rounds: list[TeamRound], profiles: dict[str, str]) -> tuple[list[list[dict]], str]:
-    """The day's messages (at most 50 blocks each) and the fallback text."""
+def _header(day: date, rounds: list[TeamRound]) -> tuple[str, list[dict]]:
     title = f"Team interviews — {day:%a} {day:%b} {day.day}"
-    if not rounds:
-        return [[_section(NO_INTERVIEWS)]], f"{title} · {NO_INTERVIEWS}"
-    head = {"type": "header", "text": {"type": "plain_text", "text": f"⏰ {title} · {_plural(len(rounds), 'interview')}",
-                                       "emoji": True}}
-    blocks = [head, *(_section(_line(no, tr, profiles.get(str(tr.iv.accountId))))
-                      for no, tr in enumerate(rounds, 1)), _section(f"_{DAY_READY_ASK}_")]
-    return ([blocks[i:i + MAX_BLOCKS] for i in range(0, len(blocks), MAX_BLOCKS)],
-            f"{title} · {_plural(len(rounds), 'interview')}")
+    count = _plural(len(rounds), "interview") if rounds else NO_INTERVIEWS
+    text = f"⏰ {title} · {count}"
+    return text, [{"type": "header", "text": {"type": "plain_text", "text": text, "emoji": True}}]
+
+
+def _round_message(no: int, tr: TeamRound, profile: Optional[str]) -> tuple[str, list[dict]]:
+    body = f"{_line(no, tr, profile)}\n_{DAY_READY_ASK}_"
+    return f"{_short(tr.iv.companyName, MAX_NAME, '—')} · {_stage_label(tr.entry.stage)}", [_section(body)]
+
+
+def _gone_message() -> tuple[str, list[dict]]:
+    text = "~This interview is no longer on today's list.~"
+    return text, [_section(text)]
+
+
+async def _claim(post: TeamDayPost, field: str, rid: str) -> bool:
+    """Claim a round's message (`rounds`) or files (`filesDone`) on the stored row, so concurrent runs act once."""
+    col = TeamDayPost.get_motor_collection()
+    if field == "rounds":
+        res = await col.update_one({"_id": post.id, f"rounds.{rid}": {"$exists": False}}, {"$set": {f"rounds.{rid}": ""}})
+    else:
+        res = await col.update_one({"_id": post.id, "filesDone": {"$ne": rid}}, {"$push": {"filesDone": rid}})
+    return res.modified_count == 1
+
+
+async def _release(post: TeamDayPost, field: str, rid: str) -> None:
+    col = TeamDayPost.get_motor_collection()
+    op = {"$unset": {f"rounds.{rid}": ""}} if field == "rounds" else {"$pull": {"filesDone": rid}}
+    await col.update_one({"_id": post.id}, op)
+
+
+async def _round_files(post: TeamDayPost, ts: str, tr: TeamRound) -> None:
+    rid = tr.entry.id
+    if not await _claim(post, "filesDone", rid):
+        return
+    try:
+        files, note = await team_files.round_files(tr.iv, rid, tr.team.timezone)
+        files = [(team_files.clean_name(name) or "file.pdf", data) for name, data in files]
+        comment = "Brief and resume for this call." if note is None else f"Brief for this call. {note}"
+        await slack.upload_files(post.channel, ts, files, comment)
+    except Exception as exc:
+        log.warning("team day files failed (team=%s round=%s): %r", post.teamId, rid, exc)
+        await _release(post, "filesDone", rid)
+
+
+async def _sync_day(post: TeamDayPost, team: CallerTeam, day: date, directory,
+                    exclude: frozenset = frozenset(), now: Optional[datetime] = None) -> None:
+    """Header edited in place; one message per round (posted once, then edited) with its files in the thread; a
+    round that left the day keeps its message (and thread), marked as no longer listed."""
+    now = _utc(now or datetime.now(timezone.utc))
+    rounds = await team_rounds_for_day(team, day, directory=directory, exclude=exclude)
+    profiles = await _profiles(rounds)
+    text, blocks = _header(day, rounds)
+    await slack.api("chat.update", {"channel": post.channel, "ts": post.ts[0], "text": text, "blocks": blocks})
+    for extra in post.ts[1:]:  # chunks of an older one-message list
+        await slack.api("chat.delete", {"channel": post.channel, "ts": extra})
+    if len(post.ts) > 1:
+        await TeamDayPost.get_motor_collection().update_one({"_id": post.id}, {"$set": {"ts": post.ts[:1]}})
+    listed = set()
+    for no, tr in enumerate(rounds, 1):
+        rid = tr.entry.id
+        listed.add(rid)
+        text, blocks = _round_message(no, tr, profiles.get(str(tr.iv.accountId)))
+        fresh = await TeamDayPost.get(post.id)
+        ts = fresh.rounds.get(rid) if fresh else None
+        if ts:
+            await slack.api("chat.update", {"channel": post.channel, "ts": ts, "text": text, "blocks": blocks})
+        elif ts is None and await _claim(post, "rounds", rid):
+            try:
+                ts = str((await slack.api("chat.postMessage", {
+                    "channel": post.channel, "text": text, "blocks": blocks, "unfurl_links": False,
+                }))["ts"])
+            except Exception:
+                await _release(post, "rounds", rid)
+                raise
+            await TeamDayPost.get_motor_collection().update_one({"_id": post.id}, {"$set": {f"rounds.{rid}": ts}})
+        # ponytail: a poster that dies between claim and post leaves "" for good; that round then has no message
+        if ts and tr.start > now and rid not in (fresh.filesDone if fresh else []):
+            await _round_files(post, ts, tr)
+    fresh = await TeamDayPost.get(post.id)
+    for rid, ts in (fresh.rounds if fresh else {}).items():
+        if ts and rid not in listed:
+            text, blocks = _gone_message()
+            await slack.api("chat.update", {"channel": post.channel, "ts": ts, "text": text, "blocks": blocks})
+    ids = sorted({str(tr.iv.id) for tr in rounds} | set(post.interviewIds))
+    if ids != post.interviewIds:
+        await TeamDayPost.get_motor_collection().update_one({"_id": post.id}, {"$set": {"interviewIds": ids}})
 
 
 def _at(team: CallerTeam) -> time:
     return time.fromisoformat(team.dailyTime)
 
 
-async def _edit(post: TeamDayPost, team: CallerTeam, day: date, directory, exclude: frozenset = frozenset()) -> None:
-    """Bring the stored messages in line with the day: edit each, post extra ones, delete surplus ones."""
-    rounds = await team_rounds_for_day(team, day, directory=directory, exclude=exclude)
-    messages, text = _messages(day, rounds, await _profiles(rounds))
-    ts = list(post.ts)
-    for i, blocks in enumerate(messages):
-        if i < len(ts):
-            await slack.api("chat.update", {"channel": post.channel, "ts": ts[i], "text": text, "blocks": blocks})
-        else:
-            sent = await slack.api("chat.postMessage", {
-                "channel": post.channel, "text": text, "blocks": blocks, "unfurl_links": False,
-            })
-            ts.append(str(sent["ts"]))
-    for extra in ts[len(messages):]:
-        await slack.api("chat.delete", {"channel": post.channel, "ts": extra})
-    ts = ts[:len(messages)]
-    if ts != post.ts:
-        post.ts = ts
-        await post.save()
-
-
-async def _post_day(team: CallerTeam, day: date, directory) -> str:
+async def _post_day(team: CallerTeam, day: date, directory, now: datetime) -> str:
     row = TeamDayPost(teamId=str(team.id), day=day.isoformat(), channel=team.reminderChannelId, ts=[])
     try:
         await row.insert()  # the claim: a concurrent tick hits the unique index
     except DuplicateKeyError:
         return "already_sent"
-    sent: list[str] = []
     try:
         rounds = await team_rounds_for_day(team, day, directory=directory)
-        messages, text = _messages(day, rounds, await _profiles(rounds))
-        for blocks in messages:
-            res = await slack.api("chat.postMessage", {
-                "channel": row.channel, "text": text, "blocks": blocks, "unfurl_links": False,
-            })
-            sent.append(str(res["ts"]))
-        row.ts = sent
-        row.interviewIds = sorted({str(tr.iv.id) for tr in rounds})
+        text, blocks = _header(day, rounds)
+        res = await slack.api("chat.postMessage", {
+            "channel": row.channel, "text": text, "blocks": blocks, "unfurl_links": False,
+        })
+        row.ts = [str(res["ts"])]
         await row.save()
-        return "posted"
     except Exception as exc:
         log.warning("team day post failed (team=%s): %s", team.id, exc)
-        for ts in sent:
-            try:
-                await slack.api("chat.delete", {"channel": row.channel, "ts": ts})
-            except Exception as exc2:
-                log.warning("team day post cleanup failed (team=%s): %s", team.id, exc2)
         await TeamDayPost.get_motor_collection().delete_one({"_id": row.id})
         return "failed"
+    try:
+        await _sync_day(row, team, day, directory, now=now)
+    except Exception as exc:  # the header is out; the next tick posts what is missing
+        log.warning("team day rounds failed (team=%s): %r", team.id, exc)
+    return "posted"
 
 
 async def run_team_day_posts(now: datetime) -> dict[str, str]:
@@ -199,14 +252,14 @@ async def run_team_day_posts(now: datetime) -> dict[str, str]:
                 continue
             post = await TeamDayPost.find_one(TeamDayPost.teamId == tid, TeamDayPost.day == day.isoformat())
             if post is None:
-                out[tid] = await _post_day(team, day, directory)
+                out[tid] = await _post_day(team, day, directory, now)
             elif not post.ts:  # a claim whose poster died: take it over once stale
                 created = _utc(post.createdAt)
                 if created < datetime.now(timezone.utc) - STALE_CLAIM:
                     await TeamDayPost.get_motor_collection().delete_one({"_id": post.id, "ts": []})
                 out[tid] = "already_sent"
             else:
-                await _edit(post, team, day, directory)
+                await _sync_day(post, team, day, directory, now=now)
                 out[tid] = "edited"
         except Exception as exc:
             log.warning("team day post failed (team=%s): %s", tid, exc)
@@ -227,7 +280,7 @@ async def refresh_team_day(team_id: str, now: datetime, deleted: frozenset = fro
         day = _utc(now).astimezone(ZoneInfo(team.timezone)).date()
         post = await TeamDayPost.find_one(TeamDayPost.teamId == str(team.id), TeamDayPost.day == day.isoformat())
         if post is not None and post.ts:
-            await _edit(post, team, day, directory, deleted)
+            await _sync_day(post, team, day, directory, deleted, now=now)
     except Exception as exc:
         log.warning("team day refresh failed (team=%s): %s", team_id, exc)
 
@@ -241,6 +294,13 @@ async def _thread_link(tr: TeamRound, round_id: str) -> Optional[str]:
     except Exception as exc:
         log.info("team reminder permalink failed (team=%s round=%s): %s", tr.team.id, round_id, exc)
         return None
+
+
+async def _day_thread(tr: TeamRound, round_id: str) -> Optional[str]:
+    """The ts of the round's own message in today's team day list, when it has one."""
+    day = tr.start.astimezone(ZoneInfo(tr.team.timezone)).date().isoformat()
+    post = await TeamDayPost.find_one(TeamDayPost.teamId == str(tr.team.id), TeamDayPost.day == day)
+    return (post.rounds.get(round_id) or None) if post else None
 
 
 def _reminder_text(tr: TeamRound, minutes: int, link: Optional[str]) -> str:
@@ -269,11 +329,13 @@ async def run_team_reminders(now: datetime) -> dict[str, int]:
             continue
         try:
             minutes = max(1, math.ceil((tr.start - now).total_seconds() / 60))
-            text = _reminder_text(tr, minutes, await _thread_link(tr, rid))
-            await slack.api("chat.postMessage", {
-                "channel": tr.team.reminderChannelId, "text": text, "blocks": [_section(text)],
-                "unfurl_links": False, "unfurl_media": False,
-            })
+            day_ts = await _day_thread(tr, rid)
+            text = _reminder_text(tr, minutes, None if day_ts else await _thread_link(tr, rid))
+            body = {"channel": tr.team.reminderChannelId, "text": text, "blocks": [_section(text)],
+                    "unfurl_links": False, "unfurl_media": False}
+            if day_ts:
+                body["thread_ts"] = day_ts
+            await slack.api("chat.postMessage", body)
             sent += 1
         except Exception as exc:
             failed += 1

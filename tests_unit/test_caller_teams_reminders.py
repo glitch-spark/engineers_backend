@@ -51,6 +51,16 @@ async def env(monkeypatch):
     )
     fake = FakeSlack()
     monkeypatch.setattr(team_slack, "api", fake.api)
+    fake.uploads = []
+
+    async def upload(channel, ts, files, comment):
+        fake.uploads.append((channel, ts, [n for n, _ in files]))
+
+    async def round_files(iv, rid, tz):
+        return [("Brief.pdf", b"%PDF"), ("Resume.pdf", b"%PDF")], None
+
+    monkeypatch.setattr(team_slack, "upload_files", upload)
+    monkeypatch.setattr(reminders.team_files, "round_files", round_files)
     monkeypatch.setattr(team_slack, "callers_configured", lambda: True)
     jamil = await Caller(name="Jamil", nameKey="jamil", slackUserId="U_JAMIL").insert()
     team = await CallerTeam(
@@ -73,22 +83,32 @@ def text_of(body):
     return body.get("text", "") + str(body.get("blocks", ""))
 
 
+async def round_ts(rid="r1"):
+    return (await TeamDayPost.find_one({})).rounds[rid]
+
+
+def all_posted(env):
+    return " ".join(text_of(b) for b in env["slack"].of("chat.postMessage"))
+
+
 async def test_day_post_waits_until_daily_time(env):
     await make_iv(env["omar"], SIX + timedelta(hours=3))
     await reminders.run_team_day_posts(SIX - timedelta(minutes=1))
     assert env["slack"].calls == []
     await reminders.run_team_day_posts(SIX)
     posts = env["slack"].of("chat.postMessage")
-    assert len(posts) == 1 and posts[0]["channel"] == "CREM"
-    assert "Acme" in text_of(posts[0]) and "<@U_OMAR>" in text_of(posts[0]) and "<@U_JAMIL>" in text_of(posts[0])
-    assert "elements" not in str(posts[0]["blocks"])
+    assert len(posts) == 2 and {p["channel"] for p in posts} == {"CREM"}
+    assert "1 interview" in text_of(posts[0]) and "Acme" not in text_of(posts[0])  # header
+    assert "Acme" in text_of(posts[1]) and "<@U_OMAR>" in text_of(posts[1]) and "<@U_JAMIL>" in text_of(posts[1])
+    assert "elements" not in str(posts[1]["blocks"])
+    assert env["slack"].uploads == [("CREM", await round_ts(), ["Brief.pdf", "Resume.pdf"])]
 
 
 async def test_day_post_lists_only_team_rounds(env):
     await make_iv(env["omar"], SIX + timedelta(hours=3))
     await make_iv(env["solo"], SIX + timedelta(hours=4), company="SoloCo")
     await reminders.run_team_day_posts(SIX)
-    body = text_of(env["slack"].of("chat.postMessage")[0])
+    body = all_posted(env)
     assert "Acme" in body and "SoloCo" not in body
 
 
@@ -97,19 +117,21 @@ async def test_day_post_local_day_edge(env):
     await make_iv(env["omar"], datetime(2026, 11, 23, 5, 30, tzinfo=timezone.utc), company="PrevDay")
     await make_iv(env["omar"], datetime(2026, 11, 24, 6, 0, tzinfo=timezone.utc), company="NextDay")
     await reminders.run_team_day_posts(SIX)
-    body = text_of(env["slack"].of("chat.postMessage")[0])
+    body = all_posted(env)
     assert "InDay" in body and "PrevDay" not in body and "NextDay" not in body
 
 
 async def test_day_post_edits_in_place(env):
     await make_iv(env["omar"], SIX + timedelta(hours=3))
     await reminders.run_team_day_posts(SIX)
-    first = env["slack"].of("chat.postMessage")
-    await make_iv(env["omar"], SIX + timedelta(hours=5), company="Later")
+    assert len(env["slack"].of("chat.postMessage")) == 2
+    await make_iv(env["omar"], SIX + timedelta(hours=5), rid="r2", company="Later")
     await reminders.run_team_day_posts(SIX + timedelta(minutes=5))
-    assert len(env["slack"].of("chat.postMessage")) == len(first) == 1
-    upd = env["slack"].of("chat.update")
-    assert len(upd) == 1 and upd[0]["ts"] == "1.000" and "Later" in text_of(upd[0])
+    posts = env["slack"].of("chat.postMessage")
+    assert len(posts) == 3 and "Later" in text_of(posts[2])  # only the new round gets a message
+    upd = {u["ts"]: text_of(u) for u in env["slack"].of("chat.update")}
+    assert "2 interviews" in upd["1.000"] and "Acme" in upd[await round_ts()]
+    assert [u[1] for u in env["slack"].uploads] == [await round_ts(), await round_ts("r2")]
     assert await TeamDayPost.count() == 1
 
 
@@ -117,9 +139,9 @@ async def test_refresh_team_day_edits_only_posted_day(env):
     await reminders.refresh_team_day(str(env["team"].id), SIX)
     assert env["slack"].calls == []  # nothing posted yet: refresh never posts
     await reminders.run_team_day_posts(SIX)
-    await make_iv(env["omar"], SIX + timedelta(hours=5), company="Later")
+    await make_iv(env["omar"], SIX + timedelta(hours=5), rid="r2", company="Later")
     await reminders.refresh_team_day(str(env["team"].id), SIX)
-    assert "Later" in text_of(env["slack"].of("chat.update")[0])
+    assert "Later" in text_of(env["slack"].of("chat.postMessage")[-1])
 
 
 async def test_empty_day_says_no_interviews(env):
@@ -169,7 +191,7 @@ async def test_failed_reminder_is_retried(env):
 async def test_tbd_round_no_reminder_not_listed(env):
     await make_iv(env["omar"], None)
     await reminders.run_team_day_posts(SIX)
-    assert "Acme" not in text_of(env["slack"].of("chat.postMessage")[0])
+    assert "Acme" not in all_posted(env)
     assert (await reminders.run_team_reminders(SIX))["sent"] == 0
 
 
@@ -213,7 +235,7 @@ async def test_day_list_line_has_the_call_method(env):
     iv.stageHistory[0].caller.method = "video"
     await iv.save()
     await reminders.run_team_day_posts(SIX)
-    assert "Video" in text_of(env["slack"].of("chat.postMessage")[0])
+    assert "Video" in all_posted(env)
 
 
 async def test_day_list_uses_the_field_per_line_format(env):
@@ -226,7 +248,7 @@ async def test_day_list_uses_the_field_per_line_format(env):
     e.caller.method, e.caller.methodValue = "video", "https://meet.google.com/abc-defg-hij"
     await iv.save()
     await reminders.run_team_day_posts(SIX)
-    text = text_of(env["slack"].of("chat.postMessage")[0])
+    text = text_of(env["slack"].of("chat.postMessage")[1])
     for want in ("1. Who: <@U_OMAR> · cc: <@U_JAMIL>", "Profile name: Brandon Mayer", "Company name: Acme",
                  "Round: ", "Job link: <https://builtin.com/job/staff-eng/1|builtin.com/job/staff-eng/1>",
                  "Meeting link: <https://meet.google.com/abc-defg-hij|meet.google.com/abc-defg-hij>",
@@ -239,7 +261,33 @@ async def test_refresh_team_day_leaves_out_deleted_rounds(env):
     iv = await make_iv(env["omar"], SIX + timedelta(hours=3))
     await reminders.run_team_day_posts(SIX)
     await reminders.refresh_team_day(str(env["team"].id), SIX, frozenset({"r1"}))
-    upd = text_of(env["slack"].of("chat.update")[-1])
-    assert "Acme" not in upd and reminders.NO_INTERVIEWS in upd
+    upd = {u["ts"]: text_of(u) for u in env["slack"].of("chat.update")}
+    assert reminders.NO_INTERVIEWS in upd["1.000"] and "no longer on today's list" in upd[await round_ts()]
+    env["slack"].calls.clear()
     await reminders.refresh_team_day(str(env["team"].id), SIX)
-    assert "Acme" in text_of(env["slack"].of("chat.update")[-1])
+    upd = {u["ts"]: text_of(u) for u in env["slack"].of("chat.update")}
+    assert "Acme" in upd[await round_ts()] and env["slack"].of("chat.postMessage") == []  # same message, same thread
+
+
+async def test_reminder_goes_in_the_rounds_day_thread(env):
+    await make_iv(env["omar"], SIX + timedelta(minutes=20))
+    await reminders.run_team_day_posts(SIX)
+    assert (await reminders.run_team_reminders(SIX))["sent"] == 1
+    rem = env["slack"].of("chat.postMessage")[-1]
+    assert rem["channel"] == "CREM" and rem["thread_ts"] == await round_ts() and "Starting in 20 min" in text_of(rem)
+
+
+async def test_failed_day_files_retry_without_reposting(env, monkeypatch):
+    calls = []
+
+    async def flaky(channel, ts, files, comment):
+        calls.append(ts)
+        if len(calls) == 1:
+            raise RuntimeError("upload down")
+
+    monkeypatch.setattr(reminders.slack, "upload_files", flaky)
+    await make_iv(env["omar"], SIX + timedelta(hours=3))
+    await reminders.run_team_day_posts(SIX)
+    await reminders.run_team_day_posts(SIX + timedelta(minutes=5))
+    await reminders.run_team_day_posts(SIX + timedelta(minutes=10))
+    assert calls == [await round_ts()] * 2 and len(env["slack"].of("chat.postMessage")) == 2
