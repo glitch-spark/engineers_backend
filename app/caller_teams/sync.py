@@ -138,7 +138,7 @@ async def _send_files(post: TeamRoundPost, tr: TeamRound, now: datetime) -> bool
         comment = "Brief and resume for this call." if note is None else f"Brief for this call. {note}"
         await slack.upload_files(post.channel, post.ts, files, comment)
     except Exception as exc:
-        log.warning("team post files failed (%s): %s", _ctx(post), exc)
+        log.warning("team post files failed (%s): %r", _ctx(post), exc)
         await _cas(post, filesFor=old)
         return False
     return True

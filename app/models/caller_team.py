@@ -44,8 +44,10 @@ class TeamDayPost(TimestampedDocument):
     teamId: str
     day: str  # YYYY-MM-DD in the team's timezone
     channel: str
-    ts: list[str]
+    ts: list[str]  # the header message (older lists: every chunk of the one-message list)
     interviewIds: list[str] = []
+    rounds: dict[str, str] = {}  # round id -> ts of its own message ("" while claimed)
+    filesDone: list[str] = []  # round ids whose brief + resume are in their thread
 
     class Settings:
         name = "teamdayposts"
