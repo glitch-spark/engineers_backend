@@ -21,7 +21,7 @@ async def api(method: str, body: dict[str, Any]) -> dict[str, Any]:
 
 
 async def upload_files(channel: str, thread_ts: str, files: list[tuple[str, bytes]], comment: str) -> None:
-    """Upload files into a thread: getUploadURLExternal (form) + raw PUT per file, then one completeUploadExternal."""
+    """Upload files into a thread: getUploadURLExternal (form) + raw POST per file (Slack redirects a PUT), then one completeUploadExternal."""
     token = (get_settings().SLACK_CALLERS_BOT_TOKEN or "").strip()
     if not token:
         raise RuntimeError("SLACK_CALLERS_BOT_TOKEN is not configured")
@@ -36,7 +36,7 @@ async def upload_files(channel: str, thread_ts: str, files: list[tuple[str, byte
             payload = resp.json() if resp.content else {}
             if not payload.get("ok"):
                 raise RuntimeError(payload.get("error") or f"files.getUploadURLExternal HTTP {resp.status_code}")
-            up = await client.put(payload["upload_url"], content=data)
+            up = await client.post(payload["upload_url"], content=data)
             if up.status_code >= 300:
                 raise RuntimeError(f"file upload HTTP {up.status_code}")
             done.append({"id": payload["file_id"], "title": filename})

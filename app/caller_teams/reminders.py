@@ -66,7 +66,7 @@ def _line(tr: TeamRound) -> str:
     method = _method_part(SimpleNamespace(method=caller.method if caller else None,
                                           link=caller.methodValue if caller else ""))
     return (f"*{_short(tr.iv.companyName, MAX_NAME, '—')}* · {_stage_label(tr.entry.stage)} · {when(tr)}"
-            + (f" · {method}" if method else "") + f"\nCaller: {people}")
+            + (f" · {method}" if method else "") + f"\nWho: {people}")
 
 
 def _messages(day: date, rounds: list[TeamRound]) -> tuple[list[list[dict]], str]:
@@ -199,7 +199,7 @@ async def _thread_link(tr: TeamRound, round_id: str) -> Optional[str]:
 
 def _reminder_text(tr: TeamRound, minutes: int, link: Optional[str]) -> str:
     lines = [f"⏰ Starting in {minutes} min — *{_short(tr.iv.companyName, MAX_NAME, '—')}* · "
-             f"{_stage_label(tr.entry.stage)}", f"When: {when(tr)}", f"Caller: {who(tr.caller) or '—'}{cc(tr)}"]
+             f"{_stage_label(tr.entry.stage)}", f"When: {when(tr)}", f"Who: {who(tr.caller) or '—'}{cc(tr)}"]
     if link:
         lines.append(f"<{link}|Open the interview thread>")
     return "\n".join(lines)

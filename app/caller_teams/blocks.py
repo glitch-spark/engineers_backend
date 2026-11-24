@@ -55,7 +55,7 @@ def scheduled_blocks(tr: TeamRound, state: str) -> tuple[str, list[dict]]:
                                           link=caller.methodValue if caller else ""))
     if method:
         lines.append(f"Call: {method}")
-    lines.append(f"Caller: {who(tr.caller) or '—'}" + cc(tr))
+    lines.append(f"Who: {who(tr.caller) or '—'}" + cc(tr))
     return f"{plain}: {company} · {_stage_label(tr.entry.stage)}", [_section("\n".join(lines))]
 
 

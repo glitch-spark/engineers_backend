@@ -29,10 +29,6 @@ class FakeClient:
         FakeClient.calls.append(("POST", url, kw))
         return httpx.Response(200, json={"ok": True, "upload_url": "https://up/x", "file_id": "F1"})
 
-    async def put(self, url, **kw):
-        FakeClient.calls.append(("PUT", url, kw))
-        return httpx.Response(200)
-
 
 def _tokens(monkeypatch, main="xoxb-main", callers="xoxb-callers"):
     s = get_settings()
@@ -78,7 +74,7 @@ async def test_upload_files_three_calls(monkeypatch):
     with patch.object(cts.httpx, "AsyncClient", FakeClient), patch.object(cts, "api", fake_api):
         await cts.upload_files("C1", "1.2", [("a.pdf", b"AAA"), ("b.pdf", b"BB")], "hi")
     kinds = [(c[0], c[1].rsplit("/", 1)[-1]) for c in FakeClient.calls]
-    assert kinds == [("POST", "files.getUploadURLExternal"), ("PUT", "x"), ("POST", "files.getUploadURLExternal"), ("PUT", "x")]
+    assert kinds == [("POST", "files.getUploadURLExternal"), ("POST", "x"), ("POST", "files.getUploadURLExternal"), ("POST", "x")]
     assert FakeClient.calls[0][2]["data"] == {"filename": "a.pdf", "length": 3}
     assert FakeClient.calls[1][2]["content"] == b"AAA"
     assert completes == [("files.completeUploadExternal", {
