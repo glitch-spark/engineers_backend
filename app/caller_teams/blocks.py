@@ -75,7 +75,8 @@ def reply_text(kind: str, tr: TeamRound, *, previous: Optional[Caller] = None) -
     """A thread reply that tags whoever must act: the caller (or `previous` one) and the manager."""
     tags = " ".join(dict.fromkeys(p for p in (who(previous or tr.caller), who(tr.manager)) if p))
     if kind == "assigned":
-        return f"Now on this call: {who(tr.caller)}" + cc(tr)
+        was = f" (was {who(previous)})" if previous is not None and previous.id != getattr(tr.caller, "id", None) else ""
+        return f":arrows_counterclockwise: *Reassigned* — this call is now with {who(tr.caller)}{was}." + cc(tr)
     if kind == "moved":
         if tr.start is None:
             return f"Time cleared — now TBD. {tags}"

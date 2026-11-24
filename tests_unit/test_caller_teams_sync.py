@@ -165,6 +165,7 @@ async def test_other_member_assigned_edits_and_replies(env):
     assert fake.calls[0][1]["ts"] == "1.000" and "<@U_SARA>" in all_text(fake.calls[0][1])
     [reply] = replies(fake)
     assert reply["thread_ts"] == "1.000" and "<@U_SARA>" in reply["text"] and "<@U_JAMIL>" in reply["text"]
+    assert "*Reassigned*" in reply["text"] and "(was <@U_OMAR>)" in reply["text"]
     assert fake.uploads == []
     assert (await TeamRoundPost.find_one()).callerId == str(env["people"]["sara"].id)
 
