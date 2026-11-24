@@ -125,8 +125,8 @@ async def brief_pdf(iv, round_id: str, tz: str) -> tuple[str, bytes]:
 
 
 async def round_files(iv, round_id: str, tz: str) -> tuple[list[tuple[str, bytes]], Optional[str]]:
-    """The brief plus the linked resume, and a note when the resume is missing. A failing brief raises; a failing
-    resume only sets the note."""
+    """The brief plus the linked resume, and a note when the resume is missing. A failing brief raises; a resume that is
+    gone (FileUnavailable) only sets the note; any other resume error raises so the caller retries."""
     out = [await brief_pdf(iv, round_id, tz)]
     link = iv.resumeLink
     try:
@@ -135,7 +135,7 @@ async def round_files(iv, round_id: str, tz: str) -> tuple[list[tuple[str, bytes
             resume_job_id=str(link.resumeJobId) if link and link.resumeJobId else None,
             account_id=str(iv.accountId), resume_id=link.resumeId if link else None,
         )
-    except Exception as exc:  # noqa: BLE001 - the brief still goes out
+    except resume_files.FileUnavailable as exc:  # gone for good: the brief still goes out; other errors propagate
         log.warning("resume for interview %s unavailable: %s", iv.id, type(exc).__name__)
         found = None
     if found is None:

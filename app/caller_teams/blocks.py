@@ -66,6 +66,8 @@ def reply_text(kind: str, tr: TeamRound, *, previous: Optional[Caller] = None) -
     if kind == "assigned":
         return f"Now on this call: {who(tr.caller)}" + (f" · manager {who(tr.manager)}" if tr.manager else "")
     if kind == "moved":
+        if tr.start is None:
+            return f"Time cleared — now TBD. {tags}"
         return f"Moved to {when(tr)}. {tags}"
     if kind == "time_set":
         return f"Time set: {when(tr)}. {tags}"

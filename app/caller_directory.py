@@ -55,7 +55,7 @@ def _external_entry(caller: Caller, team_names: Optional[dict[str, str]] = None)
 
 
 async def team_names() -> dict[str, str]:
-    return {str(t.id): t.name for t in await CallerTeam.find_all().to_list()}
+    return {str(t.id): t.name for t in await CallerTeam.find_all().to_list() if t.archivedAt is None}
 
 
 async def list_directory(*, include_archived: bool = False) -> list[CallerEntry]:

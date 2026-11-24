@@ -26,6 +26,8 @@ log = logging.getLogger(__name__)
 
 # A claim (post row with no ts yet) older than this is from a process that died before posting: it may be taken over.
 STALE_CLAIM = timedelta(minutes=2)
+# A TBD round (no time yet) is only live while it was added this recently.
+TBD_WINDOW = timedelta(days=30)
 
 
 @dataclass
@@ -58,6 +60,14 @@ def team_round(iv, entry, *, callers: dict[str, Caller], teams: dict[str, Caller
     if team is None or team.archivedAt is not None:
         return None
     return TeamRound(team, caller, callers.get(team.managerCallerId), iv, entry, _utc(entry.scheduledAt))
+
+
+def is_live(entry, now: datetime) -> bool:
+    """A round gets a new team post / files only while it is scheduled (or has no status), and a TBD round only when it
+    was added within TBD_WINDOW: finished or long-forgotten rounds are never posted to the external workspace."""
+    if normalize_status(entry.status) not in (None, "scheduled"):
+        return False
+    return entry.scheduledAt is not None or _utc(entry.at) >= now - TBD_WINDOW
 
 
 def _digest(text: str, blocks: list[dict]) -> str:
@@ -115,7 +125,7 @@ async def _send_files(post: TeamRoundPost, tr: TeamRound, now: datetime) -> bool
     """Brief + resume into the post's thread, once per start (-1 = a TBD round); never for a past round. The
     `filesFor` claim is released on failure so the sweep retries."""
     want = post.startEpoch if post.startEpoch is not None else -1
-    if post.state != "scheduled" or not post.ts or post.filesFor == want:
+    if post.state != "scheduled" or not post.ts or post.filesFor == want or not is_live(tr.entry, now):
         return False
     if tr.start is not None and tr.start <= now:
         return False
@@ -226,7 +236,7 @@ async def sync_round(iv, entry, round_id: str, now: datetime, *, callers: dict[s
         current = None
     ended = normalize_status(entry.status) in ENDED_STATUSES
     if current is None:
-        if ended:
+        if ended or not is_live(entry, now):
             return action
         return await _post_new(tr, round_id, now)
     return await _update(current, tr, ended, now)
@@ -263,12 +273,12 @@ async def sync_team_posts(interview_id: str, *, now: Optional[datetime] = None, 
     try:
         callers, teams = await _directory()
         await _sync_interview(str(interview_id), now, set(deleted), callers, teams)
-        await _refresh_days(str(interview_id), now, callers)
+        await _refresh_days(str(interview_id), now, callers, frozenset(deleted))
     except Exception as exc:
         log.exception("team posts sync failed (interview=%s): %s", interview_id, exc)
 
 
-async def _refresh_days(interview_id: str, now: datetime, callers: dict[str, Caller]) -> None:
+async def _refresh_days(interview_id: str, now: datetime, callers: dict[str, Caller], deleted=frozenset()) -> None:
     """Edit the day list of every team this interview touches (a round's caller team now, or a post it had)."""
     from app.caller_teams.reminders import refresh_team_day  # reminders imports this module
 
@@ -279,7 +289,7 @@ async def _refresh_days(interview_id: str, now: datetime, callers: dict[str, Cal
         if c is not None and c.teamId:
             ids.add(c.teamId)
     for tid in sorted(ids):
-        await refresh_team_day(tid, now)
+        await refresh_team_day(tid, now, deleted)
 
 
 async def sweep_team_posts(now: datetime) -> dict[str, int]:
@@ -295,7 +305,8 @@ async def sweep_team_posts(now: datetime) -> dict[str, int]:
     if members:
         cursor = Interview.get_motor_collection().find({"stageHistory": {"$elemMatch": {
             "caller.enabled": True, "caller.callerId": {"$in": members},
-            "$or": [{"scheduledAt": {"$gt": naive_now}}, {"scheduledAt": None}],
+            "$or": [{"scheduledAt": {"$gt": naive_now}},
+                    {"scheduledAt": None, "at": {"$gte": naive_now - TBD_WINDOW}}],
         }}}, {"_id": 1})
         ids |= {str(d["_id"]) for d in await cursor.to_list(None)}
     posts = await TeamRoundPost.find({

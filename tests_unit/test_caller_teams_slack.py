@@ -87,12 +87,6 @@ async def test_upload_files_three_calls(monkeypatch):
     })]
 
 
-def test_mention_with_and_without_slack_id():
-    assert cts.mention(Caller.model_construct(name="Omar", slackUserId="U07Q3KD2M9A")) == "<@U07Q3KD2M9A>"
-    assert cts.mention(Caller.model_construct(name="Omar", slackUserId=None)) == "Omar"
-    assert cts.mention(None) == ""
-
-
 @pytest.mark.asyncio
 async def test_workspace_name(monkeypatch):
     _tokens(monkeypatch)

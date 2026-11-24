@@ -204,4 +204,22 @@ async def test_tick_isolates_team_failures(env):
     ):
         out = await run_alert_tick()
     assert out["caller_daily"] == "posted" and out["caller_reminders"] == 2
-    assert out["team_daily"] == "failed" and out["team_reminders"] == 0
+    assert out["team_daily"] == {"_error": "failed"} and out["team_reminders"] == 0
+
+
+async def test_day_list_line_has_the_call_method(env):
+    iv = await make_iv(env["omar"], SIX + timedelta(hours=3))
+    iv.stageHistory[0].caller.method = "video"
+    await iv.save()
+    await reminders.run_team_day_posts(SIX)
+    assert "Video" in text_of(env["slack"].of("chat.postMessage")[0])
+
+
+async def test_refresh_team_day_leaves_out_deleted_rounds(env):
+    iv = await make_iv(env["omar"], SIX + timedelta(hours=3))
+    await reminders.run_team_day_posts(SIX)
+    await reminders.refresh_team_day(str(env["team"].id), SIX, frozenset({"r1"}))
+    upd = text_of(env["slack"].of("chat.update")[-1])
+    assert "Acme" not in upd and reminders.NO_INTERVIEWS in upd
+    await reminders.refresh_team_day(str(env["team"].id), SIX)
+    assert "Acme" in text_of(env["slack"].of("chat.update")[-1])

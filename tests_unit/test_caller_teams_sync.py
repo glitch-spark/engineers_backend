@@ -474,3 +474,47 @@ async def test_future_round_canceled_still_edits_and_replies(env):
     await iv.save()
     assert await run_round(iv) == "canceled"
     assert env["slack"].methods() == ["chat.update", "chat.postMessage"]
+
+
+async def test_time_cleared_back_to_tbd_says_so(env):
+    fake = env["slack"]
+    iv = await make_iv(env)
+    await run_round(iv)
+    fake.calls.clear()
+    iv.stageHistory[0].scheduledAt = None
+    await iv.save()
+    assert await run_round(iv) == "replied"
+    [reply] = replies(fake)
+    assert reply["text"].startswith("Time cleared — now TBD.") and "Moved to" not in reply["text"]
+
+
+async def test_tbd_round_with_finished_status_never_posted(env):
+    iv = await make_iv(env, at=None, status="completed")
+    assert await run_round(iv) == "none"
+    assert env["slack"].calls == [] and await TeamRoundPost.find_all().count() == 0
+
+
+async def test_old_tbd_round_never_posted_and_sweep_skips_it(env):
+    iv = await make_iv(env, at=None)
+    iv.stageHistory[0].at = NOW - timedelta(days=45)
+    await iv.save()
+    assert await run_round(iv) == "none"
+    assert await sync.sweep_team_posts(NOW) == {}
+    assert env["slack"].calls == [] and await TeamRoundPost.find_all().count() == 0
+
+
+async def test_recent_tbd_scheduled_round_is_posted(env):
+    iv = await make_iv(env, at=None)
+    assert await run_round(iv) == "posted"
+    assert len(env["slack"].uploads) == 1
+
+
+async def test_round_that_stops_being_live_gets_no_new_files(env):
+    iv = await make_iv(env, at=None)
+    await run_round(iv)
+    env["slack"].uploads.clear()
+    iv.stageHistory[0].status = "completed"
+    iv.stageHistory[0].scheduledAt = START
+    await iv.save()
+    await run_round(iv)
+    assert env["slack"].uploads == []

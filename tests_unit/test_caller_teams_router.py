@@ -209,3 +209,24 @@ async def test_blank_name_and_channels_rejected(client):
             r = await c.patch(f"/callers/teams/{tid}", json={k: "   "})
             assert r.status_code == 422 and r.json()["detail"] == msg
         assert (await CallerTeam.get(tid)).name == "Alpha"
+
+
+@pytest.mark.parametrize("method,path", [
+    ("get", "/callers/teams"), ("post", "/callers/teams"), ("patch", "/callers/teams/abc"),
+    ("get", "/callers/teams/connection"), ("post", "/callers/teams/abc/test"),
+])
+async def test_staff_gets_403_on_every_team_endpoint(client, method, path):
+    staff = await UserExtra(name="S", email="s@x.io", role="staff").insert()
+    async with client(staff) as c:
+        assert (await getattr(c, method)(path, **({"json": {}} if method != "get" else {}))).status_code == 403
+
+
+async def test_slack_ids_only_shown_to_caller_managers(client):
+    await caller("Sam", slackUserId="U07Q3KD2M9A")
+    staff = await UserExtra(name="S", email="s@x.io", role="staff").insert()
+    async with client(staff) as c:
+        got = (await c.get("/callers")).json()["callers"]
+    assert [x["slackUserId"] for x in got if x["kind"] == "external"] == [""]
+    async with client(await admin()) as c:
+        got = (await c.get("/callers")).json()["callers"]
+    assert [x["slackUserId"] for x in got if x["kind"] == "external"] == ["U07Q3KD2M9A"]

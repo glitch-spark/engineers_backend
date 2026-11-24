@@ -71,3 +71,16 @@ async def test_resolve_finds_users_and_externals_but_not_inactive_or_archived(db
     assert await resolve_caller(str(bo.id)) is None and await resolve_caller(str(old.id)) is None
     assert await resolve_caller("not-an-id") is None
     assert await resolve_caller("6ad7bb33695b5819321f5785") is None
+
+
+async def test_archived_team_names_are_not_shown(db):
+    from app.models.caller_team import CallerTeam
+
+    await init_beanie(database=db, document_models=[UserExtra, Caller, CallerTeam])
+
+    live = await CallerTeam(name="Alpha", nameKey="alpha", managerCallerId="m", channelId="C1", reminderChannelId="C2").insert()
+    gone = await CallerTeam(name="Beta", nameKey="beta", managerCallerId="m", channelId="C1", reminderChannelId="C2",
+                            archivedAt=datetime(2026, 11, 1, tzinfo=timezone.utc)).insert()
+    from app.caller_directory import team_names
+
+    assert await team_names() == {str(live.id): "Alpha"} and str(gone.id) not in await team_names()

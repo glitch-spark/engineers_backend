@@ -7,7 +7,6 @@ import httpx
 
 from app import slack_bot
 from app.config import get_settings
-from app.models.caller import Caller
 
 log = logging.getLogger(__name__)
 _TIMEOUT = 15.0
@@ -44,12 +43,6 @@ async def upload_files(channel: str, thread_ts: str, files: list[tuple[str, byte
     await api("files.completeUploadExternal", {
         "channel_id": channel, "thread_ts": thread_ts, "initial_comment": comment, "files": done,
     })
-
-
-def mention(caller: Optional[Caller]) -> str:
-    if caller is None:
-        return ""
-    return f"<@{caller.slackUserId}>" if caller.slackUserId else caller.name
 
 
 async def workspace_name() -> Optional[str]:

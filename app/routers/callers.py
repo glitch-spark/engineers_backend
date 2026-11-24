@@ -104,7 +104,11 @@ async def get_caller(caller_id: str) -> Optional[Caller]:
 @router.get("")
 async def list_callers(user: Annotated[UserExtra, Depends(get_current_user)], archived: int = 0) -> dict:
     """Active platform users, then external callers; `?archived=1` also lists archived external callers."""
-    return {"callers": await list_directory(include_archived=bool(archived)), "canManage": is_caller_manager(user)}
+    manage = is_caller_manager(user)
+    entries = await list_directory(include_archived=bool(archived))
+    if not manage:  # Slack IDs are for the people who run the teams
+        entries = [{**e, "slackUserId": ""} if "slackUserId" in e else e for e in entries]
+    return {"callers": entries, "canManage": manage}
 
 
 @router.get("/overview")

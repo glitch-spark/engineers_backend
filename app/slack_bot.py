@@ -711,7 +711,7 @@ async def run_alert_tick() -> dict[str, Any]:
         team_daily = await run_team_day_posts(datetime.now(timezone.utc))
     except Exception as exc:
         log.exception("slack_bot team day posts crashed: %s", exc)
-        team_daily = "failed"
+        team_daily = {"_error": "failed"}
     try:
         from app.caller_teams.reminders import run_team_reminders
 

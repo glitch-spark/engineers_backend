@@ -5,6 +5,7 @@ no app links. Slack trouble is logged (ids only), never raised into the intervie
 import logging
 import math
 from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -15,7 +16,7 @@ from app.caller_teams import slack
 from app.caller_teams.blocks import when, who
 from app.caller_teams.sync import STALE_CLAIM, TeamRound, _directory, _utc, team_round
 from app.interview_caller import ENDED_STATUSES
-from app.interview_day.blocks import MAX_BLOCKS, MAX_NAME, _plural, _section, _short
+from app.interview_day.blocks import MAX_BLOCKS, MAX_NAME, _method_part, _plural, _section, _short
 from app.interview_normalize import normalize_status
 from app.models.caller import Caller
 from app.models.caller_team import CallerTeam, TeamDayPost, TeamRoundPost
@@ -27,7 +28,8 @@ log = logging.getLogger(__name__)
 NO_INTERVIEWS = "No team interviews today."
 
 
-async def _rounds_between(lo: datetime, hi: datetime, callers, teams, team_id: Optional[str] = None) -> list[TeamRound]:
+async def _rounds_between(lo: datetime, hi: datetime, callers, teams, team_id: Optional[str] = None,
+                          exclude: frozenset = frozenset()) -> list[TeamRound]:
     """Live team rounds (not canceled/rejected) with lo <= start < hi, by start; one team's, or every team's."""
     members = [cid for cid, c in callers.items()
                if c.teamId in teams and teams[c.teamId].archivedAt is None and (team_id is None or c.teamId == team_id)]
@@ -41,7 +43,7 @@ async def _rounds_between(lo: datetime, hi: datetime, callers, teams, team_id: O
     out = []
     for iv in ivs:
         for e in iv.stageHistory:
-            tr = team_round(iv, e, callers=callers, teams=teams) if e.id else None
+            tr = team_round(iv, e, callers=callers, teams=teams) if e.id and e.id not in exclude else None
             if (tr is None or tr.start is None or not lo <= tr.start < hi
                     or (team_id and str(tr.team.id) != team_id)
                     or normalize_status(e.status) in ENDED_STATUSES):
@@ -50,17 +52,21 @@ async def _rounds_between(lo: datetime, hi: datetime, callers, teams, team_id: O
     return sorted(out, key=lambda t: t.start)
 
 
-async def team_rounds_for_day(team: CallerTeam, day: date, *, directory=None) -> list[TeamRound]:
+async def team_rounds_for_day(team: CallerTeam, day: date, *, directory=None,
+                              exclude: frozenset = frozenset()) -> list[TeamRound]:
     """The team's rounds that start on `day` in the team's timezone, by start. TBD rounds are not listed."""
     callers, teams = directory or await _directory()
     lo, hi = slack_bot.caller_daily_bounds(day, ZoneInfo(team.timezone))
-    return await _rounds_between(lo, hi, callers, teams, str(team.id))
+    return await _rounds_between(lo, hi, callers, teams, str(team.id), exclude)
 
 
 def _line(tr: TeamRound) -> str:
     people = f"{who(tr.caller) or '—'}" + (f" · manager {who(tr.manager)}" if tr.manager else "")
-    return (f"*{_short(tr.iv.companyName, MAX_NAME, '—')}* · {_stage_label(tr.entry.stage)} · {when(tr)}\n"
-            f"Caller: {people}")
+    caller = tr.entry.caller
+    method = _method_part(SimpleNamespace(method=caller.method if caller else None,
+                                          link=caller.methodValue if caller else ""))
+    return (f"*{_short(tr.iv.companyName, MAX_NAME, '—')}* · {_stage_label(tr.entry.stage)} · {when(tr)}"
+            + (f" · {method}" if method else "") + f"\nCaller: {people}")
 
 
 def _messages(day: date, rounds: list[TeamRound]) -> tuple[list[list[dict]], str]:
@@ -79,9 +85,9 @@ def _at(team: CallerTeam) -> time:
     return time.fromisoformat(team.dailyTime)
 
 
-async def _edit(post: TeamDayPost, team: CallerTeam, day: date, directory) -> None:
+async def _edit(post: TeamDayPost, team: CallerTeam, day: date, directory, exclude: frozenset = frozenset()) -> None:
     """Bring the stored messages in line with the day: edit each, post extra ones, delete surplus ones."""
-    messages, text = _messages(day, await team_rounds_for_day(team, day, directory=directory))
+    messages, text = _messages(day, await team_rounds_for_day(team, day, directory=directory, exclude=exclude))
     ts = list(post.ts)
     for i, blocks in enumerate(messages):
         if i < len(ts):
@@ -162,7 +168,7 @@ async def run_team_day_posts(now: datetime) -> dict[str, str]:
     return out
 
 
-async def refresh_team_day(team_id: str, now: datetime) -> None:
+async def refresh_team_day(team_id: str, now: datetime, deleted: frozenset = frozenset()) -> None:
     """Edit the team's posted day list after an interview write. Never posts (before dailyTime nothing is out yet)
     and never raises."""
     try:
@@ -175,7 +181,7 @@ async def refresh_team_day(team_id: str, now: datetime) -> None:
         day = _utc(now).astimezone(ZoneInfo(team.timezone)).date()
         post = await TeamDayPost.find_one(TeamDayPost.teamId == str(team.id), TeamDayPost.day == day.isoformat())
         if post is not None and post.ts:
-            await _edit(post, team, day, directory)
+            await _edit(post, team, day, directory, deleted)
     except Exception as exc:
         log.warning("team day refresh failed (team=%s): %s", team_id, exc)
 

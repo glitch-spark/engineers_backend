@@ -559,7 +559,7 @@ def test_tick_reports_the_chase():
     with a, b, c, d, patch("app.coordination.chase.run_coordination_chase", run):
         out = asyncio.run(slack_bot.run_alert_tick())
     assert out == {"caller_reminders": 0, "caller_daily": "already_sent", "standup_nudge": "skipped", "after_call_asks": 2, "result_reminders": 1,
-                   "heard_back_asks": 3}
+                   "heard_back_asks": 3, "team_daily": {}, "team_reminders": 0}
     run.assert_awaited_once()
     assert run.await_args.args[0].tzinfo is not None
 
@@ -579,3 +579,13 @@ def test_constants_and_answered_blocks():
     assert len(answered_blocks("x" * 5000)[0]["text"]["text"]) <= 3000
     assert chase.RESULT_REMINDER_AFTER == timedelta(days=7)
     assert str(chase.CHASE_TZ) == "America/Chicago"
+
+
+def test_tick_reports_team_daily_crash_as_a_dict():
+    a, b, c, d = _quiet_tick()
+    boom = AsyncMock(side_effect=RuntimeError("boom"))
+    with a, b, c, d, patch("app.caller_teams.reminders.run_team_day_posts", boom), patch(
+        "app.coordination.chase.run_coordination_chase", AsyncMock(return_value={})
+    ):
+        out = asyncio.run(slack_bot.run_alert_tick())
+    assert out["team_daily"] == {"_error": "failed"}

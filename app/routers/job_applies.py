@@ -2156,7 +2156,6 @@ async def _stored_file(key: str) -> bytes:
 async def resume_file(token: str):
     """A resume from an exported sheet's link, as `<Company>.zip` holding `resume.pdf`. No login: the signed,
     expiring link is the permission."""
-    import base64
 
     from fastapi.responses import Response
 

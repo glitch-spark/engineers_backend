@@ -89,6 +89,12 @@ async def test_round_files_missing_resume_keeps_brief(pdf, monkeypatch):
     assert len(got) == 1 and note == "No resume linked — ask the interview manager."
 
 
+async def test_round_files_transient_resume_error_raises(pdf, monkeypatch):
+    _stub_resume(monkeypatch, RuntimeError("s3 timeout"))
+    with pytest.raises(RuntimeError):
+        await round_files(_iv(InterviewResumeLink(kind="tailored", resumeJobId=JOB)), "r2", "UTC")
+
+
 async def test_round_files_no_link(pdf, monkeypatch):
     _stub_resume(monkeypatch, None)
     got, note = await round_files(_iv(None), "r2", "UTC")
