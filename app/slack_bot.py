@@ -706,6 +706,20 @@ async def run_alert_tick() -> dict[str, Any]:
     except Exception as exc:
         log.exception("slack_bot team posts sweep crashed: %s", exc)
     try:
+        from app.caller_teams.reminders import run_team_day_posts
+
+        team_daily = await run_team_day_posts(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot team day posts crashed: %s", exc)
+        team_daily = "failed"
+    try:
+        from app.caller_teams.reminders import run_team_reminders
+
+        team_reminders = await run_team_reminders(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot team reminders crashed: %s", exc)
+        team_reminders = {"sent": 0, "failed": 0}
+    try:
         from app.standup.nudge import run_standup_nudge
 
         standup_nudge = await run_standup_nudge(datetime.now(timezone.utc))
@@ -716,4 +730,5 @@ async def run_alert_tick() -> dict[str, Any]:
         "caller_reminders": reminders["sent"], "caller_daily": caller_daily, "standup_nudge": standup_nudge,
         "after_call_asks": chase.get("after_call_asks", 0), "result_reminders": chase.get("result_reminders", 0),
         "heard_back_asks": chase.get("heard_back_asks", 0),
+        "team_daily": team_daily, "team_reminders": team_reminders["sent"],
     }

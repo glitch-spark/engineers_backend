@@ -259,10 +259,27 @@ async def sync_team_posts(interview_id: str, *, now: Optional[datetime] = None, 
     """Sync every team post of one interview (rounds in `deleted` count as gone). Never raises."""
     if not slack.callers_configured():
         return
+    now = now or datetime.now(timezone.utc)
     try:
-        await _sync_interview(str(interview_id), now or datetime.now(timezone.utc), set(deleted), *await _directory())
+        callers, teams = await _directory()
+        await _sync_interview(str(interview_id), now, set(deleted), callers, teams)
+        await _refresh_days(str(interview_id), now, callers)
     except Exception as exc:
         log.exception("team posts sync failed (interview=%s): %s", interview_id, exc)
+
+
+async def _refresh_days(interview_id: str, now: datetime, callers: dict[str, Caller]) -> None:
+    """Edit the day list of every team this interview touches (a round's caller team now, or a post it had)."""
+    from app.caller_teams.reminders import refresh_team_day  # reminders imports this module
+
+    iv = await Interview.get(PydanticObjectId(interview_id))
+    ids = {p.teamId for p in await TeamRoundPost.find(TeamRoundPost.interviewId == interview_id).to_list()}
+    for e in (iv.stageHistory if iv else []):
+        c = callers.get(e.caller.callerId) if e.caller and e.caller.callerId else None
+        if c is not None and c.teamId:
+            ids.add(c.teamId)
+    for tid in sorted(ids):
+        await refresh_team_day(tid, now)
 
 
 async def sweep_team_posts(now: datetime) -> dict[str, int]:
