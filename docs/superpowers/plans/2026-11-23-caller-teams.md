@@ -246,7 +246,7 @@ def test_tick_isolates_team_failures(): ...          # team step raising does no
 
 **Files (engineers_app, branch `feat/caller-teams` from `main`):**
 - Modify: `src/api/endpoints.ts:1182-1206` (`Caller` gets `slackUserId`, `teamId`, `teamName`; `updateCaller` body gets `slackUserId?`, `teamId?`; add `CallerTeam`, `listCallerTeams`, `createCallerTeam`, `updateCallerTeam`, `getCallerTeamsConnection`, `testCallerTeam`)
-- Modify: `src/pages/interviews/CallersDirectory.tsx` (Slack ID + Team columns for external callers when `canManage`; amber "No Slack ID: shown by name, not tagged" for team members without one)
+- Modify: `src/pages/interviews/CallersDirectory.tsx` (remove the "People in the app" section — platform users are all internal callers, so Manage callers lists external callers only; they stay selectable in caller pickers. Slack ID + Team columns for external callers when `canManage`; amber "No Slack ID: shown by name, not tagged" for team members without one)
 - Create: `src/pages/interviews/CallerTeamsPanel.tsx` (below the directory; team cards: name, manager select of external callers, team channel ID, reminder channel ID, daily time; members as chips; Save, Archive, Send test post; connection line "Connected: <workspace> ✓" / "Not connected — set SLACK_CALLERS_BOT_TOKEN")
 - Modify: `src/components/interview/CallerEditPanel.tsx` (option label `Omar · Jamil's group` when `teamName`)
 - Test: `src/pages/interviews/CallersDirectory.test.tsx`, `src/pages/interviews/CallerTeamsPanel.test.tsx`
@@ -260,6 +260,7 @@ def test_tick_isolates_team_failures(): ...          # team step raising does no
 it('saves a caller Slack ID and team', ...)          // updateCaller called with { slackUserId: 'U07Q3KD2M9A', teamId: 't1' }
 it('flags a team member without a Slack ID', ...)
 it('hides team and Slack ID controls without canManage', ...)
+it('does not list platform users (People in the app)', ...)
 it('creates a team with manager and channels', ...)
 it('shows connection state', ...)                    // both connected and not-connected texts
 it('shows each channel result of Send test post', ...)
