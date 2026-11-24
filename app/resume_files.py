@@ -3,9 +3,13 @@ resumes. MongoDB keeps only the extracted text plus the S3 key. Without RESUME_S
 stored and callers fall back to text-only resumes."""
 import asyncio
 import logging
-from typing import Iterable
+import base64
+from typing import Iterable, Optional
+
+from beanie import PydanticObjectId
 
 from app.config import get_settings
+from app.models import Account, ResumeApplication
 from app.resume_service import _s3_client, generate_presigned_get, s3_enabled
 
 log = logging.getLogger(__name__)
@@ -67,3 +71,40 @@ async def read_resume_file(key: str) -> bytes:
 
 def presigned_url(key: str, filename: str) -> str:
     return generate_presigned_get(key, expires=900, download_filename=filename)
+
+
+async def _stored(key: str) -> bytes:
+    try:
+        return await read_resume_file(key)
+    except FileUnavailable:
+        raise FileUnavailable("This resume file isn't available.")
+
+
+async def read_linked_resume(
+    *, kind: str, resume_job_id: Optional[str], account_id: Optional[str], resume_id: Optional[str]
+) -> Optional[tuple[str, bytes]]:
+    """`(filename, bytes)` of the resume a link points at: "tailored" / "fixed" -> the generated resume record,
+    "uploaded" -> the profile's original file. None when nothing is linked. Raises FileUnavailable (its message is
+    the reason) when the record or file is gone; other storage errors propagate."""
+    if kind in ("tailored", "fixed"):
+        if not resume_job_id:
+            return None
+        doc = await ResumeApplication.get_motor_collection().find_one(
+            {"_id": PydanticObjectId(resume_job_id)}, {"s3Key": 1, "pdfData": 1, "companyName": 1}
+        )
+        if doc is None:
+            raise FileUnavailable("This resume no longer exists.")
+        if doc.get("s3Key"):
+            data = await _stored(doc["s3Key"])
+        elif doc.get("pdfData"):
+            data = base64.b64decode(doc["pdfData"])
+        else:
+            raise FileUnavailable("This resume isn't ready.")
+        return (f"{doc['companyName']}.pdf" if doc.get("companyName") else "resume.pdf"), data
+    if kind == "uploaded" and account_id and resume_id:
+        acc = await Account.get(PydanticObjectId(account_id))
+        resume = next((r for r in acc.resumes if str(r.id) == resume_id), None) if acc else None
+        if resume is None or not resume.s3Key:
+            raise FileUnavailable("This resume file isn't available.")
+        return resume.filename or "resume.pdf", await _stored(resume.s3Key)
+    return None
