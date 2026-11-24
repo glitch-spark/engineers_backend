@@ -19,10 +19,14 @@ NO_RESUME_NOTE = "No resume linked — ask the interview manager."
 _TEMPLATE = (Path(__file__).parent / "brief.html").read_text(encoding="utf-8")
 
 
+def clean_name(s: Optional[str]) -> str:
+    """A file name part safe on every OS: no path separators or reserved characters, single spaces."""
+    return re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|]+', " ", s or "")).strip()
+
+
 def brief_filename(company: str, stage_label: str, day: Optional[str]) -> str:
     """`Brief - Acme - Tech round 1 - 2026-11-06.pdf`, safe on every OS."""
-    clean = lambda s: re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|]+', " ", s or "")).strip()  # noqa: E731
-    return " - ".join(p for p in ("Brief", clean(company), clean(stage_label), day) if p) + ".pdf"
+    return " - ".join(p for p in ("Brief", clean_name(company), clean_name(stage_label), day) if p) + ".pdf"
 
 
 def _local(dt: Optional[datetime], tz: str) -> Optional[datetime]:

@@ -698,6 +698,14 @@ async def run_alert_tick() -> dict[str, Any]:
         log.exception("slack_bot coordination chase crashed: %s", exc)
         chase = {}
     try:
+        from app.caller_teams.sync import sweep_team_posts  # imports this module
+
+        team_posts = await sweep_team_posts(datetime.now(timezone.utc))
+        if any(k != "none" for k in team_posts):
+            log.info("slack_bot team posts sweep: %s", team_posts)
+    except Exception as exc:
+        log.exception("slack_bot team posts sweep crashed: %s", exc)
+    try:
         from app.standup.nudge import run_standup_nudge
 
         standup_nudge = await run_standup_nudge(datetime.now(timezone.utc))

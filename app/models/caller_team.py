@@ -33,6 +33,7 @@ class TeamRoundPost(TimestampedDocument):
     startEpoch: Optional[int] = None
     filesFor: Optional[int] = None  # -1 = files sent for a TBD round
     state: str  # "scheduled" | "canceled" | "off"
+    digest: str = ""  # hash of the post's last rendered text + blocks: an unchanged post is not edited
 
     class Settings:
         name = "teamroundposts"
