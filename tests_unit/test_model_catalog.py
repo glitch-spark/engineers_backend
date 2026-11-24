@@ -17,7 +17,7 @@ def settings(**over):
     base = dict(
         ANTHROPIC_API_KEY="sk-ant-test",
         OPENAI_API_KEY="sk-openai-test",
-        RESUME_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
+        RESUME_DEFAULT_MODEL="anthropic:claude-haiku-5-5",
         COVER_LETTER_DEFAULT_MODEL="anthropic:claude-opus-5-5",
         SCREENING_DEFAULT_MODEL="anthropic:claude-sonnet-5-5",
         JUDGE_DEFAULT_MODEL="anthropic:claude-opus-5-5",
@@ -58,7 +58,7 @@ O = "openai:"
 
 # The agreed presets: ordered, first entry is the provider's recommended model for the task.
 EXPECTED = {
-    ("resume", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-5-5", A + "haiku-4-5", A + "sonnet-5"],
+    ("resume", "anthropic"): [A + "haiku-5-5", A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
     ("cover_letter", "anthropic"): [
         A + "opus-5-5", A + "fable-5-1", A + "sonnet-5-5", A + "opus-5", A + "opus-4-8",
     ],
@@ -147,7 +147,7 @@ def test_job_applies_resume_models_are_resume_presets(use_settings):
 
 
 def test_defaults_per_task(use_settings):
-    assert mc.default_model_id("resume", None) == A + "sonnet-5-5"
+    assert mc.default_model_id("resume", None) == A + "haiku-5-5"
     assert mc.default_model_id("screening", None) == A + "sonnet-5-5"
     assert mc.default_model_id("cover_letter", None) == A + "opus-5-5"
     assert mc.default_model_id("judge", None) == A + "opus-5-5"
@@ -177,7 +177,7 @@ def test_haiku_cannot_judge(use_settings):
 
 def test_configured_default_must_be_a_usable_preset(use_settings):
     use_settings(RESUME_DEFAULT_MODEL="anthropic:claude-fable-5-1")  # not a resume preset
-    assert mc.default_model_id("resume", None) == A + "sonnet-5-5"
+    assert mc.default_model_id("resume", None) == A + "haiku-5-5"
 
 
 def test_validate_requested_blank_returns_none(use_settings):
@@ -214,13 +214,14 @@ def test_validate_requested_returns_spec(use_settings):
 
 def test_fallback_chain_order_and_dedup(use_settings):
     assert ids(mc.fallback_chain("resume", A + "haiku-4-5", None)) == [
-        A + "haiku-4-5", A + "sonnet-5-5", O + "gpt-5-mini",
+        A + "haiku-4-5", A + "haiku-5-5", O + "gpt-5-mini",
     ]
-    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", O + "gpt-5-mini"]
+    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", A + "haiku-5-5", O + "gpt-5-mini"]
+    assert ids(mc.fallback_chain("resume", A + "haiku-5-5", None)) == [A + "haiku-5-5", O + "gpt-5-mini"]
     assert ids(mc.fallback_chain("resume", O + "gpt-5.4-mini", None)) == [
-        O + "gpt-5.4-mini", A + "sonnet-5-5", O + "gpt-5-mini",
+        O + "gpt-5.4-mini", A + "haiku-5-5", O + "gpt-5-mini",
     ]
-    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [O + "gpt-5-mini", A + "sonnet-5-5"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [O + "gpt-5-mini", A + "haiku-5-5"]
     assert ids(mc.fallback_chain("cover_letter", None, None)) == [A + "opus-5-5", O + "gpt-5.6-sol"]
 
 
@@ -273,9 +274,9 @@ def test_cache_lane(use_settings):
 def test_public_view_has_tag_and_marks_each_providers_recommendation(use_settings):
     default_id = mc.default_model_id("resume", None)
     views = {m.id: mc.public_view(m, "resume", default_id) for m in mc.available_models("resume", None)}
-    sonnet = views[A + "sonnet-5-5"]
-    assert sonnet["isDefault"] is True and sonnet["recommended"] is True and sonnet["tag"]
-    assert set(sonnet) == {"id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault", "recommended", "tag"}
+    haiku = views[A + "haiku-5-5"]
+    assert haiku["isDefault"] is True and haiku["recommended"] is True and haiku["tag"]
+    assert set(haiku) == {"id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault", "recommended", "tag"}
     assert views[O + "gpt-5-mini"]["recommended"] is True and views[O + "gpt-5-mini"]["isDefault"] is False
     assert views[A + "opus-5-5"]["recommended"] is False
     assert views[O + "gpt-6-luna"]["tag"] == "Cheapest"
