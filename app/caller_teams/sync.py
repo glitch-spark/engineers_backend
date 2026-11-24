@@ -178,6 +178,15 @@ async def _mark_off(post: TeamRoundPost, iv, entry, callers, teams) -> str:
     return "off" if ok else "skipped"
 
 
+async def _caller(caller_id: Optional[str]) -> Optional[Caller]:
+    """The previous caller for the "Reassigned" reply; None (reply just omits "was …") when unknown or gone."""
+    try:
+        return await Caller.get(PydanticObjectId(caller_id)) if caller_id else None
+    except Exception:  # noqa: BLE001 - a bad id only costs the "was …" part
+        log.warning("team post: previous caller %r not loadable", caller_id, exc_info=True)
+        return None
+
+
 async def _update(post: TeamRoundPost, tr: TeamRound, ended: bool, now: datetime) -> str:
     state = "canceled" if ended else "scheduled"
     caller_id, start = str(tr.caller.id), _epoch(tr.start)
@@ -191,7 +200,7 @@ async def _update(post: TeamRoundPost, tr: TeamRound, ended: bool, now: datetime
         lines.append(reply_text("reinstated", tr))
     else:
         if post.callerId != caller_id:
-            lines.append(reply_text("assigned", tr))
+            lines.append(reply_text("assigned", tr, previous=await _caller(post.callerId)))
         if post.startEpoch != start:
             lines.append(reply_text("time_set" if post.startEpoch is None else "moved", tr))
     new = {"callerId": caller_id, "startEpoch": start, "state": state}
