@@ -166,7 +166,8 @@ async def bids_view(subject, period: str, day: date, region: str, until: Optiona
 
         per_weekday: dict = defaultdict(list)
         for d in done_days:
-            per_weekday[d.weekday()].append(mine(d))
+            if d.weekday() < 5:  # Saturday is a lighter day by design; it never counts as a weak weekday
+                per_weekday[d.weekday()].append(mine(d))
         candidates = [low_self_share(me - bidder[subject.id], me, shares), weak_weekdays(per_weekday)]
         if me:
             last, names = await profile_last_bids(subject.id, region, today)

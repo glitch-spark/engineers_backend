@@ -47,7 +47,7 @@ def test_vs_median_negative_median_keeps_sign():
 
 def test_working_days_stop_at_today():
     assert working_days(date(2026, 11, 16), date(2026, 11, 22), TODAY) == [date(2026, 11, d) for d in (16, 17, 18)]
-    assert working_days(date(2026, 11, 14), date(2026, 11, 15), TODAY) == []
+    assert working_days(date(2026, 11, 14), date(2026, 11, 15), TODAY) == [date(2026, 11, 14)]  # Sat yes, Sun no
 
 
 def test_previous_window_month_same_days():
