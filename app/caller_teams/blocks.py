@@ -39,6 +39,9 @@ def when(tr: TeamRound) -> str:
     return f"{fmt_caller_time(tr.start, zone)} · {slack_time(tr.start)}"
 
 
+READY_ASK = "Please react with :white_check_mark: once you've reviewed the details and are ready for this call."
+
+
 def scheduled_blocks(tr: TeamRound, state: str) -> tuple[str, list[dict]]:
     """(fallback text, blocks) for the round's top-level post in `state` ("scheduled" | "canceled" | "off")."""
     head, plain = _HEAD[state]
@@ -56,6 +59,8 @@ def scheduled_blocks(tr: TeamRound, state: str) -> tuple[str, list[dict]]:
     if method:
         lines.append(f"Call: {method}")
     lines.append(f"Who: {who(tr.caller) or '—'}" + cc(tr))
+    if state == "scheduled":
+        lines.append(f"_{READY_ASK}_")
     return f"{plain}: {company} · {_stage_label(tr.entry.stage)}", [_section("\n".join(lines))]
 
 

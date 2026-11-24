@@ -14,6 +14,7 @@ os.environ.setdefault("AUTH_SECRET", "unit-test-secret")
 from app import slack_bot  # noqa: E402
 from app.caller_teams import reminders  # noqa: E402
 from app.caller_teams import slack as team_slack  # noqa: E402
+from app.models.account import Account  # noqa: E402
 from app.models.caller import Caller  # noqa: E402
 from app.models.caller_team import CallerTeam, TeamDayPost, TeamRoundPost  # noqa: E402
 from app.models.interview import Interview, InterviewCaller, InterviewStageEvent  # noqa: E402
@@ -46,7 +47,7 @@ class FakeSlack:
 async def env(monkeypatch):
     await init_beanie(
         database=AsyncMongoMockClient()["t"],
-        document_models=[Interview, Caller, CallerTeam, TeamRoundPost, TeamDayPost, SlackAlertLog],
+        document_models=[Interview, Caller, CallerTeam, TeamRoundPost, TeamDayPost, SlackAlertLog, Account],
     )
     fake = FakeSlack()
     monkeypatch.setattr(team_slack, "api", fake.api)
@@ -213,6 +214,25 @@ async def test_day_list_line_has_the_call_method(env):
     await iv.save()
     await reminders.run_team_day_posts(SIX)
     assert "Video" in text_of(env["slack"].of("chat.postMessage")[0])
+
+
+async def test_day_list_uses_the_field_per_line_format(env):
+    acc = await Account(name="Brandon Mayer", createdBy=ACC).insert()
+    iv = await make_iv(env["omar"], SIX + timedelta(hours=3))
+    iv.accountId = acc.id
+    iv.jobUrl = "https://builtin.com/job/staff-eng/1"
+    e = iv.stageHistory[0]
+    e.endsAt = e.scheduledAt + timedelta(minutes=30)
+    e.caller.method, e.caller.methodValue = "video", "https://meet.google.com/abc-defg-hij"
+    await iv.save()
+    await reminders.run_team_day_posts(SIX)
+    text = text_of(env["slack"].of("chat.postMessage")[0])
+    for want in ("1. Who: <@U_OMAR> · cc: <@U_JAMIL>", "Profile name: Brandon Mayer", "Company name: Acme",
+                 "Round: ", "Job link: <https://builtin.com/job/staff-eng/1|builtin.com/job/staff-eng/1>",
+                 "Meeting link: <https://meet.google.com/abc-defg-hij|meet.google.com/abc-defg-hij>",
+                 "Meeting time: 9:00 AM - 9:30 AM CST, Nov 23"):
+        assert want in text, want
+    assert ":white_check_mark:" in text
 
 
 async def test_refresh_team_day_leaves_out_deleted_rounds(env):

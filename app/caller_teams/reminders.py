@@ -16,12 +16,13 @@ from app.caller_teams import slack
 from app.caller_teams.blocks import cc, when, who
 from app.caller_teams.sync import STALE_CLAIM, TeamRound, _directory, _utc, team_round
 from app.interview_caller import ENDED_STATUSES
-from app.interview_day.blocks import MAX_BLOCKS, MAX_NAME, _method_part, _plural, _section, _short
+from app.interview_day.blocks import MAX_BLOCKS, MAX_LINK, MAX_NAME, _method_part, _plural, _section, _short
 from app.interview_normalize import normalize_status
+from app.models.account import Account
 from app.models.caller import Caller
 from app.models.caller_team import CallerTeam, TeamDayPost, TeamRoundPost
 from app.models.interview import Interview
-from app.slack_bot import _stage_label
+from app.slack_bot import _mrkdwn_link, _stage_label
 
 log = logging.getLogger(__name__)
 
@@ -60,23 +61,67 @@ async def team_rounds_for_day(team: CallerTeam, day: date, *, directory=None,
     return await _rounds_between(lo, hi, callers, teams, str(team.id), exclude)
 
 
-def _line(tr: TeamRound) -> str:
-    people = f"{who(tr.caller) or '—'}" + cc(tr)
+def _clock(dt: datetime, zone: ZoneInfo) -> str:
+    return dt.astimezone(zone).strftime("%I:%M %p").lstrip("0")
+
+
+def _meeting_time(tr: TeamRound) -> str:
+    """"12:00 PM - 12:30 PM PST, Nov 24" in the team's timezone; no end time when the round has none."""
+    zone = ZoneInfo(tr.team.timezone)
+    local = tr.start.astimezone(zone)
+    end = tr.entry.endsAt
+    end = (end if end.tzinfo else end.replace(tzinfo=timezone.utc)) if end else None
+    span = _clock(tr.start, zone) + (f" - {_clock(end, zone)}" if end and end > tr.start else "")
+    return f"{span} {local.strftime('%Z')}, {local.strftime('%b')} {local.day}"
+
+
+def _bare(url: str) -> str:
+    """A URL without its scheme or trailing slash, for the link label."""
+    return url.split("://", 1)[-1].rstrip("/")
+
+
+def _line(no: int, tr: TeamRound, profile: Optional[str]) -> str:
+    """One numbered round in the day list, a field per line."""
     caller = tr.entry.caller
-    method = _method_part(SimpleNamespace(method=caller.method if caller else None,
-                                          link=caller.methodValue if caller else ""))
-    return (f"*{_short(tr.iv.companyName, MAX_NAME, '—')}* · {_stage_label(tr.entry.stage)} · {when(tr)}"
-            + (f" · {method}" if method else "") + f"\nWho: {people}")
+    lines = [f"{no}. Who: {who(tr.caller) or '—'}{cc(tr)}",
+             f"Profile name: {_short(profile, MAX_NAME, '—')}",
+             f"Company name: {_short(tr.iv.companyName, MAX_NAME, '—')}",
+             f"Round: {_stage_label(tr.entry.stage)}"]
+    job = (tr.iv.jobUrl or (tr.iv.resumeLink.jobUrl if tr.iv.resumeLink else None) or "").strip()
+    if job:
+        lines.append(f"Job link: {_mrkdwn_link(job, _bare(job)[:MAX_LINK])}")
+    link = ((caller.methodValue if caller else "") or "").strip()
+    if link.startswith(("http://", "https://")) and len(link) <= MAX_LINK:
+        lines.append(f"Meeting link: {_mrkdwn_link(link, _bare(link))}")
+    else:
+        method = _method_part(SimpleNamespace(method=caller.method if caller else None, link=link))
+        if method:
+            lines.append(f"Call: {method}")
+    lines.append(f"Meeting time: {_meeting_time(tr)}")
+    return "\n".join(lines)
 
 
-def _messages(day: date, rounds: list[TeamRound]) -> tuple[list[list[dict]], str]:
+async def _profiles(rounds: list[TeamRound]) -> dict[str, str]:
+    """Profile (account) name per interview account id."""
+    ids = {tr.iv.accountId for tr in rounds if tr.iv.accountId}
+    if not ids:
+        return {}
+    return {str(a.id): a.name for a in await Account.find({"_id": {"$in": list(ids)}}).to_list()}
+
+
+DAY_READY_ASK = ("Please react with :white_check_mark: once you've reviewed today's interviews and are ready for "
+                 "your calls.")
+
+
+def _messages(day: date, rounds: list[TeamRound], profiles: dict[str, str]) -> tuple[list[list[dict]], str]:
     """The day's messages (at most 50 blocks each) and the fallback text."""
     title = f"Team interviews — {day:%a} {day:%b} {day.day}"
     if not rounds:
         return [[_section(NO_INTERVIEWS)]], f"{title} · {NO_INTERVIEWS}"
     head = {"type": "header", "text": {"type": "plain_text", "text": f"⏰ {title} · {_plural(len(rounds), 'interview')}",
                                        "emoji": True}}
-    blocks = [head, *(_section(_line(tr)) for tr in rounds)]
+    blocks = [head, *(_section(_line(no, tr, profiles.get(str(tr.iv.accountId))))
+                      for no, tr in enumerate(rounds, 1)), _section(f"_{DAY_READY_ASK}_")]
     return ([blocks[i:i + MAX_BLOCKS] for i in range(0, len(blocks), MAX_BLOCKS)],
             f"{title} · {_plural(len(rounds), 'interview')}")
 
@@ -87,7 +132,8 @@ def _at(team: CallerTeam) -> time:
 
 async def _edit(post: TeamDayPost, team: CallerTeam, day: date, directory, exclude: frozenset = frozenset()) -> None:
     """Bring the stored messages in line with the day: edit each, post extra ones, delete surplus ones."""
-    messages, text = _messages(day, await team_rounds_for_day(team, day, directory=directory, exclude=exclude))
+    rounds = await team_rounds_for_day(team, day, directory=directory, exclude=exclude)
+    messages, text = _messages(day, rounds, await _profiles(rounds))
     ts = list(post.ts)
     for i, blocks in enumerate(messages):
         if i < len(ts):
@@ -114,7 +160,7 @@ async def _post_day(team: CallerTeam, day: date, directory) -> str:
     sent: list[str] = []
     try:
         rounds = await team_rounds_for_day(team, day, directory=directory)
-        messages, text = _messages(day, rounds)
+        messages, text = _messages(day, rounds, await _profiles(rounds))
         for blocks in messages:
             res = await slack.api("chat.postMessage", {
                 "channel": row.channel, "text": text, "blocks": blocks, "unfurl_links": False,
