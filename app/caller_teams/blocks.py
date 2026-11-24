@@ -55,16 +55,22 @@ def scheduled_blocks(tr: TeamRound, state: str) -> tuple[str, list[dict]]:
                                           link=caller.methodValue if caller else ""))
     if method:
         lines.append(f"Call: {method}")
-    people = [f"Caller: {who(tr.caller) or '—'}"] + ([f"Manager: {who(tr.manager)}"] if tr.manager else [])
-    lines.append(" · ".join(people))
+    lines.append(f"Caller: {who(tr.caller) or '—'}" + cc(tr))
     return f"{plain}: {company} · {_stage_label(tr.entry.stage)}", [_section("\n".join(lines))]
+
+
+def cc(tr: TeamRound) -> str:
+    """" · cc: <manager>", or "" when there is no manager or the manager is the caller."""
+    if tr.manager is None or (tr.caller is not None and tr.caller.id == tr.manager.id):
+        return ""
+    return f" · cc: {who(tr.manager)}"
 
 
 def reply_text(kind: str, tr: TeamRound, *, previous: Optional[Caller] = None) -> str:
     """A thread reply that tags whoever must act: the caller (or `previous` one) and the manager."""
     tags = " ".join(dict.fromkeys(p for p in (who(previous or tr.caller), who(tr.manager)) if p))
     if kind == "assigned":
-        return f"Now on this call: {who(tr.caller)}" + (f" · manager {who(tr.manager)}" if tr.manager else "")
+        return f"Now on this call: {who(tr.caller)}" + cc(tr)
     if kind == "moved":
         if tr.start is None:
             return f"Time cleared — now TBD. {tags}"

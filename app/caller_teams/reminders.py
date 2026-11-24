@@ -13,7 +13,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app import slack_bot
 from app.caller_teams import slack
-from app.caller_teams.blocks import when, who
+from app.caller_teams.blocks import cc, when, who
 from app.caller_teams.sync import STALE_CLAIM, TeamRound, _directory, _utc, team_round
 from app.interview_caller import ENDED_STATUSES
 from app.interview_day.blocks import MAX_BLOCKS, MAX_NAME, _method_part, _plural, _section, _short
@@ -61,7 +61,7 @@ async def team_rounds_for_day(team: CallerTeam, day: date, *, directory=None,
 
 
 def _line(tr: TeamRound) -> str:
-    people = f"{who(tr.caller) or '—'}" + (f" · manager {who(tr.manager)}" if tr.manager else "")
+    people = f"{who(tr.caller) or '—'}" + cc(tr)
     caller = tr.entry.caller
     method = _method_part(SimpleNamespace(method=caller.method if caller else None,
                                           link=caller.methodValue if caller else ""))
@@ -198,9 +198,8 @@ async def _thread_link(tr: TeamRound, round_id: str) -> Optional[str]:
 
 
 def _reminder_text(tr: TeamRound, minutes: int, link: Optional[str]) -> str:
-    tags = " ".join(dict.fromkeys(p for p in (who(tr.caller), who(tr.manager)) if p))
     lines = [f"⏰ Starting in {minutes} min — *{_short(tr.iv.companyName, MAX_NAME, '—')}* · "
-             f"{_stage_label(tr.entry.stage)}", f"When: {when(tr)}", f"Caller: {tags}"]
+             f"{_stage_label(tr.entry.stage)}", f"When: {when(tr)}", f"Caller: {who(tr.caller) or '—'}{cc(tr)}"]
     if link:
         lines.append(f"<{link}|Open the interview thread>")
     return "\n".join(lines)
