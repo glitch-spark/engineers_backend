@@ -6,11 +6,13 @@ from typing import Literal, Optional, TypedDict
 from beanie import PydanticObjectId
 
 from app.models.caller import CALLER_COLORS, Caller
+from app.models.caller_team import CallerTeam
 from app.models.user_extra import UserExtra
 
 CallerEntry = TypedDict(
     "CallerEntry",
-    {"_id": str, "kind": Literal["external", "user"], "name": str, "color": str, "archived": bool},
+    {"_id": str, "kind": Literal["external", "user"], "name": str, "color": str, "archived": bool,
+     "slackUserId": str, "teamId": str, "teamName": str},
 )
 
 
@@ -33,17 +35,27 @@ def _user_entry(user: UserExtra) -> CallerEntry:
         "name": user_display_name(user),
         "color": user_caller_color(uid, user.callerColor),
         "archived": False,
+        "slackUserId": "",
+        "teamId": "",
+        "teamName": "",
     }
 
 
-def _external_entry(caller: Caller) -> CallerEntry:
+def _external_entry(caller: Caller, team_names: Optional[dict[str, str]] = None) -> CallerEntry:
     return {
         "_id": str(caller.id),
         "kind": "external",
         "name": caller.name,
         "color": caller.color,
         "archived": caller.archivedAt is not None,
+        "slackUserId": caller.slackUserId or "",
+        "teamId": caller.teamId or "",
+        "teamName": (team_names or {}).get(caller.teamId or "", ""),
     }
+
+
+async def team_names() -> dict[str, str]:
+    return {str(t.id): t.name for t in await CallerTeam.find_all().to_list() if t.archivedAt is None}
 
 
 async def list_directory(*, include_archived: bool = False) -> list[CallerEntry]:
@@ -54,7 +66,8 @@ async def list_directory(*, include_archived: bool = False) -> list[CallerEntry]
     if not include_archived:
         externals = [c for c in externals if c.archivedAt is None]
     externals.sort(key=lambda c: c.nameKey)
-    return [_user_entry(u) for u in users] + [_external_entry(c) for c in externals]
+    names = await team_names()
+    return [_user_entry(u) for u in users] + [_external_entry(c, names) for c in externals]
 
 
 async def resolve_caller(caller_id: str) -> Optional[CallerEntry]:
@@ -68,5 +81,5 @@ async def resolve_caller(caller_id: str) -> Optional[CallerEntry]:
         return _user_entry(user) if user.isActive is not False else None
     caller = await Caller.get(oid)
     if caller is not None and caller.archivedAt is None:
-        return _external_entry(caller)
+        return _external_entry(caller, await team_names())
     return None

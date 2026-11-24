@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Slack bot. The bot token sends every message; users type their Slack member ID in Profile.
     # The cron secret protects the scheduled tick endpoint. All optional so the app boots without Slack.
     SLACK_BOT_TOKEN: Optional[str] = None
+    SLACK_CALLERS_BOT_TOKEN: Optional[str] = None  # second workspace: caller teams' round posts
     SLACK_BOT_CRON_SECRET: Optional[str] = None
     SLACK_CALLER_CHANNEL_ID: Optional[str] = None
     # Release cutoff of the interview follow-ups in the daily channel (after-interview check, 7-day result reminder):

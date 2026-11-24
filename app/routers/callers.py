@@ -1,5 +1,6 @@
 """Caller directory: everyone reads it; admins and interview managers add, edit, archive and delete callers."""
 
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
@@ -7,10 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from pymongo.errors import DuplicateKeyError
 
-from app.caller_directory import CallerEntry, _external_entry, _user_entry, list_directory
+from app.caller_directory import CallerEntry, _external_entry, _user_entry, list_directory, team_names
 from app.deps import get_current_user
 from app.models import Interview, UserExtra
 from app.models.caller import CALLER_COLORS, DEFAULT_CALLERS, Caller
+from app.models.caller_team import CallerTeam
 from app.routers._util import to_object_id
 
 router = APIRouter(prefix="/callers", tags=["callers"])
@@ -33,10 +35,29 @@ class CallerIn(BaseModel):
     name: Optional[str] = None
     color: Optional[str] = None
     archived: Optional[bool] = None  # external callers only: hide from new rounds, keep on past ones
+    slackUserId: Optional[str] = None  # external callers only; "" clears
+    teamId: Optional[str] = None  # external callers only; "" clears
 
 
-def caller_out(c: Caller) -> CallerEntry:
-    return _external_entry(c)
+async def caller_out(c: Caller) -> CallerEntry:
+    return _external_entry(c, await team_names())
+
+
+SLACK_ID_RE = re.compile(r"^[UW][A-Z0-9]{6,}$")
+
+
+def unprocessable(detail: str) -> HTTPException:
+    return HTTPException(status_code=422, detail=detail)
+
+
+async def _active_team(team_id: str) -> CallerTeam:
+    try:
+        team = await CallerTeam.get(to_object_id(team_id))
+    except HTTPException:
+        team = None
+    if team is None or team.archivedAt is not None:
+        raise unprocessable("No such team.")
+    return team
 
 
 def _clean_name(raw: Optional[str]) -> str:
@@ -83,7 +104,11 @@ async def get_caller(caller_id: str) -> Optional[Caller]:
 @router.get("")
 async def list_callers(user: Annotated[UserExtra, Depends(get_current_user)], archived: int = 0) -> dict:
     """Active platform users, then external callers; `?archived=1` also lists archived external callers."""
-    return {"callers": await list_directory(include_archived=bool(archived)), "canManage": is_caller_manager(user)}
+    manage = is_caller_manager(user)
+    entries = await list_directory(include_archived=bool(archived))
+    if not manage:  # Slack IDs are for the people who run the teams
+        entries = [{**e, "slackUserId": ""} if "slackUserId" in e else e for e in entries]
+    return {"callers": entries, "canManage": manage}
 
 
 @router.get("/overview")
@@ -103,7 +128,7 @@ async def create_caller(body: CallerIn, user: Annotated[UserExtra, Depends(requi
         c = await Caller(name=name, nameKey=name.lower(), color=color).insert()
     except DuplicateKeyError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"{name} is already on the list.")
-    return caller_out(c)
+    return await caller_out(c)
 
 
 async def rename_on_rounds(caller_id: str, name: str) -> None:
@@ -139,7 +164,7 @@ async def update_caller(
     platform_user = await _get_user(caller_id)
     if platform_user is not None:
         # A platform user's name is their profile name; only the calendar colour is the directory's to set.
-        if body.name is not None or body.archived is not None:
+        if body.name is not None or body.archived is not None or body.slackUserId is not None or body.teamId is not None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A platform user's caller only takes a colour.")
         if body.color is not None:
             platform_user.callerColor = _check_color(body.color)
@@ -148,6 +173,13 @@ async def update_caller(
     c = await get_caller(caller_id)
     if c is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Caller not found.")
+    if body.slackUserId is not None:
+        slack_id = body.slackUserId.strip()
+        if slack_id and not SLACK_ID_RE.match(slack_id):
+            raise unprocessable("Slack member ID looks like U0123ABCD.")
+        c.slackUserId = slack_id or None
+    if body.teamId is not None:
+        c.teamId = str((await _active_team(body.teamId)).id) if body.teamId else None
     renamed = False
     if body.name is not None:
         name = _clean_name(body.name)
@@ -163,7 +195,7 @@ async def update_caller(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"{c.name} is already on the list.")
     if renamed:
         await rename_on_rounds(str(c.id), c.name)
-    return caller_out(c)
+    return await caller_out(c)
 
 
 @router.delete("/{caller_id}", status_code=status.HTTP_204_NO_CONTENT)

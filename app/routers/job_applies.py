@@ -2156,7 +2156,6 @@ async def _stored_file(key: str) -> bytes:
 async def resume_file(token: str):
     """A resume from an exported sheet's link, as `<Company>.zip` holding `resume.pdf`. No login: the signed,
     expiring link is the permission."""
-    import base64
 
     from fastapi.responses import Response
 
@@ -2164,25 +2163,25 @@ async def resume_file(token: str):
         ref = file_links.read_token(token)
     except file_links.BadLink:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This link is invalid or has expired.")
-    if ref["kind"] == "tailored":
-        doc = await ResumeApplication.get_motor_collection().find_one(
-            {"_id": to_object_id(ref["id"])}, {"s3Key": 1, "pdfData": 1, "companyName": 1}
+    tailored = ref["kind"] == "tailored"
+    try:
+        found = await resume_files.read_linked_resume(
+            kind="tailored" if tailored else "uploaded", resume_job_id=ref["id"], account_id=ref["accountId"], resume_id=ref["id"]
         )
-        if doc is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume no longer exists.")
-        if doc.get("s3Key"):
-            data = await _stored_file(doc["s3Key"])
-        elif doc.get("pdfData"):
-            data = base64.b64decode(doc["pdfData"])
-        else:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume isn't ready.")
-        company, entry = doc.get("companyName") or ref["company"], file_links.entry_name(None)
+    except resume_files.FileUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read resume file %s: %s", ref["id"], exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not fetch the resume. Try the link again.")
+    if found is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
+    filename, data = found
+    if tailored:
+        # read_linked_resume names a tailored file "<company>.pdf", or "resume.pdf" with no company on record
+        company = os.path.splitext(filename)[0]
+        company, entry = (ref["company"] if company == "resume" else company), file_links.entry_name(None)
     else:
-        acc = await Account.get(to_object_id(ref["accountId"] or ""))
-        resume = next((r for r in acc.resumes if str(r.id) == ref["id"]), None) if acc else None
-        if resume is None or not resume.s3Key:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This resume file isn't available.")
-        data, company, entry = await _stored_file(resume.s3Key), ref["company"], file_links.entry_name(resume.filename)
+        company, entry = ref["company"], file_links.entry_name(filename)
     return Response(
         file_links.build_zip(data, entry),
         media_type="application/zip",

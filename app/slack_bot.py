@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -81,10 +81,14 @@ def _frontend_link(path: str) -> str:
     return f"{get_settings().FRONTEND_ORIGIN.rstrip('/')}{path}"
 
 
-async def _slack_api(method: str, body: dict[str, Any]) -> dict[str, Any]:
-    token = (get_settings().SLACK_BOT_TOKEN or "").strip()
+async def _slack_api(
+    method: str, body: dict[str, Any], *, workspace: Literal["main", "callers"] = "main"
+) -> dict[str, Any]:
+    settings = get_settings()
+    name = "SLACK_CALLERS_BOT_TOKEN" if workspace == "callers" else "SLACK_BOT_TOKEN"
+    token = (getattr(settings, name) or "").strip()
     if not token:
-        raise RuntimeError("SLACK_BOT_TOKEN is not configured")
+        raise RuntimeError(f"{name} is not configured")
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{_SLACK_API}/{method}",
@@ -694,6 +698,28 @@ async def run_alert_tick() -> dict[str, Any]:
         log.exception("slack_bot coordination chase crashed: %s", exc)
         chase = {}
     try:
+        from app.caller_teams.sync import sweep_team_posts  # imports this module
+
+        team_posts = await sweep_team_posts(datetime.now(timezone.utc))
+        if any(k != "none" for k in team_posts):
+            log.info("slack_bot team posts sweep: %s", team_posts)
+    except Exception as exc:
+        log.exception("slack_bot team posts sweep crashed: %s", exc)
+    try:
+        from app.caller_teams.reminders import run_team_day_posts
+
+        team_daily = await run_team_day_posts(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot team day posts crashed: %s", exc)
+        team_daily = {"_error": "failed"}
+    try:
+        from app.caller_teams.reminders import run_team_reminders
+
+        team_reminders = await run_team_reminders(datetime.now(timezone.utc))
+    except Exception as exc:
+        log.exception("slack_bot team reminders crashed: %s", exc)
+        team_reminders = {"sent": 0, "failed": 0}
+    try:
         from app.standup.nudge import run_standup_nudge
 
         standup_nudge = await run_standup_nudge(datetime.now(timezone.utc))
@@ -704,4 +730,5 @@ async def run_alert_tick() -> dict[str, Any]:
         "caller_reminders": reminders["sent"], "caller_daily": caller_daily, "standup_nudge": standup_nudge,
         "after_call_asks": chase.get("after_call_asks", 0), "result_reminders": chase.get("result_reminders", 0),
         "heard_back_asks": chase.get("heard_back_asks", 0),
+        "team_daily": team_daily, "team_reminders": team_reminders["sent"],
     }

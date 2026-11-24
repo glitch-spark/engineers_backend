@@ -15,7 +15,6 @@ import pytest  # noqa: E402
 from app import resume_files  # noqa: E402
 from app.job_apply import file_links  # noqa: E402
 from app.main import app  # noqa: E402
-from app.routers import job_applies  # noqa: E402
 
 JOB_ID, ACC_ID, RESUME_ID = "64b000000000000000000001", "64b000000000000000000002", "64b000000000000000000003"
 PDF = b"%PDF-1.7 tailored"
@@ -51,8 +50,8 @@ def stubs(monkeypatch):
             raise resume_files.FileUnavailable(key)
         return stored[key]
 
-    monkeypatch.setattr(job_applies, "ResumeApplication", _Jobs)
-    monkeypatch.setattr(job_applies, "Account", _Accounts)
+    monkeypatch.setattr(resume_files, "ResumeApplication", _Jobs)
+    monkeypatch.setattr(resume_files, "Account", _Accounts)
     monkeypatch.setattr(resume_files, "read_resume_file", read)
     return stored
 

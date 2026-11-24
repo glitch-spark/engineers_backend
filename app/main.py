@@ -23,6 +23,7 @@ from app.routers import (
     owner_ext,
     bidders,
     bids,
+    caller_teams,
     callers,
     dashboard,
     global_prompt,
@@ -123,6 +124,7 @@ def create_app() -> FastAPI:
     app.include_router(weekly_plans.router)
     app.include_router(daily_plans.router)
     app.include_router(interviews.router)
+    app.include_router(caller_teams.router)
     app.include_router(callers.router)
     app.include_router(skills.router)
     app.include_router(global_prompt.router)

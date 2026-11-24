@@ -7,6 +7,7 @@ from app.models.bid import Bid
 from app.models.bid_report import BidReport
 from app.models.bidder import Bidder
 from app.models.caller import Caller
+from app.models.caller_team import CallerTeam, TeamDayPost, TeamRoundPost
 from app.models.interview import Interview
 from app.models.interview_chat_log import InterviewChatLog
 from app.models.interview_day_post import InterviewDayPost
@@ -38,6 +39,7 @@ __all__ = [
     "BidReport",
     "Bidder",
     "Caller",
+    "CallerTeam",
     "DailyPlan",
     "EvalJobDescription",
     "GlobalPrompt",
@@ -61,6 +63,8 @@ __all__ = [
     "ResumeLLMCache",
     "ResumePromptEval",
     "Skill",
+    "TeamDayPost",
+    "TeamRoundPost",
     "SlackAlertLog",
     "Transaction",
     "UserExtra",

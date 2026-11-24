@@ -47,6 +47,7 @@ from app.interview_caller import (
 )
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
+from app.caller_teams.sync import sync_team_posts
 from app.caller_directory import resolve_caller
 from app.routers.callers import require_caller_manager
 from app.round_confirm import ConfirmError, confirm_round
@@ -359,17 +360,23 @@ async def _sync_caller_posts(
         await _save_interview(iv)
     if not gone:  # a delete refreshes once the round is really gone
         _refresh_day_post(iv.id)
+    _background(sync_team_posts(str(iv.id), deleted=gone))  # deleted rounds count as gone even if not popped yet
 
 
 _day_post_tasks: set[asyncio.Task] = set()
 
 
+def _background(coro) -> None:
+    """Run a Slack sync without holding up the response; drained with the day post refreshes."""
+    task = asyncio.create_task(coro)
+    _day_post_tasks.add(task)
+    task.add_done_callback(_day_post_tasks.discard)
+
+
 def _refresh_day_post(iv_id: object, *, deleted: bool = False) -> None:
     """Edit today's day post in the background (the response never waits on Slack). The refresh itself skips writes
     that cannot change the post. Slack trouble is logged, never raised."""
-    task = asyncio.create_task(_run_day_post_refresh(str(iv_id), deleted))
-    _day_post_tasks.add(task)
-    task.add_done_callback(_day_post_tasks.discard)
+    _background(_run_day_post_refresh(str(iv_id), deleted))
 
 
 async def _run_day_post_refresh(iv_id: str, deleted: bool) -> None:

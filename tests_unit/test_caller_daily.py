@@ -91,7 +91,7 @@ def test_alert_tick_survives_a_failing_refresh():
         patch("app.interview_day.post.refresh_today", AsyncMock(side_effect=RuntimeError("slack down"))),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 3, "caller_daily": "already_sent", "after_call_asks": 0, "result_reminders": 0, "heard_back_asks": 0,
+    assert out == {"caller_reminders": 3, "caller_daily": "already_sent", "after_call_asks": 0, "result_reminders": 0, "heard_back_asks": 0, "team_daily": {}, "team_reminders": 0,
                    "standup_nudge": "off"}
 
 
@@ -104,7 +104,7 @@ def test_alert_tick_sends_no_dms():
         patch.object(slack_bot, "send_dm", send),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 2, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0, "heard_back_asks": 0,
+    assert out == {"caller_reminders": 2, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0, "heard_back_asks": 0, "team_daily": {}, "team_reminders": 0,
                    "standup_nudge": "off"}
     send.assert_not_awaited()
 
@@ -125,6 +125,6 @@ def test_alert_tick_survives_reminder_crash():
         patch("app.interview_day.post.run_day_post", day_post),
     ):
         out = asyncio.run(slack_bot.run_alert_tick())
-    assert out == {"caller_reminders": 0, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0, "heard_back_asks": 0,
+    assert out == {"caller_reminders": 0, "caller_daily": "posted", "after_call_asks": 0, "result_reminders": 0, "heard_back_asks": 0, "team_daily": {}, "team_reminders": 0,
                    "standup_nudge": "off"}
     day_post.assert_awaited_once()
