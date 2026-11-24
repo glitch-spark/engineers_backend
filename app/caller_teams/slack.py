@@ -1,5 +1,6 @@
 """Slack client for the callers' workspace (a second bot token)."""
 
+import logging
 from typing import Any, Optional
 
 import httpx
@@ -8,6 +9,7 @@ from app import slack_bot
 from app.config import get_settings
 from app.models.caller import Caller
 
+log = logging.getLogger(__name__)
 _TIMEOUT = 15.0
 
 
@@ -55,5 +57,6 @@ async def workspace_name() -> Optional[str]:
         return None
     try:
         return (await api("auth.test", {})).get("team") or None
-    except Exception:
+    except Exception as exc:
+        log.warning("callers workspace auth.test failed: %s", exc)
         return None
