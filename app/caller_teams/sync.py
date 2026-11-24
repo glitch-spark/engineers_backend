@@ -200,7 +200,10 @@ async def _update(post: TeamRoundPost, tr: TeamRound, ended: bool, now: datetime
 async def sync_round(iv, entry, round_id: str, now: datetime, *, callers: dict[str, Caller],
                      teams: dict[str, CallerTeam]) -> str:
     """Bring one round's team post(s) in line: "posted" | "edited" | "replied" | "canceled" | "off" | "none" |
-    "skipped" (lost a race, a past round, or Slack failed: the sweep retries)."""
+    "skipped" (lost a race or Slack failed: the sweep retries). A past round (start <= now; a deleted one by its
+    post's stored start) gets no Slack calls at all and returns "none": its call already happened. TBD is not past."""
+    if entry is not None and entry.scheduledAt is not None and _utc(entry.scheduledAt) <= now:
+        return "none"
     tr = team_round(iv, entry, callers=callers, teams=teams) if entry is not None else None
     team_id = str(tr.team.id) if tr else None
     action = "none"
@@ -209,6 +212,8 @@ async def sync_round(iv, entry, round_id: str, now: datetime, *, callers: dict[s
         if post.teamId == team_id:
             current = post
         elif post.state != "off" and post.ts:
+            if entry is None and post.startEpoch is not None and post.startEpoch <= now.timestamp():
+                continue  # a deleted round that already happened
             action = await _mark_off(post, iv, entry, callers, teams)
     if tr is None:
         return action
@@ -223,8 +228,6 @@ async def sync_round(iv, entry, round_id: str, now: datetime, *, callers: dict[s
     if current is None:
         if ended:
             return action
-        if tr.start is not None and tr.start <= now:
-            return "skipped"  # only upcoming rounds are ever posted
         return await _post_new(tr, round_id, now)
     return await _update(current, tr, ended, now)
 

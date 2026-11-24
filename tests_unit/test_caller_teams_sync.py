@@ -308,7 +308,7 @@ async def test_archived_team_marks_off(env):
 async def test_past_round_never_posted(env):
     fake = env["slack"]
     iv = await make_iv(env, at=NOW - timedelta(hours=1))
-    assert await run_round(iv) == "skipped"
+    assert await run_round(iv) == "none"
     assert fake.calls == [] and fake.uploads == [] and await TeamRoundPost.find_all().count() == 0
 
 
@@ -416,3 +416,61 @@ async def test_interview_save_starts_team_sync(monkeypatch):
     assert thread.await_args_list[0].kwargs == {"added": {"r1"}, "deleted": set()}
     assert [c.args for c in team.await_args_list] == [("iv1",), ("iv1",)]
     assert [c.kwargs for c in team.await_args_list] == [{"deleted": set()}, {"deleted": {"r2"}}]
+
+
+async def post_then_pass(env, iv):
+    """Post the round, then move it into the past (the call happened); Slack calls so far are cleared."""
+    await run_round(iv)
+    iv.stageHistory[0].scheduledAt = NOW - timedelta(hours=1)
+    await iv.save()
+    env["slack"].calls.clear()
+    env["slack"].uploads.clear()
+
+
+async def test_rejected_past_round_makes_no_calls(env):
+    iv = await make_iv(env)
+    await post_then_pass(env, iv)
+    iv.stageHistory[0].status = "rejected"
+    await iv.save()
+    assert await run_round(iv) == "none"
+    assert env["slack"].calls == [] and (await TeamRoundPost.find_one()).state == "scheduled"
+
+
+async def test_caller_left_team_then_old_interview_edited_makes_no_calls(env):
+    iv = await make_iv(env)
+    await post_then_pass(env, iv)
+    omar = env["people"]["omar"]
+    omar.teamId = None
+    await omar.save()
+    iv.stageHistory[0].note = "edited later"
+    await iv.save()
+    await sync.sync_team_posts(str(iv.id), now=NOW)
+    assert env["slack"].calls == [] and (await TeamRoundPost.find_one()).state == "scheduled"
+
+
+async def test_archived_team_past_round_via_sweep_makes_no_calls(env):
+    iv = await make_iv(env)
+    await post_then_pass(env, iv)  # the post's stored start is still upcoming, so the sweep picks the interview
+    team = env["team"]
+    team.archivedAt = NOW
+    await team.save()
+    assert await sync.sweep_team_posts(NOW) == {"none": 1}
+    assert env["slack"].calls == [] and (await TeamRoundPost.find_one()).state == "scheduled"
+
+
+async def test_deleted_past_round_makes_no_calls(env):
+    iv = await make_iv(env)
+    await run_round(iv)
+    env["slack"].calls.clear()
+    await sync.sync_team_posts(str(iv.id), now=START + timedelta(hours=1), deleted={"r1"})
+    assert env["slack"].calls == [] and (await TeamRoundPost.find_one()).state == "scheduled"
+
+
+async def test_future_round_canceled_still_edits_and_replies(env):
+    iv = await make_iv(env)
+    await run_round(iv)
+    env["slack"].calls.clear()
+    iv.stageHistory[0].status = "canceled"
+    await iv.save()
+    assert await run_round(iv) == "canceled"
+    assert env["slack"].methods() == ["chat.update", "chat.postMessage"]
