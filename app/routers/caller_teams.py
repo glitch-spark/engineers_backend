@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
 from app.caller_teams import slack
-from app.deps import get_current_user
 from app.models import UserExtra
 from app.models.caller import Caller
 from app.models.caller_team import CallerTeam
@@ -38,6 +37,13 @@ class TeamPatch(BaseModel):
     dailyTime: Optional[str] = Field(default=None, pattern=_TIME)
     timezone: Optional[str] = None
     archived: Optional[bool] = None
+
+
+def _clean(raw: str, what: str) -> str:
+    v = " ".join(raw.split())
+    if not v:
+        raise unprocessable(f"{what} is required.")
+    return v
 
 
 def _check_timezone(tz: str) -> None:
@@ -80,7 +86,7 @@ def _name_taken() -> HTTPException:
 
 
 @router.get("")
-async def list_teams(user: Annotated[UserExtra, Depends(get_current_user)]) -> dict:
+async def list_teams(user: Annotated[UserExtra, Depends(require_caller_manager)]) -> dict:
     members: dict[str, list[str]] = {}
     for c in await Caller.find({"teamId": {"$ne": None}}).to_list():
         members.setdefault(c.teamId or "", []).append(str(c.id))
@@ -98,13 +104,14 @@ async def connection(user: Annotated[UserExtra, Depends(require_caller_manager)]
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_team(body: TeamIn, user: Annotated[UserExtra, Depends(require_caller_manager)]) -> dict:
-    name = " ".join(body.name.split())
+    name = _clean(body.name, "Team name")
+    channel, reminder = _clean(body.channelId, "Channel ID"), _clean(body.reminderChannelId, "Channel ID")
     _check_timezone(body.timezone)
     await _check_manager(body.managerCallerId)
     try:
         t = await CallerTeam(
-            name=name, nameKey=name.lower(), managerCallerId=body.managerCallerId, channelId=body.channelId.strip(),
-            reminderChannelId=body.reminderChannelId.strip(), dailyTime=body.dailyTime, timezone=body.timezone,
+            name=name, nameKey=name.lower(), managerCallerId=body.managerCallerId, channelId=channel,
+            reminderChannelId=reminder, dailyTime=body.dailyTime, timezone=body.timezone,
         ).insert()
     except DuplicateKeyError:
         raise _name_taken()
@@ -115,7 +122,7 @@ async def create_team(body: TeamIn, user: Annotated[UserExtra, Depends(require_c
 async def update_team(team_id: str, body: TeamPatch, user: Annotated[UserExtra, Depends(require_caller_manager)]) -> dict:
     t = await _get_team(team_id)
     if body.name is not None:
-        t.name = " ".join(body.name.split())
+        t.name = _clean(body.name, "Team name")
         t.nameKey = t.name.lower()
     if body.managerCallerId is not None:
         await _check_manager(body.managerCallerId)
@@ -123,9 +130,11 @@ async def update_team(team_id: str, body: TeamPatch, user: Annotated[UserExtra, 
     if body.timezone is not None:
         _check_timezone(body.timezone)
         t.timezone = body.timezone
-    for field in ("channelId", "reminderChannelId", "dailyTime"):
+    for field in ("channelId", "reminderChannelId"):
         if getattr(body, field) is not None:
-            setattr(t, field, getattr(body, field).strip())
+            setattr(t, field, _clean(getattr(body, field), "Channel ID"))
+    if body.dailyTime is not None:
+        t.dailyTime = body.dailyTime
     if body.archived is not None:
         t.archivedAt = (t.archivedAt or datetime.now(timezone.utc)) if body.archived else None
     try:

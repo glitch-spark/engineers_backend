@@ -187,3 +187,25 @@ async def test_send_test_unset_token(client, monkeypatch):
         tid = (await c.post("/callers/teams", json=team_body(m))).json()["_id"]
         r = (await c.post(f"/callers/teams/{tid}/test")).json()
     assert r["channel"] == {"ok": False, "error": "SLACK_CALLERS_BOT_TOKEN is not configured"}
+
+
+async def test_staff_cannot_list_teams(client):
+    staff = await UserExtra(name="S", email="s@x.io", role="staff").insert()
+    async with client(staff) as c:
+        assert (await c.get("/callers/teams")).status_code == 403
+
+
+async def test_blank_name_and_channels_rejected(client):
+    u, m = await admin(), await caller()
+    async with client(u) as c:
+        r = await c.post("/callers/teams", json=team_body(m, name="   "))
+        assert r.status_code == 422 and r.json()["detail"] == "Team name is required."
+        r = await c.post("/callers/teams", json=team_body(m, channelId=" "))
+        assert r.status_code == 422 and r.json()["detail"] == "Channel ID is required."
+        r = await c.post("/callers/teams", json=team_body(m, reminderChannelId=" "))
+        assert r.status_code == 422 and r.json()["detail"] == "Channel ID is required."
+        tid = (await c.post("/callers/teams", json=team_body(m))).json()["_id"]
+        for k, msg in (("name", "Team name is required."), ("channelId", "Channel ID is required."), ("reminderChannelId", "Channel ID is required.")):
+            r = await c.patch(f"/callers/teams/{tid}", json={k: "   "})
+            assert r.status_code == 422 and r.json()["detail"] == msg
+        assert (await CallerTeam.get(tid)).name == "Alpha"
