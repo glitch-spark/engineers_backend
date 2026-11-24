@@ -119,7 +119,7 @@ async def test_bids_view_contract_keys(db):
     assert h["value"] == 400 and h["rank"] == 3 and h["of"] == 4 and h["team"]["n"] == 4
     assert h["note"] == "Self 400 · bidder 0"
     per_day = out["headline"][2]
-    assert per_day["value"] == 33 and "team" in per_day["note"] and "target" not in per_day["note"]  # 400 / 12 done days
+    assert per_day["value"] == 29 and "team" in per_day["note"] and "target" not in per_day["note"]  # 400 / 14 Mon-Sat done days
     assert set(out["everyone"]) == {"rowKind", "metric", "rows"} and out["everyone"]["rowKind"] == "person" and out["trend"]["unit"] == "week"
     assert out["notEnoughData"] is False and len(out["definitions"]) == 3
 
@@ -172,7 +172,8 @@ async def test_behind_target_from_weekly_goal(db):
                      startDate=datetime(2026, 11, 2), endDate=datetime(2026, 11, 8), goal=Counts(bidsSelf=1000)).insert()
     out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
     tip = next(t for t in out["tips"] if t["id"] == "bids.behind_target")
-    assert tip["evidence"]["target"] == 1000 and tip["evidence"]["actual"] == 400 and "impact" not in tip
+    # Mon-Sat Nov 2-7, each day's share rounded up: 6 x 167
+    assert tip["evidence"]["target"] == 1002 and tip["evidence"]["actual"] == 400 and "impact" not in tip
     assert "target" in out["headline"][2]["note"]
 
 
@@ -232,17 +233,17 @@ async def test_idle_profiles_by_id_keeps_duplicate_names_and_region_less_profile
 
 async def test_per_day_matches_target_over_done_days(db):
     ana, ben, cy, dee = await _team()
-    await _plan(ana, 14, bidsSelf=999)  # a Saturday bid: not a working day, must not inflate the pace
+    await _plan(ana, 14, bidsSelf=999)  # a Saturday: a working day, so it counts toward the pace
     for u in (ana, ben, cy, dee):
         for d in (16, 17):
             await _plan(u, d, bidsSelf=40)
     await WeeklyPlan(userId=ana.id, weekStart=datetime(2026, 11, 16), weekNumber=47, year=2026,
                      startDate=datetime(2026, 11, 16), endDate=datetime(2026, 11, 22), goal=Counts(bidsSelf=200)).insert()
-    # Ana: (400 + 80) over the 12 working days before today = 40/day; the Saturday 999 is ignored.
+    # Ana: (400 + 999 + 80) over the 14 Mon-Sat days before today.
     out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
     pd = out["headline"][2]
-    assert pd["value"] == 40
-    assert pd["team"]["n"] == 4 and pd["team"]["max"] == pytest.approx(680 / 12)
+    assert pd["value"] == 106
+    assert pd["team"]["n"] == 4 and pd["team"]["max"] == pytest.approx(1479 / 14)
 
 
 async def test_per_day_equals_target_when_on_pace(db):
@@ -251,8 +252,8 @@ async def test_per_day_equals_target_when_on_pace(db):
         await _plan(ana, d, bidsSelf=100)
     await _plan(ana, 14, bidsSelf=50)  # weekend
     await WeeklyPlan(userId=ana.id, weekStart=datetime(2026, 11, 16), weekNumber=47, year=2026,
-                     startDate=datetime(2026, 11, 16), endDate=datetime(2026, 11, 22), goal=Counts(bidsSelf=500)).insert()
-    out = await sb.bids_view(ana, "week", TODAY, "all", None, TODAY)
+                     startDate=datetime(2026, 11, 16), endDate=datetime(2026, 11, 22), goal=Counts(bidsSelf=600)).insert()
+    out = await sb.bids_view(ana, "week", TODAY, "all", None, TODAY)  # 600 over Mon-Sat = 100 a day
     pd = out["headline"][2]
     assert pd["value"] == 100 and "target 100" in pd["note"]
 
@@ -286,3 +287,12 @@ async def test_definitions_mention_pre_nov16_bidder_numbers(db):
     ana, *_ = await _team()
     out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
     assert any("Nov 16, 2026" in d for d in out["definitions"])
+
+
+
+async def test_light_saturday_is_not_a_weak_weekday(db):
+    ana, *_ = await _team()
+    for d in (7, 14):  # Saturdays, far below Ana's 40 a weekday
+        await _plan(ana, d, bidsSelf=1)
+    out = await sb.bids_view(ana, "month", TODAY, "all", None, TODAY)
+    assert "bids.weak_weekdays" not in [t["id"] for t in out["tips"]]

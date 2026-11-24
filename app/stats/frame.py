@@ -41,7 +41,7 @@ def vs_median(value: float, median: Optional[float]) -> Optional[float]:
 
 def working_days(start: date, end: date, today: date) -> list[date]:
     last = min(end, today)
-    return [d for d in (start + timedelta(days=i) for i in range(max((last - start).days + 1, 0))) if d.weekday() < 5]
+    return [d for d in (start + timedelta(days=i) for i in range(max((last - start).days + 1, 0))) if d.weekday() != 6]  # Mon-Sat, as weekly plans
 
 
 def previous_window(period: str, start: date, end: date, today: date) -> tuple[date, date]:
