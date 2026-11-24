@@ -112,7 +112,7 @@ _O = "openai:"
 # Ordered presets per (task, provider): (model id, short tag shown in the picker). First active one = recommended.
 PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
     ("resume", "anthropic"): [
-        (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"), (_A + "haiku-5-5", "Cheapest"),
+        (_A + "haiku-5-5", "Cheapest"), (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
         (_A + "haiku-4-5", "Older generation"), (_A + "sonnet-5", "Older generation"),
     ],
     ("cover_letter", "anthropic"): [

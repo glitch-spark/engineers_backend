@@ -40,7 +40,7 @@ uvicorn app.main:app --reload
 | `RESUME_OPENAI_MODEL` | no | OpenAI model for the interview features and job extraction (not the resume/cover letter/screening selector); default `gpt-6-luna` |
 | `ANTHROPIC_API_KEY` | no | Enables the Anthropic presets in the resume / cover letter / screening model picker; hidden without it. `OPENAI_API_KEY` enables the OpenAI presets the same way |
 | `ANTHROPIC_WORKSPACE_ID` | no | Only for user-level Anthropic keys (`sk-ant-usr-…`), which are not tied to a workspace: the workspace id (`wrkspc_…`) sent with every request |
-| `RESUME_DEFAULT_MODEL`, `COVER_LETTER_DEFAULT_MODEL`, `SCREENING_DEFAULT_MODEL` | no | Default model per task when a request doesn't pick one (provider-prefixed ids); defaults `anthropic:claude-sonnet-5-5`, `anthropic:claude-opus-5-5`, `anthropic:claude-sonnet-5-5` |
+| `RESUME_DEFAULT_MODEL`, `COVER_LETTER_DEFAULT_MODEL`, `SCREENING_DEFAULT_MODEL` | no | Default model per task when a request doesn't pick one (provider-prefixed ids); defaults `anthropic:claude-haiku-5-5`, `anthropic:claude-opus-5-5`, `anthropic:claude-sonnet-5-5` |
 | `JUDGE_DEFAULT_MODEL` | no | Judge for the resume prompt evaluator (Resumes → Prompt Eval): scores each generated resume against a JD in a fresh context; default `anthropic:claude-opus-5-5` |
 | `PROMPT_EVAL_CONCURRENCY` | no | Job descriptions evaluated at once per eval run (each holds one slot for its generate + judge calls); default 4 |
 | `REDIS_URL`, `LLM_CACHE_TTL_SECONDS` | no | Optional Redis cache for prompt-eval judge verdicts, keyed by content hash + model lane. Generated resumes are never stored in Redis; they use only the 7-day Mongo cache. Blank = off, and a dead Redis is skipped with a warning. TTL default 2592000 (30 days) |

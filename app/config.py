@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # Only for user-level Anthropic keys (sk-ant-usr-...): the workspace every request is billed to.
     ANTHROPIC_WORKSPACE_ID: Optional[str] = None
     # Default model per task when the caller doesn't pick one (provider-prefixed ids).
-    RESUME_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
+    RESUME_DEFAULT_MODEL: str = "anthropic:claude-haiku-5-5"
     COVER_LETTER_DEFAULT_MODEL: str = "anthropic:claude-opus-5-5"
     SCREENING_DEFAULT_MODEL: str = "anthropic:claude-sonnet-5-5"
     # Judge for the resume prompt evaluator (scores generated resumes against JDs in a fresh context).
