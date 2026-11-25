@@ -399,6 +399,18 @@ async def _workable(client, p) -> FetchResult:
     )
 
 
+async def smartrecruiters_posting_url(client: httpx.AsyncClient, company: str, uuid: str) -> str:
+    """The job page of a SmartRecruiters publication uuid (apply pages carry the uuid, job pages the numeric id);
+    "" when SmartRecruiters has no such posting (closed or removed). Other HTTP / network errors raise."""
+    try:
+        d = await _get_json(client, f"https://api.smartrecruiters.com/v1/companies/{quote(company)}/postings/{quote(uuid)}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return ""
+        raise
+    return d.get("postingUrl") or "" if isinstance(d, dict) else ""
+
+
 async def _smartrecruiters(client, p) -> FetchResult:
     d = await _get_json(client, f"https://api.smartrecruiters.com/v1/companies/{p['company']}/postings/{p['id']}")
     sections = ((d.get("jobAd") or {}).get("sections")) or {}

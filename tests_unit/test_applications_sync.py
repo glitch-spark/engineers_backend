@@ -398,3 +398,46 @@ async def test_interview_fit_score_reaches_the_row(db):
     await sync.full_rebuild(SINCE, apply=True)
     row = await db["applications"].find_one({})
     assert row["interviewId"] == iv["_id"] and (row["score"], row["scoreBand"]) == (61, "fair")
+
+
+# ---- SmartRecruiters apply pages: looked up once, then keyed by the job page ----
+
+SR_APPLY = "https://jobs.smartrecruiters.com/oneclick-ui/company/Vericast/publication/adf944f9-5f63-4630-b2cd-31ef87d18700/screening?dcr_ci=Vericast"
+SR_JOB = "https://jobs.smartrecruiters.com/Vericast/744000162822809-senior-data-engineer?utm_source=remoteyeah.com"
+
+
+async def test_smartrecruiters_apply_bid_joins_its_resume_and_is_looked_up_once(db, monkeypatch):
+    calls = []
+
+    async def fake(client, company, uuid):
+        calls.append((company, uuid))
+        return "" if company == "Gone" else "https://jobs.smartrecruiters.com/Vericast/744000162822809-senior-data-engineer-"
+
+    monkeypatch.setattr("app.job_apply.fetch.smartrecruiters_posting_url", fake)
+    b = await add_bid(db, url=SR_APPLY)
+    await add_resume(db, url=SR_JOB)
+    gone = await add_bid(db, url="https://jobs.smartrecruiters.com/oneclick-ui/company/Gone/publication/00000000-0000-0000-0000-000000000000")
+    calls_before_gone = len(calls)
+
+    c = await sync.full_rebuild(SINCE, apply=True)
+    assert c["rows"] == 2  # the apply-page bid merged with the resume; the second bid has its own row
+    row = await db["applications"].find_one({"key": f"{ACC}:jobs.smartrecruiters.com/vericast/744000162822809"})
+    assert row["by"] == "bidder" and len(row["sources"]) == 2
+    assert (await db["bids"].find_one({"_id": b["_id"]}))["postingUrl"].endswith("744000162822809-senior-data-engineer-")
+    assert calls_before_gone == 0 and len(calls) == 2
+    assert (await db["bids"].find_one({"_id": gone["_id"]}))["postingUrl"] == ""  # posting gone: not asked again
+
+    await sync.full_rebuild(SINCE, apply=True)
+    assert len(calls) == 2  # answers are kept on the bids
+
+
+async def test_smartrecruiters_lookup_failure_retried_next_pass(db, monkeypatch):
+    import httpx
+
+    async def down(client, company, uuid):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr("app.job_apply.fetch.smartrecruiters_posting_url", down)
+    b = await add_bid(db, url=SR_APPLY)
+    assert (await sync.full_rebuild(SINCE, apply=True))["rows"] == 1
+    assert "postingUrl" not in await db["bids"].find_one({"_id": b["_id"]})

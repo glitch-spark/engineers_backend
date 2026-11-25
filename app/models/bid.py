@@ -44,6 +44,8 @@ class Bid(TimestampedDocument):
     ownerId: PydanticObjectId  # Bidder.createdBy at creation (self bids: the owner); decides review access
     jobKey: str  # <folder>/<YYYY-MM-DD>/<profile>/<job>: the screenshot key without its file name
     jobUrl: Optional[str] = None
+    # Job page of a SmartRecruiters apply-page jobUrl, looked up by the applications sync ("" = posting gone).
+    postingUrl: Optional[str] = None
     jobTitle: Optional[str] = None
     firstAt: datetime  # earliest capturedAt (naive UTC); decides the bid's report day
     submittedAt: Optional[datetime] = None  # None = no submit screenshot
