@@ -45,6 +45,7 @@ from app.interview_caller import (
     confirmed_by_assignment,
     round_post_state,
 )
+from app.routers._plan_access import read_subject
 from app.routers._util import doc_to_dict, parse_date, populate_owner, to_object_id
 from app.slack_bot import sync_caller_thread
 from app.caller_teams.sync import sync_team_posts
@@ -1282,18 +1283,18 @@ async def needs_items(owner_ids: Optional[list], now: datetime) -> list[dict]:
 @router.get("/needs-input")
 async def needs_input(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    userId: str = Query("", description="admins: only this owner's rounds"),
+    userId: str = Query("", description="only this owner's rounds (any active user: Home is readable by anyone)"),
 ) -> dict:
     """Rounds since the data start that still need something from the interview's owner (spec
     2026-11-20-interview-followup-design.md): `outcome` (scheduled, ended OUTCOME_WAIT ago), `follow_up` (the latest
     round, completed, ended RESULT_WAIT ago, not followed up), `heard_back` (the latest round, completed, last
     followed up RESULT_WAIT ago; carries `followedUpAt`) or `reason` (canceled / rejected with no statusReason).
     AI interviews and home assessments are only ever asked for a reason.
-    Newest first. A normal user gets their own; an admin everyone's, or one person's with `userId`."""
-    if user.role != "admin":
-        owners: Optional[list] = [user.id]
+    Newest first. One person's with `userId` (anyone's); else a normal user gets their own, an admin everyone's."""
+    if userId:
+        owners: Optional[list] = [await read_subject(user, userId)]
     else:
-        owners = [to_object_id(userId)] if userId else None
+        owners = None if user.role == "admin" else [user.id]
     items = await needs_items(owners, _now())
     return {"items": items, "counts": {need: sum(i["need"] == need for i in items) for need in NEEDS}}
 
@@ -1301,16 +1302,14 @@ async def needs_input(
 @router.get("/pipeline")
 async def pipeline(
     user: Annotated[UserExtra, Depends(get_current_user)],
-    userId: str = Query("", description="admins: this owner's interviews"),
+    userId: str = Query("", description="this owner's interviews (any active user: Home is readable by anyone)"),
 ) -> dict:
     """The interviews still open (spec 2026-11-21-admin-home-design.md), by their latest round since the data start
     (AI interviews and home assessments skipped): `scheduled` (`upcoming` while its start is ahead), `waiting`
     (completed, under RESULT_WAIT after its end), `no_result` (from then on, with whole `days` since the end),
     `followed_up` (completed and followed up; `followedUpAt` the latest) or `passed` (no later round yet). Rejected
-    and canceled ones are out. Soonest upcoming first, then most recent. One's own; an admin anyone's with `userId`."""
-    if userId and userId != str(user.id) and user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin only")
-    uid = to_object_id(userId) if userId else user.id
+    and canceled ones are out. Soonest upcoming first, then most recent. One's own; anyone's with `userId`."""
+    uid = await read_subject(user, userId or None)
     now, cutoff = _now(), local_day_start_utc(DATA_START, app_tz())
     ivs = await Interview.find({"createdBy": uid, "$or": [
         {"scheduledAt": {"$gte": cutoff}}, {"stageHistory.scheduledAt": {"$gte": cutoff}},

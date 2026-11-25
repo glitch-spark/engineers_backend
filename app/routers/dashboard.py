@@ -61,6 +61,7 @@ from app.profile_alerts import profile_alerts
 from app.profile_metrics import ProfileSpan
 from app.routers.accounts import archive_status_query
 from app.routers.interviews import follow_ups_summary, needs_items
+from app.routers._plan_access import read_subject
 from app.routers._util import to_object_id
 from app.routers.metrics import _display_name
 from app.routers.transactions import _TOTALS_GROUP
@@ -171,8 +172,9 @@ async def dashboard_week(
 ) -> dict:
     """`weekOf` (any date in it; default the week of `today`) picks the Mon-Sun week reported, never a later one
     than today's. `today` stays the real date: elapsed days, pace and the routines' day states are judged against
-    it, so a past week is all elapsed (pace: everything expected, `perDayNeeded` null)."""
-    sid = await _subject_id(user, userId)
+    it, so a past week is all elapsed (pace: everything expected, `perDayNeeded` null). `userId`: anyone's week,
+    for any active user (Home is readable by anyone, read-only)."""
+    sid = await read_subject(user, userId)
     day = _today(today)
     tz = app_tz()
     monday, saturday, sunday = week_window(_parse_ymd(weekOf, "weekOf") or day)
@@ -681,8 +683,8 @@ async def dashboard_pending(
 ) -> dict:
     """Pending items (spec 2026-11-21-admin-home-design.md), the subject's own: `interviews`, their needs-input
     rows; `profiles`, the Profiles page banners (`no_interviews` / `no_bids`); `bidders`, `not_bidding` / `slowing`
-    (`app.bidder_alerts`); `counts` per group and their `total`."""
-    sid = await _subject_id(user, userId)
+    (`app.bidder_alerts`); `counts` per group and their `total`. `userId`: anyone's, for any active user (Home)."""
+    sid = await read_subject(user, userId)
     return (await _pending([sid], _now()))[sid]
 
 
