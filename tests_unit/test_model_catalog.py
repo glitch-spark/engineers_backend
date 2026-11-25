@@ -126,10 +126,11 @@ def test_gpt_4o_mini_is_off_from_its_retirement_date(use_settings, today, day):
     assert mc.api_model_cost("gpt-4o-mini", {"input": 1_000_000}) == pytest.approx(0.15)  # old usage still priced
 
 
+# OpenAI: GPT-6 Luna and GPT-4o mini only (user, 2026-11-25); GPT-4o mini drops out at its retirement.
 @pytest.mark.parametrize("day,default,offered", [
-    (date(2026, 12, 31), "gpt-4o-mini", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini", "gpt-4o-mini"]),
-    (date(2027, 1, 1), "gpt-6-luna", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini", "gpt-4o-mini"]),
-    (date(2027, 1, 14), "gpt-6-luna", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini"]),
+    (date(2026, 12, 31), "gpt-4o-mini", ["gpt-6-luna", "gpt-4o-mini"]),
+    (date(2027, 1, 1), "gpt-6-luna", ["gpt-6-luna", "gpt-4o-mini"]),
+    (date(2027, 1, 14), "gpt-6-luna", ["gpt-6-luna"]),
 ])
 def test_job_applies_resume_models_and_default_by_date(use_settings, today, day, default, offered):
     today(day)
