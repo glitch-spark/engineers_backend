@@ -20,8 +20,9 @@ def _midnight(day: date) -> datetime:
     return datetime(day.year, day.month, day.day)
 
 
-async def bids_by_day(bidder_ids: list, start: date, end: date) -> Counter:
-    """(bidder id, report day) -> approved and pending bids of these bidders on the Bid Track days in [start, end]."""
+async def bids_by_day(bidder_ids: list, start: date, end: date, with_status: bool = False) -> Counter:
+    """(bidder id, report day) -> approved and pending bids of these bidders on the Bid Track days in [start, end].
+    `with_status`: keyed (bidder id, report day, status) instead."""
     out: Counter = Counter()
     if not bidder_ids:
         return out
@@ -30,21 +31,27 @@ async def bids_by_day(bidder_ids: list, start: date, end: date) -> Counter:
     async for d in Bid.get_motor_collection().find(
         {"bidderId": {"$in": bidder_ids}, "kind": {"$ne": "self"}, "status": {"$in": ["approved", "pending"]},
          "firstAt": {"$gte": _midnight(start) - timedelta(days=1), "$lt": _midnight(end) + timedelta(days=2)}},
-        {"firstAt": 1, "bidderId": 1},
+        {"firstAt": 1, "bidderId": 1, "status": 1},
     ):
         day = bid_report_day(d["firstAt"], sched)
         if start <= day <= end:
-            out[(d["bidderId"], day)] += 1
+            out[(d["bidderId"], day, d["status"]) if with_status else (d["bidderId"], day)] += 1
+    return out
+
+
+async def bidder_split_by_profile(owner_id, day: date) -> dict:
+    """The day's bids of the owner's bidders (archived ones too) per profile they bid for (None: on no profile), as
+    Counter({"approved": n, "pending": n})."""
+    profile_of = {b.id: b.profileId for b in await Bidder.find({"createdBy": owner_id}).to_list()}
+    out: dict = {}
+    for (bidder_id, _day, status), n in (await bids_by_day(list(profile_of), day, day, with_status=True)).items():
+        out.setdefault(profile_of[bidder_id], Counter())[status] += n
     return out
 
 
 async def bidder_done_by_profile(owner_id, day: date) -> Counter:
     """The day's bids of the owner's bidders (archived ones too) per profile they bid for (None: on no profile)."""
-    profile_of = {b.id: b.profileId for b in await Bidder.find({"createdBy": owner_id}).to_list()}
-    out: Counter = Counter()
-    for (bidder_id, _day), n in (await bids_by_day(list(profile_of), day, day)).items():
-        out[profile_of[bidder_id]] += n
-    return out
+    return Counter({pid: sum(c.values()) for pid, c in (await bidder_split_by_profile(owner_id, day)).items()})
 
 
 async def bidder_done(owner_id, day: date) -> int:
