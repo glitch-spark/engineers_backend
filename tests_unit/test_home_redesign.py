@@ -203,14 +203,15 @@ async def test_interviews_marked_and_time_order(me, monkeypatch):
     assert out["interviewsMarked"] == {"marked": 2, "total": 4}
 
 
-async def test_another_persons_rounds_never_appear(me, monkeypatch):
+async def test_a_persons_rounds_are_read_by_anyone_who_asks_for_them(me, monkeypatch):
     ben, boss = await user("Ben"), await user("Boss", "admin")
     await interview(ben, "Bens", rnd())
     await interview(ben, "Bens moved", rnd(start=at(WED, 10), reschedules=moved(at(TUE, 12), at(WED, 10))))
-    # a teammate may read the plan (as before), never the rounds
-    for out in (await get_day(TUE.isoformat(), me, None), await get_day(TUE.isoformat(), me, str(ben.id))):
-        assert out["todayInterviews"] == [] and out["interviewsMarked"] == {"marked": 0, "total": 0}
-    for reader, who in ((ben, None), (ben, str(ben.id)), (boss, str(ben.id))):
+    # one's own day never shows another person's rounds
+    out = await get_day(TUE.isoformat(), me, None)
+    assert out["todayInterviews"] == [] and out["interviewsMarked"] == {"marked": 0, "total": 0}
+    # Home is readable by anyone (user, 2026-11-24): a teammate asking for Ben gets Ben's rounds, as an admin does
+    for reader, who in ((ben, None), (ben, str(ben.id)), (boss, str(ben.id)), (me, str(ben.id))):
         out = await get_day(TUE.isoformat(), reader, who)
         assert len(out["todayInterviews"]) == 2 and out["interviewsMarked"] == {"marked": 1, "total": 2}
 

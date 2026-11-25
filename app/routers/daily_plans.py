@@ -192,12 +192,11 @@ async def get_day(
 ) -> dict:
     when = parse_ymd(day, "date")
     uid = await read_subject(user, userId)
-    return await _view(uid, when, rounds=uid == user.id or user.role == "admin")
+    return await _view(uid, when)  # Home is readable by anyone (user, 2026-11-24): the rounds too
 
 
-async def _view(uid, when: date, rounds: bool = True) -> dict:
-    """`rounds`: list the day's interviews. They are the owner's own (and an admin's to read): a teammate reading
-    the plan gets none."""
+async def _view(uid, when: date) -> dict:
+    """The day as Home shows it, for its owner or anyone reading it."""
     monday = monday_of(when)
     plans = await _week_days(uid, monday)
     plan = next((p for p in plans if p.date.date() == when), None)
@@ -207,7 +206,7 @@ async def _view(uid, when: date, rounds: bool = True) -> dict:
                    sum(sum(c.values()) for c in split.values()), await owner_profiles(uid))
     out.update(_bids_tables(out, split, when >= plan_bidder.RELEASE_DAY))
     out["followUps"] = await follow_ups_summary(uid, when)  # read-only, never stored on the plan
-    out["todayInterviews"] = today = await day_interviews(uid, when, _now()) if rounds else []
+    out["todayInterviews"] = today = await day_interviews(uid, when, _now())
     out["interviewsMarked"] = {"marked": sum(r["state"] not in ("upcoming", "now", "unmarked") for r in today),
                                "total": len(today)}
     return await _with_tracked(out, uid, when)

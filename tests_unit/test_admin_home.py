@@ -430,20 +430,29 @@ async def test_pipeline_order_soonest_upcoming_then_most_recent(me):
     assert [r["companyName"] for r in await rows_of(me)] == ["Soon", "Far", "Past new", "Past old"]
 
 
-async def test_pipeline_is_ones_own_and_an_admins_to_read(boss, me):
+async def test_pipeline_is_ones_own_and_anyones_to_read(boss, me):
     ben = await user("Ben")
     await interview(me, "Mine", rnd())
     await interview(ben, "Bens", rnd())
     assert [r["companyName"] for r in await rows_of(me)] == ["Mine"]
     assert [r["companyName"] for r in await rows_of(me, str(me.id))] == ["Mine"]
     assert [r["companyName"] for r in await rows_of(boss, str(ben.id))] == ["Bens"]
+    assert [r["companyName"] for r in await rows_of(me, str(ben.id))] == ["Bens"]  # Home is readable by anyone
     assert await rows_of(boss) == []  # an admin's own
     with pytest.raises(HTTPException) as err:
-        await rows_of(me, str(ben.id))
-    assert err.value.status_code == 403
+        await rows_of(me, str(PydanticObjectId()))
+    assert err.value.status_code == 404
 
 
 # --- GET /dashboard/pending -----------------------------------------------------------------------------------
+
+
+async def test_needs_input_for_another_person_is_theirs_for_anyone(boss, me):
+    ben = await user("Ben")
+    await interview(ben, "Bens", rnd())
+    assert (await needs_input(me, str(ben.id)))["items"] == (await needs_input(boss, str(ben.id)))["items"]
+    assert [r["companyName"] for r in (await needs_input(me, str(ben.id)))["items"]] == ["Bens"]
+    assert (await needs_input(me, ""))["items"] == []  # one's own: Ben's are not mine
 
 
 async def test_pending_interviews_are_the_needs_input_rows(boss, me):
@@ -569,7 +578,7 @@ async def test_pending_bidders(boss, me):
     assert [b["name"] for b in (await dashboard_pending(boss, str(ben.id)))["bidders"]] == ["Theirs"]
 
 
-async def test_pending_is_never_another_persons_for_a_non_admin(boss, me):
+async def test_pending_is_ones_own_and_anyones_to_read(boss, me):
     ben = await user("Ben")
     await interview(ben, "Bens", rnd())
     await profile(ben, "Quiet")
@@ -578,10 +587,11 @@ async def test_pending_is_never_another_persons_for_a_non_admin(boss, me):
              "counts": {"interviews": 0, "profiles": 0, "bidders": 0, "total": 0}}
     assert await dashboard_pending(me, None) == empty
     assert await dashboard_pending(boss, None) == empty  # an admin's own
-    for who in (str(ben.id), str(me.id)):  # as the sibling dashboard reads: userId is the admins'
-        with pytest.raises(HTTPException) as err:
-            await dashboard_pending(me, who)
-        assert err.value.status_code == 403
+    assert await dashboard_pending(me, str(me.id)) == empty
+    assert (await dashboard_pending(me, str(ben.id)))["counts"]["total"] == 3  # Home is readable by anyone
+    with pytest.raises(HTTPException) as err:
+        await dashboard_pending(me, str(PydanticObjectId()))
+    assert err.value.status_code == 404
     assert (await dashboard_pending(boss, str(ben.id)))["counts"] == {"interviews": 1, "profiles": 1, "bidders": 1,
                                                                     "total": 3}
 
@@ -701,13 +711,11 @@ async def test_interviews_by_day_follows_the_outcomes_rule(me):
     assert first["who"] == "self" and first["callerName"] is None and first["at"].endswith("Z")
 
 
-async def test_week_of_is_ones_own_and_user_id_stays_the_admins(boss, me):
+async def test_week_of_is_ones_own_and_anyones_to_read(boss, me):
     ben = await user("Ben")
     await day_plan(ben, LAST_MON, done=DoneCounts(bidsSelf=9))
     await day_plan(me, LAST_MON, done=DoneCounts(bidsSelf=4))
     assert (await dashboard_week(me, None, TODAY, LAST_MON.isoformat()))["bids"]["week"]["total"] == 4
+    assert (await dashboard_week(me, str(me.id), TODAY, LAST_MON.isoformat()))["bids"]["week"]["total"] == 4
     assert (await dashboard_week(boss, str(ben.id), TODAY, LAST_MON.isoformat()))["bids"]["week"]["total"] == 9
-    for who in (str(ben.id), str(me.id)):
-        with pytest.raises(HTTPException) as err:
-            await dashboard_week(me, who, TODAY, LAST_MON.isoformat())
-        assert err.value.status_code == 403
+    assert (await dashboard_week(me, str(ben.id), TODAY, LAST_MON.isoformat()))["bids"]["week"]["total"] == 9

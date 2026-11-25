@@ -398,15 +398,16 @@ async def test_ai_interviews_and_home_assessments_are_not_results(client, stage)
     assert (await needs(client, owner))["items"] == []
 
 
-async def test_a_normal_user_sees_only_their_own(client):
+async def test_a_normal_user_gets_their_own_or_the_person_they_ask_for(client):
     pedro, sam = await make_user(), await make_user("Sam")
     await make_interview(pedro, rnd(status="completed"), company="Pedro's")
     await make_interview(sam, rnd(status="completed"), company="Sam's")
     assert [i["companyName"] for i in (await needs(client, pedro))["items"]] == ["Pedro's"]
-    # Asking for someone else's changes nothing.
-    assert [i["companyName"] for i in (await needs(client, pedro, userId=str(sam.id)))["items"]] == ["Pedro's"]
+    # Home is readable by anyone (user, 2026-11-24): asking for someone gets that person's, never a mix
+    assert [i["companyName"] for i in (await needs(client, pedro, userId=str(sam.id)))["items"]] == ["Sam's"]
     manager = await make_user("Puma", role="interview_manager")
-    assert (await needs(client, manager, userId=str(sam.id)))["items"] == []
+    assert [i["companyName"] for i in (await needs(client, manager, userId=str(sam.id)))["items"]] == ["Sam's"]
+    assert (await needs(client, manager))["items"] == []  # their own: none
 
 
 async def test_admin_sees_everyone_or_one_person(client):
