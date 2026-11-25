@@ -114,6 +114,20 @@ async def test_backfill_keys_older_resumes(db):
     assert (await backfill(apply=True))["resumes"] == 0
 
 
+async def test_rekey_rewrites_keys_made_under_older_url_rules(db):
+    from scripts.backfill_job_url_keys import backfill
+
+    (ana, _, _), accs = await _setup()
+    r = await _resume(ana, accs["Ana"])
+    await ResumeApplication.get_motor_collection().update_one({"_id": r.id}, {"$set": {"jobUrlKey": "stale/key"}})
+
+    assert (await backfill(apply=True))["resumes"] == 0  # plain backfill only fills missing keys
+    assert await backfill(rekey=True) == {"resumes": 1, "written": 0}
+    assert await backfill(apply=True, rekey=True) == {"resumes": 1, "written": 1}
+    assert (await ResumeApplication.get(r.id)).jobUrlKey == "jobs.example.com/acme/123"
+    assert (await backfill(apply=True, rekey=True))["resumes"] == 0
+
+
 async def test_resumes_made_before_the_key_are_still_found(db):
     (ana, ben, _), accs = await _setup()
     old = await _resume(ben, accs["Ben"], url="http://www.jobs.example.com/acme/123/?utm_campaign=y", matchScore=SCORE)

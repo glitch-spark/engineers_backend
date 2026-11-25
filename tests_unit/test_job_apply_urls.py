@@ -3,6 +3,7 @@ scheme is kept, and only the scheme's default port is dropped."""
 import pytest
 
 from app.job_apply.urls import normalize_all, normalize_url
+from app.models.resume_application import job_url_key
 
 
 @pytest.mark.parametrize(
@@ -179,3 +180,91 @@ def test_normalize_all_counts_changes_and_keeps_order():
 
 def test_normalize_all_empty():
     assert normalize_all([]) == ([], 0)
+
+
+# Bid Track records the page the bidder submitted from (an apply step); the resume holds the posting link.
+# Each pair is one job seen from both sides in production data; they must clean to the same job page.
+@pytest.mark.parametrize(
+    "bid_url, resume_url",
+    [
+        ("https://akka.pinpointhq.com/en/postings/29008c2b-c99d-40dc-a59e-eaa9838dc945/applications/new",
+         "https://akka.pinpointhq.com/en/postings/29008c2b-c99d-40dc-a59e-eaa9838dc945"),
+        ("https://receptive.pinpointhq.com/en/postings/ffa7e28f-e861-4cf0-8bbd-153fc1f6e499/applications/thanks?token=z9Q",
+         "https://receptive.pinpointhq.com/en/postings/ffa7e28f-e861-4cf0-8bbd-153fc1f6e499"),
+        ("https://cplugjobs.careerplug.com/jobs/3611892/apps/new", "https://cplugjobs.careerplug.com/jobs/3611892"),
+        ("https://planatechnologies.peopleforce.io/careers/v/252369-fullstack-engineer-applied-ai/a/new",
+         "https://planatechnologies.peopleforce.io/careers/v/252369-fullstack-engineer-applied-ai"),
+        ("https://jobs.lever.co/magnetforensics/efd7e6e1-2cde-4010-8b75-b9500cfdf748/thanks",
+         "https://jobs.lever.co/magnetforensics/efd7e6e1-2cde-4010-8b75-b9500cfdf748"),
+        ("https://job-boards.greenhouse.io/keepersecurity/jobs/4438886009/confirmation",
+         "https://job-boards.greenhouse.io/keepersecurity/jobs/4438886009"),
+        ("https://app.loxo.co/job/MzY5MzEtdnpwMDFka25ka2dydmFlOQ==/form?source_type=app",
+         "https://app.loxo.co/job/MzY5MzEtdnpwMDFka25ka2dydmFlOQ"),
+        ("https://app.loxo.co/job/MzI3MjAtanU5dTMzcXo4ZWFqOWhxcw==/form?source_type=app",
+         "https://app.loxo.co/job/MzI3MjAtanU5dTMzcXo4ZWFqOWhxcw==?t=1793042439183"),
+        ("https://ekaw.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX/job/175901/apply/section/1",
+         "https://ekaw.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX/job/175901"),
+        ("https://vectorus.clearcompany.com/careers/jobs/aa7392ce-a800-7ece-3f53-b48f1d159b74/apply/092e31fa-f1bd",
+         "https://vectorus.clearcompany.com/careers/jobs/aa7392ce-a800-7ece-3f53-b48f1d159b74"),
+        ("https://itshoulders.betterteam.com/data-engineer/apply/standard", "https://itshoulders.betterteam.com/data-engineer"),
+        ("https://recruiting.paylocity.com/Recruiting/Jobs/Apply/4555860",
+         "https://recruiting.paylocity.com/Recruiting/Jobs/Details/4555860"),
+        ("https://recruiting.paylocity.com/Recruiting/jobs/Apply/4609216",
+         "https://recruiting.paylocity.com/recruiting/jobs/Details/4609216/TriVista-Business-Group-Inc/Senior-AI-Engineer"),
+        ("https://welkinhealthinc.applytojob.com/apply/confirm/n9BuXsWzAX",
+         "https://welkinhealthinc.applytojob.com/apply/n9BuXsWzAX/Senior-Software-Engineer"),
+        ("https://vispero.rec.pro.ukg.net/FRE1500FRDS/JobBoard/bdb17a81-bb2f/OpportunityApply?opportunityId=f4848774-63b1",
+         "https://vispero.rec.pro.ukg.net/FRE1500FRDS/JobBoard/bdb17a81-bb2f/OpportunityDetail?opportunityId=f4848774-63b1"),
+        ("https://redriver.rec.pro.ukg.net/RED1507RDRIV/JobBoard/66584047/OpportunityApply?opportunityId=d6908c80-d7c7",
+         "https://redriver.rec.pro.ukg.net/RED1507RDRIV/JobBoard/66584047/OpportunityDetail?opportunityId=d6908c80-d7c7&jr_id=6"),
+        ("https://recruitingbypaycor.com/career/SubmitQuestionnaire.action?clientId=8a78&id=8a7885a8&specialization=",
+         "https://recruitingbypaycor.com/career/JobIntroduction.action?clientId=8a78&id=8a7885a8&lang=en"),
+        ("https://recruitingbypaycor.com/career/SubmitVevraaForm.action?clientId=8a78c6&id=8a78ff",
+         "https://recruitingbypaycor.com/career/JobIntroduction.action?clientId=8a78c6&id=8a78ff&lang=en"),
+        ("https://highmarkhealth.wd1.myworkdayjobs.com/highmark/job/PA%2C-Working-at-Home---Pennsylvania/Software-Engineer_J281003",
+         "https://highmarkhealth.wd1.myworkdayjobs.com/highmark/job/PA-Working-at-Home---Pennsylvania/Software-Engineer_J281003"),
+        ("https://ats.rippling.com/en-GB/ozmocareers/jobs/d42d19d5-cf8d-43fc-a0eb-dce35f5bb5bf",
+         "https://ats.rippling.com/ozmocareers/jobs/d42d19d5-cf8d-43fc-a0eb-dce35f5bb5bf"),
+        ("https://jobs.workable.com/view/bn4Vdj56ioJvybihdFA1mT/remote-azure-data-engineer-in-chicago-at-tiger-analytics-inc.",
+         "https://jobs.workable.com/view/bn4Vdj56ioJvybihdFA1mT/remote-azure-data-engineer-in-chicago-at-tiger-analytics-inc"),
+    ],
+)
+def test_apply_step_and_posting_clean_to_the_same_job(bid_url, resume_url):
+    assert normalize_url(bid_url) == normalize_url(resume_url)
+    assert job_url_key(bid_url) == job_url_key(resume_url)
+    for url in (bid_url, resume_url):
+        once = normalize_url(url)
+        assert normalize_url(once) == once
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Two real segments stay: listing and form pages that are the whole site are not cut down.
+        "https://acme.com/careers/new",
+        "https://acme.com/jobs/apply",
+        "https://acme.com/a/new",
+        # "new", "a" or "apply" as part of a job's own path, not a trailing step.
+        "https://acme.com/jobs/new-grad-engineer",
+        "https://acme.com/careers/applications/123",
+        "https://acme.applytojob.com/apply/ART1tJYpSi",
+        "https://recruiting.ultipro.com/ACM1000/JobBoard/abc/OpportunityDetail?opportunityId=9f3c",
+    ],
+)
+def test_job_pages_are_left_alone(url):
+    assert normalize_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "bid_url, other_job",
+    [
+        # Same board, different jobs: never merged.
+        ("https://vectorus.clearcompany.com/careers/jobs/aa73/apply/092e", "https://vectorus.clearcompany.com/careers/jobs/bb84"),
+        ("https://recruiting.paylocity.com/Recruiting/Jobs/Apply/4555860",
+         "https://recruiting.paylocity.com/Recruiting/Jobs/Details/4555861"),
+        ("https://x.rec.pro.ukg.net/T1/JobBoard/b1/OpportunityApply?opportunityId=o1",
+         "https://x.rec.pro.ukg.net/T1/JobBoard/b1/OpportunityDetail?opportunityId=o2"),
+    ],
+)
+def test_different_jobs_stay_apart(bid_url, other_job):
+    assert normalize_url(bid_url) != normalize_url(other_job)

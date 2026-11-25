@@ -11,7 +11,9 @@ from functools import lru_cache
 from typing import Optional
 from urllib.parse import unquote, urlsplit
 
-URL_VERSION = 2  # 1: the old sheet.normalize_url (tracking params, trailing slash); 2: these rules
+# 1: the old sheet.normalize_url (tracking params, trailing slash); 2: these rules; 3: apply-step pages Bid Track
+# records (…/applications/new, …/job/N/apply/section/1, OpportunityApply, Submit*.action…) map to the job page.
+URL_VERSION = 3
 
 _SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 _JSESSION_RE = re.compile(r";jsessionid=[^/]*", re.IGNORECASE)
@@ -20,6 +22,11 @@ _WORKDAY_LOCALE_RE = re.compile(r"^/[a-z]{2}-[a-z]{2}(?=/)", re.IGNORECASE)
 _LINKEDIN_VIEW_RE = re.compile(r"^/(?:comm/)?jobs/view/(?:[^/]*-)?(\d+)/?$")
 _INDEED_HOST_RE = re.compile(r"(?:^|\.)indeed\.")
 _ICIMS_APPLY_RE = re.compile(r"^(/jobs/\d+/[^/]+)/(?:login|apply|candidate)$", re.IGNORECASE)
+_PAYLOCITY_JOB_RE = re.compile(r"^/Recruiting/Jobs/(?:Apply|Details)/(\d+)(?:/.*)?$", re.IGNORECASE)
+_APPLYTOJOB_RE = re.compile(r"^/apply/(?:confirm/)?([A-Za-z0-9]{6,})(?:/.*)?$")
+_UKG_APPLY_RE = re.compile(r"/OpportunityApply$")
+_PAYCOR_ACTION_RE = re.compile(r"^/career/\w+\.action$")
+_BETTERTEAM_APPLY_RE = re.compile(r"^(/[^/]+)/apply(?:/.*)?$", re.IGNORECASE)
 _DEFAULT_PORT = {"http": 80, "https": 443}
 
 # Registered domain (or host) -> platform. A host matches a domain when it equals it or is a subdomain of it.
@@ -47,6 +54,14 @@ _DOMAINS = {
     "zohorecruit.com.au": "zoho",
     "oraclecloud.com": "oracle",
     "join.com": "join",
+    "ukg.net": "ukg",
+    "ultipro.com": "ukg",
+    "recruitingbypaycor.com": "paycor",
+    "paylocity.com": "paylocity",
+    "applytojob.com": "applytojob",
+    "loxo.co": "loxo",
+    "betterteam.com": "betterteam",
+    "pinpointhq.com": "pinpoint",
 }
 
 # Platforms whose job pages are fully identified by the path: on a job page the whole query string is unneeded.
@@ -65,12 +80,19 @@ _JOB_PAGE = {
     "zoho": re.compile(r"/jobs/careers/\d+"),
     "oracle": re.compile(r"/CandidateExperience/.*/job/\d+", re.IGNORECASE),
     "join": re.compile(r"^/companies/[^/]+/\d+"),
+    "paylocity": re.compile(r"^/Recruiting/Jobs/Details/\d+$"),
+    "applytojob": re.compile(r"^/apply/[A-Za-z0-9]{6,}$"),
+    "loxo": re.compile(r"^/job/[^/]+$"),
+    "pinpoint": re.compile(r"^/[a-z]{2}/postings/[^/]+$"),
 }
 
-# Trailing path segments that open the application form instead of the job description.
+# Trailing path segments that open the application form, or a step after it, instead of the job description.
 _APPLY_SEGMENTS = frozenset({
     "apply", "application", "apply-now", "applynow", "applymanually", "autofillwithresume", "usemylastapplication",
+    "new", "thanks", "confirmation", "form",
 })
+# The segment holding those steps ("…/applications/new", "…/apps/new", "…/a/new"): dropped only right after one.
+_STEP_PARENTS = frozenset({"a", "apps", "applications"})
 
 # Query keys (lowercase) that only track where the click came from, on any site.
 _TRACKING_KEYS = frozenset({
@@ -174,15 +196,45 @@ def normalize_url(url: str) -> str:
     elif site == "icims":
         path = _ICIMS_APPLY_RE.sub(r"\1/job", path.rstrip("/"))
     elif site == "workday":
-        path = _WORKDAY_LOCALE_RE.sub("", path)
+        # The location segment is decorative; links differ only in whether its commas are kept ("PA%2C-…").
+        path = re.sub(r"%2c|,", "", _WORKDAY_LOCALE_RE.sub("", path), flags=re.IGNORECASE)
+    elif site == "rippling":
+        path = _WORKDAY_LOCALE_RE.sub("", path)  # /en-GB/acme/jobs/… is /acme/jobs/…
+    elif site == "paylocity":
+        path = _PAYLOCITY_JOB_RE.sub(r"/Recruiting/Jobs/Details/\1", path)
+    elif site == "applytojob":
+        path = _APPLYTOJOB_RE.sub(r"/apply/\1", path)
+    elif site == "betterteam":
+        path = _BETTERTEAM_APPLY_RE.sub(r"\1", path)
+    elif site == "loxo":
+        path = path.rstrip("/").removesuffix("/form").rstrip("=")  # job ids are base64, with or without padding
+    elif site == "ukg" and _UKG_APPLY_RE.search(path):
+        path = _UKG_APPLY_RE.sub("/OpportunityDetail", path)
+    if site == "ukg" and path.endswith("/OpportunityDetail"):
+        params = [p for p in params if p[0] == "opportunityid"]
+    elif site == "paycor" and _PAYCOR_ACTION_RE.match(path):
+        values = {k: piece for k, _, piece in params}
+        if "clientid" in values and "id" in values:
+            # Every step of the application (SubmitQuestionnaire, SubmitVevraaForm…) carries the job's ids.
+            path, params = "/career/JobIntroduction.action", [("clientid", "", values["clientid"]), ("id", "", values["id"])]
 
     # --- Apply pages and trailing slash ---
     if len(path) > 1:
         segments = path.rstrip("/").split("/")
+        # A step inside the job's own path (".../job/175901/apply/section/1"): cut at "apply" when the segment
+        # before it holds an id. Two real segments always stay.
+        for i in range(3, len(segments) - 1):
+            if segments[i].lower() == "apply" and any(c.isdigit() for c in segments[i - 1]):
+                segments = segments[:i + 1]
+                break
         # Keep at least two real segments, so a bare /careers/apply stays as it is.
+        popped = False
         while len(segments) > 3 and segments[-1].lower() in _APPLY_SEGMENTS:
             segments.pop()
-        path = "/".join(segments)
+            popped = True
+        if popped and len(segments) > 3 and segments[-1].lower() in _STEP_PARENTS:
+            segments.pop()
+        path = "/".join(segments).rstrip(".")  # a sentence-final "." copied with the link
 
     # --- Query string ---
     if params:
