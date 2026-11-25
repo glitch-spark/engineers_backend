@@ -123,11 +123,8 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
         (_A + "sonnet-5-5", "Best value"), (_A + "opus-5-5", "Top quality"),
         (_A + "haiku-4-5", "Cheapest"), (_A + "sonnet-5", "Older generation"),
     ],
-    # GPT-6.1 Sol is off; the entry after it is the recommendation meanwhile.
-    ("resume", "openai"): [
-        (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5-mini", "Low cost"), (_O + "gpt-5.4-mini", "Balanced"),
-        (_O + "gpt-4o-mini", "Older generation"), (_O + "gpt-6-luna", "Cheapest"),
-    ],
+    # GPT-6 Luna and GPT-4o mini only (user, 2026-11-25). Luna first: OpenAI's recommendation and resume fallback.
+    ("resume", "openai"): [(_O + "gpt-6-luna", "Cheapest"), (_O + "gpt-4o-mini", "Older generation")],
     ("cover_letter", "openai"): [
         (_O + "gpt-6.1-sol", "Recommended"), (_O + "gpt-5.6-sol", "Older flagship"),
         (_O + "gpt-6-astra", "Max quality"), (_O + "gpt-5.5", "Older flagship"),
@@ -149,10 +146,8 @@ PRESETS: dict[tuple[Task, Provider], list[tuple[str, str]]] = {
 
 # Job Applies tailors in bulk: budget models only. GPT-4o mini is the default through 2026 (the resume
 # prompts were tuned on it); GPT-6 Luna from 2027, before GPT-4o mini's retirement. Haiku 5.5 is offered as a
-# choice at Luna's price (user, 2026-11-20), never as the default.
-JOB_APPLIES_RESUME_MODELS: tuple[str, ...] = (
-    _O + "gpt-6-luna", _A + "haiku-5-5", _O + "gpt-5-mini", _O + "gpt-5.4-mini", _O + "gpt-4o-mini",
-)
+# choice at Luna's price (user, 2026-11-20), never as the default. OpenAI: those two only (user, 2026-11-25).
+JOB_APPLIES_RESUME_MODELS: tuple[str, ...] = (_O + "gpt-6-luna", _A + "haiku-5-5", _O + "gpt-4o-mini")
 _JOB_APPLIES_LUNA_FROM = date(2027, 1, 1)
 
 

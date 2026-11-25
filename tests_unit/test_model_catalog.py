@@ -64,7 +64,8 @@ EXPECTED = {
     ],
     ("screening", "anthropic"): [A + "sonnet-5-5", A + "opus-5-5", A + "haiku-4-5", A + "sonnet-5"],
     # GPT-6.1 Sol is turned off, so it is listed nowhere.
-    ("resume", "openai"): [O + "gpt-5-mini", O + "gpt-5.4-mini", O + "gpt-4o-mini", O + "gpt-6-luna"],
+    # Resumes from OpenAI: GPT-6 Luna and GPT-4o mini only (user, 2026-11-25).
+    ("resume", "openai"): [O + "gpt-6-luna", O + "gpt-4o-mini"],
     ("cover_letter", "openai"): [O + "gpt-5.6-sol", O + "gpt-6-astra", O + "gpt-5.5", O + "gpt-5.6-terra"],
     ("screening", "openai"): [O + "gpt-5.4-mini", O + "gpt-6-astra", O + "gpt-5-mini", O + "gpt-6-luna"],
     # Judge (prompt evaluator): strong models only, fresh-context scoring.
@@ -126,10 +127,11 @@ def test_gpt_4o_mini_is_off_from_its_retirement_date(use_settings, today, day):
     assert mc.api_model_cost("gpt-4o-mini", {"input": 1_000_000}) == pytest.approx(0.15)  # old usage still priced
 
 
+# OpenAI: GPT-6 Luna and GPT-4o mini only (user, 2026-11-25); GPT-4o mini drops out at its retirement.
 @pytest.mark.parametrize("day,default,offered", [
-    (date(2026, 12, 31), "gpt-4o-mini", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini", "gpt-4o-mini"]),
-    (date(2027, 1, 1), "gpt-6-luna", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini", "gpt-4o-mini"]),
-    (date(2027, 1, 14), "gpt-6-luna", ["gpt-6-luna", "gpt-5-mini", "gpt-5.4-mini"]),
+    (date(2026, 12, 31), "gpt-4o-mini", ["gpt-6-luna", "gpt-4o-mini"]),
+    (date(2027, 1, 1), "gpt-6-luna", ["gpt-6-luna", "gpt-4o-mini"]),
+    (date(2027, 1, 14), "gpt-6-luna", ["gpt-6-luna"]),
 ])
 def test_job_applies_resume_models_and_default_by_date(use_settings, today, day, default, offered):
     today(day)
@@ -155,7 +157,7 @@ def test_defaults_per_task(use_settings):
 
 def test_default_falls_back_to_the_openai_recommendation_without_anthropic(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
-    assert mc.default_model_id("resume", None) == O + "gpt-5-mini"
+    assert mc.default_model_id("resume", None) == O + "gpt-6-luna"
     assert mc.default_model_id("cover_letter", None) == O + "gpt-5.6-sol"
     assert mc.default_model_id("screening", None) == O + "gpt-5.4-mini"
     assert mc.default_model_id("judge", None) == O + "gpt-6-astra"
@@ -214,20 +216,22 @@ def test_validate_requested_returns_spec(use_settings):
 
 def test_fallback_chain_order_and_dedup(use_settings):
     assert ids(mc.fallback_chain("resume", A + "haiku-4-5", None)) == [
-        A + "haiku-4-5", A + "haiku-5-5", O + "gpt-5-mini",
+        A + "haiku-4-5", A + "haiku-5-5", O + "gpt-6-luna",
     ]
-    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", A + "haiku-5-5", O + "gpt-5-mini"]
-    assert ids(mc.fallback_chain("resume", A + "haiku-5-5", None)) == [A + "haiku-5-5", O + "gpt-5-mini"]
-    assert ids(mc.fallback_chain("resume", O + "gpt-5.4-mini", None)) == [
-        O + "gpt-5.4-mini", A + "haiku-5-5", O + "gpt-5-mini",
+    assert ids(mc.fallback_chain("resume", A + "sonnet-5-5", None)) == [A + "sonnet-5-5", A + "haiku-5-5", O + "gpt-6-luna"]
+    assert ids(mc.fallback_chain("resume", A + "haiku-5-5", None)) == [A + "haiku-5-5", O + "gpt-6-luna"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-4o-mini", None)) == [
+        O + "gpt-4o-mini", A + "haiku-5-5", O + "gpt-6-luna",
     ]
-    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [O + "gpt-5-mini", A + "haiku-5-5"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-6-luna", None)) == [O + "gpt-6-luna", A + "haiku-5-5"]
+    # no longer offered for resumes: the request is skipped, the default and OpenAI's recommendation remain
+    assert ids(mc.fallback_chain("resume", O + "gpt-5-mini", None)) == [A + "haiku-5-5", O + "gpt-6-luna"]
     assert ids(mc.fallback_chain("cover_letter", None, None)) == [A + "opus-5-5", O + "gpt-5.6-sol"]
 
 
 def test_fallback_chain_with_one_provider(use_settings):
     use_settings(ANTHROPIC_API_KEY=None)
-    assert ids(mc.fallback_chain("resume", O + "gpt-6-luna", None)) == [O + "gpt-6-luna", O + "gpt-5-mini"]
+    assert ids(mc.fallback_chain("resume", O + "gpt-4o-mini", None)) == [O + "gpt-4o-mini", O + "gpt-6-luna"]
 
 
 def test_turned_off_model_is_never_offered_defaulted_or_fallen_back_to(use_settings):
@@ -240,8 +244,8 @@ def test_turned_off_model_is_never_offered_defaulted_or_fallen_back_to(use_setti
         assert sol not in ids(mc.fallback_chain(task, sol, None))
         with pytest.raises(mc.ModelNotAvailable, match="GPT-6.1 Sol is turned off"):
             mc.validate_requested(task, sol, None)
-    assert mc.default_model_id("resume", None) == O + "gpt-5-mini"
-    assert ids(mc.fallback_chain("resume", sol, None)) == [O + "gpt-5-mini"]
+    assert mc.default_model_id("resume", None) == O + "gpt-6-luna"
+    assert ids(mc.fallback_chain("resume", sol, None)) == [O + "gpt-6-luna"]
 
 
 def test_usage_cost_uses_official_prices(use_settings):
@@ -277,7 +281,8 @@ def test_public_view_has_tag_and_marks_each_providers_recommendation(use_setting
     haiku = views[A + "haiku-5-5"]
     assert haiku["isDefault"] is True and haiku["recommended"] is True and haiku["tag"]
     assert set(haiku) == {"id", "label", "provider", "tier", "bestFor", "estCostUsd", "isDefault", "recommended", "tag"}
-    assert views[O + "gpt-5-mini"]["recommended"] is True and views[O + "gpt-5-mini"]["isDefault"] is False
+    assert views[O + "gpt-6-luna"]["recommended"] is True and views[O + "gpt-6-luna"]["isDefault"] is False
+    assert views[O + "gpt-4o-mini"]["recommended"] is False and O + "gpt-5-mini" not in views
     assert views[A + "opus-5-5"]["recommended"] is False
     assert views[O + "gpt-6-luna"]["tag"] == "Cheapest"
 
