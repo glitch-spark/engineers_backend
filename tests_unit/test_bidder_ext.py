@@ -73,7 +73,8 @@ async def ext(db, owner, monkeypatch):
     monkeypatch.setattr(bidder_ext, "LIMITER", FailureLimiter())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         async def create(name="Ana Lima"):
-            r = await client.post("/bidders", json={"name": name, "rate": 0.5})
+            profile = await Account(name="Default", createdBy=owner.id).insert()  # every bidder needs one
+            r = await client.post("/bidders", json={"name": name, "rate": 0.5, "profileId": str(profile.id)})
             assert r.status_code == 200, r.text
             return r.json()["bidder"]["_id"], r.json()["invite"]["code"]
 
@@ -100,7 +101,7 @@ def auth(token):
 async def test_register_login_me(ext):
     bid, _, body = await register(ext)
     assert body["bidder"] == {
-        "name": "Ana Lima", "folder": "ana-lima", "profileName": None, "username": "ana", "status": "active",
+        "name": "Ana Lima", "folder": "ana-lima", "profileName": "Default", "username": "ana", "status": "active",
     }
     me = await ext.get("/ext/me", headers=auth(body["token"]))
     assert me.status_code == 200 and me.json() == body["bidder"]

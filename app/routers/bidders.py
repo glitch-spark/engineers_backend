@@ -50,9 +50,13 @@ async def _load_owned(bidder_id: str, user) -> Bidder:
 async def _check_profile(
     body: BidderIn, user, current: Optional[PydanticObjectId] = None
 ) -> Optional[Account]:
-    """The chosen profile's account; a profile the bidder already has is kept even if since archived."""
+    """The chosen profile's account; a profile the bidder already has is kept even if since archived. Required:
+    a bidder's bids can't be credited to anyone without one."""
     if not body.profileId:
-        return None
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=[{"loc": ["body", "profileId"], "msg": "Choose a profile", "type": "value_error"}],
+        )
     account = await Account.get(PydanticObjectId(body.profileId))
     if body.profileId != str(current) and not can_select_profile(account, user):
         raise HTTPException(
@@ -151,6 +155,8 @@ async def restore_bidder(bidder_id: str, user: Annotated[UserExtra, Depends(get_
     """Undo an archive: back in lists and reports. A registered bidder signs in to the extension again with
     their username and password (archiving signed them out); an unregistered one needs a new invite code."""
     bidder = await _load_owned(bidder_id, user)
+    if bidder.archivedAt is not None and bidder.profileId is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Give this bidder a profile before restoring it")
     if bidder.archivedAt is not None:
         bidder.archivedAt = None
         await bidder.save()

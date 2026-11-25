@@ -186,6 +186,31 @@ def body(**over):
     return base
 
 
+async def own_profile(owner: UserExtra) -> str:
+    return str((await make_account(owner)).id)
+
+
+async def test_a_bidder_needs_a_profile(api):
+    me = await make_user()
+    api.login(me)
+    for res in (await api.post("/bidders", json=body()), await api.post("/bidders", json=body(profileId=""))):
+        assert res.status_code == 422
+        assert res.json()["detail"] == [{"loc": ["body", "profileId"], "msg": "Choose a profile", "type": "value_error"}]
+    assert await Bidder.find().count() == 0
+    b = await make_bidder(me, "Old")  # made before profiles were required
+    res = await api.put(f"/bidders/{b.id}", json=body(name="Old"))
+    assert res.status_code == 422 and res.json()["detail"][0]["loc"] == ["body", "profileId"]
+
+
+async def test_restore_without_a_profile_is_409(api):
+    me = await make_user()
+    api.login(me)
+    b = await make_bidder(me, "Old", archived=True, folder="old")
+    res = await api.post(f"/bidders/{b.id}/restore")
+    assert res.status_code == 409 and res.json()["detail"] == "Give this bidder a profile before restoring it"
+    assert (await Bidder.get(b.id)).archivedAt is not None
+
+
 async def test_create_and_list_bidders(api):
     me = await make_user()
     profile = await make_account(me, "AI Full-stack")
@@ -223,7 +248,7 @@ async def test_update_bidder(api):
     me = await make_user()
     b = await make_bidder(me, "Ana")
     api.login(me)
-    res = await api.put(f"/bidders/{b.id}", json=body(name="Ana S.", rate=0.75, country=""))
+    res = await api.put(f"/bidders/{b.id}", json=body(name="Ana S.", rate=0.75, country="", profileId=await own_profile(me)))
     assert res.status_code == 200
     assert (res.json()["name"], res.json()["rate"], res.json()["country"]) == ("Ana S.", 0.75, None)
     stored = await Bidder.get(b.id)
@@ -310,13 +335,13 @@ async def test_live_counts_route(api, monkeypatch):
 # --- folders, invites, reset login ---------------------------------------------------------------
 
 async def test_create_assigns_folder_and_returns_an_invite(api):
-    me = await make_user(); api.login(me)
-    res = (await api.post("/bidders", json=body(name="Puma"))).json()
+    me = await make_user(); api.login(me); pid = await own_profile(me)
+    res = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()
     assert res["bidder"]["folder"] == "puma"
     assert res["bidder"]["screenshotFolderUrl"] == "s3://bid-screenshots/puma/"
     assert res["bidder"]["status"] == "invited" and res["bidder"]["inviteExpiresAt"].endswith("Z")
     assert re.fullmatch(r"PUMA-\w{4}-\w{4}", res["invite"]["code"])
-    second = (await api.post("/bidders", json=body(name="Puma"))).json()
+    second = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()
     assert second["bidder"]["folder"] == "puma-2"
 
 
@@ -326,14 +351,14 @@ async def test_create_without_bucket_is_503(api, monkeypatch):
     monkeypatch.delenv("BID_STORAGE_BUCKET", raising=False)
     monkeypatch.setenv("BID_STORAGE_BUCKET", "")
     get_settings.cache_clear()
-    res = await api.post("/bidders", json=body(name="Puma"))
+    res = await api.post("/bidders", json=body(name="Puma", profileId=await own_profile(me)))
     assert res.status_code == 503 and res.json()["detail"] == "BID_STORAGE_BUCKET is not set"
     assert await Bidder.find().count() == 0
 
 
 async def test_create_retries_the_folder_on_a_duplicate_key(api, monkeypatch):
     from app.routers import bidders
-    me = await make_user(); api.login(me)
+    me = await make_user(); api.login(me); pid = await own_profile(me)
     folders, real = [], bidders.unique_folder
 
     async def racing(name):
@@ -343,21 +368,21 @@ async def test_create_retries_the_folder_on_a_duplicate_key(api, monkeypatch):
         return folders[-1]
 
     monkeypatch.setattr(bidders, "unique_folder", racing)
-    res = await api.post("/bidders", json=body(name="Puma"))
+    res = await api.post("/bidders", json=body(name="Puma", profileId=pid))
     assert res.status_code == 200 and folders == ["puma", "puma-2"]
     assert res.json()["bidder"]["folder"] == "puma-2"
 
 
 async def test_rename_keeps_the_folder(api):
-    me = await make_user(); api.login(me)
-    b = (await api.post("/bidders", json=body(name="Puma"))).json()["bidder"]
-    res = (await api.put(f"/bidders/{b['_id']}", json=body(name="Puma Cruz", screenshotFolderUrl="s3://x/evil/"))).json()
+    me = await make_user(); api.login(me); pid = await own_profile(me)
+    b = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()["bidder"]
+    res = (await api.put(f"/bidders/{b['_id']}", json=body(name="Puma Cruz", profileId=pid, screenshotFolderUrl="s3://x/evil/"))).json()
     assert (res["name"], res["folder"], res["screenshotFolderUrl"]) == ("Puma Cruz", "puma", "s3://bid-screenshots/puma/")
 
 
 async def test_new_invite_replaces_the_old_code(api):
-    me = await make_user(); api.login(me)
-    created = (await api.post("/bidders", json=body(name="Puma"))).json()
+    me = await make_user(); api.login(me); pid = await own_profile(me)
+    created = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()
     bid = created["bidder"]["_id"]
     old_hash = (await Bidder.get(bid)).inviteCodeHash
     res = await api.post(f"/bidders/{bid}/invite")
@@ -394,15 +419,15 @@ async def test_reset_login(api):
 
 
 async def test_reset_login_on_invited_is_409(api):
-    me = await make_user(); api.login(me)
-    b = (await api.post("/bidders", json=body(name="Puma"))).json()["bidder"]
+    me = await make_user(); api.login(me); pid = await own_profile(me)
+    b = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()["bidder"]
     res = await api.post(f"/bidders/{b['_id']}/reset-login")
     assert res.status_code == 409 and res.json()["detail"] == "Not registered yet — use New invite code"
 
 
 async def test_archive_bumps_token_version_and_clears_invite(api):
-    me = await make_user(); api.login(me)
-    b = (await api.post("/bidders", json=body(name="Puma"))).json()["bidder"]
+    me = await make_user(); api.login(me); pid = await own_profile(me)
+    b = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()["bidder"]
     assert (await api.delete(f"/bidders/{b['_id']}")).status_code == 204
     stored = await Bidder.get(b["_id"])
     assert stored.tokenVersion == 1 and stored.inviteCodeHash is None and stored.inviteExpiresAt is None
@@ -429,7 +454,7 @@ async def test_another_users_bidder_invite_routes_404(api):
 async def test_restore_brings_an_archived_bidder_back(api):
     me = await make_user(); api.login(me)
     b = await make_bidder(me, "Puma", archived=True, folder="puma", registeredAt=datetime.now(timezone.utc),
-                          username="puma", passwordHash="x", tokenVersion=1)
+                          username="puma", passwordHash="x", tokenVersion=1, profileId=(await make_account(me)).id)
     res = await api.post(f"/bidders/{b.id}/restore")
     assert res.status_code == 200
     out = res.json()
@@ -442,8 +467,8 @@ async def test_restore_brings_an_archived_bidder_back(api):
 
 
 async def test_restore_unregistered_bidder_is_invited_and_can_get_a_code(api):
-    me = await make_user(); api.login(me)
-    b = (await api.post("/bidders", json=body(name="Puma"))).json()["bidder"]
+    me = await make_user(); api.login(me); pid = await own_profile(me)
+    b = (await api.post("/bidders", json=body(name="Puma", profileId=pid))).json()["bidder"]
     await api.delete(f"/bidders/{b['_id']}")
     out = (await api.post(f"/bidders/{b['_id']}/restore")).json()
     assert out["status"] == "invited" and out["inviteExpiresAt"] is None
