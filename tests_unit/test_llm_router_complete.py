@@ -76,13 +76,13 @@ async def test_refusal_and_truncation_fall_back(monkeypatch, error):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": error,
-            "openai:gpt-5-mini": ("ok", USAGE),
+            "openai:gpt-6-luna": ("ok", USAGE),
         },
     )
     res = await llm_router.complete("resume", "p", None)
-    assert seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-5-mini"]
+    assert seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-6-luna"]
     assert res.provider == "openai" and res.fallback_used is True
-    assert res.cost_usd == pytest.approx((1000 * 0.25 + 500 * 2) / 1e6)
+    assert res.cost_usd == pytest.approx((1000 * 0.1 + 500 * 0.5) / 1e6)  # GPT-6 Luna: OpenAI's resume fallback
 
 
 async def test_validate_failure_falls_back(monkeypatch):
@@ -90,7 +90,7 @@ async def test_validate_failure_falls_back(monkeypatch):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": ("bad", USAGE),
-            "openai:gpt-5-mini": ("good", USAGE),
+            "openai:gpt-6-luna": ("good", USAGE),
         },
     )
 
@@ -99,14 +99,14 @@ async def test_validate_failure_falls_back(monkeypatch):
             raise ValueError("not good enough")
 
     res = await llm_router.complete("resume", "p", None, validate=validate)
-    assert res.text == "good" and seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-5-mini"]
+    assert res.text == "good" and seen == ["anthropic:claude-sonnet-5-5", "openai:gpt-6-luna"]
     assert "not good enough" in (res.fallback_reason or "")
 
 
 async def test_empty_output_counts_as_failure(monkeypatch):
     script(
         monkeypatch,
-        {"anthropic:claude-sonnet-5-5": ("   ", USAGE), "openai:gpt-5-mini": ("fine", USAGE)},
+        {"anthropic:claude-sonnet-5-5": ("   ", USAGE), "openai:gpt-6-luna": ("fine", USAGE)},
     )
     res = await llm_router.complete("resume", "p", None)
     assert res.text == "fine"
@@ -117,7 +117,7 @@ async def test_all_fail_raises_last_error(monkeypatch):
         monkeypatch,
         {
             "anthropic:claude-sonnet-5-5": RuntimeError("first"),
-            "openai:gpt-5-mini": RuntimeError("last"),
+            "openai:gpt-6-luna": RuntimeError("last"),
         },
     )
     with pytest.raises(RuntimeError, match="last"):
