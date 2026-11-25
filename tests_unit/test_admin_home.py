@@ -130,12 +130,12 @@ async def bidder(owner, name, on: Account = None, registered=OLD, created=OLD, a
         archivedAt=datetime(2026, 11, 1) if archived else None).insert()
 
 
-async def bids(b: Bidder, day: date, n=1) -> None:
+async def bids(b: Bidder, day: date, n=1, status="approved") -> None:
     first = datetime(day.year, day.month, day.day, 10, tzinfo=CHI).astimezone(UTC).replace(tzinfo=None)
     if n:
         await Bid.get_motor_collection().insert_many([
             Bid(bidderId=b.id, ownerId=b.createdBy, jobKey=f"{b.folder}/{next(_n)}", firstAt=first,
-                status="approved").model_dump(by_alias=True, exclude={"id"}, exclude_none=True) for _ in range(n)])
+                status=status).model_dump(by_alias=True, exclude={"id"}, exclude_none=True) for _ in range(n)])
 
 
 async def team(admin, day=WED) -> list[dict]:
@@ -314,8 +314,27 @@ async def test_bids_by_region_and_totals(me, monkeypatch):
     # from the release day it is the live count the regions are cut from (2 + 1 + 4 on no profile), not the saved 3
     monkeypatch.setattr(plan_bidder, "RELEASE_DAY", MON)
     assert (await get_day(TUE.isoformat(), me, None))["bidsTotals"] == {
-        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 12, "total": 32, "target": 42}
+        "self": 25, "selfTarget": 30, "bidder": 7, "bidderTarget": 12, "total": 32, "target": 42,
+        "bidderApproved": 7, "bidderPending": 0}
     assert latam.region == "Latam"
+
+
+async def test_bids_split_approved_and_pending_on_live_days(me, monkeypatch):
+    monkeypatch.setattr(plan_bidder, "RELEASE_DAY", MON)
+    us = await profile(me, "Usa")
+    on_us, free = await bidder(me, "Uma", us), await bidder(me, "Fay")
+    await bids(on_us, TUE, 3)
+    await bids(on_us, TUE, 2, status="pending")
+    await bids(on_us, TUE, 4, status="rejected")
+    await bids(free, TUE, 1, status="pending")  # a bidder on no profile: in the totals only
+    out = await get_day(TUE.isoformat(), me, None)
+    assert out["bidsByRegion"][0] == {"region": "US", "self": 0, "selfTarget": None, "bidder": 5,
+                                      "bidderApproved": 3, "bidderPending": 2, "total": 5}
+    t = out["bidsTotals"]
+    assert (t["bidder"], t["bidderApproved"], t["bidderPending"]) == (6, 3, 3)
+    monkeypatch.setattr(plan_bidder, "RELEASE_DAY", date(2026, 12, 1))  # before the release: no split
+    out = await get_day(TUE.isoformat(), me, None)
+    assert "bidderApproved" not in out["bidsTotals"] and "bidderApproved" not in out["bidsByRegion"][0]
 
 
 async def test_a_region_shows_for_a_profile_a_target_or_a_bid_alone(me):

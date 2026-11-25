@@ -8,6 +8,7 @@ its items are the week's routines and weekly goals with that day's results (`app
 import asyncio
 import logging
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 
@@ -201,10 +202,10 @@ async def _view(uid, when: date, rounds: bool = True) -> dict:
     plans = await _week_days(uid, monday)
     plan = next((p for p in plans if p.date.date() == when), None)
     auto_day = (await _interviews(uid, when, when)).get(when, empty_day())
-    by_profile = await plan_bidder.bidder_done_by_profile(uid, when)
+    split = await plan_bidder.bidder_split_by_profile(uid, when)
     out = _day_out(uid, when, plan, auto_day, await week_or_draft(uid, monday), plans,
-                   sum(by_profile.values()), await owner_profiles(uid))
-    out.update(_bids_tables(out, by_profile, when >= plan_bidder.RELEASE_DAY))
+                   sum(sum(c.values()) for c in split.values()), await owner_profiles(uid))
+    out.update(_bids_tables(out, split, when >= plan_bidder.RELEASE_DAY))
     out["followUps"] = await follow_ups_summary(uid, when)  # read-only, never stored on the plan
     out["todayInterviews"] = today = await day_interviews(uid, when, _now()) if rounds else []
     out["interviewsMarked"] = {"marked": sum(r["state"] not in ("upcoming", "now", "unmarked") for r in today),
@@ -212,27 +213,43 @@ async def _view(uid, when: date, rounds: bool = True) -> dict:
     return await _with_tracked(out, uid, when)
 
 
-def _bids_tables(out: dict, bidder_by_profile: dict, live: bool = True) -> dict:
+def _bids_tables(out: dict, split: dict, live: bool = True) -> dict:
     """The day view's `bidsByRegion` (US, EU, Latam; only the regions with a live profile, a target or a bid) and
-    `bidsTotals`, from its `done`, `targets` and `profiles`. A bidder's bids are in the region of the profile it bids
-    for; a target of 0 is none (null). `live`: the bidder total is the count the regions are cut from, so the two
-    always agree (the saved `done.bidsBidder` can lag a write behind); a day before the release keeps its typed one."""
+    `bidsTotals`, from its `done`, `targets` and `profiles`. `split`: the day's bidder bids per profile, as
+    Counter({"approved", "pending"}). A bidder's bids are in the region of the profile it bids for; a target of 0 is
+    none (null). `live`: the bidder total is the count the regions are cut from, so the two always agree (the saved
+    `done.bidsBidder` can lag a write behind), split into `bidderApproved` / `bidderPending`; a day before the release
+    keeps its typed total and has no split."""
     done, targets = out["done"], out["targets"]
-    bidder_total = sum(bidder_by_profile.values()) if live else done["bidsBidder"]
+
+    def counts(pids) -> Counter:
+        c: Counter = Counter()
+        for pid in pids:
+            c.update(split[pid])
+        return c
+
+    all_bids = counts(split)
+    bidder_total = sum(all_bids.values()) if live else done["bidsBidder"]
     region_of = {p["id"]: p["region"] for p in out["profiles"]}
-    live = {p["region"] for p in out["profiles"] if not p["archived"]}
+    active = {p["region"] for p in out["profiles"] if not p["archived"]}
     rows = []
     for region, field in REGION_FIELD.items():
-        bidder = sum(n for pid, n in bidder_by_profile.items() if region_of.get(str(pid)) == region)
+        c = counts(pid for pid in split if region_of.get(str(pid)) == region)
+        bidder = sum(c.values())
         row = {"region": region, "self": done[field], "selfTarget": targets[field] or None, "bidder": bidder,
                "total": done[field] + bidder}
-        if region in live or row["selfTarget"] or row["total"]:
+        if live:
+            row.update(bidderApproved=c["approved"], bidderPending=c["pending"])
+        if region in active or row["selfTarget"] or row["total"]:
             rows.append(row)
-    return {"bidsByRegion": rows, "bidsTotals": {
+    totals = {
         "self": done["bidsSelf"], "selfTarget": targets["bidsSelf"] or None,
         "bidder": bidder_total, "bidderTarget": targets["bidsBidder"] or None,
         "total": done["bidsSelf"] + bidder_total,
-        "target": (targets["bidsSelf"] + targets["bidsBidder"]) or None}}
+        "target": (targets["bidsSelf"] + targets["bidsBidder"]) or None}
+    if live:
+        totals.update(bidderApproved=all_bids["approved"], bidderPending=all_bids["pending"])
+    return {"bidsByRegion": rows, "bidsTotals": totals}
 
 
 async def _with_tracked(out: dict, uid, when: date) -> dict:
