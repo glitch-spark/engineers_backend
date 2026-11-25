@@ -21,10 +21,12 @@ FULL_TIMEOUT; a full rebuild that times out or fails is retried after FULL_RETRY
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+import httpx
 from bson import ObjectId
 from pymongo import UpdateOne
 
@@ -42,7 +44,12 @@ CHECKPOINT_OVERLAP = timedelta(minutes=2)
 _SETTINGS_ID = "applications_sync"
 _FIELDS = frozenset(Application.model_fields) - {"id", "revision_id", "createdAt"}
 _VOLATILE = frozenset({"_id", "createdAt", "updatedAt", "syncedAt"})
-_BID_FIELDS = ("kind", "bidderId", "accountId", "ownerId", "jobKey", "jobTitle", "jobUrl", "firstAt", "status")
+_BID_FIELDS = ("kind", "bidderId", "accountId", "ownerId", "jobKey", "jobTitle", "jobUrl", "postingUrl", "firstAt",
+               "status")
+# A SmartRecruiters apply page names its posting by publication uuid, the job page (what resumes carry) by numeric id.
+_SR_APPLY = re.compile(
+    r"^https?://(?:jobs|careers)\.smartrecruiters\.com/oneclick-ui/company/([^/?#]+)/publication/([0-9a-f-]{36})", re.I)
+SR_BUDGET: Optional[float] = 20  # seconds of SmartRecruiters lookups per pass (None = all); the rest wait for the next
 _RESUME_FIELDS = ("userId", "accountId", "jobUrl", "createdAt", "countsAsBid", "matchScore", "promptId",
                   "promptName", "templateName", "jobDescription")
 _TITLE_LINES = 5  # lines of jobDescription fetched for the title (leading blank lines are skipped)
@@ -98,6 +105,39 @@ async def _read_areas(resume_coll, rows: dict[str, dict]) -> None:
                 r["area"] = area
 
 
+async def _resolve_posting_urls(bids: list[dict], *, apply: bool) -> int:
+    """Point each SmartRecruiters apply-page bid at its job page, so it shares a row with the tailored resume.
+    A lookup's answer is kept on the bid as `postingUrl` ("" = no such posting) and never repeated; lookups that
+    fail or don't fit SR_BUDGET are retried on a later pass. Returns how many were looked up."""
+    todo = [b for b in bids if b.get("postingUrl") is None and _SR_APPLY.match(b.get("jobUrl") or "")]
+    if todo:
+        from app.job_apply.fetch import smartrecruiters_posting_url
+
+        found: dict = {}
+
+        async def one(client, b):
+            company, uuid = _SR_APPLY.match(b["jobUrl"]).groups()
+            try:
+                found[b["_id"]] = b["postingUrl"] = await smartrecruiters_posting_url(client, company, uuid.lower())
+            except httpx.HTTPError as exc:
+                log.warning("smartrecruiters lookup failed bid=%s: %s", b["_id"], exc)
+
+        start = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            try:
+                await asyncio.wait_for(asyncio.gather(*(one(client, b) for b in todo)), SR_BUDGET)
+            except asyncio.TimeoutError:
+                log.warning("smartrecruiters lookups: budget hit, %d of %d done", len(found), len(todo))
+        log.info("smartrecruiters lookups: %d of %d resolved in %.1fs", len(found), len(todo), time.monotonic() - start)
+        if apply and found:
+            coll = Bid.get_motor_collection()
+            await asyncio.gather(*(coll.update_one({"_id": i}, {"$set": {"postingUrl": u}}) for i, u in found.items()))
+    for b in bids:
+        if b.get("postingUrl"):
+            b["jobUrl"] = b["postingUrl"]
+    return len(todo)
+
+
 async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profiles: Optional[dict] = None) -> dict:
     """Build and match the rows of `account_ids` (None = every account) from `since`; write them when `apply`."""
     profiles = await _bidder_profiles() if profiles is None else profiles
@@ -130,6 +170,7 @@ async def _sync(since: date, account_ids: Optional[list], *, apply: bool, profil
     bid_scope = {} if accts is None else {"$or": [scope, {"bidderId": {"$in": [b for b, p in profiles.items() if p in accts]}}]}
     bids = [{**b, "accountId": _profile(b, profiles)} async for b in Bid.get_motor_collection().find(
         {**bid_scope, "firstAt": {"$gte": since_dt}}, _proj(_BID_FIELDS))]
+    await _resolve_posting_urls(bids, apply=apply)
     # countsAsBid False (Job Applies tailoring never marked applied) is not a bid, unless an interview links it
     proven = {str((d.get("resumeLink") or {}).get("resumeJobId")) for d in iv_docs}
     tailored = [r for r in resumes if r.get("countsAsBid") is False and str(r["_id"]) not in proven]  # enrich only

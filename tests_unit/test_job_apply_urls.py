@@ -227,6 +227,11 @@ def test_normalize_all_empty():
          "https://ats.rippling.com/ozmocareers/jobs/d42d19d5-cf8d-43fc-a0eb-dce35f5bb5bf"),
         ("https://jobs.workable.com/view/bn4Vdj56ioJvybihdFA1mT/remote-azure-data-engineer-in-chicago-at-tiger-analytics-inc.",
          "https://jobs.workable.com/view/bn4Vdj56ioJvybihdFA1mT/remote-azure-data-engineer-in-chicago-at-tiger-analytics-inc"),
+        # SmartRecruiters job pages: the title slug and company case vary (the API's postingUrl ends "…-engineer-").
+        ("https://jobs.smartrecruiters.com/Vericast/744000162822809-senior-data-engineer-",
+         "https://jobs.smartrecruiters.com/vericast/744000162822809-senior-data-engineer?utm_source=remoteyeah.com"),
+        ("https://jobs.smartrecruiters.com/FusionConsulting/744000137602589",
+         "https://jobs.smartrecruiters.com/FusionConsulting/744000137602589-sr-engineer?ref=remoteyeah.com"),
     ],
 )
 def test_apply_step_and_posting_clean_to_the_same_job(bid_url, resume_url):

@@ -13,7 +13,8 @@ from urllib.parse import unquote, urlsplit
 
 # 1: the old sheet.normalize_url (tracking params, trailing slash); 2: these rules; 3: apply-step pages Bid Track
 # records (…/applications/new, …/job/N/apply/section/1, OpportunityApply, Submit*.action…) map to the job page.
-URL_VERSION = 3
+# 4: SmartRecruiters job pages drop the title slug and lowercase the company (/Acme/744…-title -> /acme/744…).
+URL_VERSION = 4
 
 _SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 _JSESSION_RE = re.compile(r";jsessionid=[^/]*", re.IGNORECASE)
@@ -27,6 +28,7 @@ _APPLYTOJOB_RE = re.compile(r"^/apply/(?:confirm/)?([A-Za-z0-9]{6,})(?:/.*)?$")
 _UKG_APPLY_RE = re.compile(r"/OpportunityApply$")
 _PAYCOR_ACTION_RE = re.compile(r"^/career/\w+\.action$")
 _BETTERTEAM_APPLY_RE = re.compile(r"^(/[^/]+)/apply(?:/.*)?$", re.IGNORECASE)
+_SMARTRECRUITERS_JOB_RE = re.compile(r"^/(?!oneclick-ui/)([^/]+)/(\d{6,})(?:-[^/]*)?/?$")
 _DEFAULT_PORT = {"http": 80, "https": 443}
 
 # Registered domain (or host) -> platform. A host matches a domain when it equals it or is a subdomain of it.
@@ -204,6 +206,9 @@ def normalize_url(url: str) -> str:
         path = _PAYLOCITY_JOB_RE.sub(r"/Recruiting/Jobs/Details/\1", path)
     elif site == "applytojob":
         path = _APPLYTOJOB_RE.sub(r"/apply/\1", path)
+    elif site == "smartrecruiters" and (m := _SMARTRECRUITERS_JOB_RE.match(path)):
+        # The slug after the id is the title and changes with it; company identifiers are case-insensitive.
+        return f"https://jobs.smartrecruiters.com/{m.group(1).lower()}/{m.group(2)}"
     elif site == "betterteam":
         path = _BETTERTEAM_APPLY_RE.sub(r"\1", path)
     elif site == "loxo":

@@ -38,6 +38,9 @@ async def main() -> None:
     parser.add_argument("--since", type=date.fromisoformat, default=BACKFILL_SINCE, help="YYYY-MM-DD (default 2026-08-01)")
     parser.add_argument("--apply", action="store_true", help="write (default: dry run)")
     args = parser.parse_args()
+    import app.applications.sync as sync
+
+    sync.SR_BUDGET = None  # a manual rebuild looks up every pending SmartRecruiters bid, however long it takes
     client = AsyncIOMotorClient(get_settings().MONGODB_URI)
     await init_beanie(database=client.get_default_database(), document_models=DOCUMENT_MODELS, skip_indexes=True)
     t0 = time.monotonic()
